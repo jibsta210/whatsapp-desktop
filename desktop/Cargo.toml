@@ -1,0 +1,35 @@
+[package]
+name = "whatsapp-desktop"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "whatsapp-desktop"
+path = "src/main.rs"
+
+[dependencies]
+# UI
+gtk4 = { version = "0.9", features = ["v4_14"] }
+libadwaita = { version = "0.7", features = ["v1_5"] }
+glib = "0.20"
+
+# Async runtime (bridged to GTK main loop)
+tokio = { version = "1", features = ["full"] }
+
+# WhatsApp protocol
+whatsapp-rust = { path = ".." }
+whatsapp-rust-sqlite-storage = { path = "../storages/sqlite-storage" }
+whatsapp-rust-tokio-transport = { path = "../transports/tokio-transport" }
+whatsapp-rust-ureq-http-client = { path = "../http_clients/ureq-client" }
+
+# Utils
+anyhow = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-channel = "2"
+log = "0.4"
+env_logger = "0.11"
+qrcode = "0.14"
+image = "0.25"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }

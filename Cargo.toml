@@ -12,6 +12,7 @@ description = "Rust client for WhatsApp Web"
 [workspace]
 members = [
     ".",
+    "desktop",
     "http_clients/ureq-client",
     "storages/sqlite-storage",
     "tests/e2e",
