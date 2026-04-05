@@ -60,7 +60,8 @@ struct ChatViewInner {
     /// LID→phone mapping for avatar resolution
     lid_to_phone: RefCell<HashMap<String, String>>,
     /// Currently typing users in the active chat
-    active_typers: RefCell<Vec<String>>,
+    /// Per-chat typing state so it survives chat switches
+    all_typers: RefCell<HashMap<String, Vec<String>>>,
     /// Counter: >0 means "scroll to bottom on next vadjustment change"
     scroll_pending: Rc<Cell<u32>>,
     /// True when user is at or near the bottom of the scroll
@@ -582,7 +583,7 @@ impl ChatViewPanel {
             own_jid: RefCell::new(None),
             own_name: RefCell::new("Me".to_string()),
             lid_to_phone: RefCell::new(crate::ui::runtime::load_lid_phone_map()),
-            active_typers: RefCell::new(Vec::new()),
+            all_typers: RefCell::new(HashMap::new()),
             scroll_pending: Rc::new(Cell::new(0)),
             at_bottom: Rc::new(Cell::new(true)),
             goto_latest_btn: goto_latest_btn.clone(),
@@ -2176,8 +2177,23 @@ impl ChatViewPanel {
         *self.inner.last_msg_date.borrow_mut() = None;
         self.inner.search_entry.set_text("");
         self.inner.search_revealer.set_reveal_child(false);
-        self.inner.typing_box.set_visible(false);
-        self.inner.active_typers.borrow_mut().clear();
+        // Restore typing indicator for the newly opened chat (if anyone is typing)
+        {
+            let all = self.inner.all_typers.borrow();
+            if let Some(typers) = all.get(&chat_id) {
+                if !typers.is_empty() {
+                    let label = typers.join(", ");
+                    self.inner.typing_name.set_markup(
+                        &format!("<small><b>{label}</b> </small>")
+                    );
+                    self.inner.typing_box.set_visible(true);
+                } else {
+                    self.inner.typing_box.set_visible(false);
+                }
+            } else {
+                self.inner.typing_box.set_visible(false);
+            }
+        }
         self.inner.pin_banner.set_visible(false);
 
         // Show loading placeholder
@@ -3177,38 +3193,35 @@ impl ChatViewPanel {
     }
 
     pub fn set_typing_indicator(&self, chat_id: &str, sender_name: &str, is_typing: bool) {
-        let is_current = self
-            .inner
-            .current_chat_id
-            .borrow()
-            .as_deref()
-            .map(|id| id == chat_id)
-            .unwrap_or(false);
-
-        if !is_current {
-            return;
-        }
-
-        // Track multiple typers
+        // Track per-chat so state survives chat switches
         let display = if sender_name.is_empty() {
             "Someone".to_string()
         } else {
             sender_name.to_string()
         };
-        let mut typers = self.inner.active_typers.borrow_mut();
+        let mut all = self.inner.all_typers.borrow_mut();
+        let chat_typers = all.entry(chat_id.to_string()).or_default();
         if is_typing {
-            if !typers.contains(&display) {
-                typers.push(display);
+            if !chat_typers.contains(&display) {
+                chat_typers.push(display);
             }
         } else {
-            typers.retain(|t| *t != display);
+            chat_typers.retain(|t| *t != display);
         }
 
+        // Only update UI if this is the currently open chat
+        let is_current = self.inner.current_chat_id.borrow()
+            .as_deref().map(|id| id == chat_id).unwrap_or(false);
+        if !is_current {
+            return;
+        }
+
+        let typers = all.get(chat_id).cloned().unwrap_or_default();
+        drop(all);
         if typers.is_empty() {
             self.inner.typing_box.set_visible(false);
         } else {
             let label = typers.join(", ");
-            drop(typers);
             self.inner
                 .typing_name
                 .set_markup(&format!("<small><b>{label}</b> </small>"));
