@@ -2032,8 +2032,8 @@ impl ChatViewPanel {
             }
 
             // ── Rust-side programmatic bounce (single bubble only) ──
-            // Use set_margin_bottom() directly — zero CSS reparsing overhead.
-            // Add extra bottom padding to messages_box so the bounce stays in-frame.
+            // CSS transform: translateY() for visual-only movement (no layout shift).
+            // Pre-build all CSS strings to minimize per-frame overhead.
             bounce_active.set(true);
             if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
                 let w = bubble.widget().clone();
@@ -2041,32 +2041,52 @@ impl ChatViewPanel {
                 let msgs_box = inner.messages_box.clone();
                 let scroll = inner.scroll.clone();
 
-                // Add bottom padding so the bounce has room to be visible
+                // Add bottom padding so the bounce stays in-frame
                 msgs_box.set_margin_bottom(30);
                 Self::force_scroll_to_bottom(inner, 3);
 
-                // Bounce keyframes (margin_bottom values in px): snappy ease-out bounces
+                w.add_css_class("pilafy-bouncing");
+
+                // Bounce keyframes (translateY UP in px): snappy ease-out
                 let kf: Vec<i32> = vec![
                     0, 8, 18, 24, 18, 8, 0,
                     0, 5, 12, 5, 0,
                     0, 3, 6, 3, 0,
                 ];
-                let total = kf.len();
+                // Pre-build CSS strings to avoid format! allocation every frame
+                let css_frames: Vec<String> = kf.iter().map(|&ty| {
+                    format!("box.pilafy-bouncing {{ transform: translateY(-{}px); }}", ty)
+                }).collect();
+                let total = css_frames.len();
                 let idx = Rc::new(Cell::new(0usize));
 
+                let bounce_css = gtk4::CssProvider::new();
+                gtk4::style_context_add_provider_for_display(
+                    &gtk4::gdk::Display::default().unwrap(),
+                    &bounce_css,
+                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+                );
+
                 gtk4::glib::timeout_add_local(
-                    std::time::Duration::from_millis(16), // ~60fps
+                    std::time::Duration::from_millis(18), // ~55fps
                     move || {
                         if !ba.get() {
-                            w.set_margin_bottom(0);
+                            bounce_css.load_from_string(
+                                "box.pilafy-bouncing { transform: translateY(0px); }"
+                            );
+                            w.remove_css_class("pilafy-bouncing");
                             msgs_box.set_margin_bottom(0);
-                            // Scroll to final position
+                            if let Some(display) = gtk4::gdk::Display::default() {
+                                gtk4::style_context_remove_provider_for_display(
+                                    &display, &bounce_css,
+                                );
+                            }
                             let adj = scroll.vadjustment();
                             adj.set_value(adj.upper() - adj.page_size());
                             return gtk4::glib::ControlFlow::Break;
                         }
                         let i = idx.get() % total;
-                        w.set_margin_bottom(kf[i]);
+                        bounce_css.load_from_string(&css_frames[i]);
                         idx.set(idx.get() + 1);
                         gtk4::glib::ControlFlow::Continue
                     },
