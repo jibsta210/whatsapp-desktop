@@ -604,8 +604,7 @@ impl MessageBubble {
             } else {
                 text_label.set_wrap(true);
                 text_label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-                // Let text expand to fill the bubble width (capped at 520px by CSS max-width).
-                // No width_chars or max_width_chars — the bubble CSS is the constraint.
+                text_label.set_max_width_chars(48);
                 text_label.set_hexpand(true);
             }
             text_label.set_halign(Align::Start);

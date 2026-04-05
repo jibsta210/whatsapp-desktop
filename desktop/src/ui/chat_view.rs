@@ -1973,7 +1973,6 @@ impl ChatViewPanel {
             if let Some(bubble) = bubbles.borrow().get(&tmp_id) {
                 let w = bubble.widget();
                 w.remove_css_class("pilafy");
-                w.remove_css_class("pilafy-bouncing");
                 w.add_css_class("pilafy-settle");
                 // Update text if AI changed it
                 if final_text != original_text {
@@ -2033,55 +2032,41 @@ impl ChatViewPanel {
             }
 
             // ── Rust-side programmatic bounce (single bubble only) ──
-            // Use CSS `transform: translateY()` — a purely VISUAL effect that does
-            // NOT change layout or scroll position. Only the bubble moves; the rest
-            // of the chat stays perfectly still.
+            // Use set_margin_bottom() directly — zero CSS reparsing overhead.
+            // Add extra bottom padding to messages_box so the bounce stays in-frame.
             bounce_active.set(true);
             if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
                 let w = bubble.widget().clone();
-                w.add_css_class("pilafy-bouncing");
                 let ba = bounce_active.clone();
+                let msgs_box = inner.messages_box.clone();
+                let scroll = inner.scroll.clone();
 
-                // Bounce keyframes (positive = translateY UP in px): snappy ease-out bounces
+                // Add bottom padding so the bounce has room to be visible
+                msgs_box.set_margin_bottom(30);
+                Self::force_scroll_to_bottom(inner, 3);
+
+                // Bounce keyframes (margin_bottom values in px): snappy ease-out bounces
                 let kf: Vec<i32> = vec![
-                    0, 6, 14, 20, 22, 20, 14, 6, 0,
-                    0, 4, 10, 12, 10, 4, 0,
-                    0, 2, 5, 2, 0,
+                    0, 8, 18, 24, 18, 8, 0,
+                    0, 5, 12, 5, 0,
+                    0, 3, 6, 3, 0,
                 ];
                 let total = kf.len();
                 let idx = Rc::new(Cell::new(0usize));
-
-                // Dedicated CSS provider for dynamic transform — affects only .pilafy-bouncing
-                let bounce_css = gtk4::CssProvider::new();
-                gtk4::style_context_add_provider_for_display(
-                    &gtk4::gdk::Display::default().unwrap(),
-                    &bounce_css,
-                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-                );
 
                 gtk4::glib::timeout_add_local(
                     std::time::Duration::from_millis(16), // ~60fps
                     move || {
                         if !ba.get() {
-                            // Stop: clear transform and remove class
-                            bounce_css.load_from_string(
-                                "box.pilafy-bouncing { transform: translateY(0px); }"
-                            );
-                            w.remove_css_class("pilafy-bouncing");
-                            // Remove the provider to avoid stale CSS
-                            if let Some(display) = gtk4::gdk::Display::default() {
-                                gtk4::style_context_remove_provider_for_display(
-                                    &display, &bounce_css,
-                                );
-                            }
+                            w.set_margin_bottom(0);
+                            msgs_box.set_margin_bottom(0);
+                            // Scroll to final position
+                            let adj = scroll.vadjustment();
+                            adj.set_value(adj.upper() - adj.page_size());
                             return gtk4::glib::ControlFlow::Break;
                         }
                         let i = idx.get() % total;
-                        let ty = kf[i];
-                        // translateY with negative value moves the widget UP visually
-                        bounce_css.load_from_string(
-                            &format!("box.pilafy-bouncing {{ transform: translateY(-{}px); }}", ty)
-                        );
+                        w.set_margin_bottom(kf[i]);
                         idx.set(idx.get() + 1);
                         gtk4::glib::ControlFlow::Continue
                     },
