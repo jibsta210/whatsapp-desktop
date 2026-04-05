@@ -403,7 +403,13 @@ pub async fn prepare_dm_stanza<
 ) -> Result<Node> {
     // Generate reporting token if the message type supports it
     // For DMs, both sender_jid and remote_jid are the recipient (to_jid) per Baileys implementation
-    let reporting_result = generate_reporting_token(message, &request_id, &to_jid, &to_jid, None);
+    // Preserve any existing message_secret (e.g., from poll creation)
+    let existing_secret = message
+        .message_context_info
+        .as_ref()
+        .and_then(|ctx| ctx.message_secret.as_deref());
+    let reporting_result =
+        generate_reporting_token(message, &request_id, &to_jid, &to_jid, existing_secret);
 
     // Prepare message with MessageContextInfo containing the message secret
     let message_for_encryption = if let Some(ref result) = reporting_result {
@@ -658,7 +664,13 @@ pub async fn prepare_group_stanza<
 
     // Generate reporting token if the message type supports it
     // For groups, both sender_jid and remote_jid are the group JID (to_jid) per Baileys implementation
-    let reporting_result = generate_reporting_token(message, &request_id, &to_jid, &to_jid, None);
+    // Preserve any existing message_secret (e.g., from poll creation)
+    let existing_secret = message
+        .message_context_info
+        .as_ref()
+        .and_then(|ctx| ctx.message_secret.as_deref());
+    let reporting_result =
+        generate_reporting_token(message, &request_id, &to_jid, &to_jid, existing_secret);
 
     // Prepare message with MessageContextInfo containing the message secret
     let message_for_encryption = if let Some(ref result) = reporting_result {

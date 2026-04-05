@@ -101,10 +101,28 @@ impl Client {
             );
             let interval = Duration::from_millis(interval_ms as u64);
 
+            let wall_before = wacore::time::now_millis();
+
             futures::select! {
                 _ = self.runtime.sleep(interval).fuse() => {
                     if !self.is_connected() {
                         debug!(target: "Client/Keepalive", "Not connected, exiting keepalive loop.");
+                        return;
+                    }
+
+                    // Defense-in-depth: detect system suspend via wall-clock drift.
+                    // If a 15-30s sleep took significantly longer in wall time, the
+                    // system was likely suspended. Force an immediate reconnect to
+                    // re-establish a fresh connection and trigger offline sync.
+                    let wall_elapsed_ms = (wacore::time::now_millis() - wall_before) as u64;
+                    let expected_ms = interval_ms as u64;
+                    if wall_elapsed_ms > expected_ms + 15_000 {
+                        warn!(
+                            target: "Client/Keepalive",
+                            "Suspend detected: expected ~{}ms sleep, wall clock shows {}ms — forcing reconnect",
+                            expected_ms, wall_elapsed_ms
+                        );
+                        self.reconnect_immediately().await;
                         return;
                     }
 

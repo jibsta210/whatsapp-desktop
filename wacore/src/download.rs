@@ -28,6 +28,8 @@ pub enum MediaType {
     Image,
     Video,
     Audio,
+    /// Push-to-talk voice note — same HKDF info as Audio but different upload/download endpoint
+    Ptt,
     Document,
     History,
     AppState,
@@ -41,7 +43,7 @@ impl MediaType {
         match self {
             MediaType::Image => "WhatsApp Image Keys",
             MediaType::Video => "WhatsApp Video Keys",
-            MediaType::Audio => "WhatsApp Audio Keys",
+            MediaType::Audio | MediaType::Ptt => "WhatsApp Audio Keys",
             MediaType::Document => "WhatsApp Document Keys",
             MediaType::History => "WhatsApp History Keys",
             MediaType::AppState => "WhatsApp App State Keys",
@@ -56,6 +58,7 @@ impl MediaType {
             MediaType::Image | MediaType::Sticker => "image",
             MediaType::Video => "video",
             MediaType::Audio => "audio",
+            MediaType::Ptt => "ptt",
             MediaType::Document => "document",
             MediaType::History => "md-msg-hist",
             MediaType::AppState => "md-app-state",

@@ -394,6 +394,7 @@ pub enum Event {
     MarkChatAsReadUpdate(MarkChatAsReadUpdate),
     DeleteChatUpdate(DeleteChatUpdate),
     DeleteMessageForMeUpdate(DeleteMessageForMeUpdate),
+    QuickReplyUpdate(QuickReplyUpdate),
 
     HistorySync(HistorySync),
     OfflineSyncPreview(OfflineSyncPreview),
@@ -852,6 +853,14 @@ pub struct DeleteMessageForMeUpdate {
     pub from_me: bool,
     pub timestamp: DateTime<Utc>,
     pub action: Box<wa::sync_action_value::DeleteMessageForMeAction>,
+    pub from_full_sync: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct QuickReplyUpdate {
+    pub shortcut: String,
+    pub timestamp: DateTime<Utc>,
+    pub action: Box<wa::sync_action_value::QuickReplyAction>,
     pub from_full_sync: bool,
 }
 

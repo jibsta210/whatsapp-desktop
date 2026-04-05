@@ -971,6 +971,20 @@ impl Client {
         Ok(())
     }
 
+    /// Force a reconnect by closing the transport without stopping the bot.
+    /// The message loop will detect the broken connection and auto-reconnect,
+    /// triggering a fresh offline sync to catch missed messages.
+    pub async fn force_reconnect(self: &Arc<Self>) {
+        info!("Forcing reconnect (transport close without shutdown).");
+        self.expected_disconnect.store(true, Ordering::Relaxed);
+        // Reset error count so reconnect happens immediately (no backoff)
+        self.auto_reconnect_errors.store(0, Ordering::Relaxed);
+        if let Some(transport) = self.transport.lock().await.as_ref() {
+            transport.disconnect().await;
+        }
+        // NOTE: is_running stays true — bot will auto-reconnect
+    }
+
     pub async fn disconnect(self: &Arc<Self>) {
         info!("Disconnecting client intentionally.");
         self.expected_disconnect.store(true, Ordering::Relaxed);
@@ -1922,7 +1936,8 @@ impl Client {
                         return;
                     }
 
-                    if let Err(e) = sync_client
+                    log::info!("Starting non-critical app state sync (RegularLow, RegularHigh, Regular)");
+                    match sync_client
                         .sync_collections_batched(vec![
                             WAPatchName::RegularLow,
                             WAPatchName::RegularHigh,
@@ -1930,7 +1945,8 @@ impl Client {
                         ])
                         .await
                     {
-                        sync_client.log_sync_error("non-critical app state sync", &e);
+                        Ok(()) => log::info!("Non-critical app state sync completed successfully"),
+                        Err(e) => log::warn!("Non-critical app state sync failed: {e:#}"),
                     }
 
                     sync_client
@@ -1980,7 +1996,12 @@ impl Client {
         false
     }
 
-    #[allow(dead_code)] // Used by per-collection callers (e.g., critical sync gating)
+    /// Force a resync of a specific app-state collection.
+    pub async fn resync_app_state(&self, name: WAPatchName) -> anyhow::Result<()> {
+        self.fetch_app_state_with_retry(name).await
+    }
+
+    #[allow(dead_code)]
     pub(crate) async fn fetch_app_state_with_retry(&self, name: WAPatchName) -> anyhow::Result<()> {
         // In-flight dedup: skip if this collection is already being synced.
         // Matches WA Web's WAWebSyncdCollectionsStateMachine which tracks in-flight syncs
@@ -2588,11 +2609,80 @@ impl Client {
     ) {
         use wacore::types::events::Event;
 
+        // Log ALL mutations regardless of operation type
+        if !m.index.is_empty() {
+            use std::collections::HashSet;
+            use std::sync::Mutex as StdMutex;
+            static SEEN_KINDS: std::sync::LazyLock<StdMutex<HashSet<String>>> =
+                std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
+            let kind = m.index[0].clone();
+            let has_qr = m
+                .action_value
+                .as_ref()
+                .map(|v| v.quick_reply_action.is_some())
+                .unwrap_or(false);
+            let op = format!("{:?}", m.operation);
+            let mut seen = SEEN_KINDS.lock().unwrap();
+            if !seen.contains(&kind) {
+                seen.insert(kind.clone());
+                log::info!("APP_STATE_KIND: '{kind}' op={op} has_qr={has_qr}");
+            }
+            if has_qr {
+                log::info!("FOUND_QR: kind='{kind}' index={:?}", m.index);
+                if let Some(val) = &m.action_value {
+                    if let Some(qr) = &val.quick_reply_action {
+                        log::info!(
+                            "QR_DATA: shortcut={:?} message={:?} deleted={:?}",
+                            qr.shortcut,
+                            qr.message,
+                            qr.deleted
+                        );
+                    }
+                }
+            }
+        }
+
         if m.operation != wa::syncd_mutation::SyncdOperation::Set {
             return;
         }
         if m.index.is_empty() {
             return;
+        }
+
+        // Handled above, remove duplicate logging
+        {
+            use std::collections::HashSet;
+            use std::sync::Mutex as StdMutex;
+            static SEEN_KINDS: std::sync::LazyLock<StdMutex<HashSet<String>>> =
+                std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
+            let kind = m.index[0].clone();
+            let has_qr = m
+                .action_value
+                .as_ref()
+                .map(|v| v.quick_reply_action.is_some())
+                .unwrap_or(false);
+            let has_value = m.action_value.is_some();
+            let mut seen = SEEN_KINDS.lock().unwrap();
+            if !seen.contains(&kind) {
+                seen.insert(kind.clone());
+                log::info!(
+                    "APP_STATE_KIND: '{kind}' has_value={has_value} has_qr={has_qr} idx_len={}",
+                    m.index.len()
+                );
+            }
+            if has_qr {
+                log::info!("FOUND_QR: kind='{kind}' index={:?}", m.index);
+                if let Some(val) = &m.action_value {
+                    if let Some(qr) = &val.quick_reply_action {
+                        log::info!(
+                            "FOUND_QR_DATA: shortcut={:?} message={:?} deleted={:?}",
+                            qr.shortcut,
+                            qr.message,
+                            qr.deleted
+                        );
+                    }
+                }
+            }
         }
 
         // Delegate chat-related mutations (mute, pin, archive, star, contact, etc.)

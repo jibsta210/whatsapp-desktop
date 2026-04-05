@@ -12,7 +12,7 @@ use log::debug;
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::types::events::{
     ArchiveUpdate, ContactUpdate, DeleteChatUpdate, DeleteMessageForMeUpdate, Event,
-    MarkChatAsReadUpdate, MuteUpdate, PinUpdate, StarUpdate,
+    MarkChatAsReadUpdate, MuteUpdate, PinUpdate, QuickReplyUpdate, StarUpdate,
 };
 use wacore_binary::jid::{Jid, JidExt};
 use waproto::whatsapp as wa;
@@ -68,6 +68,7 @@ pub(crate) fn dispatch_chat_mutation(
 
     let kind = &m.index[0];
 
+    // Log unhandled mutation kinds so we can discover the correct key for quick replies
     if !matches!(
         kind.as_str(),
         "mute"
@@ -80,7 +81,20 @@ pub(crate) fn dispatch_chat_mutation(
             | "markChatAsRead"
             | "deleteChat"
             | "deleteMessageForMe"
+            | "quick_reply"
+            | "quick_reply_action"
+            | "quickReply"
+            | "quickReplyAction"
     ) {
+        // Check if this mutation has a quick_reply_action even under a different key
+        if let Some(val) = &m.action_value {
+            if val.quick_reply_action.is_some() {
+                log::warn!(
+                    "QuickReplyAction found under unexpected key: '{kind}' index={:?}",
+                    m.index
+                );
+            }
+        }
         return false;
     }
 
@@ -90,6 +104,30 @@ pub(crate) fn dispatch_chat_mutation(
         .and_then(|v| v.timestamp)
         .unwrap_or(0);
     let time = DateTime::from_timestamp_millis(ts).unwrap_or_else(wacore::time::now_utc);
+
+    // Handle quick_reply BEFORE JID parsing — quick reply index[1] is a shortcut ID, not a JID
+    if matches!(
+        kind.as_str(),
+        "quick_reply" | "quick_reply_action" | "quickReply" | "quickReplyAction"
+    ) {
+        if let Some(val) = &m.action_value
+            && let Some(act) = &val.quick_reply_action
+        {
+            let shortcut = m
+                .index
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| String::from("unknown"));
+            event_bus.dispatch(&Event::QuickReplyUpdate(QuickReplyUpdate {
+                shortcut,
+                timestamp: time,
+                action: Box::new(act.clone()),
+                from_full_sync: full_sync,
+            }));
+        }
+        return true;
+    }
+
     let jid: Jid = if m.index.len() > 1 {
         match m.index[1].parse() {
             Ok(j) => j,
@@ -528,9 +566,73 @@ impl<'a> ChatActions<'a> {
             .await
     }
 
+    /// Create or update a quick reply and sync to WhatsApp servers.
+    pub async fn save_quick_reply(&self, shortcut: &str, message: &str) -> Result<()> {
+        let index = serde_json::to_vec(&["quick_reply", shortcut])?;
+        let value = wa::SyncActionValue {
+            timestamp: Some(wacore::time::now_utc().timestamp_millis()),
+            quick_reply_action: Some(wa::sync_action_value::QuickReplyAction {
+                shortcut: Some(shortcut.to_string()),
+                message: Some(message.to_string()),
+                keywords: vec![],
+                count: Some(0),
+                deleted: Some(false),
+            }),
+            ..Default::default()
+        };
+        self.send_mutation(WAPatchName::Regular, &index, &value)
+            .await
+    }
+
+    /// Delete a quick reply and sync to WhatsApp servers.
+    pub async fn delete_quick_reply(&self, shortcut: &str) -> Result<()> {
+        let index = serde_json::to_vec(&["quick_reply", shortcut])?;
+        let value = wa::SyncActionValue {
+            timestamp: Some(wacore::time::now_utc().timestamp_millis()),
+            quick_reply_action: Some(wa::sync_action_value::QuickReplyAction {
+                shortcut: Some(shortcut.to_string()),
+                message: None,
+                keywords: vec![],
+                count: None,
+                deleted: Some(true),
+            }),
+            ..Default::default()
+        };
+        self.send_mutation(WAPatchName::Regular, &index, &value)
+            .await
+    }
+
     async fn send_mutation(
         &self,
         collection: WAPatchName,
+        index: &[u8],
+        value: &wa::SyncActionValue,
+    ) -> Result<()> {
+        self.send_mutation_op(
+            collection,
+            wa::syncd_mutation::SyncdOperation::Set,
+            index,
+            value,
+        )
+        .await
+    }
+
+    async fn send_remove_mutation(&self, collection: WAPatchName, index: &[u8]) -> Result<()> {
+        // Remove operations still need a value (empty) for the MAC computation
+        let value = wa::SyncActionValue::default();
+        self.send_mutation_op(
+            collection,
+            wa::syncd_mutation::SyncdOperation::Remove,
+            index,
+            &value,
+        )
+        .await
+    }
+
+    async fn send_mutation_op(
+        &self,
+        collection: WAPatchName,
+        operation: wa::syncd_mutation::SyncdOperation,
         index: &[u8],
         value: &wa::SyncActionValue,
     ) -> Result<()> {
@@ -549,14 +651,7 @@ impl<'a> ChatActions<'a> {
         let mut iv = [0u8; 16];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
 
-        let (mutation, value_mac) = encode_record(
-            wa::syncd_mutation::SyncdOperation::Set,
-            index,
-            value,
-            &keys,
-            &key_id,
-            &iv,
-        );
+        let (mutation, value_mac) = encode_record(operation, index, value, &keys, &key_id, &iv);
 
         self.client
             .send_app_state_patch(collection.as_str(), vec![(mutation, value_mac)])

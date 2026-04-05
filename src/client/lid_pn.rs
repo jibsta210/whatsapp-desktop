@@ -92,6 +92,17 @@ impl Client {
         Ok(())
     }
 
+    /// Resolve a @lid JID string to its corresponding @s.whatsapp.net JID string.
+    /// Returns None if the mapping is not in the local cache.
+    pub async fn resolve_lid_to_phone_jid(&self, lid_jid_str: &str) -> Option<String> {
+        let jid: Jid = lid_jid_str.parse().ok()?;
+        if !jid.is_lid() {
+            return None;
+        }
+        let phone = self.lid_pn_cache.get_phone_number(&jid.user).await?;
+        Some(format!("{}@s.whatsapp.net", phone))
+    }
+
     /// Ensure phone-to-LID mappings are resolved for the given JIDs.
     /// Matches WhatsApp Web's WAWebManagePhoneNumberMappingJob.ensurePhoneNumberToLidMapping().
     /// Should be called before establishing new E2E sessions to avoid duplicate sessions.

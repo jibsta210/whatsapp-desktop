@@ -1,10 +1,41 @@
+# Build artifacts
 /target
+/.cargo
+
+# IDE
+/.vscode
+
+# Session & auth data (NEVER commit)
+/*.db*
+/whatsapp_store
+/whatsapp.db
+/whatsapp.db-*
+
+# App data files (user-specific, generated at runtime)
+/wa_*.bin
+/wa_*.json
+/wa_messages/
+/wa_avatars/
+/wa_media/
+/wa_notes.txt
+/wa_send_groups.json
+
+# API keys & secrets
+.env
+*.key
+gemini_key.txt
+tenor_key.txt
+
+# Config with keys
+.config/
+
+# Docs & misc
+docs
 /*.xml
 /*.txt
-/whatsapp_store
-/.cargo
-/.vscode
-/*.db*
-.env
-docs
 .claude
+
+# macOS build artifacts
+/dist/
+*.app
+.DS_Store

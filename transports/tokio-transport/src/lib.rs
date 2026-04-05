@@ -163,12 +163,16 @@ impl Transport for TokioWebSocketTransport {
         if let Some(mut sink) = sink_guard.take() {
             // Send a WebSocket close frame with code 1000 (normal closure),
             // matching WhatsApp Web's graceful shutdown behavior.
-            let _ = sink
-                .send(Message::close(
+            // Timeout after 5s to avoid hanging on stale TCP sockets
+            // (e.g. after system suspend/hibernate).
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                sink.send(Message::close(
                     Some(tokio_websockets::CloseCode::NORMAL_CLOSURE),
                     "",
-                ))
-                .await;
+                )),
+            )
+            .await;
         }
     }
 }
