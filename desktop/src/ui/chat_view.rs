@@ -2042,12 +2042,11 @@ impl ChatViewPanel {
                 w.add_css_class("pilafy-bouncing");
                 let ba = bounce_active.clone();
 
-                // Bounce keyframes (positive = translateY UP in px): big → medium → small → repeat
+                // Bounce keyframes (positive = translateY UP in px): snappy ease-out bounces
                 let kf: Vec<i32> = vec![
-                    0, 4, 9, 16, 22, 28, 32, 34, 32, 28, 22, 16, 9, 4, 0,
-                    0, 3, 7, 13, 18, 22, 18, 13, 7, 3, 0,
-                    0, 2, 5, 9, 12, 9, 5, 2, 0,
-                    0, 1, 3, 5, 3, 1, 0,
+                    0, 6, 14, 20, 22, 20, 14, 6, 0,
+                    0, 4, 10, 12, 10, 4, 0,
+                    0, 2, 5, 2, 0,
                 ];
                 let total = kf.len();
                 let idx = Rc::new(Cell::new(0usize));
@@ -2061,7 +2060,7 @@ impl ChatViewPanel {
                 );
 
                 gtk4::glib::timeout_add_local(
-                    std::time::Duration::from_millis(25), // ~40fps
+                    std::time::Duration::from_millis(16), // ~60fps
                     move || {
                         if !ba.get() {
                             // Stop: clear transform and remove class
