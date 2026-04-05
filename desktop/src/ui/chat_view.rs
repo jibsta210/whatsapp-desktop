@@ -1961,6 +1961,7 @@ impl ChatViewPanel {
         let original_text = text.clone();
         let tmp_id_for_pilafy = tmp_id.clone();
         let bounce_stop = bounce_active.clone();
+        let msgs_box_for_send = inner.messages_box.clone();
         let send_network = move |final_text: String| {
             // Apply @Name → @Number replacement for the WA protocol
             let mut send_text = final_text.clone();
@@ -1968,12 +1969,15 @@ impl ChatViewPanel {
                 send_text = send_text.replace(name_pat.as_str(), number_pat.as_str());
             }
 
-            // Stop programmatic bounce (CSS transform) and settle into place
+            // Stop bounce and settle into place
             bounce_stop.set(false);
             if let Some(bubble) = bubbles.borrow().get(&tmp_id) {
                 let w = bubble.widget();
                 w.remove_css_class("pilafy");
+                w.remove_css_class("pilafy-bouncing");
                 w.add_css_class("pilafy-settle");
+                // Remove bounce bottom padding
+                msgs_box_for_send.set_margin_bottom(0);
                 // Update text if AI changed it
                 if final_text != original_text {
                     log::info!(
@@ -2031,66 +2035,19 @@ impl ChatViewPanel {
                 bubble.widget().add_css_class("pilafy");
             }
 
-            // ── Rust-side programmatic bounce (single bubble only) ──
-            // CSS transform: translateY() for visual-only movement (no layout shift).
-            // Pre-build all CSS strings to minimize per-frame overhead.
+            // ── Pure CSS bounce — no timer callbacks, GPU-accelerated ──
+            // The @keyframes pilafy-bounce animation is defined in the global CSS.
+            // Just add the class and GTK handles the rest natively.
             bounce_active.set(true);
             if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
                 let w = bubble.widget().clone();
-                let ba = bounce_active.clone();
-                let msgs_box = inner.messages_box.clone();
-                let scroll = inner.scroll.clone();
 
-                // Add bottom padding so the bounce stays in-frame
-                msgs_box.set_margin_bottom(30);
-                Self::force_scroll_to_bottom(inner, 3);
+                // Add bottom padding so the bounce stays in-frame, then scroll
+                inner.messages_box.set_margin_bottom(30);
+                Self::force_scroll_to_bottom(inner, 5);
 
+                // Trigger the CSS animation
                 w.add_css_class("pilafy-bouncing");
-
-                // Bounce keyframes (translateY UP in px): snappy ease-out
-                let kf: Vec<i32> = vec![
-                    0, 8, 18, 24, 18, 8, 0,
-                    0, 5, 12, 5, 0,
-                    0, 3, 6, 3, 0,
-                ];
-                // Pre-build CSS strings to avoid format! allocation every frame
-                let css_frames: Vec<String> = kf.iter().map(|&ty| {
-                    format!("box.pilafy-bouncing {{ transform: translateY(-{}px); }}", ty)
-                }).collect();
-                let total = css_frames.len();
-                let idx = Rc::new(Cell::new(0usize));
-
-                let bounce_css = gtk4::CssProvider::new();
-                gtk4::style_context_add_provider_for_display(
-                    &gtk4::gdk::Display::default().unwrap(),
-                    &bounce_css,
-                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-                );
-
-                gtk4::glib::timeout_add_local(
-                    std::time::Duration::from_millis(18), // ~55fps
-                    move || {
-                        if !ba.get() {
-                            bounce_css.load_from_string(
-                                "box.pilafy-bouncing { transform: translateY(0px); }"
-                            );
-                            w.remove_css_class("pilafy-bouncing");
-                            msgs_box.set_margin_bottom(0);
-                            if let Some(display) = gtk4::gdk::Display::default() {
-                                gtk4::style_context_remove_provider_for_display(
-                                    &display, &bounce_css,
-                                );
-                            }
-                            let adj = scroll.vadjustment();
-                            adj.set_value(adj.upper() - adj.page_size());
-                            return gtk4::glib::ControlFlow::Break;
-                        }
-                        let i = idx.get() % total;
-                        bounce_css.load_from_string(&css_frames[i]);
-                        idx.set(idx.get() + 1);
-                        gtk4::glib::ControlFlow::Continue
-                    },
-                );
             }
 
             log::info!("AC delay: deferring send until AI correction completes");

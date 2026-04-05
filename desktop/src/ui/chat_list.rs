@@ -551,6 +551,15 @@ impl ChatListPanel {
         drop(rows);
         // Clear typing indicator state — a real message supersedes it
         self.inner.typing_previews.borrow_mut().remove(chat_id);
+        self.inner.active_typers.borrow_mut().remove(chat_id);
+        // Reset dots visibility
+        {
+            let rows = self.inner.rows.borrow();
+            if let Some(row) = rows.get(chat_id) {
+                row.preview_label.set_visible(true);
+                row.typing_box.set_visible(false);
+            }
+        }
         self.inner
             .timestamps
             .borrow_mut()
@@ -632,22 +641,24 @@ impl ChatListPanel {
             chat_typers.retain(|t| *t != display);
         }
 
-        let mut saved = self.inner.typing_previews.borrow_mut();
         if chat_typers.is_empty() {
-            // All stopped — restore preview
+            // All stopped — show preview, hide dots
             typers.remove(chat_id);
-            if let Some(original) = saved.remove(chat_id) {
-                row.preview_label.set_text(&original);
-            }
+            row.preview_label.set_visible(true);
+            row.typing_box.set_visible(false);
         } else {
-            // Save original preview if first typer
-            if !saved.contains_key(chat_id) {
-                saved.insert(chat_id.to_string(), row.preview_label.text().to_string());
-            }
+            // Show typing dots, hide preview text
             let label = chat_typers.join(", ");
-            row.preview_label.set_markup(&format!(
-                "<i><span foreground='#00a884'>{label} typing…</span></i>"
-            ));
+            // Update the name label inside the typing_box (first child)
+            if let Some(first) = row.typing_box.first_child() {
+                if let Some(name_lbl) = first.downcast_ref::<Label>() {
+                    name_lbl.set_markup(
+                        &format!("<span foreground='#00a884'>{label} </span>")
+                    );
+                }
+            }
+            row.preview_label.set_visible(false);
+            row.typing_box.set_visible(true);
         }
     }
 
@@ -1384,6 +1395,7 @@ struct ChatRow {
     unread_count: Rc<Cell<u32>>,
     name_label: Label,
     preview_label: Label,
+    typing_box: Box,
     time_label: Label,
     unread_badge: Label,
     avatar: adw::Avatar,
@@ -1459,6 +1471,22 @@ impl ChatRow {
         preview_label.set_lines(1);
         preview_label.set_single_line_mode(true);
 
+        // Typing indicator (3 animated dots) — hidden by default
+        let typing_box = Box::new(Orientation::Horizontal, 2);
+        typing_box.set_halign(Align::Start);
+        typing_box.set_hexpand(true);
+        typing_box.set_visible(false);
+        let typing_name_lbl = Label::new(None);
+        typing_name_lbl.add_css_class("dim-label");
+        typing_name_lbl.add_css_class("body");
+        typing_box.append(&typing_name_lbl);
+        for i in 1..=3 {
+            let dot = Label::new(Some("●"));
+            dot.add_css_class("typing-dot");
+            dot.add_css_class(&format!("typing-dot-{i}"));
+            typing_box.append(&dot);
+        }
+
         let label_badge = Label::new(chat.label.as_deref());
         label_badge.add_css_class("caption");
         label_badge.add_css_class("accent");
@@ -1473,6 +1501,7 @@ impl ChatRow {
         unread_badge.set_valign(Align::Center);
 
         bottom_row.append(&preview_label);
+        bottom_row.append(&typing_box);
         bottom_row.append(&label_badge);
         bottom_row.append(&unread_badge);
 
@@ -1493,6 +1522,7 @@ impl ChatRow {
             unread_count: Rc::new(Cell::new(chat.unread_count)),
             name_label,
             preview_label,
+            typing_box,
             time_label,
             unread_badge,
             avatar,

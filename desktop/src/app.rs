@@ -256,6 +256,21 @@ box.message-bubble-out.pilafy .dim-label {
 }
 
 /* Phase 2: settle — only opacity+background-color are GTK4-animatable */
+/* Phase 1b: bounce — pure CSS animation, GPU-accelerated, no timer callbacks */
+@keyframes pilafy-bounce {
+    0%   { margin-bottom: 0px; }
+    12%  { margin-bottom: 22px; }
+    24%  { margin-bottom: 0px; }
+    36%  { margin-bottom: 12px; }
+    48%  { margin-bottom: 0px; }
+    60%  { margin-bottom: 6px; }
+    72%  { margin-bottom: 0px; }
+    100% { margin-bottom: 0px; }
+}
+box.pilafy-bouncing {
+    animation: pilafy-bounce 0.45s ease-out;
+}
+
 @keyframes pilafy-settle {
     0%   { background-color: rgba(42, 57, 66, 0.75); opacity: 0.85; }
     100% { background-color: #005c4b; opacity: 1.0; }
