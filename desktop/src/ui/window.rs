@@ -572,6 +572,16 @@ impl MainWindow {
                 let contacts = crate::ui::runtime::load_contact_names();
                 let lid_map = crate::ui::runtime::load_lid_phone_map();
 
+                // Resolve phone-number chat names from contacts
+                for c in &mut chats {
+                    if !c.id.ends_with("@g.us") && c.name.starts_with('+') {
+                        // Chat name is still a phone number — look up contact name
+                        if let Some(name) = contacts.get(&c.id) {
+                            c.name = name.clone();
+                        }
+                    }
+                }
+
                 // Resolve @mentions in chat list previews
                 for c in &mut chats {
                     if c.last_message.contains('@') {
