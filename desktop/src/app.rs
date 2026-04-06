@@ -415,7 +415,7 @@ impl WhatsAppApp {
             // Process up to BATCH_SIZE events per iteration, then yield back
             // to the GTK event loop so it can paint frames and respond to
             // window-manager pings (prevents "Not Responding" during sync).
-            const BATCH_SIZE: usize = 3;
+            const BATCH_SIZE: usize = 20;
             let win_clone = window.clone();
             glib::MainContext::default().spawn_local(async move {
                 loop {
