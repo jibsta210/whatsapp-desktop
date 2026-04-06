@@ -2105,8 +2105,8 @@ impl ChatViewPanel {
             let bounce_start = std::time::Instant::now();
             let original_for_guard = text.clone();
             let send_with_min_bounce = move |final_text: String| {
-                // Guard: if AI returned a shorter string, it truncated — use original
-                let safe_text = if final_text.len() < original_for_guard.len().saturating_sub(5) {
+                // Guard: if AI returned less than half the original, it truncated — use original
+                let safe_text = if final_text.len() * 2 < original_for_guard.len() {
                     log::warn!(
                         "AC guard: AI output shorter than original ({} < {}), using original",
                         final_text.len(), original_for_guard.len()
