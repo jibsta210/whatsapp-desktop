@@ -1,0 +1,44 @@
+name: Desktop Build Check
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux Desktop Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-01-30
+      - name: Install GTK4 + libadwaita dev dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev pkg-config protobuf-compiler
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Build desktop app
+        run: cargo build --release -p whatsapp-desktop
+
+  macos:
+    name: macOS Desktop Build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-01-30
+      - name: Install GTK4 + libadwaita via Homebrew
+        run: |
+          brew install gtk4 libadwaita protobuf pkg-config
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Build desktop app
+        run: cargo build --release -p whatsapp-desktop
