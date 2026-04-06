@@ -6449,7 +6449,7 @@ async fn fetch_and_update_group_names(
                     .filter(|c| c.id.ends_with("@g.us"))
                     .filter(|c| !resolved_ids.contains(&c.id))
                     .map(|c| c.id.clone())
-                    .take(5)
+                    .take(20)
                     .collect()
             };
             if !unresolved.is_empty() {
