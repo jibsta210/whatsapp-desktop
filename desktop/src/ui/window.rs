@@ -97,6 +97,7 @@ impl MainWindow {
         let chat_view_for_list = chat_view.clone();
         let bridge_for_list = bridge.clone();
         let profile_rev_for_list = profile_revealer.clone();
+        let app_for_list = app.clone();
         let chat_list = ChatListPanel::new(bridge.clone(), move |chat_id, chat_name| {
             let needs_load = chat_view_for_list.open_chat(chat_id.clone(), &chat_name);
             if needs_load {
@@ -105,7 +106,11 @@ impl MainWindow {
                     chat_name,
                 });
             }
-            bridge_for_list.send_command(crate::bridge::WaCommand::MarkRead { chat_id });
+            bridge_for_list.send_command(crate::bridge::WaCommand::MarkRead {
+                chat_id: chat_id.clone(),
+            });
+            // Dismiss any notifications for this chat
+            withdraw_chat_notification(&app_for_list, &chat_id);
             // Close profile panel when switching chats
             profile_rev_for_list.set_reveal_child(false);
         });
@@ -757,7 +762,7 @@ impl MainWindow {
                             "New message".to_string()
                         };
 
-                        send_desktop_notification(&title, &body);
+                        send_desktop_notification(&inner.gtk_app, &msg.chat_id, &title, &body);
                     }
                     // Play notification sound
                     if inner.settings.should_play_sound() && !is_current_chat {
@@ -803,6 +808,7 @@ impl MainWindow {
             WaEvent::ChatReadOnOtherDevice { chat_id } => {
                 log::info!("UI: Clearing unread badge for {chat_id}");
                 inner.chat_list.reset_unread(&chat_id);
+                withdraw_chat_notification(&inner.gtk_app, &chat_id);
             }
             WaEvent::SyncProgress(syncing) => {
                 inner.sync_revealer.set_reveal_child(syncing);
@@ -1523,20 +1529,20 @@ fn open_own_profile_window(
     window.present();
 }
 
-/// Send a desktop notification via notify-send (freedesktop DBus notifications).
-fn send_desktop_notification(title: &str, body: &str) {
-    let title = title.to_string();
-    let body = body.to_string();
-    std::thread::spawn(move || {
-        let _ = std::process::Command::new("notify-send")
-            .arg("--app-name=WhatsApp")
-            .arg("--icon=com.whatsapp.desktop")
-            .arg("--urgency=normal")
-            .arg("--category=im.received")
-            .arg(&title)
-            .arg(&body)
-            .spawn();
-    });
+/// Send a desktop notification via GApplication (allows withdrawal later).
+/// Uses a stable per-chat notification ID so new messages replace old ones
+/// and can be dismissed when the chat is read.
+fn send_desktop_notification(app: &adw::Application, chat_id: &str, title: &str, body: &str) {
+    let notif = gtk4::gio::Notification::new(title);
+    notif.set_body(Some(body));
+    let notif_id = format!("chat-{}", chat_id.replace('@', "-").replace('.', "-"));
+    app.send_notification(Some(&notif_id), &notif);
+}
+
+/// Withdraw (dismiss) any notification for a chat — called when chat is opened or read.
+fn withdraw_chat_notification(app: &adw::Application, chat_id: &str) {
+    let notif_id = format!("chat-{}", chat_id.replace('@', "-").replace('.', "-"));
+    app.withdraw_notification(&notif_id);
 }
 
 /// Play the standard freedesktop message notification sound.
