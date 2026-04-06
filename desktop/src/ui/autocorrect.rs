@@ -1380,7 +1380,7 @@ fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRe
             }],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 512,
+                "maxOutputTokens": 2048,
             }
         });
 
@@ -1399,6 +1399,7 @@ fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRe
                         if corrected != req.full_text
                             && !corrected.is_empty()
                             && (corrected.len() as f64) < (req.full_text.len() as f64 * 1.5 + 20.0)
+                            && corrected.len() + 5 >= req.full_text.len()
                         {
                             let _ = req.reply_tx.send(corrected);
                         } else if req.always_reply {

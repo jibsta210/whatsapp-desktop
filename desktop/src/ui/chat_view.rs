@@ -2103,15 +2103,26 @@ impl ChatViewPanel {
             // Without this, a fast AI response would kill the bounce on the first frame.
             let min_bounce_ms = 600u64;
             let bounce_start = std::time::Instant::now();
+            let original_for_guard = text.clone();
             let send_with_min_bounce = move |final_text: String| {
+                // Guard: if AI returned a shorter string, it truncated — use original
+                let safe_text = if final_text.len() < original_for_guard.len().saturating_sub(5) {
+                    log::warn!(
+                        "AC guard: AI output shorter than original ({} < {}), using original",
+                        final_text.len(), original_for_guard.len()
+                    );
+                    original_for_guard
+                } else {
+                    final_text
+                };
                 let elapsed = bounce_start.elapsed().as_millis() as u64;
                 if elapsed >= min_bounce_ms {
-                    send_network(final_text);
+                    send_network(safe_text);
                 } else {
                     let remaining = min_bounce_ms - elapsed;
                     gtk4::glib::timeout_add_local_once(
                         std::time::Duration::from_millis(remaining),
-                        move || { send_network(final_text); },
+                        move || { send_network(safe_text); },
                     );
                 }
             };
