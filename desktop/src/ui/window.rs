@@ -605,21 +605,38 @@ impl MainWindow {
                 }
 
                 // ── Dedup: same phone number = same person ──
-                // Strips :device suffix and @domain, keeps first occurrence.
-                // Catches: @lid vs @s.whatsapp.net, device variants like :20
+                // Strips :device suffix and @domain, keeps the CLEAN JID
+                // (no :device suffix) since that's where message history lives.
                 {
                     let before = chats.len();
-                    let mut seen_phones: std::collections::HashSet<String> =
-                        std::collections::HashSet::new();
-                    chats.retain(|c| {
+                    // First pass: for each phone, prefer the clean JID (no colon)
+                    let mut best_idx: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
+                    for (i, c) in chats.iter().enumerate() {
                         let phone = phone_number_from_jid(&c.id);
-                        if seen_phones.contains(&phone) {
-                            log::info!("Dedup: dropping {} ({}) — phone {} already seen", c.name, c.id, phone);
-                            false
-                        } else {
-                            seen_phones.insert(phone);
-                            true
+                        let local = c.id.split('@').next().unwrap_or("");
+                        let has_device = local.contains(':');
+                        match best_idx.get(&phone).copied() {
+                            None => { best_idx.insert(phone, i); }
+                            Some(prev) => {
+                                let prev_local = chats[prev].id.split('@').next().unwrap_or("");
+                                let prev_has_device = prev_local.contains(':');
+                                // Prefer clean JID (no device suffix)
+                                if prev_has_device && !has_device {
+                                    log::info!("Dedup: replacing {} with {} for phone {}", chats[prev].id, c.id, phone);
+                                    best_idx.insert(phone, i);
+                                } else if !prev_has_device && has_device {
+                                    log::info!("Dedup: dropping {} — clean {} already kept", c.id, chats[prev].id);
+                                }
+                            }
                         }
+                    }
+                    let keep: std::collections::HashSet<usize> = best_idx.values().copied().collect();
+                    let mut idx = 0;
+                    chats.retain(|_| {
+                        let kept = keep.contains(&idx);
+                        idx += 1;
+                        kept
                     });
                     if chats.len() < before {
                         log::info!("Dedup: removed {} duplicate(s)", before - chats.len());
