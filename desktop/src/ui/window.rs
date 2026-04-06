@@ -707,6 +707,18 @@ impl MainWindow {
                         });
                 }
 
+                // Clear typing indicator for this sender — they sent a message,
+                // so they're no longer typing. Do this BEFORE appending so the
+                // dots disappear at the same time the message appears.
+                if !msg.is_from_me {
+                    inner.chat_view.set_typing_indicator(
+                        &msg.chat_id, &msg.sender_name, false,
+                    );
+                    inner.chat_list.set_typing(
+                        &msg.chat_id, &msg.sender_name, false,
+                    );
+                }
+
                 // Append to chat view FIRST so the message body appears before
                 // the chat list preview updates (fixes visual race condition).
                 inner.chat_view.append_message(msg.clone());
