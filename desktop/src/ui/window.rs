@@ -665,22 +665,27 @@ impl MainWindow {
                     (chats, Vec::new())
                 };
 
-                // Re-fetch group names for any @g.us chat with a person-like name
-                for c in first.iter().chain(rest.iter()) {
-                    if c.id.ends_with("@g.us") {
-                        let words: Vec<&str> = c.name.split_whitespace().collect();
-                        let looks_like_person = words.len() <= 3
-                            && words.len() >= 1
-                            && words.iter().all(|w| {
-                                w.chars().next().map_or(false, |ch| ch.is_uppercase())
-                                    && w.len() < 20
-                            });
-                        if looks_like_person {
-                            inner.bridge.send_command(
-                                crate::bridge::WaCommand::GetGroupInfo {
-                                    chat_id: c.id.clone(),
-                                },
-                            );
+                // Re-fetch group names for any @g.us chat with a person-like name (max 5)
+                {
+                    let mut refetch_count = 0u32;
+                    for c in first.iter().chain(rest.iter()) {
+                        if refetch_count >= 5 { break; }
+                        if c.id.ends_with("@g.us") {
+                            let words: Vec<&str> = c.name.split_whitespace().collect();
+                            let looks_like_person = words.len() <= 3
+                                && !words.is_empty()
+                                && words.iter().all(|w| {
+                                    w.chars().next().map_or(false, |ch| ch.is_uppercase())
+                                        && w.len() < 20
+                                });
+                            if looks_like_person {
+                                inner.bridge.send_command(
+                                    crate::bridge::WaCommand::GetGroupInfo {
+                                        chat_id: c.id.clone(),
+                                    },
+                                );
+                                refetch_count += 1;
+                            }
                         }
                     }
                 }
