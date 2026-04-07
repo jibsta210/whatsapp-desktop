@@ -594,15 +594,36 @@ impl MainWindow {
                 }
 
                 // ── Resolve phone-number chat names to contact names ──
+                // Build reverse map: phone_jid → LID for cross-referencing
+                let phone_to_lid: std::collections::HashMap<&str, &str> = lid_map
+                    .iter()
+                    .map(|(lid, phone)| (phone.as_str(), lid.as_str()))
+                    .collect();
+
                 for c in &mut chats {
                     if !c.id.ends_with("@g.us") && c.name.starts_with('+') {
-                        // Try direct JID lookup first, then strip :device suffix
-                        let resolved = contacts.get(&c.id).cloned().or_else(|| {
-                            let clean_jid = c.id.split(':').next().unwrap_or(&c.id);
-                            contacts.get(clean_jid).cloned()
-                        });
+                        let clean_jid = c.id.split(':').next().unwrap_or(&c.id);
+                        // Try: exact JID → clean JID → via LID → by phone number
+                        let resolved = contacts
+                            .get(&c.id)
+                            .or_else(|| contacts.get(clean_jid))
+                            .or_else(|| {
+                                // Try reverse: phone JID → LID → contact name
+                                phone_to_lid
+                                    .get(clean_jid)
+                                    .and_then(|lid| contacts.get(*lid))
+                            })
+                            .or_else(|| {
+                                // Last resort: extract phone number, try {num}@lid
+                                let num = clean_jid.split('@').next().unwrap_or("");
+                                if !num.is_empty() {
+                                    contacts.get(&format!("{num}@lid"))
+                                } else {
+                                    None
+                                }
+                            });
                         if let Some(name) = resolved {
-                            c.name = name;
+                            c.name = name.clone();
                         }
                     }
                 }
@@ -704,12 +725,27 @@ impl MainWindow {
                 // Resolve phone-number name to contact name
                 if !chat.id.ends_with("@g.us") && chat.name.starts_with('+') {
                     let contacts = crate::ui::runtime::load_contact_names();
-                    let resolved = contacts.get(&chat.id).cloned().or_else(|| {
-                        let clean_jid = chat.id.split(':').next().unwrap_or(&chat.id);
-                        contacts.get(clean_jid).cloned()
-                    });
+                    let lid_map = crate::ui::runtime::load_lid_phone_map();
+                    let clean_jid = chat.id.split(':').next().unwrap_or(&chat.id);
+                    let resolved = contacts
+                        .get(&chat.id)
+                        .or_else(|| contacts.get(clean_jid))
+                        .or_else(|| {
+                            lid_map
+                                .iter()
+                                .find(|(_, phone)| phone.as_str() == clean_jid)
+                                .and_then(|(lid, _)| contacts.get(lid))
+                        })
+                        .or_else(|| {
+                            let num = clean_jid.split('@').next().unwrap_or("");
+                            if !num.is_empty() {
+                                contacts.get(&format!("{num}@lid"))
+                            } else {
+                                None
+                            }
+                        });
                     if let Some(name) = resolved {
-                        chat.name = name;
+                        chat.name = name.clone();
                     }
                 }
                 // When a phone JID chat arrives, remove any @lid duplicate for

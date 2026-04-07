@@ -2025,16 +2025,31 @@ impl ChatViewPanel {
 
         if inner.ac_delay_send.get() {
             // AC delay ON — submit to AI, send corrected text when it returns.
-            // Pill shape via CSS class, opacity pulse via Rust set_opacity() (GTK4
-            // CSS @keyframes don't animate on Box widgets, so we drive it manually).
-            if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
-                bubble.widget().add_css_class("pilafy");
+            // Get the bubble widget directly — don't rely on HashMap lookup which
+            // may fail if append_bubble_to_inner stored it under a different key.
+            let pilafy_widget: Option<gtk4::Widget> = inner
+                .bubbles
+                .borrow()
+                .get(&tmp_id_for_pilafy)
+                .map(|b| b.widget().clone().upcast::<gtk4::Widget>())
+                .or_else(|| {
+                    // Fallback: last child of messages_box IS the bubble we just added
+                    log::warn!("Pilafy: bubble not found in HashMap for {}, using last_child", tmp_id_for_pilafy);
+                    inner.messages_box.last_child()
+                });
+
+            if let Some(ref w) = pilafy_widget {
+                w.add_css_class("pilafy");
+                log::info!("Pilafy: added pilafy class + starting opacity pulse");
+            } else {
+                log::warn!("Pilafy: no widget found at all!");
             }
 
-            // Smooth opacity pulse using set_opacity() — GPU-composited, guaranteed to work
+            // Smooth opacity pulse: use set_opacity() directly (GTK4 CSS @keyframes
+            // do NOT animate on Box widgets — completely broken). set_opacity() is a
+            // native GTK widget API that is GPU-composited and guaranteed to work.
             bounce_active.set(true);
-            if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
-                let w = bubble.widget().clone();
+            if let Some(w) = pilafy_widget {
                 let ba = bounce_active.clone();
                 let frame = Rc::new(Cell::new(0u32));
                 gtk4::glib::timeout_add_local(
@@ -2049,7 +2064,7 @@ impl ChatViewPanel {
                         let t = (f as f64) * std::f64::consts::PI * 2.0 / 60.0;
                         let opacity = 0.7 + 0.3 * t.cos(); // oscillates 0.4 ↔ 1.0
                         w.set_opacity(opacity);
-                        frame.set(f + 1);
+                        frame.set(f.wrapping_add(1));
                         gtk4::glib::ControlFlow::Continue
                     },
                 );
