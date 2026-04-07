@@ -255,6 +255,16 @@ box.message-bubble-out.pilafy .dim-label {
     opacity: 0.0;
 }
 
+/* Phase 1b: pulse — smooth opacity + color breathing while AC processes */
+@keyframes pilafy-pulse {
+    0%   { opacity: 0.95; background-color: rgba(0, 92, 75, 0.9); }
+    50%  { opacity: 0.55; background-color: rgba(42, 57, 66, 0.7); }
+    100% { opacity: 0.95; background-color: rgba(0, 92, 75, 0.9); }
+}
+box.message-bubble-out.pilafy-pulse {
+    animation: pilafy-pulse 1.0s ease-in-out infinite;
+}
+
 /* Phase 2: settle — only opacity+background-color are GTK4-animatable */
 
 @keyframes pilafy-settle {

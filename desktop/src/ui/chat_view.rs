@@ -1975,10 +1975,8 @@ impl ChatViewPanel {
             if let Some(bubble) = bubbles.borrow().get(&tmp_id) {
                 let w = bubble.widget();
                 w.remove_css_class("pilafy");
-                w.remove_css_class("pilafy-bouncing");
+                w.remove_css_class("pilafy-pulse");
                 w.add_css_class("pilafy-settle");
-                // Remove bounce bottom padding
-                msgs_box_for_send.set_margin_bottom(0);
                 // Update text if AI changed it
                 if final_text != original_text {
                     log::info!(
@@ -2036,65 +2034,12 @@ impl ChatViewPanel {
                 bubble.widget().add_css_class("pilafy");
             }
 
-            // ── Bounce via transform: translateY() + timer ──
-            // This is the only approach that actually produces visible movement in GTK4.
+            // ── Smooth pulse animation via pure CSS @keyframes ──
+            // Opacity + background-color are GPU-composited in GTK4 and always smooth.
+            // No timer callbacks, no CSS reparsing. Just add a class.
             bounce_active.set(true);
             if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
-                let w = bubble.widget().clone();
-                let ba = bounce_active.clone();
-                let msgs_box = inner.messages_box.clone();
-                let scroll = inner.scroll.clone();
-
-                // Bottom padding so bounce stays in-frame
-                msgs_box.set_margin_bottom(40);
-                Self::force_scroll_to_bottom(inner, 5);
-
-                w.add_css_class("pilafy-bouncing");
-
-                // Original keyframes that worked great
-                let kf: Vec<i32> = vec![
-                    0, 4, 9, 16, 22, 28, 32, 34, 32, 28, 22, 16, 9, 4, 0,
-                    0, 3, 7, 13, 18, 22, 18, 13, 7, 3, 0,
-                    0, 2, 5, 9, 12, 9, 5, 2, 0,
-                    0, 1, 3, 5, 3, 1, 0,
-                ];
-                let total = kf.len();
-                let idx = Rc::new(Cell::new(0usize));
-
-                let bounce_css = gtk4::CssProvider::new();
-                gtk4::style_context_add_provider_for_display(
-                    &gtk4::gdk::Display::default().unwrap(),
-                    &bounce_css,
-                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-                );
-
-                gtk4::glib::timeout_add_local(
-                    std::time::Duration::from_millis(25),
-                    move || {
-                        if !ba.get() {
-                            bounce_css.load_from_string(
-                                "box.pilafy-bouncing { transform: translateY(0px); }"
-                            );
-                            w.remove_css_class("pilafy-bouncing");
-                            msgs_box.set_margin_bottom(0);
-                            if let Some(display) = gtk4::gdk::Display::default() {
-                                gtk4::style_context_remove_provider_for_display(
-                                    &display, &bounce_css,
-                                );
-                            }
-                            let adj = scroll.vadjustment();
-                            adj.set_value(adj.upper() - adj.page_size());
-                            return gtk4::glib::ControlFlow::Break;
-                        }
-                        let i = idx.get() % total;
-                        let ty = kf[i];
-                        bounce_css.load_from_string(
-                            &format!("box.pilafy-bouncing {{ transform: translateY(-{}px); }}", ty)
-                        );
-                        idx.set(idx.get() + 1);
-                        gtk4::glib::ControlFlow::Continue
-                    },
-                );
+                bubble.widget().add_css_class("pilafy-pulse");
             }
 
             log::info!("AC delay: deferring send until AI correction completes");
