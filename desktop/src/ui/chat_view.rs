@@ -3240,12 +3240,14 @@ impl ChatViewPanel {
 }
 
 fn gen_tmp_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .subsec_nanos();
-    format!("tmp-{:08x}", nanos)
+        .as_nanos() as u64;
+    format!("tmp-{:016x}-{}", nanos, seq)
 }
 
 fn maybe_insert_date_separator(inner: &Rc<ChatViewInner>, timestamp: i64) {

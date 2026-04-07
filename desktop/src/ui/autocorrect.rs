@@ -1351,7 +1351,9 @@ fn clean_ai_response(raw: &str) -> String {
 }
 
 fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRequest>) {
-    let client = ureq::Agent::new();
+    let client = ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(3))
+        .build();
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={api_key}"
     );
