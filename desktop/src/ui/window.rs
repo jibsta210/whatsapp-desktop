@@ -588,6 +588,20 @@ impl MainWindow {
                     }
                 }
 
+                // ── Resolve phone-number chat names to contact names ──
+                for c in &mut chats {
+                    if !c.id.ends_with("@g.us") && c.name.starts_with('+') {
+                        // Try direct JID lookup first, then strip :device suffix
+                        let resolved = contacts.get(&c.id).cloned().or_else(|| {
+                            let clean_jid = c.id.split(':').next().unwrap_or(&c.id);
+                            contacts.get(clean_jid).cloned()
+                        });
+                        if let Some(name) = resolved {
+                            c.name = name;
+                        }
+                    }
+                }
+
                 // ── Dedup: same phone number = same person ──
                 // Strips :device suffix and @domain, keeps first occurrence.
                 // Catches: @lid vs @s.whatsapp.net, device variants like :20
@@ -681,7 +695,18 @@ impl MainWindow {
                     });
                 }
             }
-            WaEvent::ChatAdded(chat) => {
+            WaEvent::ChatAdded(mut chat) => {
+                // Resolve phone-number name to contact name
+                if !chat.id.ends_with("@g.us") && chat.name.starts_with('+') {
+                    let contacts = crate::ui::runtime::load_contact_names();
+                    let resolved = contacts.get(&chat.id).cloned().or_else(|| {
+                        let clean_jid = chat.id.split(':').next().unwrap_or(&chat.id);
+                        contacts.get(clean_jid).cloned()
+                    });
+                    if let Some(name) = resolved {
+                        chat.name = name;
+                    }
+                }
                 // When a phone JID chat arrives, remove any @lid duplicate for
                 // the same person (same name, one is @lid, one is @s.whatsapp.net)
                 if chat.id.ends_with("@s.whatsapp.net") {

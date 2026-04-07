@@ -1968,12 +1968,11 @@ impl ChatViewPanel {
                 send_text = send_text.replace(name_pat.as_str(), number_pat.as_str());
             }
 
-            // Stop programmatic bounce (CSS transform) and settle into place
+            // Stop pulse and settle into normal bubble shape
             bounce_stop.set(false);
             if let Some(bubble) = bubbles.borrow().get(&tmp_id) {
                 let w = bubble.widget();
                 w.remove_css_class("pilafy");
-                w.remove_css_class("pilafy-bouncing");
                 w.add_css_class("pilafy-settle");
                 // Update text if AI changed it
                 if final_text != original_text {
@@ -2026,88 +2025,30 @@ impl ChatViewPanel {
 
         if inner.ac_delay_send.get() {
             // AC delay ON — submit to AI, send corrected text when it returns.
-            // The user sees their message bubble bouncing (pilafy), and the network
-            // send is deferred until the AI finishes (max ~4s timeout).
+            // The bubble gets the "pilafy" CSS class which applies a smooth
+            // opacity/color pulse animation (GPU-composited, no layout changes).
             if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
                 bubble.widget().add_css_class("pilafy");
             }
 
-            // ── Rust-side programmatic bounce (single bubble only) ──
-            // Use CSS `transform: translateY()` — a purely VISUAL effect that does
-            // NOT change layout or scroll position. Only the bubble moves; the rest
-            // of the chat stays perfectly still.
-            bounce_active.set(true);
-            if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
-                let w = bubble.widget().clone();
-                w.add_css_class("pilafy-bouncing");
-                let ba = bounce_active.clone();
-
-                // Bounce keyframes (positive = translateY UP in px): big → medium → small → repeat
-                let kf: Vec<i32> = vec![
-                    0, 4, 9, 16, 22, 28, 32, 34, 32, 28, 22, 16, 9, 4, 0,
-                    0, 3, 7, 13, 18, 22, 18, 13, 7, 3, 0,
-                    0, 2, 5, 9, 12, 9, 5, 2, 0,
-                    0, 1, 3, 5, 3, 1, 0,
-                ];
-                let total = kf.len();
-                let idx = Rc::new(Cell::new(0usize));
-
-                // Dedicated CSS provider for dynamic transform — affects only .pilafy-bouncing
-                let bounce_css = gtk4::CssProvider::new();
-                gtk4::style_context_add_provider_for_display(
-                    &gtk4::gdk::Display::default().unwrap(),
-                    &bounce_css,
-                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-                );
-
-                gtk4::glib::timeout_add_local(
-                    std::time::Duration::from_millis(25), // ~40fps
-                    move || {
-                        if !ba.get() {
-                            // Stop: clear transform and remove class
-                            bounce_css.load_from_string(
-                                "box.pilafy-bouncing { transform: translateY(0px); }"
-                            );
-                            w.remove_css_class("pilafy-bouncing");
-                            // Remove the provider to avoid stale CSS
-                            if let Some(display) = gtk4::gdk::Display::default() {
-                                gtk4::style_context_remove_provider_for_display(
-                                    &display, &bounce_css,
-                                );
-                            }
-                            return gtk4::glib::ControlFlow::Break;
-                        }
-                        let i = idx.get() % total;
-                        let ty = kf[i];
-                        // translateY with negative value moves the widget UP visually
-                        bounce_css.load_from_string(
-                            &format!("box.pilafy-bouncing {{ transform: translateY(-{}px); }}", ty)
-                        );
-                        idx.set(idx.get() + 1);
-                        gtk4::glib::ControlFlow::Continue
-                    },
-                );
-            }
-
             log::info!("AC delay: deferring send until AI correction completes");
 
-            // Ensure the bounce is visible for at least 600ms even if AI returns fast.
-            // Without this, a fast AI response would kill the bounce on the first frame.
-            let min_bounce_ms = 600u64;
-            let bounce_start = std::time::Instant::now();
-            let send_with_min_bounce = move |final_text: String| {
-                let elapsed = bounce_start.elapsed().as_millis() as u64;
-                if elapsed >= min_bounce_ms {
+            // Ensure the pulse is visible for at least 600ms even if AI returns fast.
+            let min_pulse_ms = 600u64;
+            let pulse_start = std::time::Instant::now();
+            let send_with_min_pulse = move |final_text: String| {
+                let elapsed = pulse_start.elapsed().as_millis() as u64;
+                if elapsed >= min_pulse_ms {
                     send_network(final_text);
                 } else {
-                    let remaining = min_bounce_ms - elapsed;
+                    let remaining = min_pulse_ms - elapsed;
                     gtk4::glib::timeout_add_local_once(
                         std::time::Duration::from_millis(remaining),
                         move || { send_network(final_text); },
                     );
                 }
             };
-            crate::ui::autocorrect::correct_for_send(text, send_with_min_bounce);
+            crate::ui::autocorrect::correct_for_send(text, send_with_min_pulse);
         } else {
             // AC delay OFF — send immediately, typos and all
             send_network(text);
