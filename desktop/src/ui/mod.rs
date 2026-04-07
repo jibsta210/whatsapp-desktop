@@ -1,6 +1,13 @@
+pub mod autocorrect;
 pub mod chat_list;
+pub mod chat_picker;
 pub mod chat_view;
 pub mod login;
 pub mod message_bubble;
+pub mod new_chat_panel;
+pub mod profile_panel;
+pub mod quick_replies;
 pub mod runtime;
+pub mod settings;
+pub mod tray;
 pub mod window;

@@ -18,6 +18,7 @@ tokio = { version = "1", features = ["full"] }
 
 # WhatsApp protocol
 whatsapp-rust = { path = ".." }
+wacore = { path = "../wacore" }
 whatsapp-rust-sqlite-storage = { path = "../storages/sqlite-storage" }
 whatsapp-rust-tokio-transport = { path = "../transports/tokio-transport" }
 whatsapp-rust-ureq-http-client = { path = "../http_clients/ureq-client" }
@@ -33,3 +34,9 @@ qrcode = "0.14"
 image = "0.25"
 chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+libc = "0.2"
+tikv-jemallocator = "0.6"
+ureq = { version = "2", features = ["tls", "json"] }
+ksni = { version = "0.3", features = ["blocking"] }
