@@ -1379,16 +1379,20 @@ fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRe
     let client = ureq::AgentBuilder::new()
         .timeout(std::time::Duration::from_secs(3))
         .build();
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={api_key}"
-    );
+    // Try models in order: fast flash first, fall back to stable
+    let models = ["gemini-2.0-flash", "gemini-2.5-flash-preview-05-20", "gemini-1.5-flash"];
+    let mut working_url: Option<String> = None;
+
+    let base_url = |model: &str| {
+        format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+        )
+    };
 
     while let Ok(req) = rx.recv() {
         let text = &req.full_text;
         if text.len() < 3 {
-            if req.always_reply {
-                let _ = req.reply_tx.send(req.full_text.clone());
-            }
+            let _ = req.reply_tx.send(req.full_text.clone());
             continue;
         }
 
@@ -1411,58 +1415,77 @@ fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRe
             }
         });
 
-        // Retry up to 3 times — never send uncorrected
+        // Retry up to 3 times per model, auto-discover working model on first request
         const MAX_ATTEMPTS: u32 = 3;
         let mut result: Option<String> = None;
+        let mut last_error = String::new();
 
-        for attempt in 1..=MAX_ATTEMPTS {
-            if attempt > 1 {
-                send_toast(&format!("AC retry {}/{}…", attempt, MAX_ATTEMPTS));
-                log::info!("AI autocorrect: retry {attempt}/{MAX_ATTEMPTS}");
-            }
+        // If we already found a working model, try it first
+        let urls_to_try: Vec<String> = if let Some(ref url) = working_url {
+            vec![url.clone()]
+        } else {
+            models.iter().map(|m| base_url(m)).collect()
+        };
 
-            match client
-                .post(&url)
-                .set("content-type", "application/json")
-                .send_json(&body)
-            {
-                Ok(resp) => match resp.into_json::<serde_json::Value>() {
-                    Ok(json) => {
-                        if let Some(raw) =
-                            json["candidates"][0]["content"]["parts"][0]["text"].as_str()
-                        {
-                            let corrected = clean_ai_response(raw);
-                            log::info!("AI autocorrect: got '{corrected}'");
-                            if !corrected.is_empty()
-                                && (corrected.len() as f64)
-                                    < (req.full_text.len() as f64 * 1.5 + 20.0)
-                            {
-                                result = Some(corrected);
-                                break;
-                            }
-                        } else {
-                            log::warn!("AI autocorrect: unexpected response: {json}");
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!("AI autocorrect: JSON parse error: {e}");
-                    }
-                },
-                Err(e) => {
-                    log::warn!("AI autocorrect: request failed: {e}");
+        'outer: for url in &urls_to_try {
+            for attempt in 1..=MAX_ATTEMPTS {
+                if attempt > 1 {
+                    // No toast on retry — just silently retry. The pulse
+                    // animation keeps running so the user knows it's working.
+                    log::info!("AI autocorrect: retry {attempt}/{MAX_ATTEMPTS}");
+                    std::thread::sleep(std::time::Duration::from_millis(300));
                 }
-            }
 
-            // Brief pause before retry
-            if attempt < MAX_ATTEMPTS {
-                std::thread::sleep(std::time::Duration::from_millis(300));
+                match client
+                    .post(url)
+                    .set("content-type", "application/json")
+                    .send_json(&body)
+                {
+                    Ok(resp) => match resp.into_json::<serde_json::Value>() {
+                        Ok(json) => {
+                            if let Some(raw) =
+                                json["candidates"][0]["content"]["parts"][0]["text"].as_str()
+                            {
+                                let corrected = clean_ai_response(raw);
+                                log::info!("AI autocorrect: got '{corrected}'");
+                                if !corrected.is_empty()
+                                    && (corrected.len() as f64)
+                                        < (req.full_text.len() as f64 * 1.5 + 20.0)
+                                {
+                                    // Remember this model works
+                                    working_url = Some(url.clone());
+                                    result = Some(corrected);
+                                    break 'outer;
+                                }
+                            } else {
+                                last_error = format!("bad response: {}", &json.to_string()[..100.min(json.to_string().len())]);
+                                log::warn!("AI autocorrect: unexpected response: {json}");
+                            }
+                        }
+                        Err(e) => {
+                            last_error = format!("parse: {e}");
+                            log::warn!("AI autocorrect: JSON parse error: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        // 404 = model doesn't exist, try next model immediately
+                        if err_str.contains("404") {
+                            log::warn!("AI autocorrect: model not found at {url}, trying next");
+                            last_error = "model not found".into();
+                            break; // next model
+                        }
+                        last_error = format!("{e}");
+                        log::warn!("AI autocorrect: request failed: {e}");
+                    }
+                }
             }
         }
 
-        // Send result: corrected text, or original if all retries failed
+        // Send result: corrected text, or original if everything failed
         let final_text = result.unwrap_or_else(|| {
-            send_toast("AC unavailable — sending original");
-            log::warn!("AI autocorrect: all {MAX_ATTEMPTS} attempts failed, sending original");
+            send_toast(&format!("AC failed: {last_error}"));
+            log::warn!("AI autocorrect: all attempts failed ({last_error}), sending original");
             req.full_text.clone()
         });
         let _ = req.reply_tx.send(final_text);
