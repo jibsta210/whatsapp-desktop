@@ -1377,7 +1377,7 @@ fn clean_ai_response(raw: &str) -> String {
 
 fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRequest>) {
     let client = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(8))
         .build();
     // Try models in order: original working model first, then fallbacks
     let models = ["gemini-3-flash-preview", "gemini-2.0-flash", "gemini-2.5-flash-preview-05-20"];
