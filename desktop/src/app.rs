@@ -244,25 +244,20 @@ button.ac-mode-btn:checked {
 
 /* ── Pilafy: input-pill bounces then morphs into chat bubble ── */
 /* Phase 1: pill — matches the input bar appearance (bounce via Rust) */
+/* Phase 1: pill shape + breathing pulse while AC processes */
+@keyframes pilafy-pulse {
+    0%   { opacity: 1.0; background-color: #005c4b; }
+    50%  { opacity: 0.45; background-color: rgba(42, 57, 66, 0.6); }
+    100% { opacity: 1.0; background-color: #005c4b; }
+}
 box.message-bubble-out.pilafy {
     border-radius: 9999px;
-    background-color: rgba(42, 57, 66, 0.55);
     border: 1.5px solid rgba(255, 255, 255, 0.2);
     padding: 10px 20px;
-    opacity: 0.9;
+    animation: pilafy-pulse 1.0s ease-in-out infinite;
 }
 box.message-bubble-out.pilafy .dim-label {
     opacity: 0.0;
-}
-
-/* Phase 1b: pulse — smooth opacity + color breathing while AC processes */
-@keyframes pilafy-pulse {
-    0%   { opacity: 0.95; background-color: rgba(0, 92, 75, 0.9); }
-    50%  { opacity: 0.55; background-color: rgba(42, 57, 66, 0.7); }
-    100% { opacity: 0.95; background-color: rgba(0, 92, 75, 0.9); }
-}
-box.message-bubble-out.pilafy-pulse {
-    animation: pilafy-pulse 1.0s ease-in-out infinite;
 }
 
 /* Phase 2: settle — only opacity+background-color are GTK4-animatable */

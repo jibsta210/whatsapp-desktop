@@ -1975,7 +1975,6 @@ impl ChatViewPanel {
             if let Some(bubble) = bubbles.borrow().get(&tmp_id) {
                 let w = bubble.widget();
                 w.remove_css_class("pilafy");
-                w.remove_css_class("pilafy-pulse");
                 w.add_css_class("pilafy-settle");
                 // Update text if AI changed it
                 if final_text != original_text {
@@ -2034,13 +2033,8 @@ impl ChatViewPanel {
                 bubble.widget().add_css_class("pilafy");
             }
 
-            // ── Smooth pulse animation via pure CSS @keyframes ──
-            // Opacity + background-color are GPU-composited in GTK4 and always smooth.
-            // No timer callbacks, no CSS reparsing. Just add a class.
+            // Pulse animation is on the pilafy class itself — already added above.
             bounce_active.set(true);
-            if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
-                bubble.widget().add_css_class("pilafy-pulse");
-            }
 
             log::info!("AC delay: deferring send until AI correction completes");
 
