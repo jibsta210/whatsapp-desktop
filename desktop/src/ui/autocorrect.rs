@@ -1167,6 +1167,26 @@ static AI_IN_FLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// pending AI corrections from the previous chat.
 static GLOBAL_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Toast messages from the AI thread → GTK thread (retry notifications).
+static TOAST_TX: std::sync::OnceLock<std::sync::mpsc::Sender<String>> =
+    std::sync::OnceLock::new();
+static TOAST_RX: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Receiver<String>>> =
+    std::sync::OnceLock::new();
+
+/// Poll for pending toast messages (called from GTK thread).
+pub fn poll_toast() -> Option<String> {
+    TOAST_RX
+        .get()
+        .and_then(|rx| rx.lock().ok())
+        .and_then(|rx| rx.try_recv().ok())
+}
+
+fn send_toast(msg: &str) {
+    if let Some(tx) = TOAST_TX.get() {
+        let _ = tx.send(msg.to_string());
+    }
+}
+
 /// Call when switching chats to cancel any pending AI autocorrect.
 /// Prevents corrections from one chat leaking into another.
 pub fn cancel_pending() {
@@ -1234,9 +1254,9 @@ pub fn correct_for_send(text: String, callback: impl FnOnce(String) + 'static) {
                 gtk4::glib::ControlFlow::Break
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if attempts > 80 {
-                    // ~4s timeout — send original
-                    log::warn!("correct_for_send: AI timed out, sending original");
+                if attempts > 240 {
+                    // ~12s timeout (3 retries × 3s + buffer) — send original
+                    log::warn!("correct_for_send: AI timed out after retries, sending original");
                     if let Some(f) = cb.take() {
                         f(original.clone());
                     }
@@ -1290,6 +1310,11 @@ pub fn start_ai_corrector() {
 
     let (tx, rx) = std::sync::mpsc::channel::<AiCorrectionRequest>();
     let _ = AI_TX.set(tx);
+
+    // Toast channel for retry notifications
+    let (toast_tx, toast_rx) = std::sync::mpsc::channel::<String>();
+    let _ = TOAST_TX.set(toast_tx);
+    let _ = TOAST_RX.set(std::sync::Mutex::new(toast_rx));
 
     std::thread::Builder::new()
         .name("ai-autocorrect".into())
@@ -1386,48 +1411,61 @@ fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRe
             }
         });
 
-        match client
-            .post(&url)
-            .set("content-type", "application/json")
-            .send_json(&body)
-        {
-            Ok(resp) => match resp.into_json::<serde_json::Value>() {
-                Ok(json) => {
-                    if let Some(raw) =
-                        json["candidates"][0]["content"]["parts"][0]["text"].as_str()
-                    {
-                        let corrected = clean_ai_response(raw);
-                        log::info!("AI autocorrect: got '{corrected}'");
-                        if corrected != req.full_text
-                            && !corrected.is_empty()
-                            && (corrected.len() as f64) < (req.full_text.len() as f64 * 1.5 + 20.0)
+        // Retry up to 3 times — never send uncorrected
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut result: Option<String> = None;
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            if attempt > 1 {
+                send_toast(&format!("AC retry {}/{}…", attempt, MAX_ATTEMPTS));
+                log::info!("AI autocorrect: retry {attempt}/{MAX_ATTEMPTS}");
+            }
+
+            match client
+                .post(&url)
+                .set("content-type", "application/json")
+                .send_json(&body)
+            {
+                Ok(resp) => match resp.into_json::<serde_json::Value>() {
+                    Ok(json) => {
+                        if let Some(raw) =
+                            json["candidates"][0]["content"]["parts"][0]["text"].as_str()
                         {
-                            let _ = req.reply_tx.send(corrected);
-                        } else if req.always_reply {
-                            // Text unchanged or safety-guarded — return original
-                            let _ = req.reply_tx.send(req.full_text.clone());
-                        }
-                    } else {
-                        log::warn!("AI autocorrect: unexpected response: {json}");
-                        if req.always_reply {
-                            let _ = req.reply_tx.send(req.full_text.clone());
+                            let corrected = clean_ai_response(raw);
+                            log::info!("AI autocorrect: got '{corrected}'");
+                            if !corrected.is_empty()
+                                && (corrected.len() as f64)
+                                    < (req.full_text.len() as f64 * 1.5 + 20.0)
+                            {
+                                result = Some(corrected);
+                                break;
+                            }
+                        } else {
+                            log::warn!("AI autocorrect: unexpected response: {json}");
                         }
                     }
-                }
+                    Err(e) => {
+                        log::warn!("AI autocorrect: JSON parse error: {e}");
+                    }
+                },
                 Err(e) => {
-                    log::warn!("AI autocorrect: JSON parse error: {e}");
-                    if req.always_reply {
-                        let _ = req.reply_tx.send(req.full_text.clone());
-                    }
-                }
-            },
-            Err(e) => {
-                log::warn!("AI autocorrect: request failed: {e}");
-                if req.always_reply {
-                    let _ = req.reply_tx.send(req.full_text.clone());
+                    log::warn!("AI autocorrect: request failed: {e}");
                 }
             }
+
+            // Brief pause before retry
+            if attempt < MAX_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
         }
+
+        // Send result: corrected text, or original if all retries failed
+        let final_text = result.unwrap_or_else(|| {
+            send_toast("AC unavailable — sending original");
+            log::warn!("AI autocorrect: all {MAX_ATTEMPTS} attempts failed, sending original");
+            req.full_text.clone()
+        });
+        let _ = req.reply_tx.send(final_text);
     }
 }
 

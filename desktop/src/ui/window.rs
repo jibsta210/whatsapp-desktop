@@ -48,6 +48,7 @@ struct MainWindowInner {
     own_profile_data: RefCell<Option<OwnProfileData>>,
     /// Cached chat list for multi-send
     cached_chats: RefCell<Vec<crate::bridge::ChatSummary>>,
+    toast_overlay: adw::ToastOverlay,
 }
 
 #[derive(Clone)]
@@ -248,7 +249,9 @@ impl MainWindow {
         toolbar_view.add_top_bar(&top_header);
         toolbar_view.set_content(Some(&stack));
 
-        window.set_content(Some(&toolbar_view));
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&toolbar_view));
+        window.set_content(Some(&toast_overlay));
 
         let settings = SettingsHandle::new();
 
@@ -274,7 +277,21 @@ impl MainWindow {
             settings,
             own_profile_data: RefCell::new(None),
             cached_chats: RefCell::new(Vec::new()),
+            toast_overlay,
         });
+
+        // Poll AC toast messages and show them via the toast overlay
+        {
+            let overlay = inner.toast_overlay.clone();
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                while let Some(msg) = crate::ui::autocorrect::poll_toast() {
+                    let toast = adw::Toast::new(&msg);
+                    toast.set_timeout(2);
+                    overlay.add_toast(toast);
+                }
+                gtk4::glib::ControlFlow::Continue
+            });
+        }
 
         // Wire own avatar click → open profile window with cached data
         {
