@@ -1380,7 +1380,7 @@ fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRe
             }],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 512,
+                "maxOutputTokens": 2048,
             }
         });
 

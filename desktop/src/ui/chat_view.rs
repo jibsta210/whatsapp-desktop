@@ -2025,10 +2025,34 @@ impl ChatViewPanel {
 
         if inner.ac_delay_send.get() {
             // AC delay ON — submit to AI, send corrected text when it returns.
-            // The bubble gets the "pilafy" CSS class which applies a smooth
-            // opacity/color pulse animation (GPU-composited, no layout changes).
+            // Pill shape via CSS class, opacity pulse via Rust set_opacity() (GTK4
+            // CSS @keyframes don't animate on Box widgets, so we drive it manually).
             if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
                 bubble.widget().add_css_class("pilafy");
+            }
+
+            // Smooth opacity pulse using set_opacity() — GPU-composited, guaranteed to work
+            bounce_active.set(true);
+            if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
+                let w = bubble.widget().clone();
+                let ba = bounce_active.clone();
+                let frame = Rc::new(Cell::new(0u32));
+                gtk4::glib::timeout_add_local(
+                    std::time::Duration::from_millis(30),
+                    move || {
+                        if !ba.get() {
+                            w.set_opacity(1.0);
+                            return gtk4::glib::ControlFlow::Break;
+                        }
+                        let f = frame.get();
+                        // Sine wave: period ~60 frames (30ms * 60 = 1.8s cycle)
+                        let t = (f as f64) * std::f64::consts::PI * 2.0 / 60.0;
+                        let opacity = 0.7 + 0.3 * t.cos(); // oscillates 0.4 ↔ 1.0
+                        w.set_opacity(opacity);
+                        frame.set(f + 1);
+                        gtk4::glib::ControlFlow::Continue
+                    },
+                );
             }
 
             log::info!("AC delay: deferring send until AI correction completes");
