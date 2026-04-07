@@ -2050,19 +2050,22 @@ impl ChatViewPanel {
             // native GTK widget API that is GPU-composited and guaranteed to work.
             bounce_active.set(true);
             if let Some(w) = pilafy_widget {
+                // Set initial low opacity so the pulse is visible from the first frame
+                w.set_opacity(0.3);
+
                 let ba = bounce_active.clone();
                 let frame = Rc::new(Cell::new(0u32));
                 gtk4::glib::timeout_add_local(
-                    std::time::Duration::from_millis(30),
+                    std::time::Duration::from_millis(25),
                     move || {
                         if !ba.get() {
                             w.set_opacity(1.0);
                             return gtk4::glib::ControlFlow::Break;
                         }
                         let f = frame.get();
-                        // Sine wave: period ~60 frames (30ms * 60 = 1.8s cycle)
-                        let t = (f as f64) * std::f64::consts::PI * 2.0 / 60.0;
-                        let opacity = 0.7 + 0.3 * t.cos(); // oscillates 0.4 ↔ 1.0
+                        // Sine wave: period ~40 frames (25ms * 40 = 1.0s cycle)
+                        let t = (f as f64) * std::f64::consts::PI * 2.0 / 40.0;
+                        let opacity = 0.5 + 0.5 * t.cos(); // oscillates 0.0 ↔ 1.0
                         w.set_opacity(opacity);
                         frame.set(f.wrapping_add(1));
                         gtk4::glib::ControlFlow::Continue
@@ -2072,8 +2075,8 @@ impl ChatViewPanel {
 
             log::info!("AC delay: deferring send until AI correction completes");
 
-            // Ensure the pulse is visible for at least 600ms even if AI returns fast.
-            let min_pulse_ms = 600u64;
+            // Ensure the pulse is visible for at least 1200ms even if AI returns fast.
+            let min_pulse_ms = 1200u64;
             let pulse_start = std::time::Instant::now();
             let send_with_min_pulse = move |final_text: String| {
                 let elapsed = pulse_start.elapsed().as_millis() as u64;
