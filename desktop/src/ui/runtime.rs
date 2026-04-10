@@ -275,6 +275,14 @@ pub fn display_name_from_jid(jid: &str) -> String {
             return format!("+{user}");
         }
     }
+    // LID JIDs look like "12345678.0:90@lid" — extract digits before the dot
+    // and format as a phone-ish number so it's at least recognisable.
+    if let Some(user) = jid.strip_suffix("@lid") {
+        let digits: String = user.split('.').next().unwrap_or(user).to_string();
+        if digits.chars().all(|c| c.is_ascii_digit()) && digits.len() >= 5 {
+            return format!("+{digits}");
+        }
+    }
     jid.to_string()
 }
 
@@ -572,6 +580,12 @@ impl RuntimeState {
     /// Pass both a LID and phone JID when available so lookups always hit.
     /// Update contact name in memory and return true if changed (caller should
     /// flush contact_names to disk AFTER releasing the lock).
+    /// Insert a LID→phone mapping and keep the reverse map in sync.
+    fn insert_lid_phone(&mut self, lid: String, phone: String) {
+        self.phone_to_lid.insert(phone.clone(), lid.clone());
+        self.lid_to_phone.insert(lid, phone);
+    }
+
     fn record_contact_name(&mut self, jid: &str, name: &str, also_jid: Option<&str>) -> bool {
         if name.is_empty() {
             return false;
@@ -589,9 +603,9 @@ impl RuntimeState {
             // Store LID→phone mapping whenever we have both JIDs
             if !alt.is_empty() {
                 if jid.ends_with("@lid") && alt.ends_with("@s.whatsapp.net") {
-                    self.lid_to_phone.insert(jid.to_string(), alt.to_string());
+                    self.insert_lid_phone(jid.to_string(), alt.to_string());
                 } else if alt.ends_with("@lid") && jid.ends_with("@s.whatsapp.net") {
-                    self.lid_to_phone.insert(alt.to_string(), jid.to_string());
+                    self.insert_lid_phone(alt.to_string(), jid.to_string());
                 }
             }
         }
@@ -1162,9 +1176,9 @@ async fn handle_wa_event(
                 let alt_str = alt.to_string();
                 let mut s = state.lock().unwrap();
                 if sender.ends_with("@lid") && alt_str.ends_with("@s.whatsapp.net") {
-                    s.lid_to_phone.insert(sender, alt_str);
+                    s.insert_lid_phone(sender, alt_str);
                 } else if alt_str.ends_with("@lid") && sender.ends_with("@s.whatsapp.net") {
-                    s.lid_to_phone.insert(alt_str, sender);
+                    s.insert_lid_phone(alt_str, sender);
                 }
             }
 
@@ -1937,8 +1951,7 @@ async fn handle_wa_event(
                         state
                             .lock()
                             .unwrap()
-                            .lid_to_phone
-                            .insert(raw_id.clone(), pn_from_conv.clone());
+                            .insert_lid_phone(raw_id.clone(), pn_from_conv.clone());
                         pn_from_conv.clone()
                     } else {
                         let s = state.lock().unwrap();
@@ -2011,7 +2024,7 @@ async fn handle_wa_event(
                 // Store LID→phone mapping from every JoinedGroup conversation
                 if chat_id.ends_with("@lid") && !pn_jid.is_empty() {
                     let mut s = state.lock().unwrap();
-                    s.lid_to_phone.insert(chat_id.clone(), pn_jid.clone());
+                    s.insert_lid_phone(chat_id.clone(), pn_jid.clone());
                     // Also store contact name under phone JID if we have one for the LID
                     if let Some(lid_name) = s.contact_names.get(&chat_id).cloned() {
                         if !s.contact_names.contains_key(&pn_jid) {
@@ -2311,7 +2324,7 @@ async fn handle_wa_event(
                 s.record_contact_name(&lid_jid, &name, phone_opt);
                 // Store the LID→phone mapping for sender name resolution
                 if lid_jid.ends_with("@lid") && !phone_jid.is_empty() {
-                    s.lid_to_phone.insert(lid_jid.clone(), phone_jid.clone());
+                    s.insert_lid_phone(lid_jid.clone(), phone_jid.clone());
                 }
                 s.contact_names.clone()
             };
@@ -3323,6 +3336,25 @@ async fn handle_command(
                 }
             }
 
+            // Collect unresolved LID senders for async resolution
+            let unresolved_lids: Vec<String> = {
+                let s = state.lock().unwrap();
+                messages
+                    .iter()
+                    .filter(|m| {
+                        !m.is_from_me
+                            && m.sender_id.ends_with("@lid")
+                            && (m.sender_name.contains("@lid")
+                                || m.sender_name.starts_with('+')
+                                || m.sender_name.is_empty())
+                    })
+                    .map(|m| m.sender_id.clone())
+                    .filter(|lid| !s.lid_to_phone.contains_key(lid))
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect()
+            };
+
             let _ = tx
                 .send(WaEvent::HistoryMessages {
                     chat_id: chat_id.clone(),
@@ -3332,7 +3364,133 @@ async fn handle_command(
                 .await;
 
             if let Some(msg_id) = pinned_msg_id {
-                let _ = tx.send(WaEvent::MessagePinned { chat_id, msg_id }).await;
+                let _ = tx.send(WaEvent::MessagePinned { chat_id: chat_id.clone(), msg_id }).await;
+            }
+
+            // Async LID→phone resolution for unresolved group participant senders.
+            // Uses usync (device-list query) which does a network round-trip and
+            // persists mappings. After resolving, re-sends updated messages to UI.
+            if !unresolved_lids.is_empty() && chat_id.ends_with("@g.us") {
+                log::info!(
+                    "LoadChat {chat_id}: {} unresolved LID senders, triggering usync resolution",
+                    unresolved_lids.len()
+                );
+                let client_c = client.clone();
+                let state_c = state.clone();
+                let tx_c = tx.clone();
+                let chat_id_c = chat_id.clone();
+                tokio::spawn(async move {
+                    // Parse LID JIDs and query the server
+                    let jids: Vec<Jid> = unresolved_lids
+                        .iter()
+                        .filter_map(|s| s.parse::<Jid>().ok())
+                        .collect();
+                    if jids.is_empty() {
+                        return;
+                    }
+                    match client_c.get_user_devices(&jids).await {
+                        Ok(_devices) => {
+                            // Usync response stored LID→phone mappings in client cache.
+                            // Now pull them into our RuntimeState.
+                            let mut newly_resolved = 0u32;
+                            for lid_str in &unresolved_lids {
+                                if let Some(phone_jid) =
+                                    client_c.resolve_lid_to_phone_jid(lid_str).await
+                                {
+                                    let mut s = state_c.lock().unwrap();
+                                    s.insert_lid_phone(lid_str.clone(), phone_jid.clone());
+                                    if let Some(name) =
+                                        s.contact_names.get(lid_str).cloned()
+                                    {
+                                        if !s.contact_names.contains_key(&phone_jid) {
+                                            s.contact_names
+                                                .insert(phone_jid.clone(), name);
+                                        }
+                                    }
+                                    newly_resolved += 1;
+                                }
+                            }
+                            if newly_resolved > 0 {
+                                log::info!(
+                                    "LoadChat {chat_id_c}: resolved {newly_resolved}/{} LID senders via usync",
+                                    unresolved_lids.len()
+                                );
+                                // Persist updated mappings
+                                {
+                                    let map = state_c.lock().unwrap().lid_to_phone.clone();
+                                    tokio::task::spawn_blocking(move || save_lid_phone_map(&map));
+                                }
+
+                                // Re-resolve message sender names in cache and resend to UI.
+                                // Two-phase: first collect resolutions, then apply.
+                                let updated_msgs = {
+                                    let mut s = state_c.lock().unwrap();
+                                    // Phase 1: collect (jid → resolved name) while &s is immutable
+                                    let resolutions: HashMap<String, String> = unresolved_lids
+                                        .iter()
+                                        .map(|lid| {
+                                            let name = resolve_sender_name(&s, lid);
+                                            (lid.clone(), name)
+                                        })
+                                        .collect();
+                                    // Phase 2: apply resolved names to cached messages
+                                    if let Some(msgs) = s.history.get_mut(&chat_id_c) {
+                                        for m in msgs.iter_mut() {
+                                            if let Some(resolved) =
+                                                resolutions.get(&m.sender_id)
+                                            {
+                                                if !resolved.contains("@lid")
+                                                    && *resolved != m.sender_name
+                                                {
+                                                    m.sender_name = resolved.clone();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Return the last 50 for display
+                                    s.history.get(&chat_id_c).map(|all| {
+                                        let mut filtered: Vec<_> = all
+                                            .iter()
+                                            .filter(|m| {
+                                                m.text.is_some()
+                                                    || m.media_type.is_some()
+                                                    || m.media_caption.is_some()
+                                            })
+                                            .cloned()
+                                            .collect();
+                                        filtered.sort_by_key(|m| m.timestamp);
+                                        if filtered.len() > 50 {
+                                            filtered =
+                                                filtered.split_off(filtered.len() - 50);
+                                        }
+                                        filtered
+                                    })
+                                };
+                                if let Some(messages) = updated_msgs {
+                                    let chat_name = state_c
+                                        .lock()
+                                        .unwrap()
+                                        .chat_names
+                                        .get(&chat_id_c)
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let _ = tx_c
+                                        .send(WaEvent::HistoryMessages {
+                                            chat_id: chat_id_c,
+                                            chat_name,
+                                            messages,
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "LoadChat {chat_id_c}: usync LID resolution failed: {e:#}"
+                            );
+                        }
+                    }
+                });
             }
         }
 
@@ -6236,7 +6394,7 @@ async fn resolve_all_lids(client: &Arc<Client>, state: &Arc<Mutex<RuntimeState>>
     for lid_jid in &lid_jids {
         if let Some(phone_jid) = client.resolve_lid_to_phone_jid(lid_jid).await {
             let mut s = state.lock().unwrap();
-            s.lid_to_phone.insert(lid_jid.clone(), phone_jid.clone());
+            s.insert_lid_phone(lid_jid.clone(), phone_jid.clone());
             // Also store the contact name under the phone JID if we have one for the LID
             if let Some(name) = s.contact_names.get(lid_jid).cloned() {
                 if !s.contact_names.contains_key(&phone_jid) {
@@ -6411,7 +6569,7 @@ async fn fetch_and_update_group_names(
                 let mut lid_phone_count = 0u32;
                 for (lid_jid, phone_str) in &lid_updates {
                     if !s.lid_to_phone.contains_key(lid_jid) {
-                        s.lid_to_phone.insert(lid_jid.clone(), phone_str.clone());
+                        s.insert_lid_phone(lid_jid.clone(), phone_str.clone());
                         if let Some(lid_name) = s.contact_names.get(lid_jid).cloned() {
                             if !s.contact_names.contains_key(phone_str) {
                                 s.contact_names.insert(phone_str.clone(), lid_name);

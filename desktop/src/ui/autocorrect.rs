@@ -1478,7 +1478,6 @@ use std::rc::Rc;
 /// Corrected words are highlighted with a subtle background tag.
 /// Backspace at the end of a highlighted word reverts the correction.
 pub fn install_on_textview(view: &gtk4::TextView) {
-    let key_ctrl = gtk4::EventControllerKey::new();
     let buf = view.buffer();
     let buf_ai = view.buffer();
 
@@ -1506,44 +1505,57 @@ pub fn install_on_textview(view: &gtk4::TextView) {
     let skip_ref = skip_next.clone();
     let skip_ref2 = skip_next.clone();
 
-    key_ctrl.connect_key_released(move |_, key, _, modifier| {
-        // ── Backspace: revert a highlighted correction ──
+    // ── Backspace revert: intercept key-press BEFORE GTK deletes a char ──
+    // CAPTURE phase ensures we run before the TextView's own key handler.
+    let bs_ctrl = gtk4::EventControllerKey::new();
+    bs_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    let buf_bs = view.buffer();
+    let tag_bs = correction_tag.clone();
+    let revert_bs = revert_map.clone();
+    let skip_bs = skip_next.clone();
+    bs_ctrl.connect_key_pressed(move |_, key, _, modifier| {
         if key == gtk4::gdk::Key::BackSpace {
-            let cursor = buf.cursor_position();
-            let iter = buf.iter_at_offset(cursor);
+            let cursor = buf_bs.cursor_position();
+            let iter = buf_bs.iter_at_offset(cursor);
+            let tag_ref = tag_bs.as_ref().unwrap();
             // Check if cursor is at or inside a tagged (corrected) word
-            if iter.has_tag(correction_tag.as_ref().unwrap()) || {
+            let in_tag = iter.has_tag(tag_ref) || {
                 let mut prev = iter.clone();
                 prev.backward_char();
-                prev.has_tag(correction_tag.as_ref().unwrap())
-            } {
+                prev.has_tag(tag_ref)
+            };
+            if in_tag {
                 // Find the tagged range
                 let mut start = iter.clone();
                 let mut end = iter.clone();
-                if !start.starts_tag(correction_tag.as_ref()) {
-                    start.backward_to_tag_toggle(correction_tag.as_ref());
+                if !start.starts_tag(Some(tag_ref)) {
+                    start.backward_to_tag_toggle(Some(tag_ref));
                 }
-                if !end.ends_tag(correction_tag.as_ref()) {
-                    end.forward_to_tag_toggle(correction_tag.as_ref());
+                if !end.ends_tag(Some(tag_ref)) {
+                    end.forward_to_tag_toggle(Some(tag_ref));
                 }
                 let tag_start_offset = start.offset();
-                if let Some(original) = revert_ref.borrow().get(&tag_start_offset).cloned() {
-                    let mut s = buf.iter_at_offset(start.offset());
-                    let mut e = buf.iter_at_offset(end.offset());
-                    buf.delete(&mut s, &mut e);
-                    buf.insert(&mut s, &original);
-                    revert_ref.borrow_mut().remove(&tag_start_offset);
-                    skip_ref.set(true); // Don't re-correct this
-                    return;
+                if let Some(original) = revert_bs.borrow().get(&tag_start_offset).cloned() {
+                    let mut s = buf_bs.iter_at_offset(start.offset());
+                    let mut e = buf_bs.iter_at_offset(end.offset());
+                    buf_bs.delete(&mut s, &mut e);
+                    buf_bs.insert(&mut s, &original);
+                    revert_bs.borrow_mut().remove(&tag_start_offset);
+                    skip_bs.set(true); // Don't re-correct this
+                    return gtk4::glib::Propagation::Stop;
                 }
             }
         }
-
         // ── Ctrl+Z: skip next AI pass ──
         if key == gtk4::gdk::Key::z && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
-            skip_ref.set(true);
-            return;
+            skip_bs.set(true);
         }
+        gtk4::glib::Propagation::Proceed
+    });
+    view.add_controller(bs_ctrl);
+
+    let key_ctrl = gtk4::EventControllerKey::new();
+    key_ctrl.connect_key_released(move |_, key, _, modifier| {
 
         // ── Layer 1: Local instant correction on word boundaries ──
         // ONLY runs when AI is NOT available. When Gemini is active it handles

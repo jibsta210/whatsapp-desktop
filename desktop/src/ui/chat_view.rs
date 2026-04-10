@@ -2067,7 +2067,28 @@ impl ChatViewPanel {
             };
             crate::ui::autocorrect::correct_for_send(text, send_with_min_bounce);
         } else {
-            // AC delay OFF — send immediately, typos and all
+            // AC delay OFF — quick pill→bubble settle animation, then send
+            if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
+                bubble.widget().add_css_class("pilafy");
+            }
+            // Brief pill flash then settle into normal bubble shape
+            let bubbles_settle = inner.bubbles.clone();
+            let tid = tmp_id_for_pilafy.clone();
+            gtk4::glib::timeout_add_local_once(
+                std::time::Duration::from_millis(150),
+                move || {
+                    if let Some(bubble) = bubbles_settle.borrow().get(&tid) {
+                        let w = bubble.widget();
+                        w.remove_css_class("pilafy");
+                        w.add_css_class("pilafy-settle");
+                        let w2 = w.clone();
+                        gtk4::glib::timeout_add_local_once(
+                            std::time::Duration::from_millis(500),
+                            move || { w2.remove_css_class("pilafy-settle"); },
+                        );
+                    }
+                },
+            );
             send_network(text);
         }
     }
