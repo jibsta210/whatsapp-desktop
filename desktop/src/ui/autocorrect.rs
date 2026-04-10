@@ -1505,6 +1505,17 @@ pub fn install_on_textview(view: &gtk4::TextView) {
     let skip_ref = skip_next.clone();
     let skip_ref2 = skip_next.clone();
 
+    // Guard flag: prevents re-entrant buffer modifications when backspace
+    // revert fires delete+insert (which triggers change signals synchronously).
+    let modifying: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    let modifying_local = modifying.clone();
+    let modifying_ai = modifying.clone();
+
+    // Words the user has reverted — skip autocorrect for these in this session.
+    let ignored_words: Rc<RefCell<HashSet<String>>> = Rc::new(RefCell::new(HashSet::new()));
+    let ignored_local = ignored_words.clone();
+    let ignored_ai = ignored_words.clone();
+
     // ── Backspace revert: intercept key-press BEFORE GTK deletes a char ──
     // CAPTURE phase ensures we run before the TextView's own key handler.
     let bs_ctrl = gtk4::EventControllerKey::new();
@@ -1513,11 +1524,19 @@ pub fn install_on_textview(view: &gtk4::TextView) {
     let tag_bs = correction_tag.clone();
     let revert_bs = revert_map.clone();
     let skip_bs = skip_next.clone();
+    let modifying_bs = modifying.clone();
+    let ignored_bs = ignored_words.clone();
     bs_ctrl.connect_key_pressed(move |_, key, _, modifier| {
         if key == gtk4::gdk::Key::BackSpace {
+            // Prevent re-entrant calls (delete+insert triggers change signals)
+            if modifying_bs.get() {
+                return gtk4::glib::Propagation::Proceed;
+            }
+            let Some(tag_ref) = tag_bs.as_ref() else {
+                return gtk4::glib::Propagation::Proceed;
+            };
             let cursor = buf_bs.cursor_position();
             let iter = buf_bs.iter_at_offset(cursor);
-            let tag_ref = tag_bs.as_ref().unwrap();
             // Check if cursor is at or inside a tagged (corrected) word
             let in_tag = iter.has_tag(tag_ref) || {
                 let mut prev = iter.clone();
@@ -1536,12 +1555,27 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                 }
                 let tag_start_offset = start.offset();
                 if let Some(original) = revert_bs.borrow().get(&tag_start_offset).cloned() {
-                    let mut s = buf_bs.iter_at_offset(start.offset());
-                    let mut e = buf_bs.iter_at_offset(end.offset());
+                    // Set flags BEFORE modifying buffer to block re-entrant handlers
+                    skip_bs.set(true);
+                    modifying_bs.set(true);
+                    // Remember this word so we never autocorrect it again this session
+                    ignored_bs.borrow_mut().insert(original.to_lowercase());
+                    // Batch the delete+insert as a single user action
+                    buf_bs.begin_user_action();
+                    let start_off = start.offset();
+                    let end_off = end.offset();
+                    let mut s = buf_bs.iter_at_offset(start_off);
+                    let mut e = buf_bs.iter_at_offset(end_off);
                     buf_bs.delete(&mut s, &mut e);
-                    buf_bs.insert(&mut s, &original);
+                    // Re-acquire iterator after delete (s is revalidated by GTK)
+                    let mut insert_iter = buf_bs.iter_at_offset(start_off);
+                    buf_bs.insert(&mut insert_iter, &original);
+                    // Place cursor at end of restored word
+                    let cursor_iter = buf_bs.iter_at_offset(start_off + original.len() as i32);
+                    buf_bs.place_cursor(&cursor_iter);
+                    buf_bs.end_user_action();
                     revert_bs.borrow_mut().remove(&tag_start_offset);
-                    skip_bs.set(true); // Don't re-correct this
+                    modifying_bs.set(false);
                     return gtk4::glib::Propagation::Stop;
                 }
             }
@@ -1556,6 +1590,11 @@ pub fn install_on_textview(view: &gtk4::TextView) {
 
     let key_ctrl = gtk4::EventControllerKey::new();
     key_ctrl.connect_key_released(move |_, key, _, modifier| {
+
+        // Guard: don't run corrections while backspace revert is modifying the buffer
+        if modifying_local.get() {
+            return;
+        }
 
         // ── Layer 1: Local instant correction on word boundaries ──
         // ONLY runs when AI is NOT available. When Gemini is active it handles
@@ -1588,7 +1627,7 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                     }
                 }
                 let word = buf.text(&word_start, &trigger_iter, false).to_string();
-                if !word.is_empty() {
+                if !word.is_empty() && !ignored_local.borrow().contains(&word.to_lowercase()) {
                     if let Some(corrected) = correct_word(&word) {
                         let offset_start = word_start.offset();
                         let offset_end = trigger_iter.offset();
@@ -1630,7 +1669,7 @@ pub fn install_on_textview(view: &gtk4::TextView) {
         }
 
         // ── Layer 2: AI full-context correction after typing pause ──
-        if AI_TX.get().is_some() {
+        if AI_TX.get().is_some() && !modifying_ai.get() {
             let generation_id = gen_ref.get() + 1;
             gen_ref.set(generation_id);
 
@@ -1639,6 +1678,7 @@ pub fn install_on_textview(view: &gtk4::TextView) {
             let skip_check = skip_ref2.clone();
             let tag_for_ai = correction_tag.clone();
             let rv_for_ai = revert_ref2.clone();
+            let ignored_for_ai = ignored_ai.clone();
             gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
                 if gen_check.get() != generation_id {
                     return;
@@ -1669,6 +1709,7 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                     let original = full_text;
                     let tag_apply = tag_for_ai.clone();
                     let rv_apply = rv_for_ai.clone();
+                    let ignored_apply = ignored_for_ai.clone();
                     // Capture generation + cancellation counter at request time.
                     let request_gen = generation_id;
                     let gen_at_apply = gen_check.clone();
@@ -1716,6 +1757,31 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                                         AI_IN_FLIGHT
                                             .store(false, std::sync::atomic::Ordering::Relaxed);
                                         return gtk4::glib::ControlFlow::Break;
+                                    };
+
+                                    // Filter out corrections of ignored words
+                                    let apply_text = {
+                                        let ignored = ignored_apply.borrow();
+                                        if ignored.is_empty() {
+                                            apply_text
+                                        } else {
+                                            let old_words: Vec<&str> = current.split_whitespace().collect();
+                                            let new_words: Vec<&str> = apply_text.split_whitespace().collect();
+                                            if old_words.len() == new_words.len() {
+                                                let filtered: Vec<&str> = old_words.iter().zip(new_words.iter())
+                                                    .map(|(o, n)| {
+                                                        if o != n && ignored.contains(&o.to_lowercase()) {
+                                                            *o // keep original — user reverted this word
+                                                        } else {
+                                                            *n
+                                                        }
+                                                    })
+                                                    .collect();
+                                                filtered.join(" ")
+                                            } else {
+                                                apply_text
+                                            }
+                                        }
                                     };
 
                                     if apply_text == current {
