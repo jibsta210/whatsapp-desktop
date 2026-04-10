@@ -350,7 +350,17 @@ pub fn show_settings_window(settings: &SettingsHandle, parent: Option<&gtk4::Win
     // ── Zoom / Scale ──
     let zoom_group = adw::PreferencesGroup::new();
     zoom_group.set_title("Zoom");
-    zoom_group.set_description(Some("Adjust the UI scale — useful for high-DPI displays"));
+    zoom_group.set_description(Some(
+        "Scales the entire UI — text, spacing, icons, everything. Restart required.",
+    ));
+
+    // Current effective zoom display
+    let effective = current_effective_zoom();
+    let zoom_info = adw::ActionRow::new();
+    zoom_info.set_title("Current Scale");
+    zoom_info.set_subtitle(&format!("{:.0}%", effective * 100.0));
+
+    zoom_group.add(&zoom_info);
 
     // Zoom level row with a Scale (slider) widget
     let zoom_row = adw::ActionRow::new();
@@ -376,31 +386,55 @@ pub fn show_settings_window(settings: &SettingsHandle, parent: Option<&gtk4::Win
     };
     scale.set_value(display_val);
 
+    // Restart hint label (hidden until changed)
+    let restart_hint = Label::new(Some("Restart app to apply new zoom level"));
+    restart_hint.add_css_class("dim-label");
+    restart_hint.set_visible(false);
+    restart_hint.set_halign(Align::Start);
+    restart_hint.set_margin_top(4);
+
     let sh = settings.clone();
     let row_ref = zoom_row.clone();
+    let hint_ref = restart_hint.clone();
     scale.connect_value_changed(move |s| {
         let val = s.value();
         // Snap: if within 0.1 of 0.75, treat as "auto"
         let level = if val < 0.85 { 0.0 } else { (val * 4.0).round() / 4.0 };
         sh.update(|settings| settings.zoom_level = level);
         row_ref.set_subtitle(&zoom_label(level));
-        apply_zoom(level);
+        hint_ref.set_visible(true);
     });
     zoom_row.add_suffix(&scale);
     zoom_group.add(&zoom_row);
 
-    // Reset to auto button
+    // Restart now button
+    let restart_box = Box::new(Orientation::Horizontal, 8);
+    restart_box.set_halign(Align::Start);
+    restart_box.set_margin_top(4);
+
     let auto_btn = gtk4::Button::with_label("Reset to Auto");
-    auto_btn.set_halign(Align::Start);
-    auto_btn.set_margin_top(4);
     let sh = settings.clone();
     let scale_ref = scale.clone();
+    let hint_ref2 = restart_hint.clone();
     auto_btn.connect_clicked(move |_| {
         sh.update(|s| s.zoom_level = 0.0);
         scale_ref.set_value(0.75);
-        apply_zoom(0.0);
+        hint_ref2.set_visible(true);
     });
-    zoom_group.add(&auto_btn);
+
+    let restart_btn = gtk4::Button::with_label("Restart Now");
+    restart_btn.add_css_class("suggested-action");
+    restart_btn.connect_clicked(move |_| {
+        // Re-exec the process so GDK_DPI_SCALE takes effect
+        let exe = std::env::current_exe().unwrap_or_default();
+        let _ = std::process::Command::new(&exe).spawn();
+        std::process::exit(0);
+    });
+
+    restart_box.append(&auto_btn);
+    restart_box.append(&restart_btn);
+    zoom_group.add(&restart_hint);
+    zoom_group.add(&restart_box);
 
     appear_page.add(&zoom_group);
     window.add(&appear_page);
@@ -496,60 +530,19 @@ pub fn apply_theme(theme: &str) {
     }
 }
 
-/// Auto-detect a sensible zoom level from the primary monitor's geometry.
-/// Returns a multiplier (e.g. 1.5 for 150%).
-pub fn detect_zoom() -> f64 {
-    let display = match gtk4::gdk::Display::default() {
-        Some(d) => d,
-        None => return 1.0,
-    };
-
-    // Get the monitors list
-    let monitors = display.monitors();
-    let monitor: Option<gtk4::gdk::Monitor> = monitors
-        .item(0)
-        .and_then(|obj| obj.downcast::<gtk4::gdk::Monitor>().ok());
-
-    if let Some(mon) = monitor {
-        let scale_factor = mon.scale_factor() as f64;
-        let geom = mon.geometry();
-        let width_px = (geom.width() as f64) * scale_factor;
-
-        // High DPI heuristic: if native resolution > 2500px wide and
-        // the compositor isn't already applying 2x scaling, suggest scaling up.
-        if width_px > 2500.0 && scale_factor < 1.5 {
-            // Scale proportionally: 3200px → ~1.5x, 3840px → ~1.75x
-            let suggested = (width_px / 1920.0).min(2.5).max(1.0);
-            // Round to nearest 0.25
-            return (suggested * 4.0).round() / 4.0;
-        }
-        // If compositor already scales (e.g. 2x), don't double up
-        return 1.0;
-    }
-    1.0
-}
-
-/// Apply a zoom level to the GTK runtime via the Xft DPI setting.
-/// This scales all fonts and most widgets uniformly.
-/// `level` is a multiplier: 1.0 = 100%, 1.5 = 150%, etc.
-pub fn apply_zoom(level: f64) {
-    let effective = if level <= 0.0 { detect_zoom() } else { level };
-    let dpi = (effective * 96.0 * 1024.0) as i32; // GTK uses DPI × 1024
-    if let Some(settings) = gtk4::Settings::default() {
-        settings.set_gtk_xft_dpi(dpi);
-    }
-    log::info!(
-        "Applied zoom: {:.0}% (xft-dpi={})",
-        effective * 100.0,
-        dpi / 1024
-    );
+/// Read the currently active scale from GDK_DPI_SCALE (set in main.rs before GTK init).
+pub fn current_effective_zoom() -> f64 {
+    std::env::var("GDK_DPI_SCALE")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1.0)
 }
 
 /// Format a zoom level for display: "Auto (150%)" or "125%"
 fn zoom_label(level: f64) -> String {
     if level <= 0.0 {
-        let auto = detect_zoom();
-        format!("Auto ({:.0}%)", auto * 100.0)
+        let effective = current_effective_zoom();
+        format!("Auto ({:.0}%)", effective * 100.0)
     } else {
         format!("{:.0}%", level * 100.0)
     }

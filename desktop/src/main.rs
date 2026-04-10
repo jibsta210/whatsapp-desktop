@@ -22,6 +22,66 @@ fn ensure_data_dir() -> std::path::PathBuf {
     dir
 }
 
+/// Detect native display width from sysfs (no GTK needed).
+/// Returns the widest mode in pixels, or 0 if detection fails.
+fn detect_display_width() -> u32 {
+    let mut max_w = 0u32;
+    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
+        for entry in entries.flatten() {
+            let modes = entry.path().join("modes");
+            if let Ok(text) = std::fs::read_to_string(&modes) {
+                if let Some(first) = text.lines().next() {
+                    if let Some(w_str) = first.split('x').next() {
+                        if let Ok(w) = w_str.parse::<u32>() {
+                            max_w = max_w.max(w);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    max_w
+}
+
+/// Apply display scaling BEFORE GTK initializes by setting GDK_DPI_SCALE.
+/// This env var scales the entire rendering pipeline — text, padding,
+/// margins, icons, widgets — everything uniformly.
+fn apply_prescale(data_dir: &std::path::Path) {
+    // Don't override if the user already set GDK_DPI_SCALE externally
+    if std::env::var("GDK_DPI_SCALE").is_ok() {
+        return;
+    }
+
+    // Load zoom_level from settings (before GTK init, so no GTK APIs available)
+    let settings_path = data_dir.join("wa_settings.json");
+    let zoom_level: f64 = std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("zoom_level")?.as_f64())
+        .unwrap_or(0.0);
+
+    let scale = if zoom_level > 0.0 {
+        zoom_level
+    } else {
+        // Auto-detect from display resolution
+        let width = detect_display_width();
+        if width > 2500 {
+            // High-DPI: 3200px→1.5, 3840px→1.75, cap at 2.5
+            let s = (width as f64 / 2200.0).min(2.5).max(1.0);
+            (s * 4.0).round() / 4.0 // round to nearest 0.25
+        } else {
+            1.0
+        }
+    };
+
+    if (scale - 1.0).abs() > 0.01 {
+        let scale_str = format!("{:.4}", scale);
+        // SAFETY: called in main() before any threads or GTK init — single-threaded.
+        unsafe { std::env::set_var("GDK_DPI_SCALE", &scale_str) };
+        eprintln!("WhatsApp: applied UI scale {:.0}% (GDK_DPI_SCALE={scale_str})", scale * 100.0);
+    }
+}
+
 fn main() {
     // Set the working directory to the XDG data dir so every relative
     // path in the app (whatsapp.db, wa_avatars/, wa_messages/, …)
@@ -29,6 +89,10 @@ fn main() {
     let data_dir = ensure_data_dir();
     std::env::set_current_dir(&data_dir)
         .unwrap_or_else(|e| panic!("failed to chdir to {}: {}", data_dir.display(), e));
+
+    // Apply display scaling BEFORE GTK init — GDK_DPI_SCALE must be set
+    // as an env var before the toolkit reads it.
+    apply_prescale(&data_dir);
 
     env_logger::init();
 
