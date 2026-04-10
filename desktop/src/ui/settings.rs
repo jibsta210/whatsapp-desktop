@@ -41,6 +41,9 @@ pub struct AppSettings {
     /// Theme: "dark", "light", or "system"
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// UI zoom level: 0.0 = auto-detect, otherwise 0.75 – 3.0
+    #[serde(default)]
+    pub zoom_level: f64,
     // ── Behaviour ──
     /// Close to tray instead of quitting
     #[serde(default = "default_true")]
@@ -74,6 +77,7 @@ impl Default for AppSettings {
             ai_api_key: String::new(),
             ai_model: "gemini".to_string(),
             theme: "dark".to_string(),
+            zoom_level: 0.0, // 0.0 = auto-detect
             close_to_tray: true,
             audio_input: String::new(),
         }
@@ -342,6 +346,63 @@ pub fn show_settings_window(settings: &SettingsHandle, parent: Option<&gtk4::Win
     });
     appear_group.add(&theme_row);
     appear_page.add(&appear_group);
+
+    // ── Zoom / Scale ──
+    let zoom_group = adw::PreferencesGroup::new();
+    zoom_group.set_title("Zoom");
+    zoom_group.set_description(Some("Adjust the UI scale — useful for high-DPI displays"));
+
+    // Zoom level row with a Scale (slider) widget
+    let zoom_row = adw::ActionRow::new();
+    zoom_row.set_title("Zoom Level");
+    let current_zoom = settings.get().zoom_level;
+    zoom_row.set_subtitle(&zoom_label(current_zoom));
+
+    let scale = gtk4::Scale::with_range(Orientation::Horizontal, 0.75, 3.0, 0.25);
+    scale.set_width_request(200);
+    scale.set_valign(Align::Center);
+    scale.set_draw_value(false);
+    // Snap positions at 0.25 increments
+    for v in (3..=12).map(|i| i as f64 * 0.25) {
+        scale.add_mark(v, gtk4::PositionType::Bottom, None);
+    }
+    // Special "Auto" mark at the left edge
+    scale.add_mark(0.75, gtk4::PositionType::Top, Some("Auto"));
+    // If zoom_level is 0 (auto), show the slider at the auto-detect position
+    let display_val = if current_zoom <= 0.0 {
+        0.75_f64 // "Auto" position at left edge
+    } else {
+        current_zoom
+    };
+    scale.set_value(display_val);
+
+    let sh = settings.clone();
+    let row_ref = zoom_row.clone();
+    scale.connect_value_changed(move |s| {
+        let val = s.value();
+        // Snap: if within 0.1 of 0.75, treat as "auto"
+        let level = if val < 0.85 { 0.0 } else { (val * 4.0).round() / 4.0 };
+        sh.update(|settings| settings.zoom_level = level);
+        row_ref.set_subtitle(&zoom_label(level));
+        apply_zoom(level);
+    });
+    zoom_row.add_suffix(&scale);
+    zoom_group.add(&zoom_row);
+
+    // Reset to auto button
+    let auto_btn = gtk4::Button::with_label("Reset to Auto");
+    auto_btn.set_halign(Align::Start);
+    auto_btn.set_margin_top(4);
+    let sh = settings.clone();
+    let scale_ref = scale.clone();
+    auto_btn.connect_clicked(move |_| {
+        sh.update(|s| s.zoom_level = 0.0);
+        scale_ref.set_value(0.75);
+        apply_zoom(0.0);
+    });
+    zoom_group.add(&auto_btn);
+
+    appear_page.add(&zoom_group);
     window.add(&appear_page);
 
     // ── Behaviour page ────────────────────────────────────────────────
@@ -432,5 +493,64 @@ pub fn apply_theme(theme: &str) {
         "light" => sm.set_color_scheme(adw::ColorScheme::ForceLight),
         "dark" => sm.set_color_scheme(adw::ColorScheme::ForceDark),
         _ => sm.set_color_scheme(adw::ColorScheme::Default),
+    }
+}
+
+/// Auto-detect a sensible zoom level from the primary monitor's geometry.
+/// Returns a multiplier (e.g. 1.5 for 150%).
+pub fn detect_zoom() -> f64 {
+    let display = match gtk4::gdk::Display::default() {
+        Some(d) => d,
+        None => return 1.0,
+    };
+
+    // Get the monitors list
+    let monitors = display.monitors();
+    let monitor: Option<gtk4::gdk::Monitor> = monitors
+        .item(0)
+        .and_then(|obj| obj.downcast::<gtk4::gdk::Monitor>().ok());
+
+    if let Some(mon) = monitor {
+        let scale_factor = mon.scale_factor() as f64;
+        let geom = mon.geometry();
+        let width_px = (geom.width() as f64) * scale_factor;
+
+        // High DPI heuristic: if native resolution > 2500px wide and
+        // the compositor isn't already applying 2x scaling, suggest scaling up.
+        if width_px > 2500.0 && scale_factor < 1.5 {
+            // Scale proportionally: 3200px → ~1.5x, 3840px → ~1.75x
+            let suggested = (width_px / 1920.0).min(2.5).max(1.0);
+            // Round to nearest 0.25
+            return (suggested * 4.0).round() / 4.0;
+        }
+        // If compositor already scales (e.g. 2x), don't double up
+        return 1.0;
+    }
+    1.0
+}
+
+/// Apply a zoom level to the GTK runtime via the Xft DPI setting.
+/// This scales all fonts and most widgets uniformly.
+/// `level` is a multiplier: 1.0 = 100%, 1.5 = 150%, etc.
+pub fn apply_zoom(level: f64) {
+    let effective = if level <= 0.0 { detect_zoom() } else { level };
+    let dpi = (effective * 96.0 * 1024.0) as i32; // GTK uses DPI × 1024
+    if let Some(settings) = gtk4::Settings::default() {
+        settings.set_gtk_xft_dpi(dpi);
+    }
+    log::info!(
+        "Applied zoom: {:.0}% (xft-dpi={})",
+        effective * 100.0,
+        dpi / 1024
+    );
+}
+
+/// Format a zoom level for display: "Auto (150%)" or "125%"
+fn zoom_label(level: f64) -> String {
+    if level <= 0.0 {
+        let auto = detect_zoom();
+        format!("Auto ({:.0}%)", auto * 100.0)
+    } else {
+        format!("{:.0}%", level * 100.0)
     }
 }

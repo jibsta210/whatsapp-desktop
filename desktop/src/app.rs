@@ -380,9 +380,10 @@ impl WhatsAppApp {
                 gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
             );
 
-            // Apply saved theme on startup
+            // Apply saved theme and zoom on startup
             let startup_settings = crate::ui::settings::AppSettings::load();
             crate::ui::settings::apply_theme(&startup_settings.theme);
+            crate::ui::settings::apply_zoom(startup_settings.zoom_level);
 
             // GTK → Tokio: command channel
             let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<WaCommand>();
