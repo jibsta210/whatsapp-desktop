@@ -435,9 +435,7 @@ impl ChatListPanel {
                 row.is_favorite.set(chat.is_favorite);
                 row.pin_indicator.set_visible(chat.is_pinned);
                 row.mute_indicator.set_visible(chat.is_muted);
-                if chat.unread_count > 0 {
-                    row.set_unread(chat.unread_count);
-                }
+                row.set_unread(chat.unread_count);
 
                 // Only update preview + timestamp if incoming is newer
                 let existing_ts = self

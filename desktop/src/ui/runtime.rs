@@ -1874,9 +1874,10 @@ async fn handle_wa_event(
                 "MarkChatAsReadUpdate: {chat_id} read={is_read} full_sync={}",
                 update.from_full_sync
             );
-            // Skip full sync events — they represent historical state, not new reads.
-            // Only react to real-time read updates from other devices.
-            if update.from_full_sync {
+            // For full sync events, only process "read" updates (clearing badges
+            // is always safe). Skip "unread" from full sync since the server's
+            // unread_count in history sync is more authoritative.
+            if update.from_full_sync && !is_read {
                 return;
             }
             if is_read {
