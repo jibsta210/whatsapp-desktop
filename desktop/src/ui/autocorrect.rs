@@ -1291,6 +1291,7 @@ pub fn start_ai_corrector() {
     let (tx, rx) = std::sync::mpsc::channel::<AiCorrectionRequest>();
     let _ = AI_TX.set(tx);
 
+    log::info!("AI autocorrect enabled (key={}...)", &key[..8.min(key.len())]);
     std::thread::Builder::new()
         .name("ai-autocorrect".into())
         .spawn(move || {
@@ -1351,9 +1352,16 @@ fn clean_ai_response(raw: &str) -> String {
 }
 
 fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRequest>) {
-    let client = ureq::Agent::new();
+    log::info!("AI corrector thread started, waiting for requests...");
+    let client = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(5))
+        .timeout_read(std::time::Duration::from_secs(8))
+        .timeout_write(std::time::Duration::from_secs(5))
+        .build();
+    // Use gemini-2.5-flash-lite for speed — no thinking overhead, ~1s responses.
+    // gemini-3-flash-preview wastes 100-300 "thinking" tokens per request.
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={api_key}"
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={api_key}"
     );
 
     while let Ok(req) = rx.recv() {
@@ -1586,6 +1594,7 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                             let ci = buf_def.iter_at_offset(new_cursor as i32);
                             buf_def.place_cursor(&ci);
                         }
+                        // MUST clear this flag — if it gets stuck, all autocorrect dies.
                         mod_def.set(false);
                     });
                     return gtk4::glib::Propagation::Stop;
