@@ -842,8 +842,15 @@ async fn run_inner(
 
     let state = Arc::new(Mutex::new(RuntimeState::new(save_tx, msg_save_tx)));
 
+    // ── Centralized LID resolver ──
+    // Any handler that encounters an unresolved @lid JID sends it here.
+    // The resolver batches requests, deduplicates, and runs usync in bulk.
+    let (lid_resolve_tx, mut lid_resolve_rx) =
+        tokio::sync::mpsc::unbounded_channel::<String>();
+
     let tx = event_tx.clone();
     let state_ev = state.clone();
+    let lid_tx_ev = lid_resolve_tx.clone();
     let mut bot = Bot::builder()
         .with_backend(backend)
         .with_transport_factory(transport_factory)
@@ -852,8 +859,9 @@ async fn run_inner(
         .on_event(move |event, client| {
             let tx = tx.clone();
             let state = state_ev.clone();
+            let lid_tx = lid_tx_ev.clone();
             async move {
-                handle_wa_event(&tx, &state, &client, event).await;
+                handle_wa_event(&tx, &state, &client, &lid_tx, event).await;
             }
         })
         .build()
@@ -861,6 +869,34 @@ async fn run_inner(
 
     let client = bot.client();
     let mut bot_handle = bot.run().await?;
+
+    // Spawn the background LID resolver task
+    {
+        let client_r = client.clone();
+        let state_r = state.clone();
+        let tx_r = event_tx.clone();
+        tokio::spawn(async move {
+            // Collect LIDs and resolve every 2s (or when queue is large)
+            let mut pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    Some(lid) = lid_resolve_rx.recv() => {
+                        pending.insert(lid);
+                        // If we have enough, resolve immediately
+                        if pending.len() >= 10 {
+                            resolve_lid_batch(&client_r, &state_r, &tx_r, &mut pending).await;
+                        }
+                    }
+                    _ = interval.tick() => {
+                        if !pending.is_empty() {
+                            resolve_lid_batch(&client_r, &state_r, &tx_r, &mut pending).await;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Spawn suspend/resume detector — watches for wall-clock drift that indicates
     // the system was sleeping. On wake, forces a disconnect+reconnect to re-sync.
@@ -912,10 +948,80 @@ async fn run_inner(
 
 // ── Event handler ─────────────────────────────────────────────────────────────
 
+/// Send an unresolved LID to the background resolver. Deduplicates automatically.
+fn queue_lid_resolve(resolver_tx: &tokio::sync::mpsc::UnboundedSender<String>, lid: &str) {
+    let _ = resolver_tx.send(lid.to_string());
+}
+
+/// Resolve a batch of LID JIDs via usync, persist mappings, and notify UI.
+async fn resolve_lid_batch(
+    client: &Arc<Client>,
+    state: &Arc<Mutex<RuntimeState>>,
+    tx: &Sender<WaEvent>,
+    pending: &mut std::collections::HashSet<String>,
+) {
+    // Filter out already-resolved LIDs
+    let unresolved: Vec<String> = {
+        let s = state.lock().unwrap();
+        pending
+            .drain()
+            .filter(|lid| !s.lid_to_phone.contains_key(lid))
+            .collect()
+    };
+    if unresolved.is_empty() {
+        return;
+    }
+    let jids: Vec<Jid> = unresolved
+        .iter()
+        .filter_map(|s| s.parse::<Jid>().ok())
+        .collect();
+    if jids.is_empty() {
+        return;
+    }
+    log::info!("LID resolver: resolving {} JIDs via usync", jids.len());
+    match client.get_user_devices(&jids).await {
+        Ok(_) => {
+            let mut resolved = 0u32;
+            for lid in &unresolved {
+                if let Some(phone_jid) = client.resolve_lid_to_phone_jid(lid).await {
+                    let mut s = state.lock().unwrap();
+                    s.insert_lid_phone(lid.clone(), phone_jid.clone());
+                    // Copy contact name to phone JID if known under LID
+                    if let Some(name) = s.contact_names.get(lid).cloned() {
+                        if !s.contact_names.contains_key(&phone_jid) {
+                            s.contact_names.insert(phone_jid, name);
+                        }
+                    }
+                    resolved += 1;
+                }
+            }
+            if resolved > 0 {
+                log::info!("LID resolver: resolved {resolved}/{} JIDs", unresolved.len());
+                // Persist mappings
+                let map = state.lock().unwrap().lid_to_phone.clone();
+                tokio::task::spawn_blocking(move || save_lid_phone_map(&map));
+                // Refresh the full chat list so any LID-named chats get updated names
+                let chats: Vec<crate::bridge::ChatSummary> = state
+                    .lock()
+                    .unwrap()
+                    .chats_with_best_names()
+                    .into_iter()
+                    .filter(|c| !c.id.contains("@broadcast"))
+                    .collect();
+                let _ = tx.send(WaEvent::ChatsLoaded(chats)).await;
+            }
+        }
+        Err(e) => {
+            log::warn!("LID resolver: usync failed: {e:#}");
+        }
+    }
+}
+
 async fn handle_wa_event(
     tx: &Sender<WaEvent>,
     state: &Arc<Mutex<RuntimeState>>,
     client: &Arc<Client>,
+    lid_resolver_tx: &tokio::sync::mpsc::UnboundedSender<String>,
     event: Event,
 ) {
     let ev = match event {
@@ -1688,6 +1794,11 @@ async fn handle_wa_event(
                             .await;
                     }
 
+                    // Queue unresolved LID for background resolution
+                    if m.sender_name.contains("@lid") && m.sender_id.ends_with("@lid") && !m.is_from_me {
+                        queue_lid_resolve(&lid_resolver_tx, &m.sender_id);
+                    }
+
                     WaEvent::MessageReceived(m)
                 }
                 None => return,
@@ -1923,13 +2034,18 @@ async fn handle_wa_event(
                     s.lid_to_phone
                         .get(&chat_stripped)
                         .cloned()
-                        .unwrap_or(chat_stripped)
+                        .unwrap_or(chat_stripped.clone())
                 } else {
-                    chat_stripped
+                    chat_stripped.clone()
                 };
                 let sname = resolve_sender_name(&s, &sender_stripped);
                 (cid, sname)
             };
+
+            // Queue unresolved LID for background resolution
+            if sender_name.contains("@lid") && sender_stripped.ends_with("@lid") {
+                queue_lid_resolve(&lid_resolver_tx, &sender_stripped);
+            }
 
             log::debug!("Typing: chat={chat_id} sender={sender_name} typing={is_typing}");
             WaEvent::TypingIndicator {
