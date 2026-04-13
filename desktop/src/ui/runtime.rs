@@ -1706,6 +1706,17 @@ async fn handle_wa_event(
                         let s = state.lock().unwrap();
                         if m.sender_name.is_empty() && !m.sender_id.is_empty() && !m.is_from_me {
                             m.sender_name = resolve_sender_name(&s, &m.sender_id);
+                            // DM fallback: if sender is unresolved LID, use chat name
+                            if m.sender_name.contains("@lid") && !chat_id.ends_with("@g.us") {
+                                let chat_name = resolve_sender_name(&s, &chat_id);
+                                if !chat_name.contains('@') {
+                                    m.sender_name = chat_name;
+                                } else if let Some(name) = s.chat_names.get(&chat_id) {
+                                    if !name.is_empty() && !name.contains('@') {
+                                        m.sender_name = name.clone();
+                                    }
+                                }
+                            }
                         }
                         if let Some(qs) = &m.quoted_sender {
                             if qs.contains('@') {
@@ -2038,7 +2049,20 @@ async fn handle_wa_event(
                 } else {
                     chat_stripped.clone()
                 };
-                let sname = resolve_sender_name(&s, &sender_stripped);
+                let mut sname = resolve_sender_name(&s, &sender_stripped);
+                // For DM chats, the sender IS the contact — use the chat name
+                // if sender resolution failed (still contains @lid)
+                if sname.contains("@lid") && !cid.ends_with("@g.us") {
+                    // Try resolving via the chat JID (which may be phone-based)
+                    let chat_name = resolve_sender_name(&s, &cid);
+                    if !chat_name.contains('@') {
+                        sname = chat_name;
+                    } else if let Some(name) = s.chat_names.get(&cid) {
+                        if !name.is_empty() && !name.contains('@') {
+                            sname = name.clone();
+                        }
+                    }
+                }
                 (cid, sname)
             };
 
