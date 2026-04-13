@@ -1524,90 +1524,132 @@ pub fn install_on_textview(view: &gtk4::TextView) {
     let ignored_local = ignored_words.clone();
     let ignored_ai = ignored_words.clone();
 
-    // ── Backspace revert: intercept key-press BEFORE GTK deletes a char ──
-    // CAPTURE phase ensures we run before the TextView's own key handler.
-    let bs_ctrl = gtk4::EventControllerKey::new();
-    bs_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
-    let buf_bs = view.buffer();
-    let tag_bs = correction_tag.clone();
-    let revert_bs = revert_map.clone();
-    let skip_bs = skip_next.clone();
-    let modifying_bs = modifying.clone();
-    let ignored_bs = ignored_words.clone();
-    bs_ctrl.connect_key_pressed(move |_, key, _, modifier| {
-        if key == gtk4::gdk::Key::BackSpace {
-            if modifying_bs.get() {
-                return gtk4::glib::Propagation::Stop; // swallow while deferred revert runs
+    // ── Backspace revert via buffer change detection ──
+    // Instead of intercepting BackSpace in Capture phase (which fights with GTK
+    // internals and causes crashes), we let GTK handle the keypress normally.
+    // Then in `connect_changed` we detect that a tagged region was disturbed
+    // and schedule a full revert on the next idle tick.
+    {
+        let buf_ch = view.buffer();
+        let tag_ch = correction_tag.clone();
+        let revert_ch = revert_map.clone();
+        let skip_ch = skip_next.clone();
+        let modifying_ch = modifying.clone();
+        let ignored_ch = ignored_words.clone();
+        // Track the previous snapshot so we can detect what changed
+        let prev_text: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        buf_ch.connect_changed(move |buf| {
+            // Don't recurse when WE are the ones changing the buffer
+            if modifying_ch.get() {
+                return;
             }
-            let Some(tag_ref) = tag_bs.as_ref() else {
-                return gtk4::glib::Propagation::Proceed;
+            let Some(tag_ref) = tag_ch.as_ref() else {
+                return;
             };
-            let cursor = buf_bs.cursor_position();
-            let iter = buf_bs.iter_at_offset(cursor);
-            // Check if cursor is at or inside a tagged (corrected) word
+            // Check if cursor is now adjacent to or inside a tagged region
+            // that has been partially edited (tag range shrunk from original).
+            let cursor = buf.cursor_position();
+            let iter = buf.iter_at_offset(cursor);
+            // Look at cursor and one char before for tag presence
             let in_tag = iter.has_tag(tag_ref) || {
-                let mut prev = iter.clone();
-                prev.backward_char();
-                prev.has_tag(tag_ref)
+                if cursor > 0 {
+                    let prev = buf.iter_at_offset(cursor - 1);
+                    prev.has_tag(tag_ref)
+                } else {
+                    false
+                }
             };
-            if in_tag {
-                // Find the tagged range
-                let mut start = iter.clone();
-                let mut end = iter.clone();
-                if !start.starts_tag(Some(tag_ref)) {
-                    start.backward_to_tag_toggle(Some(tag_ref));
-                }
-                if !end.ends_tag(Some(tag_ref)) {
-                    end.forward_to_tag_toggle(Some(tag_ref));
-                }
-                let tag_start_offset = start.offset();
-                let tag_end_offset = end.offset();
-                if let Some(original) = revert_bs.borrow().get(&tag_start_offset).cloned() {
-                    // Set flags now, do buffer work in idle callback to avoid
-                    // re-entrant GTK signal handler crashes.
-                    skip_bs.set(true);
-                    modifying_bs.set(true);
-                    ignored_bs.borrow_mut().insert(original.to_lowercase());
-                    revert_bs.borrow_mut().remove(&tag_start_offset);
-
-                    // Defer the actual buffer modification to an idle callback —
-                    // this runs AFTER the key event is fully processed by GTK,
-                    // so no signal re-entrancy can occur.
-                    let buf_def = buf_bs.clone();
-                    let mod_def = modifying_bs.clone();
-                    gtk4::glib::idle_add_local_once(move || {
-                        // Snapshot & rebuild: replace entire buffer to avoid
-                        // delete+insert signal cascade.
-                        let full = buf_def
-                            .text(&buf_def.start_iter(), &buf_def.end_iter(), false)
-                            .to_string();
-                        // The tagged region is [tag_start_offset..tag_end_offset] in chars
-                        let chars: Vec<char> = full.chars().collect();
-                        let so = tag_start_offset as usize;
-                        let eo = tag_end_offset as usize;
-                        if so <= chars.len() && eo <= chars.len() && so <= eo {
-                            let prefix: String = chars[..so].iter().collect();
-                            let suffix: String = chars[eo..].iter().collect();
-                            let new_text = format!("{prefix}{original}{suffix}");
-                            let new_cursor = so + original.chars().count();
-                            buf_def.set_text(&new_text);
-                            let ci = buf_def.iter_at_offset(new_cursor as i32);
-                            buf_def.place_cursor(&ci);
-                        }
-                        // MUST clear this flag — if it gets stuck, all autocorrect dies.
-                        mod_def.set(false);
-                    });
-                    return gtk4::glib::Propagation::Stop;
-                }
+            if !in_tag {
+                // Also check: did a tagged region just disappear entirely?
+                // If the revert_map has entries but no tags exist, a tagged word
+                // was fully deleted — just clean up the map entry.
+                return;
             }
-        }
-        // ── Ctrl+Z: skip next AI pass ──
-        if key == gtk4::gdk::Key::z && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
-            skip_bs.set(true);
-        }
-        gtk4::glib::Propagation::Proceed
-    });
-    view.add_controller(bs_ctrl);
+            // Find the (possibly truncated) tagged range
+            let mut start = iter.clone();
+            let mut end = iter.clone();
+            // Move to tag boundary
+            if !start.starts_tag(Some(tag_ref)) {
+                start.backward_to_tag_toggle(Some(tag_ref));
+            }
+            if !end.ends_tag(Some(tag_ref)) {
+                end.forward_to_tag_toggle(Some(tag_ref));
+            }
+            let tag_start = start.offset();
+            // Look up the original word for this tag region.
+            // The start offset might have shifted by ±1 from the backspace,
+            // so check a small window around the tag start.
+            let original = {
+                let map = revert_ch.borrow();
+                map.get(&tag_start)
+                    .or_else(|| map.get(&(tag_start + 1)))
+                    .or_else(|| map.get(&(tag_start - 1).max(0)))
+                    .cloned()
+            };
+            let Some(original) = original else {
+                return;
+            };
+            // The tagged region was edited (backspace deleted a char from it).
+            // Schedule a full replacement on the next idle tick.
+            skip_ch.set(true);
+            modifying_ch.set(true);
+            ignored_ch.borrow_mut().insert(original.to_lowercase());
+            // Remove all nearby revert entries (offset may have shifted)
+            {
+                let mut map = revert_ch.borrow_mut();
+                map.remove(&tag_start);
+                map.remove(&(tag_start + 1));
+                map.remove(&(tag_start - 1).max(0));
+            }
+            let buf_c = buf.clone();
+            let mod_c = modifying_ch.clone();
+            let tag_c = tag_ref.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                // Find remaining tagged range (may have shrunk after backspace)
+                let mut s = buf_c.start_iter();
+                let found = s.forward_to_tag_toggle(Some(&tag_c));
+                if found && s.has_tag(&tag_c) {
+                    let tag_s = s.offset();
+                    let mut e = s.clone();
+                    e.forward_to_tag_toggle(Some(&tag_c));
+                    let tag_e = e.offset();
+                    // Replace the tagged remnant with original word
+                    let full = buf_c
+                        .text(&buf_c.start_iter(), &buf_c.end_iter(), false)
+                        .to_string();
+                    let chars: Vec<char> = full.chars().collect();
+                    let so = tag_s as usize;
+                    let eo = tag_e as usize;
+                    if so <= chars.len() && eo <= chars.len() && so <= eo {
+                        let prefix: String = chars[..so].iter().collect();
+                        let suffix: String = chars[eo..].iter().collect();
+                        let new_text = format!("{prefix}{original}{suffix}");
+                        let new_cursor = so + original.chars().count();
+                        buf_c.set_text(&new_text);
+                        let ci = buf_c.iter_at_offset(new_cursor as i32);
+                        buf_c.place_cursor(&ci);
+                    }
+                } else {
+                    // Tag completely gone — just restore using full buffer snapshot
+                    // (the user deleted the entire word, so nothing to replace)
+                }
+                mod_c.set(false);
+            });
+        });
+    }
+    // ── Ctrl+Z handler ──
+    {
+        let ctrl_z = gtk4::EventControllerKey::new();
+        let skip_cz = skip_next.clone();
+        ctrl_z.connect_key_pressed(move |_, key, _, modifier| {
+            if key == gtk4::gdk::Key::z && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+            {
+                skip_cz.set(true);
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+        view.add_controller(ctrl_z);
+    }
 
     let key_ctrl = gtk4::EventControllerKey::new();
     key_ctrl.connect_key_released(move |_, key, _, modifier| {
