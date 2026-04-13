@@ -2538,7 +2538,8 @@ async fn handle_wa_event(
                     Err(_) => return,
                 };
                 if let Ok(meta) = c.groups().get_metadata(&jid).await {
-                    let members: Vec<crate::bridge::GroupMember> = meta
+                    // First pass: resolve what we can from cache
+                    let mut members: Vec<crate::bridge::GroupMember> = meta
                         .participants
                         .iter()
                         .map(|p| {
@@ -2552,12 +2553,68 @@ async fn handle_wa_event(
                             }
                         })
                         .collect();
+
+                    // Send initial (partially resolved) list immediately
                     let _ = t
                         .send(WaEvent::GroupMembers {
-                            chat_id: cid,
-                            members,
+                            chat_id: cid.clone(),
+                            members: members.clone(),
                         })
                         .await;
+
+                    // Collect unresolved LID members for usync
+                    let unresolved: Vec<String> = members
+                        .iter()
+                        .filter(|m| m.name.contains("@lid"))
+                        .map(|m| m.jid.clone())
+                        .collect();
+
+                    if !unresolved.is_empty() {
+                        log::info!(
+                            "GroupMembers {cid}: {} unresolved LID participants, triggering usync",
+                            unresolved.len()
+                        );
+                        let jids: Vec<Jid> = unresolved
+                            .iter()
+                            .filter_map(|lid| lid.parse::<Jid>().ok())
+                            .collect();
+                        if let Ok(_) = c.get_user_devices(&jids).await {
+                            let mut newly_resolved = 0u32;
+                            for lid_str in &unresolved {
+                                if let Some(phone_jid) =
+                                    c.resolve_lid_to_phone_jid(lid_str).await
+                                {
+                                    let mut st = s.lock().unwrap();
+                                    st.insert_lid_phone(lid_str.clone(), phone_jid.clone());
+                                    newly_resolved += 1;
+                                }
+                            }
+                            if newly_resolved > 0 {
+                                // Persist and re-resolve
+                                {
+                                    let map = s.lock().unwrap().lid_to_phone.clone();
+                                    tokio::task::spawn_blocking(move || save_lid_phone_map(&map));
+                                }
+                                // Re-resolve all members with updated mappings
+                                for m in &mut members {
+                                    if m.name.contains("@lid") || m.name.contains("@s.whatsapp.net") {
+                                        let st = s.lock().unwrap();
+                                        m.name = resolve_sender_name(&st, &m.jid);
+                                    }
+                                }
+                                log::info!(
+                                    "GroupMembers {cid}: resolved {newly_resolved}/{} via usync",
+                                    unresolved.len()
+                                );
+                                let _ = t
+                                    .send(WaEvent::GroupMembers {
+                                        chat_id: cid,
+                                        members,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
                 }
             });
             return;

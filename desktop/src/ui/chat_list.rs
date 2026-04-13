@@ -499,6 +499,7 @@ impl ChatListPanel {
         }
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
+            let doc_preview: String;
             let content = msg
                 .text
                 .as_deref()
@@ -507,7 +508,17 @@ impl ChatListPanel {
                     Some(crate::bridge::MediaType::Image) => "📷 Photo",
                     Some(crate::bridge::MediaType::Video) => "🎥 Video",
                     Some(crate::bridge::MediaType::Audio) => "🎵 Audio",
-                    Some(crate::bridge::MediaType::Document) => "📄 Document",
+                    Some(crate::bridge::MediaType::Document) => {
+                        let fname = msg.media_filename.as_deref().unwrap_or("Document");
+                        let icon = crate::ui::message_bubble::file_type_icon(fname);
+                        let ext = fname.rsplit('.').next().unwrap_or("").to_uppercase();
+                        doc_preview = if ext.is_empty() || ext == fname.to_uppercase() {
+                            format!("{icon} Document")
+                        } else {
+                            format!("{icon} {ext} File")
+                        };
+                        &doc_preview
+                    }
                     Some(crate::bridge::MediaType::Sticker) => "🎭 Sticker",
                     Some(crate::bridge::MediaType::Gif) => "🎞 GIF",
                     None => "",
@@ -943,6 +954,7 @@ fn build_stealth_popover(parent: &ListBoxRow, chat_id: &str) -> Popover {
             row.append(&top);
 
             // Message text
+            let doc_preview2: String;
             let text = msg
                 .text
                 .as_deref()
@@ -951,7 +963,17 @@ fn build_stealth_popover(parent: &ListBoxRow, chat_id: &str) -> Popover {
                     Some(crate::bridge::MediaType::Image) => "📷 Photo",
                     Some(crate::bridge::MediaType::Video) => "🎥 Video",
                     Some(crate::bridge::MediaType::Audio) => "🎵 Audio",
-                    Some(crate::bridge::MediaType::Document) => "📄 Document",
+                    Some(crate::bridge::MediaType::Document) => {
+                        let fname = msg.media_filename.as_deref().unwrap_or("Document");
+                        let icon = crate::ui::message_bubble::file_type_icon(fname);
+                        let ext = fname.rsplit('.').next().unwrap_or("").to_uppercase();
+                        doc_preview2 = if ext.is_empty() || ext == fname.to_uppercase() {
+                            format!("{icon} Document")
+                        } else {
+                            format!("{icon} {ext} File")
+                        };
+                        &doc_preview2
+                    }
                     Some(crate::bridge::MediaType::Sticker) => "✨ Sticker",
                     Some(crate::bridge::MediaType::Gif) => "🎞 GIF",
                     None => "",

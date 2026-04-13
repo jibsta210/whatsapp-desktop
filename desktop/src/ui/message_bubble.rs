@@ -1713,7 +1713,7 @@ fn build_document_widget(container: &Box, path: &str) {
         hbox.set_overflow(gtk4::Overflow::Hidden);
     }
 
-    let icon = Label::new(Some(if is_pdf { "📕" } else { "📄" }));
+    let icon = Label::new(Some(file_type_icon(path)));
     let name_label = Label::new(Some(&decoded));
     name_label.add_css_class("body");
     name_label.set_wrap(true);
@@ -1750,7 +1750,8 @@ fn media_placeholder_label(msg: &IncomingMessage) -> Label {
             // URL-decode the filename for display (e.g., %20 → space)
             let raw = msg.media_filename.as_deref().unwrap_or("Document");
             let decoded = urldecode(raw);
-            format!("📄 {decoded}")
+            let icon = file_type_icon(raw);
+            format!("{icon} {decoded}")
         }
         None => "📎 Message".to_string(),
     };
@@ -1766,6 +1767,42 @@ fn media_placeholder_label(msg: &IncomingMessage) -> Label {
 }
 
 /// Simple percent-decode (%XX → char) for display purposes.
+/// Return an emoji icon based on the file extension.
+pub fn file_type_icon(filename: &str) -> &'static str {
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        // Archives
+        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "tgz" => "🗜️",
+        // PDF
+        "pdf" => "📕",
+        // Spreadsheets
+        "xlsx" | "xls" | "csv" | "tsv" | "ods" => "📊",
+        // Presentations
+        "pptx" | "ppt" | "odp" | "key" => "📽️",
+        // Word / text documents
+        "docx" | "doc" | "odt" | "rtf" | "txt" | "md" => "📝",
+        // Images (when sent as document)
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp" | "heic" => "🖼️",
+        // Audio
+        "mp3" | "wav" | "ogg" | "flac" | "aac" | "m4a" | "opus" => "🎵",
+        // Video
+        "mp4" | "mov" | "avi" | "mkv" | "webm" | "wmv" => "🎬",
+        // Code
+        "py" | "js" | "ts" | "rs" | "go" | "java" | "c" | "cpp" | "h" | "html" | "css"
+        | "json" | "xml" | "yaml" | "yml" | "toml" | "sh" | "sql" => "💻",
+        // Executables / installers
+        "exe" | "msi" | "dmg" | "deb" | "rpm" | "appimage" | "apk" => "⚙️",
+        // Fonts
+        "ttf" | "otf" | "woff" | "woff2" => "🔤",
+        // Default
+        _ => "📄",
+    }
+}
+
 fn urldecode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.bytes();
