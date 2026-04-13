@@ -1528,9 +1528,8 @@ pub fn install_on_textview(view: &gtk4::TextView) {
     let ignored_bs = ignored_words.clone();
     bs_ctrl.connect_key_pressed(move |_, key, _, modifier| {
         if key == gtk4::gdk::Key::BackSpace {
-            // Prevent re-entrant calls (delete+insert triggers change signals)
             if modifying_bs.get() {
-                return gtk4::glib::Propagation::Proceed;
+                return gtk4::glib::Propagation::Stop; // swallow while deferred revert runs
             }
             let Some(tag_ref) = tag_bs.as_ref() else {
                 return gtk4::glib::Propagation::Proceed;
@@ -1554,28 +1553,41 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                     end.forward_to_tag_toggle(Some(tag_ref));
                 }
                 let tag_start_offset = start.offset();
+                let tag_end_offset = end.offset();
                 if let Some(original) = revert_bs.borrow().get(&tag_start_offset).cloned() {
-                    // Set flags BEFORE modifying buffer to block re-entrant handlers
+                    // Set flags now, do buffer work in idle callback to avoid
+                    // re-entrant GTK signal handler crashes.
                     skip_bs.set(true);
                     modifying_bs.set(true);
-                    // Remember this word so we never autocorrect it again this session
                     ignored_bs.borrow_mut().insert(original.to_lowercase());
-                    // Batch the delete+insert as a single user action
-                    buf_bs.begin_user_action();
-                    let start_off = start.offset();
-                    let end_off = end.offset();
-                    let mut s = buf_bs.iter_at_offset(start_off);
-                    let mut e = buf_bs.iter_at_offset(end_off);
-                    buf_bs.delete(&mut s, &mut e);
-                    // Re-acquire iterator after delete (s is revalidated by GTK)
-                    let mut insert_iter = buf_bs.iter_at_offset(start_off);
-                    buf_bs.insert(&mut insert_iter, &original);
-                    // Place cursor at end of restored word
-                    let cursor_iter = buf_bs.iter_at_offset(start_off + original.len() as i32);
-                    buf_bs.place_cursor(&cursor_iter);
-                    buf_bs.end_user_action();
                     revert_bs.borrow_mut().remove(&tag_start_offset);
-                    modifying_bs.set(false);
+
+                    // Defer the actual buffer modification to an idle callback —
+                    // this runs AFTER the key event is fully processed by GTK,
+                    // so no signal re-entrancy can occur.
+                    let buf_def = buf_bs.clone();
+                    let mod_def = modifying_bs.clone();
+                    gtk4::glib::idle_add_local_once(move || {
+                        // Snapshot & rebuild: replace entire buffer to avoid
+                        // delete+insert signal cascade.
+                        let full = buf_def
+                            .text(&buf_def.start_iter(), &buf_def.end_iter(), false)
+                            .to_string();
+                        // The tagged region is [tag_start_offset..tag_end_offset] in chars
+                        let chars: Vec<char> = full.chars().collect();
+                        let so = tag_start_offset as usize;
+                        let eo = tag_end_offset as usize;
+                        if so <= chars.len() && eo <= chars.len() && so <= eo {
+                            let prefix: String = chars[..so].iter().collect();
+                            let suffix: String = chars[eo..].iter().collect();
+                            let new_text = format!("{prefix}{original}{suffix}");
+                            let new_cursor = so + original.chars().count();
+                            buf_def.set_text(&new_text);
+                            let ci = buf_def.iter_at_offset(new_cursor as i32);
+                            buf_def.place_cursor(&ci);
+                        }
+                        mod_def.set(false);
+                    });
                     return gtk4::glib::Propagation::Stop;
                 }
             }
@@ -1627,8 +1639,10 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                     }
                 }
                 let word = buf.text(&word_start, &trigger_iter, false).to_string();
+                log::debug!("autocorrect: local trigger word='{word}'");
                 if !word.is_empty() && !ignored_local.borrow().contains(&word.to_lowercase()) {
                     if let Some(corrected) = correct_word(&word) {
+                        log::info!("autocorrect: local correction '{word}' → '{corrected}'");
                         let offset_start = word_start.offset();
                         let offset_end = trigger_iter.offset();
                         let buf_c = buf.clone();
