@@ -1604,6 +1604,13 @@ async fn handle_wa_event(
                         if let Some(qs) = &m.quoted_sender {
                             if qs.contains('@') {
                                 m.quoted_sender = Some(resolve_sender_name(&s, qs));
+                            } else if qs.starts_with('+') || qs.chars().all(|c| c.is_ascii_digit()) {
+                                let num = qs.trim_start_matches('+');
+                                let phone_jid = format!("{num}@s.whatsapp.net");
+                                let resolved = resolve_sender_name(&s, &phone_jid);
+                                if resolved != phone_jid {
+                                    m.quoted_sender = Some(resolved);
+                                }
                             }
                         }
                         // Resolve reaction sender JIDs to display names
@@ -3256,6 +3263,14 @@ async fn handle_command(
                     if let Some(qs) = &m.quoted_sender {
                         if qs.contains('@') {
                             m.quoted_sender = Some(resolve_cached(qs, &mut name_cache, &s));
+                        } else if qs.starts_with('+') || qs.chars().all(|c| c.is_ascii_digit()) {
+                            // Raw phone number — try constructing JID variants
+                            let num = qs.trim_start_matches('+');
+                            let phone_jid = format!("{num}@s.whatsapp.net");
+                            let resolved = resolve_cached(&phone_jid, &mut name_cache, &s);
+                            if resolved != phone_jid {
+                                m.quoted_sender = Some(resolved);
+                            }
                         }
                     }
                     // Resolve reaction sender JIDs to display names

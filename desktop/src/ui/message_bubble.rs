@@ -180,7 +180,20 @@ impl MessageBubble {
             let text_col = Box::new(Orientation::Vertical, 2);
 
             let resolved_sender = if !quoted_sender.contains('@') {
-                quoted_sender.clone()
+                // Might be a raw phone number like "+1234567890" — try JID lookup
+                let num = quoted_sender.trim_start_matches('+');
+                if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                    let phone_jid = format!("{num}@s.whatsapp.net");
+                    let formatted = crate::ui::runtime::display_name_from_jid(&phone_jid);
+                    if formatted.contains('@') {
+                        // Still unresolved — format as phone number
+                        quoted_sender.clone()
+                    } else {
+                        formatted
+                    }
+                } else {
+                    quoted_sender.clone()
+                }
             } else {
                 let formatted = crate::ui::runtime::display_name_from_jid(quoted_sender);
                 if formatted.contains('@') || formatted.contains("lid") {
