@@ -3181,13 +3181,24 @@ async fn handle_command(
 
         WaCommand::DeleteForEveryone { chat_id, msg_id } => {
             let jid: Jid = chat_id.parse()?;
-            // Try to revoke on server, but always remove locally regardless
-            if let Err(e) = client
+            log::info!("DeleteForEveryone: chat={chat_id} msg={msg_id}");
+            match client
                 .revoke_message(jid, msg_id.clone(), RevokeType::Sender)
                 .await
             {
-                log::warn!("DeleteForEveryone server error (removing locally): {e:#}");
+                Ok(_) => {
+                    log::info!("DeleteForEveryone: server revoke succeeded for {msg_id}");
+                }
+                Err(e) => {
+                    log::warn!("DeleteForEveryone server error: {e:#}");
+                    let _ = tx
+                        .send(WaEvent::ErrorToast(format!(
+                            "Delete for everyone failed: {e}"
+                        )))
+                        .await;
+                }
             }
+            // Always remove locally
             {
                 let mut s = state.lock().unwrap();
                 if let Some(history) = s.history.get_mut(&chat_id) {
@@ -3196,7 +3207,10 @@ async fn handle_command(
                 }
             }
             let _ = tx
-                .send(WaEvent::MessageDeletedLocal { chat_id, msg_id })
+                .send(WaEvent::MessageDeletedLocal {
+                    chat_id: chat_id.clone(),
+                    msg_id: msg_id.clone(),
+                })
                 .await;
         }
 

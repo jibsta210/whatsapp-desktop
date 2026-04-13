@@ -2763,10 +2763,19 @@ impl ChatViewPanel {
             .as_deref()
             .map(|id| id == chat_id)
             .unwrap_or(false);
+        let current_id = self.inner.current_chat_id.borrow().clone();
+        log::info!(
+            "remove_message: chat_id={chat_id} msg_id={msg_id} is_current={is_current} current={:?}",
+            current_id
+        );
         if !is_current {
             return;
         }
         let mut bubbles = self.inner.bubbles.borrow_mut();
+        log::info!(
+            "remove_message: {} bubbles in cache, looking for {msg_id}",
+            bubbles.len()
+        );
         if let Some(bubble) = bubbles.remove(msg_id) {
             // Replace bubble content with "deleted" placeholder (like WhatsApp)
             let widget = bubble.widget();

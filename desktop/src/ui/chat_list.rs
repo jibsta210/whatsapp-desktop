@@ -44,6 +44,10 @@ struct ChatListInner {
     /// Message search results section (visible when search query matches messages)
     msg_results_section: Box,
     msg_results_box: ListBox,
+    /// In-memory cache of recent messages per chat for stealth peek.
+    /// Updated on every update_last_message. Keeps last 10 per chat.
+    /// Wrapped in Rc so stealth hover closures can share it.
+    recent_messages: Rc<RefCell<HashMap<String, Vec<IncomingMessage>>>>,
 }
 
 impl ChatListPanel {
@@ -167,6 +171,7 @@ impl ChatListPanel {
             active_typers: RefCell::new(HashMap::new()),
             msg_results_section,
             msg_results_box,
+            recent_messages: Rc::new(RefCell::new(HashMap::new())),
         });
 
         // Sort: pinned first, then newest
@@ -550,6 +555,18 @@ impl ChatListPanel {
                 clean
             };
             row.update_preview(&preview, msg.timestamp);
+            // Cache message for stealth peek (keep last 10)
+            {
+                let mut cache = self.inner.recent_messages.borrow_mut();
+                let entry = cache.entry(chat_id.to_string()).or_default();
+                // Dedup by message id
+                if !entry.iter().any(|m| m.id == msg.id) {
+                    entry.push(msg.clone());
+                    if entry.len() > 10 {
+                        entry.remove(0);
+                    }
+                }
+            }
             // Only increment unread if NOT from us AND NOT the chat we're currently viewing
             let is_viewing = current_chat_id == Some(chat_id);
             if !msg.is_from_me && !is_viewing {
@@ -816,7 +833,7 @@ impl ChatListPanel {
         attach_context_menu(&row, inner, chat.id.clone());
 
         // Attach hover-to-stealth-read popup (shows unread messages without marking read)
-        attach_stealth_hover(&row, chat.id.clone());
+        attach_stealth_hover(&row, chat.id.clone(), self.inner.recent_messages.clone());
 
         inner.list_box.append(&row.gtk_row);
         inner
@@ -832,7 +849,7 @@ impl ChatListPanel {
 
 /// Shows a popover with recent unread messages when the user hovers over a
 /// chat row for ≥600ms. Does NOT mark messages as read — pure stealth peek.
-fn attach_stealth_hover(row: &ChatRow, chat_id: String) {
+fn attach_stealth_hover(row: &ChatRow, chat_id: String, recent_cache: Rc<RefCell<HashMap<String, Vec<IncomingMessage>>>>) {
     let hover = gtk4::EventControllerMotion::new();
     let row_widget = row.gtk_row.clone();
     let unread_count = row.unread_count.clone();
@@ -860,11 +877,12 @@ fn attach_stealth_hover(row: &ChatRow, chat_id: String) {
         let rw2 = rw.clone();
         let pop2 = pop_clone.clone();
         let timer_clear = timer_clone.clone();
+        let cache = recent_cache.clone();
         let id =
             gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(600), move || {
                 // Clear the timer ID so leave doesn't try to remove a fired source
                 *timer_clear.borrow_mut() = None;
-                let popover = build_stealth_popover(&rw2, &cid2);
+                let popover = build_stealth_popover(&rw2, &cid2, &cache);
                 popover.popup();
                 *pop2.borrow_mut() = Some(popover);
             });
@@ -889,7 +907,7 @@ fn attach_stealth_hover(row: &ChatRow, chat_id: String) {
 
 /// Build the stealth read popover — loads messages from disk cache,
 /// shows the last N unread ones without sending read receipts.
-fn build_stealth_popover(parent: &ListBoxRow, chat_id: &str) -> Popover {
+fn build_stealth_popover(parent: &ListBoxRow, chat_id: &str, recent_cache: &Rc<RefCell<HashMap<String, Vec<IncomingMessage>>>>) -> Popover {
     let popover = Popover::new();
     popover.set_parent(parent);
     popover.add_css_class("stealth-popover");
@@ -903,8 +921,17 @@ fn build_stealth_popover(parent: &ListBoxRow, chat_id: &str) -> Popover {
     header.set_halign(Align::Start);
     vbox.append(&header);
 
-    // Load messages from disk (no network, no read receipt)
-    let messages = crate::ui::runtime::load_messages(chat_id);
+    // Load messages: merge disk cache with in-memory recent messages.
+    // In-memory cache has the latest messages that may not be flushed to disk yet.
+    let mut messages = crate::ui::runtime::load_messages(chat_id);
+    if let Some(recent) = recent_cache.borrow().get(chat_id) {
+        for rm in recent {
+            if !messages.iter().any(|m| m.id == rm.id) {
+                messages.push(rm.clone());
+            }
+        }
+        messages.sort_by_key(|m| m.timestamp);
+    }
 
     if messages.is_empty() {
         let empty = Label::new(Some("No cached messages"));
