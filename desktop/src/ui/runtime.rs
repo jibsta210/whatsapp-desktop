@@ -2240,7 +2240,9 @@ async fn handle_wa_event(
 
                     if in_cache {
                         let mut s = state.lock().unwrap();
-                        let history = s.history.get_mut(&chat_id).unwrap();
+                        let Some(history) = s.history.get_mut(&chat_id) else {
+                            return; // chat evicted from LRU cache
+                        };
                         let mut new_msgs = Vec::new();
                         for m in &sync_messages {
                             if let Some(existing) = history.iter_mut().find(|x| x.id == m.id) {
@@ -2799,7 +2801,7 @@ fn persist_new_message(
         s.touch_history(&chat_id);
         s.evict_old_histories();
 
-        let history = s.history.get_mut(&chat_id).unwrap();
+        let history = s.history.entry(chat_id.clone()).or_default();
         if !history.iter().any(|x| x.id == m.id) {
             history.push(m.clone());
             history.sort_by_key(|msg| msg.timestamp);

@@ -96,6 +96,34 @@ fn main() {
 
     env_logger::init();
 
+    // Log panics to a file before aborting — so we can diagnose crashes
+    // even when running without a terminal attached.
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let crash_msg = format!("PANIC at {location}: {msg}\n");
+        eprintln!("{crash_msg}");
+        // Append to crash log file so it survives abort
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("crash.log")
+            .and_then(|mut f| {
+                use std::io::Write;
+                let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+                writeln!(f, "[{ts}] {crash_msg}")
+            });
+    }));
+
     let app = WhatsAppApp::new();
     app.run();
 }
