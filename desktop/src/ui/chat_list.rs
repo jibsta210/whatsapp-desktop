@@ -661,7 +661,7 @@ impl ChatListPanel {
         let chat_typers = typers.entry(chat_id.to_string()).or_default();
         if is_typing {
             if !chat_typers.contains(&display) {
-                chat_typers.push(display);
+                chat_typers.push(display.clone());
             }
         } else {
             chat_typers.retain(|t| *t != display);
@@ -685,6 +685,47 @@ impl ChatListPanel {
             }
             row.preview_label.set_visible(false);
             row.typing_box.set_visible(true);
+        }
+
+        // Auto-expire after 15s (WhatsApp re-sends Composing every ~10s)
+        if is_typing {
+            let inner_w = Rc::downgrade(&self.inner);
+            let cid = chat_id.to_string();
+            let name = display;
+            gtk4::glib::timeout_add_local_once(
+                std::time::Duration::from_secs(15),
+                move || {
+                    let Some(inner) = inner_w.upgrade() else { return };
+                    let mut typers = inner.active_typers.borrow_mut();
+                    if let Some(chat_typers) = typers.get_mut(&cid) {
+                        chat_typers.retain(|t| *t != name);
+                    }
+                    let empty = typers.get(&cid).map(|t| t.is_empty()).unwrap_or(true);
+                    if empty {
+                        typers.remove(&cid);
+                    }
+                    drop(typers);
+                    let rows = inner.rows.borrow();
+                    if let Some(row) = rows.get(&cid) {
+                        if empty {
+                            row.preview_label.set_visible(true);
+                            row.typing_box.set_visible(false);
+                        } else {
+                            let all = inner.active_typers.borrow();
+                            if let Some(remaining) = all.get(&cid) {
+                                let label = remaining.join(", ");
+                                if let Some(first) = row.typing_box.first_child() {
+                                    if let Some(name_lbl) = first.downcast_ref::<Label>() {
+                                        name_lbl.set_markup(
+                                            &format!("<span foreground='#00a884'>{label} </span>")
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+            );
         }
     }
 

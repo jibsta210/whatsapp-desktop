@@ -3229,7 +3229,7 @@ impl ChatViewPanel {
         let chat_typers = all.entry(chat_id.to_string()).or_default();
         if is_typing {
             if !chat_typers.contains(&display) {
-                chat_typers.push(display);
+                chat_typers.push(display.clone());
             }
         } else {
             chat_typers.retain(|t| *t != display);
@@ -3252,6 +3252,40 @@ impl ChatViewPanel {
                 .typing_name
                 .set_markup(&format!("<small><b>{label}</b> </small>"));
             self.inner.typing_box.set_visible(true);
+        }
+
+        // Auto-expire typing indicator after 15 seconds.
+        // WhatsApp clients re-send Composing every ~10s while still typing,
+        // so if we don't receive a refresh within 15s, the person stopped.
+        if is_typing {
+            let inner_w = Rc::downgrade(&self.inner);
+            let cid = chat_id.to_string();
+            let name = display;
+            gtk4::glib::timeout_add_local_once(
+                std::time::Duration::from_secs(15),
+                move || {
+                    if let Some(inner) = inner_w.upgrade() {
+                        let mut all = inner.all_typers.borrow_mut();
+                        if let Some(typers) = all.get_mut(&cid) {
+                            typers.retain(|t| *t != name);
+                        }
+                        let is_current = inner.current_chat_id.borrow()
+                            .as_deref().map(|id| id == cid).unwrap_or(false);
+                        if is_current {
+                            let remaining = all.get(&cid).cloned().unwrap_or_default();
+                            drop(all);
+                            if remaining.is_empty() {
+                                inner.typing_box.set_visible(false);
+                            } else {
+                                let label = remaining.join(", ");
+                                inner.typing_name.set_markup(
+                                    &format!("<small><b>{label}</b> </small>"),
+                                );
+                            }
+                        }
+                    }
+                },
+            );
         }
     }
 }
