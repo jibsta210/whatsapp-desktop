@@ -46,27 +46,51 @@ pub async fn resolve_and_update_version(
     let device = persistence_manager.get_device_snapshot().await;
     let last_fetched_ms = device.app_version_last_fetched_ms;
 
-    let needs_fetch = if last_fetched_ms == 0 {
-        true
-    } else {
-        match chrono::DateTime::from_timestamp_millis(last_fetched_ms) {
-            Some(last_fetched_dt) => {
-                wacore::time::now_utc().signed_duration_since(last_fetched_dt)
-                    > chrono::Duration::hours(24)
-            }
-            None => true,
+    // ALWAYS refetch the version on startup. WhatsApp rolls out new client
+    // revisions frequently, and an older cached version triggers "you're
+    // using an older version" warnings from the server. The HTTP fetch
+    // takes <1s, so the cache isn't worth the stale-version bugs.
+    // If the fetch fails, fall back to the cached value.
+    let needs_fetch = true;
+    // Keep this variable referenced to avoid unused warnings when the
+    // cache path is restored in the future.
+    let _cache_staleness_check = match chrono::DateTime::from_timestamp_millis(last_fetched_ms) {
+        Some(last_fetched_dt) => {
+            wacore::time::now_utc().signed_duration_since(last_fetched_dt)
+                > chrono::Duration::hours(6)
         }
+        None => true,
     };
 
     if needs_fetch {
-        debug!("WhatsApp version is stale or missing, fetching latest...");
-        let (p, s, t) = fetch_latest_app_version(http_client)
-            .await
-            .map_err(|e| anyhow!("Failed to fetch latest WhatsApp version: {}", e))?;
-        debug!("Fetched latest version: {}.{}.{}", p, s, t);
-        persistence_manager
-            .process_command(DeviceCommand::SetAppVersion((p, s, t)))
-            .await;
+        debug!("Fetching latest WhatsApp Web version...");
+        match fetch_latest_app_version(http_client).await {
+            Ok((p, s, t)) => {
+                debug!("Fetched latest version: {}.{}.{}", p, s, t);
+                persistence_manager
+                    .process_command(DeviceCommand::SetAppVersion((p, s, t)))
+                    .await;
+            }
+            Err(e) => {
+                // Fetch failed (no network, Meta CDN down, etc). Fall back
+                // to the cached version if we have one — better than crashing
+                // the client during startup.
+                if device.app_version_primary != 0 {
+                    log::warn!(
+                        "Failed to fetch latest WhatsApp version: {}. Using cached {}.{}.{}",
+                        e,
+                        device.app_version_primary,
+                        device.app_version_secondary,
+                        device.app_version_tertiary
+                    );
+                } else {
+                    return Err(anyhow!(
+                        "Failed to fetch WhatsApp version and no cached version available: {}",
+                        e
+                    ));
+                }
+            }
+        }
     } else {
         debug!(
             "Using cached version: {}.{}.{}",
