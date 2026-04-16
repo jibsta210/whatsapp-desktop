@@ -2450,8 +2450,8 @@ impl ChatViewPanel {
         }
 
         // Wire quick action buttons: React, Reply, Forward
-        {
-            let (btn_react, btn_reply, btn_forward) = bubble.quick_action_buttons();
+        // System-message bubbles have no hover actions — skip wiring
+        if let Some((btn_react, btn_reply, btn_forward)) = bubble.quick_action_buttons() {
 
             let inner_c = inner.clone();
             let msg_c = msg.clone();

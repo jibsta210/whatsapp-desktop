@@ -1157,8 +1157,9 @@ impl MessageBubble {
         &self.chevron_btn
     }
 
-    /// Get the quick action button box children: (react, reply, forward)
-    pub fn quick_action_buttons(&self) -> (Button, Button, Button) {
+    /// Get the quick action button box children: (react, reply, forward).
+    /// Returns None for system-message bubbles which have no hover actions.
+    pub fn quick_action_buttons(&self) -> Option<(Button, Button, Button)> {
         let mut children = Vec::new();
         let mut child = self.hover_actions.first_child();
         while let Some(c) = child {
@@ -1167,11 +1168,14 @@ impl MessageBubble {
             }
             child = c.next_sibling();
         }
-        (
+        if children.len() < 3 {
+            return None;
+        }
+        Some((
             children[0].clone(),
             children[1].clone(),
             children[2].clone(),
-        )
+        ))
     }
 
     pub fn avatar_widget(&self) -> &libadwaita::Avatar {
