@@ -1363,19 +1363,46 @@ async fn handle_wa_event(
                 return;
             }
 
-            // Handle message edits — update text in cache and notify UI
-            if matches!(info.edit, EditAttribute::MessageEdit) {
+            // Handle message edits — update text in cache and notify UI.
+            // Detect edits either via the edit attribute OR by checking
+            // for protocol_message.edited_message (self-edits from phone
+            // sometimes arrive without the edit attribute set).
+            let has_edited_msg = msg
+                .protocol_message
+                .as_ref()
+                .and_then(|pm| pm.edited_message.as_ref())
+                .is_some();
+            if matches!(info.edit, EditAttribute::MessageEdit) || has_edited_msg {
+                // Target ID priority: meta_info.target_id → protocol_message.key.id
+                // → fall back to msg_id (last resort; risks editing wrong msg)
                 let target_id = info
                     .meta_info
                     .target_id
                     .as_ref()
                     .map(|id| id.to_string())
+                    .or_else(|| {
+                        msg.protocol_message
+                            .as_ref()
+                            .and_then(|pm| pm.key.as_ref())
+                            .and_then(|k| k.id.clone())
+                    })
                     .unwrap_or_else(|| msg_id.clone());
+                // Edits arrive wrapped in protocol_message.edited_message (tag 14).
+                // text_content() alone doesn't unwrap this layer, so check both.
                 let new_text = msg
                     .text_content()
                     .map(|s| s.to_string())
+                    .or_else(|| {
+                        msg.protocol_message
+                            .as_ref()
+                            .and_then(|pm| pm.edited_message.as_deref())
+                            .and_then(|em| em.text_content().map(|s| s.to_string()))
+                    })
                     .unwrap_or_default();
-                log::info!("Message edit received: {target_id} in {chat_id}");
+                log::info!(
+                    "Message edit received: {target_id} in {chat_id} new_text={:?}",
+                    new_text
+                );
                 {
                     let mut s = state.lock().unwrap();
                     if let Some(msgs) = s.history.get_mut(&chat_id) {
