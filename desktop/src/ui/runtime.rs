@@ -1289,9 +1289,12 @@ async fn handle_wa_event(
             }
 
             // Resolve LID chat_id to phone JID: check sender_alt first (for 1:1 DMs),
-            // then cached lid_to_phone mapping
+            // then cached lid_to_phone mapping. IMPORTANT: only trust the mapping
+            // if the resolved phone JID actually has an existing chat — otherwise
+            // stale/corrupt LID→phone mappings create phantom chats with wrong
+            // phone numbers (bug where self-sent messages from phone land in a
+            // completely different chat).
             let chat_id = if raw_chat_id.ends_with("@lid") {
-                // For 1:1 DMs, sender_alt may carry the phone JID for the chat peer
                 let alt_phone = info
                     .source
                     .sender_alt
@@ -1299,11 +1302,31 @@ async fn handle_wa_event(
                     .filter(|a| a.to_string().ends_with("@s.whatsapp.net"))
                     .map(|a| a.to_string());
                 let s = state.lock().unwrap();
-                s.lid_to_phone
-                    .get(&raw_chat_id)
-                    .cloned()
-                    .or(alt_phone)
-                    .unwrap_or(raw_chat_id)
+                // Try cached mapping first
+                let cached = s.lid_to_phone.get(&raw_chat_id).cloned();
+                // For self-messages (is_from_me), verify the resolved JID
+                // actually has an existing chat — otherwise keep the LID so
+                // messages merge into the correct existing chat entry.
+                let resolved = if info.source.is_from_me {
+                    match cached.as_ref().or(alt_phone.as_ref()) {
+                        Some(phone) if s.chats.iter().any(|c| &c.id == phone) => {
+                            Some(phone.clone())
+                        }
+                        // Mapping doesn't match any known chat — check if
+                        // the raw LID itself has a chat we should use
+                        _ => {
+                            if s.chats.iter().any(|c| c.id == raw_chat_id) {
+                                None // keep raw_chat_id as the @lid form
+                            } else {
+                                // Neither form known — try the best available mapping
+                                cached.clone().or_else(|| alt_phone.clone())
+                            }
+                        }
+                    }
+                } else {
+                    cached.or(alt_phone)
+                };
+                resolved.unwrap_or(raw_chat_id)
             } else {
                 raw_chat_id
             };
@@ -1696,8 +1719,33 @@ async fn handle_wa_event(
                 extract_pending_download(base)
             };
 
-            match map_message(*msg, info) {
+            // Diagnostic logging for self-messages — helps catch the "phone
+            // message lands in wrong chat" and "group message missing" bugs.
+            let is_from_me_dbg = info.source.is_from_me;
+            let is_group_dbg = chat_id.ends_with("@g.us");
+            let raw_chat_dbg = info.source.chat.to_string();
+            let sender_dbg = info.source.sender.to_string();
+            let edit_dbg = format!("{:?}", info.edit);
+
+            let mapped = map_message(*msg, info);
+            if mapped.is_none() && is_from_me_dbg {
+                log::warn!(
+                    "DROPPED self-message: chat={chat_id} raw_chat={raw_chat_dbg} \
+                     sender={sender_dbg} group={is_group_dbg} edit={edit_dbg} \
+                     — map_message returned None (no text/media/contact/poll)"
+                );
+                return;
+            }
+            match mapped {
                 Some(mut m) => {
+                    if is_from_me_dbg {
+                        log::info!(
+                            "SELF MSG routed: chat={} raw_chat={raw_chat_dbg} \
+                             group={is_group_dbg} text={:?}",
+                            m.chat_id,
+                            m.text.as_deref().unwrap_or("<media>")
+                        );
+                    }
                     // Override chat_id with the resolved (merged) version
                     m.chat_id = chat_id.clone();
 

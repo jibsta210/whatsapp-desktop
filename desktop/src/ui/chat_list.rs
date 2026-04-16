@@ -440,7 +440,12 @@ impl ChatListPanel {
                 row.is_favorite.set(chat.is_favorite);
                 row.pin_indicator.set_visible(chat.is_pinned);
                 row.mute_indicator.set_visible(chat.is_muted);
-                row.set_unread(chat.unread_count);
+                // Unread: take the MAX of existing (real-time increments)
+                // and incoming (server's authoritative count). This prevents
+                // a refresh with count=0 from wiping out badges that were
+                // accumulated from MessageReceived events during sync.
+                let existing = row.unread_count.get();
+                row.set_unread(existing.max(chat.unread_count));
 
                 // Only update preview + timestamp if incoming is newer
                 let existing_ts = self
