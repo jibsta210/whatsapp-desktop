@@ -657,7 +657,10 @@ impl ChatListPanel {
     pub fn set_typing(&self, chat_id: &str, sender_name: &str, is_typing: bool) {
         let rows = self.inner.rows.borrow();
         let Some(row) = rows.get(chat_id) else { return };
-        let display = if sender_name.is_empty() {
+        // Hide raw JIDs (unresolved LIDs, numeric user parts) as "Someone"
+        let looks_like_jid = sender_name.contains('@')
+            || (sender_name.len() > 8 && sender_name.chars().all(|c| c.is_ascii_digit()));
+        let display = if sender_name.is_empty() || looks_like_jid {
             "Someone".to_string()
         } else {
             sender_name.to_string()

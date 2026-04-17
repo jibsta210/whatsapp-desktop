@@ -3219,8 +3219,11 @@ impl ChatViewPanel {
     }
 
     pub fn set_typing_indicator(&self, chat_id: &str, sender_name: &str, is_typing: bool) {
-        // Track per-chat so state survives chat switches
-        let display = if sender_name.is_empty() {
+        // Track per-chat so state survives chat switches.
+        // Hide raw JIDs (unresolved LIDs, phone numbers) behind "Someone".
+        let looks_like_jid = sender_name.contains('@')
+            || (sender_name.len() > 8 && sender_name.chars().all(|c| c.is_ascii_digit()));
+        let display = if sender_name.is_empty() || looks_like_jid {
             "Someone".to_string()
         } else {
             sender_name.to_string()
