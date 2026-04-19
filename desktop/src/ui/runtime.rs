@@ -1746,33 +1746,32 @@ async fn handle_wa_event(
                 extract_pending_download(base)
             };
 
-            // Diagnostic logging for self-messages — helps catch the "phone
-            // message lands in wrong chat" and "group message missing" bugs.
+            // Diagnostic logging for ALL messages — helps catch missing-message bugs.
             let is_from_me_dbg = info.source.is_from_me;
             let is_group_dbg = chat_id.ends_with("@g.us");
             let raw_chat_dbg = info.source.chat.to_string();
             let sender_dbg = info.source.sender.to_string();
             let edit_dbg = format!("{:?}", info.edit);
+            let msg_id_dbg = info.id.to_string();
 
             let mapped = map_message(*msg, info);
-            if mapped.is_none() && is_from_me_dbg {
+            if mapped.is_none() {
                 log::warn!(
-                    "DROPPED self-message: chat={chat_id} raw_chat={raw_chat_dbg} \
-                     sender={sender_dbg} group={is_group_dbg} edit={edit_dbg} \
-                     — map_message returned None (no text/media/contact/poll)"
+                    "DROPPED message: id={msg_id_dbg} chat={chat_id} raw_chat={raw_chat_dbg} \
+                     sender={sender_dbg} from_me={is_from_me_dbg} group={is_group_dbg} \
+                     edit={edit_dbg} — map_message returned None (no text/media/contact/poll)"
                 );
                 return;
             }
             match mapped {
                 Some(mut m) => {
-                    if is_from_me_dbg {
-                        log::info!(
-                            "SELF MSG routed: chat={} raw_chat={raw_chat_dbg} \
-                             group={is_group_dbg} text={:?}",
-                            m.chat_id,
-                            m.text.as_deref().unwrap_or("<media>")
-                        );
-                    }
+                    log::info!(
+                        "MSG routed: id={} chat={} raw_chat={raw_chat_dbg} from_me={is_from_me_dbg} \
+                         group={is_group_dbg} sender={sender_dbg} text={:?}",
+                        m.id,
+                        m.chat_id,
+                        m.text.as_deref().unwrap_or("<media>")
+                    );
                     // Override chat_id with the resolved (merged) version
                     m.chat_id = chat_id.clone();
 
@@ -2307,35 +2306,48 @@ async fn handle_wa_event(
                     .or(conv.conversation_timestamp)
                     .unwrap_or(0) as i64;
 
-                // Merge sync messages with disk data WITHOUT caching in memory.
-                // This keeps RAM bounded — only LoadChat/persist_new_message populate the cache.
-                // Track which sync messages are NEW (not already on disk/cache) for UI notification.
+                // Merge sync messages with disk data. Track which sync messages
+                // are NEW (not already on disk/cache) for UI notification.
+                //
+                // CRITICAL: always merge against the current state (cache OR disk),
+                // never silently drop sync messages. Previous code had a TOCTOU race
+                // where chat eviction between cache check and lock acquisition caused
+                // sync messages to be lost — the most common cause of "messages
+                // missing after reboot" in groups with many chats.
                 let (last_message, best_timestamp, new_messages) = {
-                    let in_cache = state.lock().unwrap().history.contains_key(&chat_id);
-
-                    if in_cache {
+                    // Try cache path first, fall back to disk path if the chat was
+                    // evicted between check and use.
+                    let cache_result = {
                         let mut s = state.lock().unwrap();
-                        let Some(history) = s.history.get_mut(&chat_id) else {
-                            return; // chat evicted from LRU cache
-                        };
-                        let mut new_msgs = Vec::new();
-                        for m in &sync_messages {
-                            if let Some(existing) = history.iter_mut().find(|x| x.id == m.id) {
-                                if !m.reactions.is_empty() && existing.reactions.is_empty() {
-                                    existing.reactions = m.reactions.clone();
+                        if let Some(history) = s.history.get_mut(&chat_id) {
+                            let mut new_msgs = Vec::new();
+                            for m in &sync_messages {
+                                if let Some(existing) = history.iter_mut().find(|x| x.id == m.id) {
+                                    if !m.reactions.is_empty() && existing.reactions.is_empty() {
+                                        existing.reactions = m.reactions.clone();
+                                    }
+                                } else {
+                                    new_msgs.push(m.clone());
+                                    history.push(m.clone());
                                 }
-                            } else {
-                                new_msgs.push(m.clone());
-                                history.push(m.clone());
                             }
+                            history.sort_by_key(|m| m.timestamp);
+                            let last_msg = history.last();
+                            let preview = last_msg.map(|m| media_preview(m)).unwrap_or_default();
+                            let ts = last_msg.map(|m| m.timestamp).unwrap_or(conv_timestamp);
+                            s.queue_save_messages(&chat_id);
+                            Some((preview, ts, new_msgs))
+                        } else {
+                            None
                         }
-                        history.sort_by_key(|m| m.timestamp);
-                        let last_msg = history.last();
-                        let preview = last_msg.map(|m| media_preview(m)).unwrap_or_default();
-                        let ts = last_msg.map(|m| m.timestamp).unwrap_or(conv_timestamp);
-                        s.queue_save_messages(&chat_id);
-                        (preview, ts, new_msgs)
+                    };
+
+                    if let Some(result) = cache_result {
+                        result
                     } else {
+                        // Not in cache — load from disk, merge, and save back.
+                        // This is the safe fallback path that also handles the
+                        // TOCTOU race (chat evicted between cache check and use).
                         let mut disk_msgs = load_messages(&chat_id);
                         let mut new_msgs = Vec::new();
                         for m in &sync_messages {
