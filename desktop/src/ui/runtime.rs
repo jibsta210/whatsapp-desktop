@@ -271,15 +271,20 @@ fn migrate_json_to_bincode() {
 /// Groups and anything else → returned as-is.
 pub fn display_name_from_jid(jid: &str) -> String {
     if let Some(user) = jid.strip_suffix("@s.whatsapp.net") {
+        // Strip device suffix (e.g., "12345:5" → "12345")
+        let user = user.split(':').next().unwrap_or(user);
         if user.chars().all(|c| c.is_ascii_digit()) {
             return format!("+{user}");
         }
     }
-    // LID JIDs look like "12345678.0:90@lid" — extract digits before the dot
-    // and format as a phone-ish number so it's at least recognisable.
+    // LID JIDs look like "12345678.0:90@lid" or "12345:8@lid" — extract digits
+    // before the first non-digit (., :) and format as a phone-ish number.
     if let Some(user) = jid.strip_suffix("@lid") {
-        let digits: String = user.split('.').next().unwrap_or(user).to_string();
-        if digits.chars().all(|c| c.is_ascii_digit()) && digits.len() >= 5 {
+        let digits: String = user
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if digits.len() >= 5 {
             return format!("+{digits}");
         }
     }

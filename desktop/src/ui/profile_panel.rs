@@ -712,7 +712,27 @@ impl ProfilePanel {
             inner.groups_section.set_visible(true);
             inner.about_section.set_visible(true);
             inner.disappearing_section.set_visible(true);
-            let phone = crate::ui::runtime::display_name_from_jid(chat_id);
+            // If chat_id is a LID, resolve to the real phone number first
+            // so the profile shows a proper +1... phone, not a raw LID like
+            // "156753471783022:8@lid".
+            let phone = {
+                let lid_map = crate::ui::runtime::load_lid_phone_map();
+                if chat_id.ends_with("@lid") {
+                    // Strip device suffix before lookup (lid_to_phone keys are non-AD)
+                    let base = chat_id
+                        .split(':')
+                        .next()
+                        .map(|b| if b.ends_with("@lid") { b.to_string() } else { format!("{b}@lid") })
+                        .unwrap_or_else(|| chat_id.to_string());
+                    if let Some(pn) = lid_map.get(&base).cloned() {
+                        crate::ui::runtime::display_name_from_jid(&pn)
+                    } else {
+                        crate::ui::runtime::display_name_from_jid(chat_id)
+                    }
+                } else {
+                    crate::ui::runtime::display_name_from_jid(chat_id)
+                }
+            };
             inner.subtitle_label.set_text(&phone);
             inner.bridge.send_command(WaCommand::GetContactProfile {
                 chat_id: chat_id.to_string(),
