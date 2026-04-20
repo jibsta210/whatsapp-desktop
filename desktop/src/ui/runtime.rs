@@ -128,6 +128,54 @@ fn save_contact_names(names: &HashMap<String, String>) {
     write_bin(CONTACTS_FILE, names);
 }
 
+/// One-time startup pass: scan every message file on disk and extract any
+/// push_names we haven't seen yet. Populates contact_names comprehensively
+/// so LIDs that have ever sent a message get display names resolved from
+/// the moment the app starts — before any chat is opened.
+///
+/// Runs in the background so startup isn't delayed. When finished, writes
+/// the merged contact_names to disk.
+pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
+    let mut names = load_contact_names();
+    let dir = messages_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return names;
+    };
+    let mut learned = 0u32;
+    let mut scanned = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if ext != "bin" {
+            continue;
+        }
+        scanned += 1;
+        let Some(msgs) = read_bin_path::<Vec<IncomingMessage>>(&path) else {
+            continue;
+        };
+        for m in msgs {
+            if m.is_from_me || m.sender_id.is_empty() || m.sender_name.is_empty() {
+                continue;
+            }
+            // Don't overwrite — first-seen push_name wins (avoid churn from
+            // users changing their name mid-session).
+            if !names.contains_key(&m.sender_id) {
+                names.insert(m.sender_id.clone(), m.sender_name.clone());
+                learned += 1;
+            }
+        }
+    }
+    log::info!(
+        "Scanned {scanned} message files, learned {learned} new push_names from history"
+    );
+    if learned > 0 {
+        save_contact_names(&names);
+    }
+    names
+}
+
 pub fn load_lid_phone_map() -> HashMap<String, String> {
     if let Some(map) = read_bin::<HashMap<String, String>>(LID_PHONE_FILE) {
         return map;
@@ -844,6 +892,14 @@ async fn run_inner(
 
     // One-time migration from JSON to binary format
     migrate_json_to_bincode();
+
+    // Rebuild contact_names from ALL historical message files before
+    // RuntimeState loads contact_names from disk. This captures push_names
+    // from every chat's message history so that LIDs resolve to display
+    // names from the moment the app starts — no need to open each chat.
+    // Rebuild writes to the same disk file that RuntimeState::new() reads.
+    let _ = tokio::task::spawn_blocking(rebuild_contact_names_from_history)
+        .await;
 
     let state = Arc::new(Mutex::new(RuntimeState::new(save_tx, msg_save_tx)));
 
