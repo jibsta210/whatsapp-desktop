@@ -2392,16 +2392,79 @@ impl ChatViewPanel {
     pub fn append_message(&self, msg: IncomingMessage) {
         let inner = &self.inner;
 
-        // Only render if this message belongs to the open chat
-        // (runtime already resolves LID→phone before sending)
-        let is_current = inner
-            .current_chat_id
-            .borrow()
-            .as_deref()
-            .map(|id| id == msg.chat_id)
-            .unwrap_or(false);
+        // Match the current chat — tolerant of LID/phone JID aliases so
+        // that self-messages from phone (which may arrive as @lid when the
+        // open chat is @s.whatsapp.net, or vice versa) still render.
+        let is_current = {
+            let current = inner.current_chat_id.borrow();
+            match current.as_deref() {
+                Some(cid) => {
+                    if cid == msg.chat_id {
+                        true
+                    } else {
+                        // Check LID↔phone alias via the shared lid_to_phone map.
+                        let map = inner.lid_to_phone.borrow();
+                        let cid_phone = map.get(cid).map(|s| s.as_str());
+                        let cid_lid = map
+                            .iter()
+                            .find(|(_, v)| v.as_str() == cid)
+                            .map(|(k, _)| k.as_str());
+                        let msg_phone = map.get(&msg.chat_id).map(|s| s.as_str());
+                        let msg_lid = map
+                            .iter()
+                            .find(|(_, v)| v.as_str() == msg.chat_id.as_str())
+                            .map(|(k, _)| k.as_str());
+                        cid_phone == Some(msg.chat_id.as_str())
+                            || cid_lid == Some(msg.chat_id.as_str())
+                            || msg_phone == Some(cid)
+                            || msg_lid == Some(cid)
+                    }
+                }
+                None => false,
+            }
+        };
+
+        // If no match AND this is a self-message, try refreshing the LID map
+        // from disk (runtime may have learned new mappings after we loaded).
+        let is_current = if !is_current && msg.is_from_me {
+            let fresh = crate::ui::runtime::load_lid_phone_map();
+            let current = inner.current_chat_id.borrow();
+            let matched = match current.as_deref() {
+                Some(cid) => {
+                    let cid_phone = fresh.get(cid).map(|s| s.as_str());
+                    let cid_lid = fresh
+                        .iter()
+                        .find(|(_, v)| v.as_str() == cid)
+                        .map(|(k, _)| k.as_str());
+                    let msg_phone = fresh.get(&msg.chat_id).map(|s| s.as_str());
+                    let msg_lid = fresh
+                        .iter()
+                        .find(|(_, v)| v.as_str() == msg.chat_id.as_str())
+                        .map(|(k, _)| k.as_str());
+                    cid_phone == Some(msg.chat_id.as_str())
+                        || cid_lid == Some(msg.chat_id.as_str())
+                        || msg_phone == Some(cid)
+                        || msg_lid == Some(cid)
+                }
+                None => false,
+            };
+            if matched {
+                *inner.lid_to_phone.borrow_mut() = fresh;
+            }
+            matched
+        } else {
+            is_current
+        };
 
         if !is_current {
+            if msg.is_from_me {
+                log::info!(
+                    "append_message: self-message for chat={} doesn't match current={:?} \
+                     — message will be in history but not rendered now",
+                    msg.chat_id,
+                    inner.current_chat_id.borrow().as_deref()
+                );
+            }
             return;
         }
 
