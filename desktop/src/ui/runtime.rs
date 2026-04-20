@@ -857,6 +857,31 @@ async fn run_inner(
     crate::ui::autocorrect::start_ai_corrector();
 
     let backend = Arc::new(SqliteStore::new("whatsapp.db").await?);
+
+    // One-time migration: force re-sync of app-state 'regular' collections to
+    // pick up LidContactAction mutations that earlier builds ignored. Uses a
+    // marker file so it runs only once per user.
+    {
+        let marker = std::path::PathBuf::from(".contact_resync_v2");
+        if !marker.exists() {
+            log::info!("Running one-time contact re-sync migration");
+            let device_id = backend.device_id();
+            for name in &["regular_low", "regular_high", "regular"] {
+                if let Err(e) = backend
+                    .set_app_state_version_for_device(
+                        name,
+                        wacore::appstate::hash::HashState::default(),
+                        device_id,
+                    )
+                    .await
+                {
+                    log::warn!("Failed to reset {name}: {e}");
+                }
+            }
+            log::info!("Reset app_state_versions for regular collections");
+            let _ = std::fs::write(&marker, "done");
+        }
+    }
     let transport_factory = TokioWebSocketTransportFactory::new();
     let http_client = UreqHttpClient::new();
 

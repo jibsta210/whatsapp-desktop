@@ -441,6 +441,38 @@ impl ChatViewPanel {
         slash_popover.set_has_arrow(false);
         slash_popover.set_position(gtk4::PositionType::Top);
 
+        // Dismiss mention + slash popovers when the window loses focus or
+        // is minimized. Without this, autohide=false popovers can float
+        // above other windows as orphaned popups.
+        {
+            let mp = mention_popover.clone();
+            let sp = slash_popover.clone();
+            let iv_for_hook = input_view.clone();
+            input_view.connect_realize(move |iv| {
+                if let Some(root) = iv.root() {
+                    if let Some(window) = root.downcast_ref::<gtk4::Window>() {
+                        let mp2 = mp.clone();
+                        let sp2 = sp.clone();
+                        window.connect_is_active_notify(move |w| {
+                            if !w.is_active() {
+                                mp2.popdown();
+                                sp2.popdown();
+                            }
+                        });
+                        // Also dismiss when window gets unmapped (minimized)
+                        let mp3 = mp.clone();
+                        let sp3 = sp.clone();
+                        window.connect_unmap(move |_| {
+                            mp3.popdown();
+                            sp3.popdown();
+                        });
+                    }
+                }
+                // Keep reference alive
+                let _ = &iv_for_hook;
+            });
+        }
+
         // ── Emoji/GIF/Sticker popover (persistent) ──
         let emoji_popover = gtk4::Popover::new();
         emoji_popover.set_parent(&input_view);
