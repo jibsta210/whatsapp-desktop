@@ -128,15 +128,47 @@ fn save_contact_names(names: &HashMap<String, String>) {
     write_bin(CONTACTS_FILE, names);
 }
 
+/// Check if a proposed "name" is actually a valid display name rather than
+/// a raw JID / phone / garbage. Rejects names containing '@', names that
+/// look like pure digit sequences, and names that match the JID they're
+/// keyed under.
+fn is_valid_contact_name(name: &str, jid: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if name == jid {
+        return false;
+    }
+    if name.contains('@') {
+        return false;
+    }
+    // Pure digit sequences (phone numbers without '+') aren't real names
+    if name.len() > 6 && name.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    true
+}
+
 /// One-time startup pass: scan every message file on disk and extract any
 /// push_names we haven't seen yet. Populates contact_names comprehensively
 /// so LIDs that have ever sent a message get display names resolved from
 /// the moment the app starts — before any chat is opened.
 ///
-/// Runs in the background so startup isn't delayed. When finished, writes
-/// the merged contact_names to disk.
+/// Also PURGES existing poison entries where name == JID (bad data from
+/// earlier builds where resolve_sender_name fallback got persisted as
+/// push_name, creating entries like `{'12345@lid': '12345@lid'}` which
+/// shadow real resolution attempts).
 pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
     let mut names = load_contact_names();
+
+    // Purge poison entries (name == JID or name contains '@')
+    let before = names.len();
+    names.retain(|jid, name| is_valid_contact_name(name, jid));
+    let purged = before - names.len();
+    if purged > 0 {
+        log::info!("Purged {purged} poison entries from contact_names (name == JID)");
+    }
+
     let dir = messages_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return names;
@@ -156,7 +188,11 @@ pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
             continue;
         };
         for m in msgs {
-            if m.is_from_me || m.sender_id.is_empty() || m.sender_name.is_empty() {
+            if m.is_from_me || m.sender_id.is_empty() {
+                continue;
+            }
+            // Skip messages where sender_name is poisoned (looks like a JID)
+            if !is_valid_contact_name(&m.sender_name, &m.sender_id) {
                 continue;
             }
             // Don't overwrite — first-seen push_name wins (avoid churn from
@@ -168,11 +204,11 @@ pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
         }
     }
     log::info!(
-        "Scanned {scanned} message files, learned {learned} new push_names from history"
+        "Scanned {scanned} message files, learned {learned} new push_names, purged {purged} poison entries"
     );
-    if learned > 0 {
-        save_contact_names(&names);
-    }
+    // Always save after purge — even if we didn't learn new names, the
+    // poison removal needs to persist.
+    save_contact_names(&names);
     names
 }
 
@@ -640,7 +676,7 @@ impl RuntimeState {
     }
 
     fn record_contact_name(&mut self, jid: &str, name: &str, also_jid: Option<&str>) -> bool {
-        if name.is_empty() {
+        if !is_valid_contact_name(name, jid) {
             return false;
         }
         let mut changed = false;
@@ -649,7 +685,10 @@ impl RuntimeState {
             changed = true;
         }
         if let Some(alt) = also_jid {
-            if !alt.is_empty() && self.contact_names.get(alt).map(|n| n.as_str()) != Some(name) {
+            if !alt.is_empty()
+                && is_valid_contact_name(name, alt)
+                && self.contact_names.get(alt).map(|n| n.as_str()) != Some(name)
+            {
                 self.contact_names.insert(alt.to_string(), name.to_string());
                 changed = true;
             }
@@ -1913,7 +1952,10 @@ async fn handle_wa_event(
                     // Store push_name as contact name for group participants
                     // who aren't in the user's contacts. This lets resolve_sender_name
                     // find their profile name on future lookups.
-                    if !m.sender_name.is_empty() && !m.sender_id.is_empty() && !m.is_from_me {
+                    if is_valid_contact_name(&m.sender_name, &m.sender_id)
+                        && !m.sender_id.is_empty()
+                        && !m.is_from_me
+                    {
                         let mut s = state.lock().unwrap();
                         if !s.contact_names.contains_key(&m.sender_id) {
                             s.contact_names
@@ -1921,7 +1963,9 @@ async fn handle_wa_event(
                             // Also store under phone JID if sender is LID
                             if m.sender_id.ends_with("@lid") {
                                 if let Some(phone) = s.lid_to_phone.get(&m.sender_id).cloned() {
-                                    if !s.contact_names.contains_key(&phone) {
+                                    if !s.contact_names.contains_key(&phone)
+                                        && is_valid_contact_name(&m.sender_name, &phone)
+                                    {
                                         s.contact_names.insert(phone, m.sender_name.clone());
                                     }
                                 }
@@ -3576,7 +3620,10 @@ async fn handle_command(
                 let mut s = state.lock().unwrap();
                 let mut learned = 0u32;
                 for m in &all_messages {
-                    if !m.sender_name.is_empty() && !m.sender_id.is_empty() && !m.is_from_me {
+                    if is_valid_contact_name(&m.sender_name, &m.sender_id)
+                        && !m.sender_id.is_empty()
+                        && !m.is_from_me
+                    {
                         if !s.contact_names.contains_key(&m.sender_id) {
                             s.contact_names
                                 .insert(m.sender_id.clone(), m.sender_name.clone());
