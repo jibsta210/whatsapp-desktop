@@ -68,6 +68,35 @@ pub(crate) fn dispatch_chat_mutation(
 
     let kind = &m.index[0];
 
+    // Special-case: lid_contact_action can arrive under various kind strings.
+    // Catch it regardless of kind by checking for the action payload itself.
+    // This populates contact_names for LID participants in groups so raw
+    // '@lid' JIDs get resolved to display names immediately on startup.
+    if let Some(val) = &m.action_value {
+        if let Some(act) = &val.lid_contact_action {
+            // index[1] should be the LID JID
+            if let Some(jid_str) = m.index.get(1) {
+                if let Ok(jid) = jid_str.parse::<Jid>() {
+                    event_bus.dispatch(&Event::ContactUpdate(ContactUpdate {
+                        jid,
+                        timestamp: DateTime::from_timestamp_millis(
+                            val.timestamp.unwrap_or(0),
+                        )
+                        .unwrap_or_else(wacore::time::now_utc),
+                        action: Box::new(wa::sync_action_value::ContactAction {
+                            full_name: act.full_name.clone(),
+                            first_name: act.first_name.clone(),
+                            username: act.username.clone(),
+                            ..Default::default()
+                        }),
+                        from_full_sync: full_sync,
+                    }));
+                    return true;
+                }
+            }
+        }
+    }
+
     // Log unhandled mutation kinds so we can discover the correct key for quick replies
     if !matches!(
         kind.as_str(),
