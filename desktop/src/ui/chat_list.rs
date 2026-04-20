@@ -259,6 +259,7 @@ impl ChatListPanel {
                 let msg_box = inner.msg_results_box.clone();
                 let bridge = inner.bridge.clone();
                 let on_select = inner.on_select.clone();
+                let inner_weak = Rc::downgrade(&inner);
                 // Debounce timer for message search
                 let debounce: Rc<Cell<u32>> = Rc::new(Cell::new(0));
                 move |entry| {
@@ -281,6 +282,7 @@ impl ChatListPanel {
                     let mb = msg_box.clone();
                     let os = on_select.clone();
                     let br = bridge.clone();
+                    let inner_w = inner_weak.clone();
                     gtk4::glib::timeout_add_local_once(
                         std::time::Duration::from_millis(400),
                         move || {
@@ -323,12 +325,30 @@ impl ChatListPanel {
                                 gtk_row.set_selectable(true);
                                 let cid = hit.chat_id.clone();
                                 let cn = hit.chat_name.clone();
+                                let rows_ref = inner_w.clone();
                                 let os2 = os.clone();
                                 let br2 = br.clone();
                                 let gesture = GestureClick::new();
                                 gesture.set_button(1);
                                 gesture.connect_released(move |_, _, _, _| {
-                                    let name = if cn.is_empty() { cid.clone() } else { cn.clone() };
+                                    // Look up the actual chat display name from
+                                    // the existing chat list rows. Falls back to
+                                    // the hit's chat_name, then to formatted JID.
+                                    let name = if !cn.is_empty() {
+                                        cn.clone()
+                                    } else if let Some(inner) = rows_ref.upgrade() {
+                                        inner
+                                            .rows
+                                            .borrow()
+                                            .get(&cid)
+                                            .map(|r| r.chat_name.clone())
+                                            .filter(|n| !n.is_empty())
+                                            .unwrap_or_else(|| {
+                                                crate::ui::runtime::display_name_from_jid(&cid)
+                                            })
+                                    } else {
+                                        crate::ui::runtime::display_name_from_jid(&cid)
+                                    };
                                     (os2)(cid.clone(), name.clone());
                                     br2.send_command(crate::bridge::WaCommand::LoadChat {
                                         chat_id: cid.clone(),
@@ -1687,16 +1707,24 @@ fn search_local_messages(query: &str) -> Vec<crate::bridge::SearchHit> {
             Ok(m) => m,
             Err(_) => continue,
         };
-        let chat_id = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
+        // Get the real chat_id from a message inside the file — the
+        // filename is a file-safe form where '@' and ':' are replaced with
+        // '_' (e.g. "120363...@g.us" → "120363..._g.us"), which isn't a
+        // valid JID. Using the filename as chat_id broke search-click.
+        let real_chat_id = messages
+            .first()
+            .map(|m| m.chat_id.clone())
+            .unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string()
+            });
         for msg in &messages {
             if let Some(text) = &msg.text {
                 if text.to_lowercase().contains(&query_lower) {
                     hits.push(SearchHit {
-                        chat_id: chat_id.clone(),
+                        chat_id: real_chat_id.clone(),
                         chat_name: String::new(),
                         msg_id: msg.id.clone(),
                         sender_name: msg.sender_name.clone(),
