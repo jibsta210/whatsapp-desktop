@@ -898,12 +898,15 @@ async fn run_inner(
     let backend = Arc::new(SqliteStore::new("whatsapp.db").await?);
 
     // One-time migration: force re-sync of app-state 'regular' collections to
-    // pick up LidContactAction mutations that earlier builds ignored. Uses a
-    // marker file so it runs only once per user.
+    // pick up contact-name mutations (both ContactAction and LidContactAction).
+    // Marker version bumped whenever we change contact handling so the re-sync
+    // runs again with the new code. Current version: v3 (poison purge + validation).
     {
-        let marker = std::path::PathBuf::from(".contact_resync_v2");
+        let marker = std::path::PathBuf::from(".contact_resync_v3");
+        // Clean up old marker from v2 so we don't accumulate cruft
+        let _ = std::fs::remove_file(".contact_resync_v2");
         if !marker.exists() {
-            log::info!("Running one-time contact re-sync migration");
+            log::info!("Running one-time contact re-sync migration (v3)");
             let device_id = backend.device_id();
             for name in &["regular_low", "regular_high", "regular"] {
                 if let Err(e) = backend
@@ -917,8 +920,8 @@ async fn run_inner(
                     log::warn!("Failed to reset {name}: {e}");
                 }
             }
-            log::info!("Reset app_state_versions for regular collections");
-            let _ = std::fs::write(&marker, "done");
+            log::info!("Reset app_state_versions for regular collections — next connect will pull all contact names from phone");
+            let _ = std::fs::write(&marker, "v3");
         }
     }
     let transport_factory = TokioWebSocketTransportFactory::new();
