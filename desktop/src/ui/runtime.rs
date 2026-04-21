@@ -128,10 +128,10 @@ fn save_contact_names(names: &HashMap<String, String>) {
     write_bin(CONTACTS_FILE, names);
 }
 
-/// Check if a proposed "name" is actually a valid display name rather than
-/// a raw JID / phone / garbage. Rejects names containing '@', names that
-/// look like pure digit sequences, and names that match the JID they're
-/// keyed under.
+/// Check if a proposed "name" is a valid display name (not a raw JID).
+/// Strict: only rejects empty, name-equals-jid, or name-contains-@.
+/// Does NOT reject pure phone numbers like "+16472876066" — those are
+/// legitimate display fallbacks for unsaved contacts.
 fn is_valid_contact_name(name: &str, jid: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -142,10 +142,6 @@ fn is_valid_contact_name(name: &str, jid: &str) -> bool {
     if name.contains('@') {
         return false;
     }
-    // Pure digit sequences (phone numbers without '+') aren't real names
-    if name.len() > 6 && name.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
     true
 }
 
@@ -154,23 +150,34 @@ fn is_valid_contact_name(name: &str, jid: &str) -> bool {
 /// so LIDs that have ever sent a message get display names resolved from
 /// the moment the app starts — before any chat is opened.
 ///
-/// Also PURGES existing poison entries where name == JID (bad data from
-/// earlier builds where resolve_sender_name fallback got persisted as
-/// push_name, creating entries like `{'12345@lid': '12345@lid'}` which
-/// shadow real resolution attempts).
+/// The poison-purge (removing name == JID entries) is guarded behind a
+/// marker file so it runs ONCE per user — previously it ran every startup
+/// which could wipe legitimate names if validation was too strict.
+///
+/// Never REMOVES entries on subsequent runs — only ADDS new push_names.
 pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
     let mut names = load_contact_names();
 
-    // Purge poison entries (name == JID or name contains '@')
-    let before = names.len();
-    names.retain(|jid, name| is_valid_contact_name(name, jid));
-    let purged = before - names.len();
-    if purged > 0 {
-        log::info!("Purged {purged} poison entries from contact_names (name == JID)");
+    // One-time poison purge (gated by marker — runs once per user only)
+    let purge_marker = std::path::PathBuf::from(".contact_purge_v1");
+    let mut purged = 0;
+    if !purge_marker.exists() {
+        let before = names.len();
+        // Strict purge: only remove entries where name exactly equals the JID
+        // (true poison from push_name storing the raw JID as a fallback).
+        // Do NOT use is_valid_contact_name here — that's too aggressive and
+        // would wipe legitimately saved names like "+16472876066".
+        names.retain(|jid, name| name != jid);
+        purged = before - names.len();
+        if purged > 0 {
+            log::info!("One-time purge: removed {purged} entries where name == JID");
+        }
+        let _ = std::fs::write(&purge_marker, "done");
     }
 
     let dir = messages_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
+        save_contact_names(&names);
         return names;
     };
     let mut learned = 0u32;
@@ -191,12 +198,11 @@ pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
             if m.is_from_me || m.sender_id.is_empty() {
                 continue;
             }
-            // Skip messages where sender_name is poisoned (looks like a JID)
-            if !is_valid_contact_name(&m.sender_name, &m.sender_id) {
+            // Skip messages where sender_name looks like a JID (old poison)
+            if m.sender_name.is_empty() || m.sender_name == m.sender_id {
                 continue;
             }
-            // Don't overwrite — first-seen push_name wins (avoid churn from
-            // users changing their name mid-session).
+            // Don't overwrite — first-seen push_name wins.
             if !names.contains_key(&m.sender_id) {
                 names.insert(m.sender_id.clone(), m.sender_name.clone());
                 learned += 1;
@@ -204,10 +210,8 @@ pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
         }
     }
     log::info!(
-        "Scanned {scanned} message files, learned {learned} new push_names, purged {purged} poison entries"
+        "Scanned {scanned} message files, learned {learned} push_names, purged {purged} poison entries"
     );
-    // Always save after purge — even if we didn't learn new names, the
-    // poison removal needs to persist.
     save_contact_names(&names);
     names
 }
