@@ -1426,7 +1426,7 @@ async fn handle_wa_event(
             // stale/corrupt LID→phone mappings create phantom chats with wrong
             // phone numbers (bug where self-sent messages from phone land in a
             // completely different chat).
-            let chat_id = if raw_chat_id.ends_with("@lid") {
+            let (chat_id, needs_lid_resolve) = if raw_chat_id.ends_with("@lid") {
                 let alt_phone = info
                     .source
                     .sender_alt
@@ -1436,32 +1436,82 @@ async fn handle_wa_event(
                 let s = state.lock().unwrap();
                 // Try cached mapping first
                 let cached = s.lid_to_phone.get(&raw_chat_id).cloned();
-                // For self-messages (is_from_me), verify the resolved JID
-                // actually has an existing chat — otherwise keep the LID so
-                // messages merge into the correct existing chat entry.
+                // Strip :device suffix for alternate lookup (LIDs can arrive
+                // with or without device suffix; the stored map uses non-AD)
+                let base_lid = if let Some(colon) = raw_chat_id.find(':') {
+                    if let Some(at) = raw_chat_id.find('@') {
+                        if colon < at {
+                            format!("{}{}", &raw_chat_id[..colon], &raw_chat_id[at..])
+                        } else {
+                            raw_chat_id.clone()
+                        }
+                    } else {
+                        raw_chat_id.clone()
+                    }
+                } else {
+                    raw_chat_id.clone()
+                };
+                let cached_base = s.lid_to_phone.get(&base_lid).cloned();
+
+                // Check if contact_names has an entry for this LID (or its base form).
+                // If yes AND we can find the person's phone JID chat, merge there.
+                let contact_phone_chat = {
+                    let find_chat_by_name = |name: &str| -> Option<String> {
+                        if name.is_empty() {
+                            return None;
+                        }
+                        s.chats
+                            .iter()
+                            .find(|c| c.id.ends_with("@s.whatsapp.net") && c.name == name)
+                            .map(|c| c.id.clone())
+                    };
+                    s.contact_names
+                        .get(&raw_chat_id)
+                        .or_else(|| s.contact_names.get(&base_lid))
+                        .and_then(|name| find_chat_by_name(name))
+                };
+
+                let mut needs_resolve = false;
                 let resolved = if info.source.is_from_me {
-                    match cached.as_ref().or(alt_phone.as_ref()) {
+                    match cached.as_ref().or(cached_base.as_ref()).or(alt_phone.as_ref()) {
                         Some(phone) if s.chats.iter().any(|c| &c.id == phone) => {
                             Some(phone.clone())
                         }
-                        // Mapping doesn't match any known chat — check if
-                        // the raw LID itself has a chat we should use
+                        _ if contact_phone_chat.is_some() => contact_phone_chat,
                         _ => {
                             if s.chats.iter().any(|c| c.id == raw_chat_id) {
                                 None // keep raw_chat_id as the @lid form
+                            } else if s.chats.iter().any(|c| c.id == base_lid) {
+                                Some(base_lid.clone())
                             } else {
-                                // Neither form known — try the best available mapping
-                                cached.clone().or_else(|| alt_phone.clone())
+                                // Neither form known — queue background
+                                // resolution so merge_lid_chats can dedup later.
+                                needs_resolve = true;
+                                cached
+                                    .clone()
+                                    .or_else(|| cached_base.clone())
+                                    .or_else(|| alt_phone.clone())
                             }
                         }
                     }
                 } else {
-                    cached.or(alt_phone)
+                    cached.or(cached_base).or(alt_phone)
                 };
-                resolved.unwrap_or(raw_chat_id)
+                (resolved.unwrap_or(raw_chat_id), needs_resolve)
             } else {
-                raw_chat_id
+                (raw_chat_id, false)
             };
+
+            // Queue background LID resolution when a self-message landed on a
+            // phantom chat. If resolution finds the phone JID for an existing
+            // chat, merge_lid_chats (triggered on next startup/refresh) folds
+            // the phantom into the real chat.
+            if needs_lid_resolve && chat_id.ends_with("@lid") {
+                queue_lid_resolve(&lid_resolver_tx, &chat_id);
+                log::info!(
+                    "Queued LID resolution for self-message phantom chat: {chat_id}"
+                );
+            }
 
             // Handle message revoke (delete for everyone) — edit_attribute tells us
             use whatsapp_rust::types::message::EditAttribute;

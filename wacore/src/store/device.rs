@@ -85,10 +85,12 @@ fn build_base_client_payload(
             app_version: Some(app_version),
             mcc: Some("000".to_string()),
             mnc: Some("000".to_string()),
-            os_version: Some("0.1.0".to_string()),
+            // Match current Chrome on Linux — what real WA Web sends.
+            // WhatsApp flags 0.1.0 / rust as an old/unknown client.
+            os_version: Some("0.1".to_string()),
             manufacturer: Some("".to_string()),
             device: Some("Desktop".to_string()),
-            os_build_number: Some("0.1.0".to_string()),
+            os_build_number: Some("0.1".to_string()),
             locale_language_iso6391: Some("en".to_string()),
             locale_country_iso31661_alpha2: Some("en".to_string()),
             ..Default::default()
@@ -103,15 +105,21 @@ fn build_base_client_payload(
     }
 }
 
+// Device properties identify THIS client to WhatsApp. The os name and
+// version are surfaced in the phone's "Linked Devices" list. WhatsApp
+// flags devices with unknown OS / ancient version as "older version" —
+// so we claim to be a current Chrome-on-Linux desktop client, matching
+// what real WhatsApp Web sends.
 pub static DEVICE_PROPS: Lazy<wa::DeviceProps> = Lazy::new(|| wa::DeviceProps {
-    os: Some("rust".to_string()),
+    os: Some("Linux".to_string()),
     version: Some(wa::device_props::AppVersion {
-        primary: Some(0),
-        secondary: Some(1),
+        // Match a current Chrome version on Linux (what WA Web would send)
+        primary: Some(131),
+        secondary: Some(0),
         tertiary: Some(0),
         ..Default::default()
     }),
-    platform_type: Some(wa::device_props::PlatformType::Unknown as i32),
+    platform_type: Some(wa::device_props::PlatformType::Chrome as i32),
     require_full_sync: Some(true),
     history_sync_config: Some(wa::device_props::HistorySyncConfig {
         full_sync_days_limit: Some(30),
