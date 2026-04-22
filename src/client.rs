@@ -1761,8 +1761,16 @@ impl Client {
 
             // === Passive Tasks (mimics WhatsApp Web's PassiveTaskManager) ===
             // WhatsApp Web executes passive tasks (like PreKey upload) BEFORE sending the active IQ.
+            //
+            // Force pre-key upload on every startup. Non-force skips upload if the
+            // server has enough of our keys, but that leaves the phone with a stale
+            // cached session when this desktop was last paired. When the session
+            // is stale, phone-sent group messages fail with NoSession errors and
+            // retry receipts get ignored (phone thinks its session is still valid).
+            // Forcing fresh keys invalidates the phone's cached session so it
+            // rebuilds + re-sends sender key distribution messages properly.
             check_generation!();
-            if let Err(e) = client_clone.upload_pre_keys(false).await {
+            if let Err(e) = client_clone.upload_pre_keys(true).await {
                 warn!("Failed to upload pre-keys during startup: {e:?}");
             }
 
