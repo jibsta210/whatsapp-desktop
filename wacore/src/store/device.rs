@@ -105,29 +105,57 @@ fn build_base_client_payload(
     }
 }
 
-// Device properties identify THIS client to WhatsApp. The os name and
-// version are surfaced in the phone's "Linked Devices" list. WhatsApp
-// flags devices with unknown OS / ancient version as "older version" —
-// so we claim to be a current Chrome-on-Linux desktop client, matching
-// what real WhatsApp Web sends.
-pub static DEVICE_PROPS: Lazy<wa::DeviceProps> = Lazy::new(|| wa::DeviceProps {
-    os: Some("Linux".to_string()),
-    version: Some(wa::device_props::AppVersion {
-        // Match a current Chrome version on Linux (what WA Web would send)
-        primary: Some(131),
-        secondary: Some(0),
-        tertiary: Some(0),
-        ..Default::default()
-    }),
-    platform_type: Some(wa::device_props::PlatformType::Chrome as i32),
-    require_full_sync: Some(true),
-    history_sync_config: Some(wa::device_props::HistorySyncConfig {
-        full_sync_days_limit: Some(30),
-        inline_initial_payload_in_e2_ee_msg: Some(true),
-        storage_quota_mb: Some(10240),
-        ..Default::default()
-    }),
-});
+// Chrome version we claim to be running. Defaults to a recent known-good
+// version (147 as of mid-2026). The higher-level client overrides this at
+// startup by fetching the current stable Chrome release from Google's
+// versionhistory.googleapis.com endpoint — see `whatsapp-rust`'s version
+// module. This keeps us from looking "too old" as Chrome advances.
+pub static CHROME_VERSION_PRIMARY: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(147);
+pub static CHROME_VERSION_SECONDARY: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+pub static CHROME_VERSION_TERTIARY: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(7727);
+
+pub fn set_chrome_version(primary: u32, secondary: u32, tertiary: u32) {
+    use std::sync::atomic::Ordering;
+    CHROME_VERSION_PRIMARY.store(primary, Ordering::Relaxed);
+    CHROME_VERSION_SECONDARY.store(secondary, Ordering::Relaxed);
+    CHROME_VERSION_TERTIARY.store(tertiary, Ordering::Relaxed);
+}
+
+/// Device properties identify THIS client to WhatsApp. The os name and
+/// version are surfaced in the phone's "Linked Devices" list. WhatsApp
+/// flags devices with unknown OS / ancient version as "older version" —
+/// so we claim to be a current Chrome-on-Linux desktop client, matching
+/// what real WhatsApp Web sends.
+///
+/// Rebuilt on every call so it picks up the latest Chrome version set by
+/// the HTTP-layer version fetcher.
+pub fn device_props() -> wa::DeviceProps {
+    use std::sync::atomic::Ordering;
+    wa::DeviceProps {
+        os: Some("Linux".to_string()),
+        version: Some(wa::device_props::AppVersion {
+            primary: Some(CHROME_VERSION_PRIMARY.load(Ordering::Relaxed)),
+            secondary: Some(CHROME_VERSION_SECONDARY.load(Ordering::Relaxed)),
+            tertiary: Some(CHROME_VERSION_TERTIARY.load(Ordering::Relaxed)),
+            ..Default::default()
+        }),
+        platform_type: Some(wa::device_props::PlatformType::Chrome as i32),
+        require_full_sync: Some(true),
+        history_sync_config: Some(wa::device_props::HistorySyncConfig {
+            full_sync_days_limit: Some(30),
+            inline_initial_payload_in_e2_ee_msg: Some(true),
+            storage_quota_mb: Some(10240),
+            ..Default::default()
+        }),
+    }
+}
+
+/// Kept for backwards compatibility — callers that referenced DEVICE_PROPS
+/// now get a freshly-built DeviceProps with the current Chrome version.
+pub static DEVICE_PROPS: Lazy<wa::DeviceProps> = Lazy::new(device_props);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Device {
@@ -213,7 +241,7 @@ impl Device {
             app_version_secondary: 3000,
             app_version_tertiary: 1031424117,
             app_version_last_fetched_ms: 0,
-            device_props: DEVICE_PROPS.clone(),
+            device_props: device_props(),
             edge_routing_info: None,
             props_hash: None,
             next_pre_key_id: 1,

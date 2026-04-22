@@ -928,6 +928,14 @@ impl Client {
                 self.override_version,
             ),
         );
+        // Also refresh Chrome version used by DEVICE_PROPS. Runs in
+        // parallel with the other fetches; failure is non-fatal (we
+        // fall back to the compiled default in wacore).
+        let chrome_future = rt_timeout(
+            &*self.runtime,
+            TRANSPORT_CONNECT_TIMEOUT,
+            crate::version::refresh_chrome_version(&self.http_client),
+        );
         let transport_future = rt_timeout(
             &*self.runtime,
             TRANSPORT_CONNECT_TIMEOUT,
@@ -935,7 +943,12 @@ impl Client {
         );
 
         debug!("Connecting WebSocket and fetching latest client version in parallel...");
-        let (version_result, transport_result) = futures::join!(version_future, transport_future);
+        let (version_result, chrome_result, transport_result) =
+            futures::join!(version_future, chrome_future, transport_future);
+        // Chrome version is best-effort; log but don't fail on timeout
+        if chrome_result.is_err() {
+            log::warn!("Chrome version fetch timed out — using compiled default");
+        }
 
         version_result
             .map_err(|_| anyhow!("Version fetch timed out after {TRANSPORT_CONNECT_TIMEOUT:?}"))?

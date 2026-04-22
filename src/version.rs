@@ -8,6 +8,59 @@ use std::sync::Arc;
 pub use wacore::version::parse_sw_js;
 
 const SW_URL: &str = "https://web.whatsapp.com/sw.js";
+const CHROME_VERSION_URL: &str =
+    "https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/stable/versions?pageSize=1";
+
+/// Fetch the current stable Chrome version for Linux from Google's
+/// versionhistory API. Returns (primary, secondary, tertiary).
+/// On failure, falls back to the compiled-in default (via wacore).
+pub async fn fetch_latest_chrome_version(
+    http_client: &Arc<dyn HttpClient>,
+) -> Result<(u32, u32, u32)> {
+    let request = HttpRequest::get(CHROME_VERSION_URL);
+    let response = http_client
+        .execute(request)
+        .await
+        .map_err(|e| anyhow!("Chrome version fetch failed: {}", e))?;
+
+    let body = response
+        .body_string()
+        .map_err(|e| anyhow!("Chrome version body decode failed: {}", e))?;
+
+    // Minimal parse — look for "version": "147.0.7727.101"
+    let version_str = body
+        .split("\"version\":")
+        .nth(1)
+        .and_then(|s| s.split('"').nth(1))
+        .ok_or_else(|| anyhow!("Chrome version not found in response"))?;
+
+    let mut parts = version_str.split('.');
+    let primary: u32 = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing primary"))?
+        .parse()?;
+    let secondary: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let tertiary: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    Ok((primary, secondary, tertiary))
+}
+
+/// Fetch and apply the latest Chrome version to the shared atomic statics
+/// in wacore. Called at startup — a failure just keeps the compiled-in
+/// fallback. Never errors out the caller.
+pub async fn refresh_chrome_version(http_client: &Arc<dyn HttpClient>) {
+    match fetch_latest_chrome_version(http_client).await {
+        Ok((p, s, t)) => {
+            log::info!("Fetched current Chrome version: {}.{}.{}", p, s, t);
+            wacore::store::device::set_chrome_version(p, s, t);
+        }
+        Err(e) => {
+            log::warn!(
+                "Failed to fetch Chrome version ({}), using compiled default",
+                e
+            );
+        }
+    }
+}
 
 pub async fn fetch_latest_app_version(
     http_client: &Arc<dyn HttpClient>,
