@@ -1203,7 +1203,25 @@ impl Client {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
         let own_jid = device_snapshot.pn.clone().unwrap_or_default();
         let own_lid = device_snapshot.lid.clone();
-        wacore::messages::parse_message_info(node, &own_jid, own_lid.as_ref())
+        let info = wacore::messages::parse_message_info(node, &own_jid, own_lid.as_ref())?;
+        // Diagnostic: log when a DM (non-group) from_me=false message arrives
+        // whose sender user-part matches our own JID — that's the bug pattern
+        // where phone-sent self-echoes are classified as from the other party.
+        if !info.source.is_group && !info.source.is_from_me {
+            let sender_user = info.source.sender.user.clone();
+            if sender_user == own_jid.user
+                || own_lid.as_ref().map(|l| l.user.clone()).unwrap_or_default() == sender_user
+            {
+                log::warn!(
+                    "SELF-ECHO MISCLASSIFIED: sender={} own_jid={} own_lid={:?} — \
+                     is_from_me should be true but is false",
+                    info.source.sender,
+                    own_jid,
+                    own_lid
+                );
+            }
+        }
+        Ok(info)
     }
 
     pub(crate) async fn handle_app_state_sync_key_share(
