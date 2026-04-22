@@ -25,13 +25,57 @@ pub enum PickerResult {
 /// `multi_select` — allow multiple selections with checkboxes
 /// `parent` — parent window for modality
 /// `callback` — called with selected chat IDs when user confirms
+/// Resolve the best display name for each chat by applying the same lookup
+/// chain as the main sidebar (contact_names → lid_to_phone → phone_to_lid).
+/// Without this, the picker shows raw masked phone numbers like '+1......53'
+/// while the sidebar shows the real contact name.
+fn resolve_chat_names(chats: Vec<ChatSummary>) -> Vec<ChatSummary> {
+    let contact_names = crate::ui::runtime::load_contact_names();
+    let lid_to_phone = crate::ui::runtime::load_lid_phone_map();
+    // Build reverse map: phone → lid
+    let phone_to_lid: std::collections::HashMap<String, String> = lid_to_phone
+        .iter()
+        .map(|(lid, phone)| (phone.clone(), lid.clone()))
+        .collect();
+
+    chats
+        .into_iter()
+        .map(|mut c| {
+            // 1. Direct contact_names lookup
+            if let Some(name) = contact_names.get(&c.id).cloned() {
+                c.name = name;
+                return c;
+            }
+            // 2. If chat_id is phone JID, reverse-look up LID and try
+            if c.id.ends_with("@s.whatsapp.net") {
+                if let Some(lid) = phone_to_lid.get(&c.id) {
+                    if let Some(name) = contact_names.get(lid).cloned() {
+                        c.name = name;
+                        return c;
+                    }
+                }
+            }
+            // 3. If chat_id is LID, resolve to phone and look up
+            if c.id.ends_with("@lid") {
+                if let Some(phone) = lid_to_phone.get(&c.id) {
+                    if let Some(name) = contact_names.get(phone).cloned() {
+                        c.name = name;
+                        return c;
+                    }
+                }
+            }
+            c
+        })
+        .collect()
+}
+
 pub fn show_chat_picker(
     title: &str,
     multi_select: bool,
     parent: Option<&gtk4::Window>,
     callback: impl Fn(Vec<String>) + 'static,
 ) {
-    let chats = crate::ui::runtime::load_chats();
+    let chats = resolve_chat_names(crate::ui::runtime::load_chats());
     if chats.is_empty() {
         return;
     }
@@ -45,7 +89,7 @@ pub fn show_chat_picker_preselected(
     pre_selected: &[String],
     callback: impl Fn(Vec<String>) + 'static,
 ) {
-    let chats = crate::ui::runtime::load_chats();
+    let chats = resolve_chat_names(crate::ui::runtime::load_chats());
     if chats.is_empty() {
         return;
     }
