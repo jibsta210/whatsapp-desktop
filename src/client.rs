@@ -917,16 +917,38 @@ impl Client {
             }
 
             let error_count = self.auto_reconnect_errors.fetch_add(1, Ordering::SeqCst);
-            // WA Web: Fibonacci backoff with 10% jitter, max 900s.
-            // algo: { type: "fibonacci", first: 1000, second: 1000 }
-            // jitter: 0.1, max: 9e5
+            // Fibonacci backoff with 10% jitter, capped at 60s (see fibonacci_backoff).
             let delay = fibonacci_backoff(error_count);
             info!(
-                "Will attempt to reconnect in {:?} (attempt {})",
+                "Will attempt to reconnect in {:?} (attempt {}). Probing network every 5s.",
                 delay,
                 error_count + 1
             );
-            self.runtime.sleep(delay).await;
+            // Interruptible sleep: every 5s, probe if the internet is back
+            // (DNS lookup for web.whatsapp.com). If the probe succeeds before
+            // the backoff elapses, wake early and try to reconnect. Without
+            // this, a laptop coming back online could wait up to ~60s.
+            let probe_interval = Duration::from_secs(5);
+            let start = std::time::Instant::now();
+            while start.elapsed() < delay {
+                let remaining = delay.saturating_sub(start.elapsed());
+                let chunk = probe_interval.min(remaining);
+                self.runtime.sleep(chunk).await;
+                if start.elapsed() >= delay {
+                    break;
+                }
+                // Best-effort DNS probe. If it resolves, we likely have net.
+                let probe_ok = tokio::task::spawn_blocking(|| {
+                    use std::net::ToSocketAddrs;
+                    "web.whatsapp.com:443".to_socket_addrs().is_ok()
+                })
+                .await
+                .unwrap_or(false);
+                if probe_ok {
+                    info!("Network probe succeeded — waking reconnect loop early");
+                    break;
+                }
+            }
         }
         info!("Client run loop has shut down.");
     }
@@ -3475,7 +3497,11 @@ fn is_encrypt_identity_notification(node: &Node) -> bool {
 /// Sequence: 1s, 1s, 2s, 3s, 5s, 8s, 13s, 21s, 34s, 55s, 89s, 144s, ... capped at 900s.
 /// Each value gets ±10% random jitter.
 fn fibonacci_backoff(attempt: u32) -> Duration {
-    const MAX_MS: u64 = 900_000; // WA Web: 9e5
+    // Capped at 60s so a laptop coming back from an offline window
+    // reconnects within ~1 minute instead of waiting up to 15 minutes.
+    // WA Web uses 15min for bots/servers; for desktop clients we want
+    // fast recovery when the user brings the machine back online.
+    const MAX_MS: u64 = 60_000;
 
     let mut a: u64 = 1000;
     let mut b: u64 = 1000;
