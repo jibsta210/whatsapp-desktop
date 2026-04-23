@@ -1216,23 +1216,115 @@ impl ChatViewPanel {
                 if key == gtk4::gdk::Key::v
                     && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
                 {
-                    let clipboard = gtk4::gdk::Display::default().unwrap().clipboard();
+                    log::info!("Paste handler: Ctrl+V detected, checking clipboard");
+                    let Some(display) = gtk4::gdk::Display::default() else {
+                        log::warn!("Paste: no default display");
+                        return gtk4::glib::Propagation::Proceed;
+                    };
+                    let clipboard = display.clipboard();
                     let inner_cc = inner_c.clone();
+                    // Primary path: read as GDK texture. Works for images
+                    // copied from most apps on X11 and Wayland.
                     clipboard.read_texture_async(None::<&gtk4::gio::Cancellable>, move |result| {
-                        if let Ok(Some(texture)) = result {
-                            let tmp_path = format!(
-                                "/tmp/wa_paste_{}.png",
-                                std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis()
-                            );
-                            if texture.save_to_png(&tmp_path).is_ok() {
-                                // Show preview instead of auto-sending
-                                inner_cc.image_preview_pic.set_paintable(Some(&texture));
-                                *inner_cc.pending_image_path.borrow_mut() = Some(tmp_path);
-                                inner_cc.image_preview_bar.set_visible(true);
-                                inner_cc.input_view.grab_focus();
+                        match result {
+                            Ok(Some(texture)) => {
+                                log::info!("Paste: got texture from clipboard");
+                                let tmp_path = format!(
+                                    "/tmp/wa_paste_{}.png",
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                );
+                                match texture.save_to_png(&tmp_path) {
+                                    Ok(_) => {
+                                        inner_cc.image_preview_pic.set_paintable(Some(&texture));
+                                        *inner_cc.pending_image_path.borrow_mut() =
+                                            Some(tmp_path);
+                                        inner_cc.image_preview_bar.set_visible(true);
+                                        inner_cc.input_view.grab_focus();
+                                    }
+                                    Err(e) => log::warn!("Paste: save_to_png failed: {e}"),
+                                }
+                            }
+                            Ok(None) => {
+                                log::info!("Paste: no texture on clipboard (likely text paste)");
+                            }
+                            Err(e) => {
+                                // Common when clipboard has image in MIME type GDK
+                                // can't decode directly (e.g. image/jpeg on some
+                                // Wayland compositors). Try reading raw bytes.
+                                log::info!(
+                                    "Paste: read_texture_async failed ({e}), trying raw bytes fallback"
+                                );
+                                let display_fb = gtk4::gdk::Display::default();
+                                if let Some(d) = display_fb {
+                                    let cb = d.clipboard();
+                                    let inner_fb = inner_cc.clone();
+                                    cb.read_async(
+                                        &["image/png", "image/jpeg", "image/webp", "image/gif"],
+                                        gtk4::glib::Priority::DEFAULT,
+                                        None::<&gtk4::gio::Cancellable>,
+                                        move |res| {
+                                            let Ok((stream, mime)) = res else {
+                                                log::warn!("Paste fallback: no image MIME on clipboard");
+                                                return;
+                                            };
+                                            log::info!("Paste fallback: got {mime} stream");
+                                            use gtk4::gio::prelude::*;
+                                            let ext = mime.split('/').nth(1).unwrap_or("png");
+                                            let tmp_path = format!(
+                                                "/tmp/wa_paste_{}.{}",
+                                                std::time::SystemTime::now()
+                                                    .duration_since(std::time::UNIX_EPOCH)
+                                                    .unwrap_or_default()
+                                                    .as_millis(),
+                                                ext
+                                            );
+                                            let path_for_close = tmp_path.clone();
+                                            let inner_done = inner_fb.clone();
+                                            stream.read_bytes_async(
+                                                10 * 1024 * 1024, // 10MB cap
+                                                gtk4::glib::Priority::DEFAULT,
+                                                None::<&gtk4::gio::Cancellable>,
+                                                move |read_res| {
+                                                    match read_res {
+                                                        Ok(bytes) => {
+                                                            if let Err(e) =
+                                                                std::fs::write(&path_for_close, &bytes)
+                                                            {
+                                                                log::warn!(
+                                                                    "Paste fallback: write failed: {e}"
+                                                                );
+                                                                return;
+                                                            }
+                                                            if let Ok(tex) =
+                                                                gtk4::gdk::Texture::from_filename(
+                                                                    &path_for_close,
+                                                                )
+                                                            {
+                                                                inner_done
+                                                                    .image_preview_pic
+                                                                    .set_paintable(Some(&tex));
+                                                            }
+                                                            *inner_done
+                                                                .pending_image_path
+                                                                .borrow_mut() =
+                                                                Some(path_for_close);
+                                                            inner_done
+                                                                .image_preview_bar
+                                                                .set_visible(true);
+                                                            inner_done.input_view.grab_focus();
+                                                        }
+                                                        Err(e) => log::warn!(
+                                                            "Paste fallback: read_bytes failed: {e}"
+                                                        ),
+                                                    }
+                                                },
+                                            );
+                                        },
+                                    );
+                                }
                             }
                         }
                     });
