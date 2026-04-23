@@ -78,6 +78,16 @@ pub mod key_pair_serde {
 fn build_base_client_payload(
     app_version: wa::client_payload::user_agent::AppVersion,
 ) -> wa::ClientPayload {
+    use std::sync::atomic::Ordering;
+    // Build Chrome version string from the atomics updated by refresh_chrome_version()
+    // (e.g. "147.0.7727.101"). This gets sent as os_version / os_build_number on
+    // every login — WhatsApp checks these to decide if the client is outdated.
+    let chrome_version = format!(
+        "{}.{}.{}",
+        CHROME_VERSION_PRIMARY.load(Ordering::Relaxed),
+        CHROME_VERSION_SECONDARY.load(Ordering::Relaxed),
+        CHROME_VERSION_TERTIARY.load(Ordering::Relaxed),
+    );
     wa::ClientPayload {
         user_agent: Some(wa::client_payload::UserAgent {
             platform: Some(wa::client_payload::user_agent::Platform::Web as i32),
@@ -85,12 +95,10 @@ fn build_base_client_payload(
             app_version: Some(app_version),
             mcc: Some("000".to_string()),
             mnc: Some("000".to_string()),
-            // Match current Chrome on Linux — what real WA Web sends.
-            // WhatsApp flags 0.1.0 / rust as an old/unknown client.
-            os_version: Some("0.1".to_string()),
-            manufacturer: Some("".to_string()),
+            os_version: Some(chrome_version.clone()),
+            manufacturer: Some("Google".to_string()),
             device: Some("Desktop".to_string()),
-            os_build_number: Some("0.1".to_string()),
+            os_build_number: Some(chrome_version),
             locale_language_iso6391: Some("en".to_string()),
             locale_country_iso31661_alpha2: Some("en".to_string()),
             ..Default::default()

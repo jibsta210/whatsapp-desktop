@@ -479,12 +479,49 @@ impl Client {
     }
 
     /// Dispatch the Connected event and notify waiters.
-    fn dispatch_connected(&self) {
+    fn dispatch_connected(self: &Arc<Self>) {
         self.is_ready.store(true, Ordering::Relaxed);
         self.core
             .event_bus
             .dispatch(&Event::Connected(crate::types::events::Connected));
         self.connected_notifier.notify(usize::MAX);
+        // Start periodic refresh of WhatsApp Web + Chrome versions.
+        // Runs only once per client lifetime — protected by a once flag.
+        self.start_version_refresh_loop();
+    }
+
+    /// Spawn a background task that periodically refreshes the cached
+    /// WhatsApp Web client_revision and the Chrome version used in
+    /// DEVICE_PROPS/user_agent. Real WhatsApp Web refreshes while running,
+    /// and if we don't, long-running desktop sessions eventually hit the
+    /// "older version" warning. Runs every 2 hours; best-effort.
+    fn start_version_refresh_loop(self: &Arc<Self>) {
+        static STARTED: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        if STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let client = self.clone();
+        self.runtime.spawn(Box::pin(async move {
+            const REFRESH_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(2 * 60 * 60); // 2 hours
+            loop {
+                client.runtime.sleep(REFRESH_INTERVAL).await;
+                log::info!("Periodic version refresh: fetching WA Web + Chrome versions");
+                // WA Web version (client_revision) — writes to device store
+                if let Err(e) = crate::version::resolve_and_update_version(
+                    &client.persistence_manager,
+                    &client.http_client,
+                    client.override_version,
+                )
+                .await
+                {
+                    log::warn!("Periodic WA version refresh failed: {e:#}");
+                }
+                // Chrome version — writes to wacore atomics, affects next login payload
+                crate::version::refresh_chrome_version(&client.http_client).await;
+            }
+        })).detach();
     }
 
     /// Enable or disable skipping of history sync notifications at runtime.
