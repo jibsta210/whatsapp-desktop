@@ -904,13 +904,15 @@ async fn run_inner(
     // One-time migration: force re-sync of app-state 'regular' collections to
     // pick up contact-name mutations (both ContactAction and LidContactAction).
     // Marker version bumped whenever we change contact handling so the re-sync
-    // runs again with the new code. Current version: v3 (poison purge + validation).
+    // runs again with the new code. Current version: v4 (wider name propagation —
+    // stores under LID, phone, AND device-suffix-stripped base JIDs).
     {
-        let marker = std::path::PathBuf::from(".contact_resync_v3");
-        // Clean up old marker from v2 so we don't accumulate cruft
+        let marker = std::path::PathBuf::from(".contact_resync_v4");
+        // Clean up old markers to avoid cruft
         let _ = std::fs::remove_file(".contact_resync_v2");
+        let _ = std::fs::remove_file(".contact_resync_v3");
         if !marker.exists() {
-            log::info!("Running one-time contact re-sync migration (v3)");
+            log::info!("Running one-time contact re-sync migration (v4)");
             let device_id = backend.device_id();
             for name in &["regular_low", "regular_high", "regular"] {
                 if let Err(e) = backend
@@ -925,7 +927,7 @@ async fn run_inner(
                 }
             }
             log::info!("Reset app_state_versions for regular collections — next connect will pull all contact names from phone");
-            let _ = std::fs::write(&marker, "v3");
+            let _ = std::fs::write(&marker, "v4");
         }
     }
     let transport_factory = TokioWebSocketTransportFactory::new();
@@ -2738,27 +2740,59 @@ async fn handle_wa_event(
 
             log::debug!("ContactUpdate: lid={lid_jid} phone={phone_jid} name={name}");
 
-            let phone_opt = if phone_jid.is_empty() {
-                None
-            } else {
-                Some(phone_jid.as_str())
-            };
-            let names_snapshot = {
+            // Store the phonebook name under ALL known JID variants so
+            // lookups succeed whether the chat is keyed by LID, phone, or
+            // any device-suffix variant. This OVERWRITES existing entries
+            // (including push_names we captured from messages) because the
+            // phonebook name from the user's contacts should always win.
+            let (names_snapshot, resolved_phone) = {
                 let mut s = state.lock().unwrap();
-                s.record_contact_name(&lid_jid, &name, phone_opt);
-                // Store the LID→phone mapping for sender name resolution
-                if lid_jid.ends_with("@lid") && !phone_jid.is_empty() {
-                    s.insert_lid_phone(lid_jid.clone(), phone_jid.clone());
+                // 1. Primary LID
+                s.record_contact_name(&lid_jid, &name, None);
+                // 2. Explicit phone JID from ContactAction
+                let mut phone = phone_jid.clone();
+                if !phone.is_empty() {
+                    s.record_contact_name(&phone, &name, None);
+                    if lid_jid.ends_with("@lid") {
+                        s.insert_lid_phone(lid_jid.clone(), phone.clone());
+                    }
                 }
-                s.contact_names.clone()
+                // 3. Phone derived from lid_to_phone mapping (for LidContactAction
+                //    which has no pn_jid field — previously we stored only under
+                //    LID, leaving phone-JID chats unresolved)
+                if phone.is_empty() && lid_jid.ends_with("@lid") {
+                    if let Some(mapped) = s.lid_to_phone.get(&lid_jid).cloned() {
+                        s.record_contact_name(&mapped, &name, None);
+                        phone = mapped;
+                    }
+                }
+                // 4. Also strip :device suffix and store under non-AD variants
+                //    (app-state JIDs sometimes carry device, chat JIDs often don't)
+                let strip_dev = |j: &str| -> String {
+                    match (j.find(':'), j.find('@')) {
+                        (Some(c), Some(a)) if c < a => format!("{}{}", &j[..c], &j[a..]),
+                        _ => j.to_string(),
+                    }
+                };
+                let lid_base = strip_dev(&lid_jid);
+                if lid_base != lid_jid {
+                    s.record_contact_name(&lid_base, &name, None);
+                }
+                if !phone.is_empty() {
+                    let phone_base = strip_dev(&phone);
+                    if phone_base != phone {
+                        s.record_contact_name(&phone_base, &name, None);
+                    }
+                }
+                (s.contact_names.clone(), phone)
             };
             tokio::task::spawn_blocking(move || save_contact_names(&names_snapshot));
 
             // Notify the UI — use the phone JID if available (more likely to match a chat row)
-            let chat_id = if phone_jid.is_empty() {
+            let chat_id = if resolved_phone.is_empty() {
                 lid_jid
             } else {
-                phone_jid
+                resolved_phone
             };
             WaEvent::ChatNameUpdated { chat_id, name }
         }
