@@ -307,6 +307,13 @@ pub enum WaCommand {
     MarkRead {
         chat_id: String,
     },
+    /// Toggle "auto-mark read on receive" for a chat (local-only flag,
+    /// not synced to phone). When enabled, incoming messages trigger
+    /// MarkRead automatically so the chat stays visually read.
+    SetAutoMarkRead {
+        chat_id: String,
+        enabled: bool,
+    },
     Logout,
     /// Set own profile picture from a file path
     SetProfilePicture { path: String },
@@ -560,6 +567,11 @@ pub struct ChatSummary {
     /// ID of the pinned message in this chat (if any)
     #[serde(default)]
     pub pinned_msg_id: Option<String>,
+    /// Auto-mark received messages as read (per-chat, usually for groups).
+    /// When true, every incoming MessageReceived fires a MarkRead cmd so
+    /// the chat is never unread on desktop — useful for noisy groups.
+    #[serde(default)]
+    pub auto_mark_read: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -4559,6 +4559,66 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
     counter.set_halign(Align::Center);
     counter.set_margin_start(48); // balance the close button
 
+    // Save button — copies the currently-displayed media file to ~/Downloads
+    // (or user-chosen path via FileChooserDialog). Positioned before Close.
+    let save_btn = Button::from_icon_name("document-save-symbolic");
+    save_btn.add_css_class("flat");
+    save_btn.set_tooltip_text(Some("Save to disk"));
+    {
+        let items_ref = items.clone();
+        let car = carousel.clone();
+        let win_ref = window.clone();
+        save_btn.connect_clicked(move |_| {
+            let idx = car.position().round() as usize;
+            let Some((_, src_path)) = items_ref.get(idx).cloned() else {
+                return;
+            };
+            let src = std::path::PathBuf::from(&src_path);
+            let default_name = src
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("download")
+                .to_string();
+            // Strip the 8-char msg-id prefix that downloader prepends (e.g.
+            // "AB12CD34_image.jpg" → "image.jpg") so the user sees a clean name.
+            let clean_name = default_name
+                .splitn(2, '_')
+                .nth(1)
+                .unwrap_or(&default_name)
+                .to_string();
+            let dialog = gtk4::FileChooserDialog::new(
+                Some("Save media"),
+                Some(&win_ref),
+                gtk4::FileChooserAction::Save,
+                &[
+                    ("Cancel", gtk4::ResponseType::Cancel),
+                    ("Save", gtk4::ResponseType::Accept),
+                ],
+            );
+            dialog.set_current_name(&clean_name);
+            if let Some(home) = std::env::var_os("HOME") {
+                let downloads = std::path::PathBuf::from(&home).join("Downloads");
+                if downloads.exists() {
+                    let _ = dialog.set_current_folder(Some(&gtk4::gio::File::for_path(&downloads)));
+                }
+            }
+            let src_owned = src.clone();
+            dialog.connect_response(move |d, resp| {
+                if resp == gtk4::ResponseType::Accept {
+                    if let Some(target) = d.file().and_then(|f| f.path()) {
+                        if let Err(e) = std::fs::copy(&src_owned, &target) {
+                            log::warn!("Save media failed: {e}");
+                        } else {
+                            log::info!("Saved media to {}", target.display());
+                        }
+                    }
+                }
+                d.close();
+            });
+            dialog.show();
+        });
+    }
+
     let close_btn = Button::from_icon_name("window-close-symbolic");
     close_btn.add_css_class("flat");
     close_btn.set_halign(Align::End);
@@ -4566,6 +4626,7 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
     close_btn.connect_clicked(move |_| win_clone.close());
 
     top_bar.append(&counter);
+    top_bar.append(&save_btn);
     top_bar.append(&close_btn);
     overlay.add_overlay(&top_bar);
 

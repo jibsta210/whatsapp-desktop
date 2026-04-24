@@ -780,8 +780,9 @@ impl MainWindow {
                 inner
                     .chat_list
                     .update_last_message(&msg.chat_id, &msg, current_chat.as_deref());
-                // If viewing this chat: mark as read
-                if is_current_chat && !msg.is_from_me {
+                // If viewing this chat OR chat has auto-mark-read enabled, mark as read.
+                let auto_mark = inner.chat_list.is_auto_mark_read(&msg.chat_id);
+                if (is_current_chat || auto_mark) && !msg.is_from_me {
                     inner
                         .bridge
                         .send_command(crate::bridge::WaCommand::MarkRead {

@@ -357,6 +357,49 @@ fn migrate_json_to_bincode() {
 /// `14155551234@s.whatsapp.net` → `+14155551234`
 /// `12345.6789@lid` → `+12345` (LID — not a real phone, but better than raw JID)
 /// Groups and anything else → returned as-is.
+/// Map a file extension to a proper MIME type. Used when sending
+/// documents — WhatsApp receivers store files with `application/octet-stream`
+/// as `.bin`, losing the original extension. Returning the correct MIME
+/// preserves the file's true type (pdf stays pdf, xlsx stays xlsx, etc.).
+fn mime_from_extension(lower_path: &str) -> String {
+    let ext = lower_path.rsplit('.').next().unwrap_or("");
+    let mime = match ext {
+        "pdf" => "application/pdf",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "odt" => "application/vnd.oasis.opendocument.text",
+        "ods" => "application/vnd.oasis.opendocument.spreadsheet",
+        "odp" => "application/vnd.oasis.opendocument.presentation",
+        "rtf" => "application/rtf",
+        "txt" => "text/plain",
+        "csv" => "text/csv",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "html" | "htm" => "text/html",
+        "zip" => "application/zip",
+        "rar" => "application/vnd.rar",
+        "7z" => "application/x-7z-compressed",
+        "tar" => "application/x-tar",
+        "gz" => "application/gzip",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "ogg" => "audio/ogg",
+        "m4a" => "audio/mp4",
+        "apk" => "application/vnd.android.package-archive",
+        "exe" | "msi" => "application/x-msdownload",
+        "dmg" => "application/x-apple-diskimage",
+        "deb" => "application/vnd.debian.binary-package",
+        "rpm" => "application/x-rpm",
+        _ => "application/octet-stream",
+    };
+    mime.to_string()
+}
+
 pub fn display_name_from_jid(jid: &str) -> String {
     if let Some(user) = jid.strip_suffix("@s.whatsapp.net") {
         // Strip device suffix (e.g., "12345:5" → "12345")
@@ -2597,6 +2640,7 @@ async fn handle_wa_event(
                     is_favorite: false,
                     label: None,
                     pinned_msg_id: None,
+                auto_mark_read: false,
                 };
 
                 persist_chat(state, summary);
@@ -3169,6 +3213,7 @@ fn persist_new_message(
         is_favorite: existing_is_favorite,
         label: existing_label,
         pinned_msg_id: None,
+                auto_mark_read: false,
     };
     persist_chat(state, summary);
 
@@ -4129,6 +4174,25 @@ async fn handle_command(
             }
         }
 
+        WaCommand::SetAutoMarkRead { chat_id, enabled } => {
+            let save_tx;
+            let chats_snapshot;
+            {
+                let mut s = state.lock().unwrap();
+                if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
+                    c.auto_mark_read = enabled;
+                }
+                save_tx = s.save_tx.clone();
+                chats_snapshot = s.chats.clone();
+            }
+            let _ = save_tx.send(chats_snapshot);
+            // If enabling, mark now so the chat transitions immediately.
+            if enabled {
+                let jid: Jid = chat_id.parse()?;
+                let _ = client.chat_actions().mark_chat_as_read(&jid, true, None).await;
+            }
+        }
+
         WaCommand::ArchiveChat { chat_id, archived } => {
             let jid: Jid = chat_id.parse()?;
             if archived {
@@ -4794,6 +4858,7 @@ async fn handle_command(
                         is_favorite: false,
                         label: None,
                         pinned_msg_id: None,
+                auto_mark_read: false,
                     };
                     persist_chat(state, summary.clone());
                     let _ = tx.send(WaEvent::ChatAdded(summary)).await;
@@ -5146,6 +5211,7 @@ async fn handle_command(
                                 is_favorite: false,
                                 label: None,
                                 pinned_msg_id: None,
+                auto_mark_read: false,
                             })
                         })
                         .collect()
@@ -5369,6 +5435,7 @@ async fn handle_command(
                     is_favorite: false,
                     label: None,
                     pinned_msg_id: None,
+                auto_mark_read: false,
                 };
                 persist_chat(state, summary.clone());
                 let _ = tx.send(WaEvent::ChatAdded(summary)).await;
@@ -5434,16 +5501,19 @@ async fn handle_command(
                 || lower_path.ends_with(".mov")
                 || lower_path.ends_with(".avi");
 
-            let (upload_type, mime) = if is_image {
-                (wacore::download::MediaType::Image, "image/jpeg")
+            let (upload_type, mime_owned) = if is_image {
+                (wacore::download::MediaType::Image, "image/jpeg".to_string())
             } else if is_video {
-                (wacore::download::MediaType::Video, "video/mp4")
+                (wacore::download::MediaType::Video, "video/mp4".to_string())
             } else {
+                // Detect MIME from extension — sending application/octet-stream
+                // for everything made receivers see all files as .bin.
                 (
                     wacore::download::MediaType::Document,
-                    "application/octet-stream",
+                    mime_from_extension(&lower_path),
                 )
             };
+            let mime = mime_owned.as_str();
 
             let filename = std::path::Path::new(&path)
                 .file_name()
@@ -7038,6 +7108,7 @@ async fn merge_lid_chats(
                 is_favorite: lid_chat.is_favorite,
                 label: lid_chat.label.clone(),
                 pinned_msg_id: lid_chat.pinned_msg_id.clone(),
+                auto_mark_read: lid_chat.auto_mark_read,
             };
             // Remove @lid entry, upsert @s.whatsapp.net — all within the same lock
             s.chats.retain(|c| c.id != lid_chat.id);

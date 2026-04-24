@@ -526,6 +526,7 @@ impl ChatListPanel {
                 is_favorite: false,
                 label: None,
                 pinned_msg_id: None,
+                auto_mark_read: false,
             });
         }
         let rows = self.inner.rows.borrow();
@@ -791,6 +792,25 @@ impl ChatListPanel {
         if let Some(row) = rows.get(chat_id) {
             row.is_muted.set(muted);
             row.mute_indicator.set_visible(muted);
+        }
+    }
+
+    /// Query whether the given chat is configured to auto-mark-read on incoming messages.
+    pub fn is_auto_mark_read(&self, chat_id: &str) -> bool {
+        self.inner
+            .rows
+            .borrow()
+            .get(chat_id)
+            .map(|r| r.auto_mark_read.get())
+            .unwrap_or(false)
+    }
+
+    /// Toggle the auto-mark-read flag for a chat. Caller is responsible for
+    /// sending the WaCommand::SetAutoMarkRead to persist server-side.
+    pub fn set_auto_mark_read(&self, chat_id: &str, enabled: bool) {
+        let rows = self.inner.rows.borrow();
+        if let Some(row) = rows.get(chat_id) {
+            row.auto_mark_read.set(enabled);
         }
     }
 
@@ -1105,6 +1125,7 @@ fn attach_context_menu(row: &ChatRow, inner: &Rc<ChatListInner>, chat_id: String
     let is_muted = row.is_muted.clone();
     let is_pinned = row.is_pinned.clone();
     let is_favorite = row.is_favorite.clone();
+    let auto_mark_read = row.auto_mark_read.clone();
     let row_widget = row.gtk_row.clone();
     let bridge = inner.bridge.clone();
 
@@ -1117,6 +1138,7 @@ fn attach_context_menu(row: &ChatRow, inner: &Rc<ChatListInner>, chat_id: String
             is_muted.clone(),
             is_pinned.clone(),
             is_favorite.clone(),
+            auto_mark_read.clone(),
             x,
             y,
         );
@@ -1133,6 +1155,7 @@ fn show_context_menu(
     is_muted: Rc<Cell<bool>>,
     is_pinned: Rc<Cell<bool>>,
     is_favorite: Rc<Cell<bool>>,
+    auto_mark_read: Rc<Cell<bool>>,
     x: f64,
     y: f64,
 ) {
@@ -1245,10 +1268,34 @@ fn show_context_menu(
         });
     }
 
+    // Auto-mark-read toggle — useful for noisy groups
+    let auto_mr_text = if auto_mark_read.get() {
+        "Disable auto-mark read"
+    } else {
+        "Enable auto-mark read"
+    };
+    let btn_auto_mr = menu_item!(auto_mr_text, "");
+    {
+        let bridge = bridge.clone();
+        let chat_id = chat_id.clone();
+        let popover = popover.clone();
+        let auto_mr = auto_mark_read.clone();
+        btn_auto_mr.connect_clicked(move |_| {
+            let new_val = !auto_mr.get();
+            auto_mr.set(new_val);
+            bridge.send_command(WaCommand::SetAutoMarkRead {
+                chat_id: chat_id.clone(),
+                enabled: new_val,
+            });
+            popover.popdown();
+        });
+    }
+
     vbox.append(&btn_archive);
     vbox.append(&btn_mute);
     vbox.append(&btn_pin);
     vbox.append(&btn_label);
+    vbox.append(&btn_auto_mr);
     vbox.append(&Separator::new(Orientation::Horizontal));
 
     // 5. Mark as unread
@@ -1509,6 +1556,7 @@ struct ChatRow {
     is_archived: Rc<Cell<bool>>,
     is_muted: Rc<Cell<bool>>,
     is_favorite: Rc<Cell<bool>>,
+    auto_mark_read: Rc<Cell<bool>>,
     unread_count: Rc<Cell<u32>>,
     name_label: Label,
     preview_label: Label,
@@ -1636,6 +1684,7 @@ impl ChatRow {
             is_archived: Rc::new(Cell::new(chat.is_archived)),
             is_muted: Rc::new(Cell::new(chat.is_muted)),
             is_favorite: Rc::new(Cell::new(chat.is_favorite)),
+            auto_mark_read: Rc::new(Cell::new(chat.auto_mark_read)),
             unread_count: Rc::new(Cell::new(chat.unread_count)),
             name_label,
             preview_label,
