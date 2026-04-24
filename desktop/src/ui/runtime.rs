@@ -103,6 +103,58 @@ pub fn load_chats() -> Vec<ChatSummary> {
     if let Some(chats) = read_bin::<Vec<ChatSummary>>(CHATS_FILE) {
         return chats;
     }
+    // Fallback: try the PREVIOUS schema version (without the auto_mark_read
+    // field). Bincode doesn't respect #[serde(default)] when a field is
+    // missing, so adding a new field to ChatSummary makes old wa_chats.bin
+    // files fail to deserialize. This fallback reads the old format, copies
+    // the data into the new struct with defaults, and re-saves so it loads
+    // cleanly next time.
+    #[derive(serde::Deserialize)]
+    struct LegacyChatSummary {
+        id: String,
+        name: String,
+        last_message: String,
+        timestamp: i64,
+        unread_count: u32,
+        is_group: bool,
+        is_muted: bool,
+        is_pinned: bool,
+        #[serde(default)]
+        is_archived: bool,
+        #[serde(default)]
+        is_favorite: bool,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        pinned_msg_id: Option<String>,
+    }
+    if let Some(legacy) = read_bin::<Vec<LegacyChatSummary>>(CHATS_FILE) {
+        log::info!(
+            "Migrating {} chats from legacy ChatSummary format (no auto_mark_read)",
+            legacy.len()
+        );
+        let migrated: Vec<ChatSummary> = legacy
+            .into_iter()
+            .map(|c| ChatSummary {
+                id: c.id,
+                name: c.name,
+                last_message: c.last_message,
+                timestamp: c.timestamp,
+                unread_count: c.unread_count,
+                is_group: c.is_group,
+                is_muted: c.is_muted,
+                is_pinned: c.is_pinned,
+                is_archived: c.is_archived,
+                is_favorite: c.is_favorite,
+                label: c.label,
+                pinned_msg_id: c.pinned_msg_id,
+                auto_mark_read: false,
+            })
+            .collect();
+        // Re-save in new format so subsequent loads use the fast path
+        write_bin(CHATS_FILE, &migrated);
+        return migrated;
+    }
     // Fallback: try legacy JSON
     let Ok(data) = std::fs::read_to_string(CHATS_FILE_JSON) else {
         return vec![];
