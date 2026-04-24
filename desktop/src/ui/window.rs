@@ -745,7 +745,23 @@ impl MainWindow {
                 if chat.id.ends_with("@s.whatsapp.net") {
                     inner.chat_list.remove_lid_duplicate(&chat.name);
                 }
+                // If this incoming chat is pinned/favourite, the rail needs
+                // to pick it up. A debounced refresh handles bursts of adds
+                // during initial sync without hammering load_chats().
+                let needs_rail_refresh = chat.is_pinned || chat.is_favorite;
                 inner.chat_list.add_chat(chat);
+                if needs_rail_refresh {
+                    let rail = inner.rail_favourites.clone();
+                    let cv = inner.chat_view.clone();
+                    let br = inner.bridge.clone();
+                    glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(800),
+                        move || {
+                            let chats = crate::ui::runtime::load_chats();
+                            populate_rail_favourites(&rail, &chats, &cv, &br);
+                        },
+                    );
+                }
             }
             WaEvent::MessageReceived(msg) => {
                 let current_chat = inner.chat_view.current_chat_id();
