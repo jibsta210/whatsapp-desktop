@@ -460,6 +460,8 @@ impl ChatListPanel {
                 row.is_favorite.set(chat.is_favorite);
                 row.pin_indicator.set_visible(chat.is_pinned);
                 row.mute_indicator.set_visible(chat.is_muted);
+                row.auto_mark_read.set(chat.auto_mark_read);
+                row.auto_mr_indicator.set_visible(chat.auto_mark_read);
                 // Trust the server's unread count directly. The server knows
                 // what's been read on any device. If this wipes a real-time
                 // increment from a MessageReceived that fired during sync,
@@ -811,6 +813,7 @@ impl ChatListPanel {
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             row.auto_mark_read.set(enabled);
+            row.auto_mr_indicator.set_visible(enabled);
         }
     }
 
@@ -1566,6 +1569,7 @@ struct ChatRow {
     avatar: adw::Avatar,
     pin_indicator: Label,
     mute_indicator: Label,
+    auto_mr_indicator: Label,
     label_badge: Label,
 }
 
@@ -1607,6 +1611,13 @@ impl ChatRow {
         mute_indicator.add_css_class("caption");
         mute_indicator.set_visible(chat.is_muted);
 
+        // 👁 = auto-mark-read is enabled for this chat
+        let auto_mr_indicator = Label::new(Some("👁"));
+        auto_mr_indicator.add_css_class("caption");
+        auto_mr_indicator.add_css_class("dim-label");
+        auto_mr_indicator.set_tooltip_text(Some("Auto-mark read on receive"));
+        auto_mr_indicator.set_visible(chat.auto_mark_read);
+
         let time_label = Label::new(Some(&format_timestamp(chat.timestamp)));
         time_label.add_css_class("dim-label");
         time_label.add_css_class("caption");
@@ -1615,6 +1626,7 @@ impl ChatRow {
         top_row.append(&pin_indicator);
         top_row.append(&name_label);
         top_row.append(&mute_indicator);
+        top_row.append(&auto_mr_indicator);
         top_row.append(&time_label);
 
         // Bottom row: preview [label] unread
@@ -1694,6 +1706,7 @@ impl ChatRow {
             avatar,
             pin_indicator,
             mute_indicator,
+            auto_mr_indicator,
             label_badge,
         }
     }
