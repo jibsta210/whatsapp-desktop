@@ -848,6 +848,7 @@ impl RuntimeState {
             let old_favorite = existing.is_favorite;
             let old_label = existing.label.clone();
             let old_pinned_msg = existing.pinned_msg_id.clone();
+            let old_auto_mark_read = existing.auto_mark_read;
 
             if old_pinned != summary.is_pinned {
                 log::info!(
@@ -865,6 +866,7 @@ impl RuntimeState {
             existing.is_muted = old_muted;
             existing.is_archived = old_archived;
             existing.is_favorite = old_favorite;
+            existing.auto_mark_read = old_auto_mark_read;
             if old_label.is_some() {
                 existing.label = old_label;
             }

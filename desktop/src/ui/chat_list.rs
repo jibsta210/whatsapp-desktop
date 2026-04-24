@@ -1129,6 +1129,7 @@ fn attach_context_menu(row: &ChatRow, inner: &Rc<ChatListInner>, chat_id: String
     let is_pinned = row.is_pinned.clone();
     let is_favorite = row.is_favorite.clone();
     let auto_mark_read = row.auto_mark_read.clone();
+    let auto_mr_indicator = row.auto_mr_indicator.clone();
     let row_widget = row.gtk_row.clone();
     let bridge = inner.bridge.clone();
 
@@ -1142,6 +1143,7 @@ fn attach_context_menu(row: &ChatRow, inner: &Rc<ChatListInner>, chat_id: String
             is_pinned.clone(),
             is_favorite.clone(),
             auto_mark_read.clone(),
+            auto_mr_indicator.clone(),
             x,
             y,
         );
@@ -1159,6 +1161,7 @@ fn show_context_menu(
     is_pinned: Rc<Cell<bool>>,
     is_favorite: Rc<Cell<bool>>,
     auto_mark_read: Rc<Cell<bool>>,
+    auto_mr_indicator: Label,
     x: f64,
     y: f64,
 ) {
@@ -1283,9 +1286,13 @@ fn show_context_menu(
         let chat_id = chat_id.clone();
         let popover = popover.clone();
         let auto_mr = auto_mark_read.clone();
+        let indicator = auto_mr_indicator.clone();
         btn_auto_mr.connect_clicked(move |_| {
             let new_val = !auto_mr.get();
             auto_mr.set(new_val);
+            // Toggle the 👁 indicator immediately — the command updates
+            // backing state but doesn't bounce back to this row.
+            indicator.set_visible(new_val);
             bridge.send_command(WaCommand::SetAutoMarkRead {
                 chat_id: chat_id.clone(),
                 enabled: new_val,
