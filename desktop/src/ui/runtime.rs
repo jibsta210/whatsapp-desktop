@@ -920,24 +920,63 @@ impl RuntimeState {
                     }
                 }
 
-                // Priority: contact_names by chat_id → contact_names via LID mapping → c.name
+                // Strip :device suffix to a base form. Chats may be keyed by
+                // any device-suffixed variant (e.g. "12345:5@s.whatsapp.net")
+                // while contact_names keys land on the non-AD form. Without
+                // this fallback, `Francis Lau Hedgefund` stored under the
+                // base JID never matches a chat keyed by a device variant.
+                let strip_dev = |j: &str| -> String {
+                    match (j.find(':'), j.find('@')) {
+                        (Some(c), Some(a)) if c < a => format!("{}{}", &j[..c], &j[a..]),
+                        _ => j.to_string(),
+                    }
+                };
+                let base_id = strip_dev(&c.id);
+
+                // Priority: contact_names by chat_id → device-stripped → LID
+                // reverse lookup → device-stripped LID — then fall through.
                 let name = self
                     .contact_names
                     .get(&c.id)
                     .cloned()
                     .or_else(|| {
+                        if base_id != c.id {
+                            self.contact_names.get(&base_id).cloned()
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
                         // If chat_id is phone JID, use reverse map to find LID
                         if c.id.ends_with("@s.whatsapp.net") {
-                            if let Some(lid) = self.phone_to_lid.get(&c.id) {
-                                if let Some(n) = self.contact_names.get(lid) {
+                            if let Some(lid) = self
+                                .phone_to_lid
+                                .get(&c.id)
+                                .or_else(|| self.phone_to_lid.get(&base_id))
+                            {
+                                let lid_base = strip_dev(lid);
+                                if let Some(n) = self
+                                    .contact_names
+                                    .get(lid)
+                                    .or_else(|| self.contact_names.get(&lid_base))
+                                {
                                     return Some(n.clone());
                                 }
                             }
                         }
                         // If chat_id is LID, resolve to phone and look up
                         if c.id.ends_with("@lid") {
-                            if let Some(phone) = self.lid_to_phone.get(&c.id) {
-                                if let Some(n) = self.contact_names.get(phone) {
+                            if let Some(phone) = self
+                                .lid_to_phone
+                                .get(&c.id)
+                                .or_else(|| self.lid_to_phone.get(&base_id))
+                            {
+                                let phone_base = strip_dev(phone);
+                                if let Some(n) = self
+                                    .contact_names
+                                    .get(phone)
+                                    .or_else(|| self.contact_names.get(&phone_base))
+                                {
                                     return Some(n.clone());
                                 }
                             }
