@@ -879,38 +879,52 @@ impl SqliteStore {
             // First attempt: if address has no inner :device, search for
             // any stored record with the same group + same sender user but
             // any device suffix.
-            let sender_jid = if let Some(idx) = address.find(":") {
-                // Skip first ':' which is the group/sender separator
-                if let Some(group_end) = address[..idx].find('@') {
-                    let _ = group_end; // guarantee we found '@' before ':'
+            // Diagnostic: log every miss so we can see exact address format
+            log::info!("sender_key MISS for address={address:?} dev={device_id}");
+
+            // Address format: "{group_or_chat}:{sender_jid}.{agent}"
+            // For groups: "120363...@g.us:248133...@lid.0" or "120363...@g.us:248133...:94@lid.0"
+            //
+            // Try BOTH directions:
+            // (a) If address has NO inner :device on sender → search for any device variant
+            // (b) If address HAS :device → try without it
+            if let (Some(grp_end), Some(at)) = (address.find(':'), address.rfind('@')) {
+                let group_part = &address[..grp_end + 1]; // "120363...@g.us:"
+                let server_part = &address[at..]; // "@lid.0"
+                let user_part = &address[grp_end + 1..at]; // "248133263056915" or "248133...:94"
+
+                // Strip any inner :device from user_part
+                let bare_user = user_part.split(':').next().unwrap_or(user_part);
+
+                // (a) Search for ANY device suffix on this user under same group
+                let pattern_any_dev = format!("{group_part}{bare_user}:%{server_part}");
+                log::info!("sender_key trying LIKE pattern: {pattern_any_dev}");
+                let alt: Option<Vec<u8>> = sender_keys::table
+                    .select(sender_keys::record)
+                    .filter(sender_keys::address.like(&pattern_any_dev))
+                    .filter(sender_keys::device_id.eq(device_id))
+                    .first(&mut conn)
+                    .optional()
+                    .map_err(|e| StoreError::Database(e.to_string()))?;
+                if alt.is_some() {
+                    log::info!("sender_key device-stripped fallback HIT for {address}");
+                    return Ok(alt);
                 }
-                &address[idx + 1..]
-            } else {
-                ""
-            };
-            // Build a LIKE pattern that matches the same sender USER under
-            // any device suffix, e.g. "120363...@g.us:248133263056915%@lid.0"
-            let has_inner_device = sender_jid.matches(':').count() > 0;
-            if !has_inner_device && address.contains('@') {
-                // Address is "group:user@server.0" with no device on user.
-                // Build pattern "group:user:%@server.0" to match any device.
-                if let (Some(grp_end), Some(at)) = (address.find(':'), address.rfind('@')) {
-                    let group_part = &address[..grp_end + 1]; // includes trailing ':'
-                    let server_part = &address[at..]; // "@server.0"
-                    let user_part = &address[grp_end + 1..at]; // "248133..."
-                    let pattern = format!("{group_part}{user_part}:%{server_part}");
-                    let alt: Option<Vec<u8>> = sender_keys::table
+
+                // (b) Try the bare form (no device on user) if we had one
+                if user_part != bare_user {
+                    let bare_addr = format!("{group_part}{bare_user}{server_part}");
+                    log::info!("sender_key trying bare address: {bare_addr}");
+                    let alt2: Option<Vec<u8>> = sender_keys::table
                         .select(sender_keys::record)
-                        .filter(sender_keys::address.like(pattern))
+                        .filter(sender_keys::address.eq(&bare_addr))
                         .filter(sender_keys::device_id.eq(device_id))
                         .first(&mut conn)
                         .optional()
                         .map_err(|e| StoreError::Database(e.to_string()))?;
-                    if alt.is_some() {
-                        log::debug!(
-                            "sender_key: device-stripped lookup HIT for {address} (matched a device-suffixed variant)"
-                        );
-                        return Ok(alt);
+                    if alt2.is_some() {
+                        log::info!("sender_key bare fallback HIT for {address}");
+                        return Ok(alt2);
                     }
                 }
             }
