@@ -855,14 +855,66 @@ impl SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(e.to_string()))?;
+            // Direct match first
             let res: Option<Vec<u8>> = sender_keys::table
                 .select(sender_keys::record)
-                .filter(sender_keys::address.eq(address))
+                .filter(sender_keys::address.eq(&address))
                 .filter(sender_keys::device_id.eq(device_id))
                 .first(&mut conn)
                 .optional()
                 .map_err(|e| StoreError::Database(e.to_string()))?;
-            Ok(res)
+            if res.is_some() {
+                return Ok(res);
+            }
+            // Fallback: device-suffix mismatch. SKDMs are often stored under
+            // a sender JID with a device suffix (e.g. ":94@lid"), but the
+            // actual group message arrives with the bare LID (no device).
+            // Try the inverse — strip the device part of the SENDER inside
+            // the address string, or add a device part by LIKE match.
+            //
+            // Address format examples:
+            //   "120363...@g.us:248133...:94@lid.0"  (with sender device)
+            //   "120363...@g.us:248133...@lid.0"     (without)
+            //
+            // First attempt: if address has no inner :device, search for
+            // any stored record with the same group + same sender user but
+            // any device suffix.
+            let sender_jid = if let Some(idx) = address.find(":") {
+                // Skip first ':' which is the group/sender separator
+                if let Some(group_end) = address[..idx].find('@') {
+                    let _ = group_end; // guarantee we found '@' before ':'
+                }
+                &address[idx + 1..]
+            } else {
+                ""
+            };
+            // Build a LIKE pattern that matches the same sender USER under
+            // any device suffix, e.g. "120363...@g.us:248133263056915%@lid.0"
+            let has_inner_device = sender_jid.matches(':').count() > 0;
+            if !has_inner_device && address.contains('@') {
+                // Address is "group:user@server.0" with no device on user.
+                // Build pattern "group:user:%@server.0" to match any device.
+                if let (Some(grp_end), Some(at)) = (address.find(':'), address.rfind('@')) {
+                    let group_part = &address[..grp_end + 1]; // includes trailing ':'
+                    let server_part = &address[at..]; // "@server.0"
+                    let user_part = &address[grp_end + 1..at]; // "248133..."
+                    let pattern = format!("{group_part}{user_part}:%{server_part}");
+                    let alt: Option<Vec<u8>> = sender_keys::table
+                        .select(sender_keys::record)
+                        .filter(sender_keys::address.like(pattern))
+                        .filter(sender_keys::device_id.eq(device_id))
+                        .first(&mut conn)
+                        .optional()
+                        .map_err(|e| StoreError::Database(e.to_string()))?;
+                    if alt.is_some() {
+                        log::debug!(
+                            "sender_key: device-stripped lookup HIT for {address} (matched a device-suffixed variant)"
+                        );
+                        return Ok(alt);
+                    }
+                }
+            }
+            Ok(None)
         })
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?
