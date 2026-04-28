@@ -1034,7 +1034,14 @@ impl Client {
             // The sender key is stored under the sender's display JID (e.g., LID), while sender_encryption_jid
             // is the phone number used for E2E session decryption only.
             // Using sender_encryption_jid here causes "No sender key state" errors for self-sent LID messages.
-            let sender_address = info.source.sender.to_protocol_address();
+            //
+            // ALWAYS strip the device suffix (to_non_ad) before computing the sender_address.
+            // WhatsApp's server stamps `participant` with a device suffix on SKDMs (pkmsg)
+            // but often strips it on subsequent skmsg messages — especially for self-sends.
+            // Without this normalization, the SKDM stores the sender_key under
+            // "...:248133...:94@lid.0" but the skmsg looks it up at "...:248133...@lid.0"
+            // and the lookup misses → NoSenderKey → retry → message lost.
+            let sender_address = info.source.sender.to_non_ad().to_protocol_address();
             let sender_key_name =
                 SenderKeyName::new(info.source.chat.to_string(), sender_address.to_string());
 
@@ -1379,7 +1386,11 @@ impl Client {
 
         let device_arc = self.persistence_manager.get_device_arc().await;
 
-        let sender_address = sender_jid.to_protocol_address();
+        // Normalize the sender JID to its non-AD form (strip :device) before
+        // building the sender_address. The decryption path also strips the
+        // device — so SKDMs we store now will be found by future skmsg
+        // lookups regardless of which device suffix WA's server stamps.
+        let sender_address = sender_jid.to_non_ad().to_protocol_address();
 
         let sender_key_name = SenderKeyName::new(group_jid.to_string(), sender_address.to_string());
 

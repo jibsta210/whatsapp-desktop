@@ -1066,6 +1066,7 @@ async fn run_inner(
             let _ = std::fs::write(&marker, "v4");
         }
     }
+
     let transport_factory = TokioWebSocketTransportFactory::new();
     let http_client = UreqHttpClient::new();
 
