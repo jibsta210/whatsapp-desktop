@@ -11,7 +11,7 @@ path = "src/main.rs"
 # UI
 gtk4 = { version = "0.9", features = ["v4_14"] }
 libadwaita = { version = "0.7", features = ["v1_5"] }
-glib = "0.20"
+glib = "0.22"
 
 # Async runtime (bridged to GTK main loop)
 tokio = { version = "1", features = ["full"] }
