@@ -855,7 +855,14 @@ impl SqliteStore {
             let mut conn = pool
                 .get()
                 .map_err(|e| StoreError::Connection(e.to_string()))?;
-            // Direct match first
+            // Exact match only. Sender_key records for OUTGOING sends contain
+                // the private signing key; records for incoming sends from another
+                // device do not. Returning the wrong device's record makes
+                // encryption fail with "missing private key bytes". The proper
+                // device-suffix normalization happens at the call site
+                // (src/message.rs uses to_non_ad before building the address) —
+                // so by the time we hit the store, the address is already
+                // canonical and an exact match is correct.
             let res: Option<Vec<u8>> = sender_keys::table
                 .select(sender_keys::record)
                 .filter(sender_keys::address.eq(&address))
@@ -863,72 +870,7 @@ impl SqliteStore {
                 .first(&mut conn)
                 .optional()
                 .map_err(|e| StoreError::Database(e.to_string()))?;
-            if res.is_some() {
-                return Ok(res);
-            }
-            // Fallback: device-suffix mismatch. SKDMs are often stored under
-            // a sender JID with a device suffix (e.g. ":94@lid"), but the
-            // actual group message arrives with the bare LID (no device).
-            // Try the inverse — strip the device part of the SENDER inside
-            // the address string, or add a device part by LIKE match.
-            //
-            // Address format examples:
-            //   "120363...@g.us:248133...:94@lid.0"  (with sender device)
-            //   "120363...@g.us:248133...@lid.0"     (without)
-            //
-            // First attempt: if address has no inner :device, search for
-            // any stored record with the same group + same sender user but
-            // any device suffix.
-            // Diagnostic: log every miss so we can see exact address format
-            log::info!("sender_key MISS for address={address:?} dev={device_id}");
-
-            // Address format: "{group_or_chat}:{sender_jid}.{agent}"
-            // For groups: "120363...@g.us:248133...@lid.0" or "120363...@g.us:248133...:94@lid.0"
-            //
-            // Try BOTH directions:
-            // (a) If address has NO inner :device on sender → search for any device variant
-            // (b) If address HAS :device → try without it
-            if let (Some(grp_end), Some(at)) = (address.find(':'), address.rfind('@')) {
-                let group_part = &address[..grp_end + 1]; // "120363...@g.us:"
-                let server_part = &address[at..]; // "@lid.0"
-                let user_part = &address[grp_end + 1..at]; // "248133263056915" or "248133...:94"
-
-                // Strip any inner :device from user_part
-                let bare_user = user_part.split(':').next().unwrap_or(user_part);
-
-                // (a) Search for ANY device suffix on this user under same group
-                let pattern_any_dev = format!("{group_part}{bare_user}:%{server_part}");
-                log::info!("sender_key trying LIKE pattern: {pattern_any_dev}");
-                let alt: Option<Vec<u8>> = sender_keys::table
-                    .select(sender_keys::record)
-                    .filter(sender_keys::address.like(&pattern_any_dev))
-                    .filter(sender_keys::device_id.eq(device_id))
-                    .first(&mut conn)
-                    .optional()
-                    .map_err(|e| StoreError::Database(e.to_string()))?;
-                if alt.is_some() {
-                    log::info!("sender_key device-stripped fallback HIT for {address}");
-                    return Ok(alt);
-                }
-
-                // (b) Try the bare form (no device on user) if we had one
-                if user_part != bare_user {
-                    let bare_addr = format!("{group_part}{bare_user}{server_part}");
-                    log::info!("sender_key trying bare address: {bare_addr}");
-                    let alt2: Option<Vec<u8>> = sender_keys::table
-                        .select(sender_keys::record)
-                        .filter(sender_keys::address.eq(&bare_addr))
-                        .filter(sender_keys::device_id.eq(device_id))
-                        .first(&mut conn)
-                        .optional()
-                        .map_err(|e| StoreError::Database(e.to_string()))?;
-                    if alt2.is_some() {
-                        log::info!("sender_key bare fallback HIT for {address}");
-                        return Ok(alt2);
-                    }
-                }
-            }
-            Ok(None)
+            Ok(res)
         })
         .await
         .map_err(|e| StoreError::Database(e.to_string()))?
