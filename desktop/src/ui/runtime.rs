@@ -918,13 +918,27 @@ impl RuntimeState {
     /// so that phonebook names (from ContactUpdate) always win, even if some
     /// `JoinedGroup` tasks raced ahead and stored a phone number.
     fn chats_with_best_names(&self) -> Vec<ChatSummary> {
-        // Build a set of phone JIDs that already have their own chat entry,
-        // so we can suppress duplicate @lid chats that map to the same person.
-        let phone_chat_ids: std::collections::HashSet<&str> = self
+        let strip_dev_static = |j: &str| -> String {
+            match (j.find(':'), j.find('@')) {
+                (Some(c), Some(a)) if c < a => format!("{}{}", &j[..c], &j[a..]),
+                _ => j.to_string(),
+            }
+        };
+
+        // Build a set of phone JIDs (in their bare form) that already have
+        // a non-device-suffixed chat entry. Used to suppress duplicates.
+        let phone_chat_ids: std::collections::HashSet<String> = self
             .chats
             .iter()
             .filter(|c| c.id.ends_with("@s.whatsapp.net"))
-            .map(|c| c.id.as_str())
+            .map(|c| c.id.clone())
+            .collect();
+        // Set of bare-form chat IDs that exist in the chat list, regardless
+        // of whether they're @lid or @s.whatsapp.net.
+        let bare_chat_ids: std::collections::HashSet<String> = self
+            .chats
+            .iter()
+            .map(|c| strip_dev_static(&c.id))
             .collect();
 
         self.chats
@@ -937,10 +951,17 @@ impl RuntimeState {
                 // Suppress @lid ghost chats when the phone JID chat already exists
                 if c.id.ends_with("@lid") {
                     if let Some(phone) = self.lid_to_phone.get(&c.id) {
-                        if phone_chat_ids.contains(phone.as_str()) {
+                        if phone_chat_ids.contains(phone) {
                             return None;
                         }
                     }
+                }
+                // Suppress device-suffixed duplicates when the bare-form chat
+                // also exists. Example: hide "14167992936:13@s.whatsapp.net"
+                // when "14167992936@s.whatsapp.net" is also in the list.
+                let base = strip_dev_static(&c.id);
+                if base != c.id && bare_chat_ids.contains(&base) {
+                    return None;
                 }
 
                 // Strip :device suffix to a base form. Chats may be keyed by
