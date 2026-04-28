@@ -769,9 +769,32 @@ impl RuntimeState {
     /// Update contact name in memory and return true if changed (caller should
     /// flush contact_names to disk AFTER releasing the lock).
     /// Insert a LID→phone mapping and keep the reverse map in sync.
+    /// Normalizes both JIDs by stripping the `:device` suffix so the cache
+    /// stays consistent across reconnects (WhatsApp's server stamps device
+    /// suffixes that can rotate). Also keeps the original-form variants
+    /// for cheap lookup compatibility.
     fn insert_lid_phone(&mut self, lid: String, phone: String) {
-        self.phone_to_lid.insert(phone.clone(), lid.clone());
-        self.lid_to_phone.insert(lid, phone);
+        let strip_dev = |j: &str| -> String {
+            match (j.find(':'), j.find('@')) {
+                (Some(c), Some(a)) if c < a => format!("{}{}", &j[..c], &j[a..]),
+                _ => j.to_string(),
+            }
+        };
+        let lid_base = strip_dev(&lid);
+        let phone_base = strip_dev(&phone);
+
+        // Always store the bare→bare mapping (canonical, device-agnostic).
+        self.phone_to_lid.insert(phone_base.clone(), lid_base.clone());
+        self.lid_to_phone.insert(lid_base.clone(), phone_base.clone());
+
+        // Also store the originals if they differ from the bare forms — so
+        // callers passing device-suffixed JIDs still hit on direct lookup.
+        if lid != lid_base {
+            self.lid_to_phone.insert(lid.clone(), phone_base.clone());
+        }
+        if phone != phone_base {
+            self.phone_to_lid.insert(phone.clone(), lid_base.clone());
+        }
     }
 
     fn record_contact_name(&mut self, jid: &str, name: &str, also_jid: Option<&str>) -> bool {
