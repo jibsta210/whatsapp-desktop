@@ -215,10 +215,6 @@ pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
     let mut purged = 0;
     if !purge_marker.exists() {
         let before = names.len();
-        // Strict purge: only remove entries where name exactly equals the JID
-        // (true poison from push_name storing the raw JID as a fallback).
-        // Do NOT use is_valid_contact_name here — that's too aggressive and
-        // would wipe legitimately saved names like "+16472876066".
         names.retain(|jid, name| name != jid);
         purged = before - names.len();
         if purged > 0 {
@@ -227,9 +223,25 @@ pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
         let _ = std::fs::write(&purge_marker, "done");
     }
 
+    // The full message-history scan is expensive (1000+ files, bincode
+    // deserialize each). Gate behind a marker so it runs ONCE — every
+    // startup after that uses the cached contact_names directly.
+    // Push_names from new messages are still captured in the live message
+    // handler, so we don't lose anything by not re-scanning.
+    let scan_marker = std::path::PathBuf::from(".contact_scan_v1");
+    if scan_marker.exists() {
+        log::debug!("Skipping contact name history scan (already done)");
+        // Save in case the purge above changed anything.
+        if purged > 0 {
+            save_contact_names(&names);
+        }
+        return names;
+    }
+
     let dir = messages_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         save_contact_names(&names);
+        let _ = std::fs::write(&scan_marker, "done");
         return names;
     };
     let mut learned = 0u32;
@@ -250,17 +262,16 @@ pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
             if m.is_from_me || m.sender_id.is_empty() {
                 continue;
             }
-            // Skip messages where sender_name looks like a JID (old poison)
             if m.sender_name.is_empty() || m.sender_name == m.sender_id {
                 continue;
             }
-            // Don't overwrite — first-seen push_name wins.
             if !names.contains_key(&m.sender_id) {
                 names.insert(m.sender_id.clone(), m.sender_name.clone());
                 learned += 1;
             }
         }
     }
+    let _ = std::fs::write(&scan_marker, "done");
     log::info!(
         "Scanned {scanned} message files, learned {learned} push_names, purged {purged} poison entries"
     );
@@ -3246,10 +3257,26 @@ fn persist_new_message(
 ) -> (Option<(String, String)>, Option<ChatSummary>) {
     let chat_id = m.chat_id.clone();
     let is_group = chat_id.ends_with("@g.us");
-    let was_new = !state.lock().unwrap().chats.iter().any(|c| c.id == chat_id);
+
+    // Check cache miss WITHOUT disk I/O (cheap lock).
+    let needs_disk_load;
+    let was_new;
+    {
+        let s = state.lock().unwrap();
+        was_new = !s.chats.iter().any(|c| c.id == chat_id);
+        needs_disk_load = !s.history.contains_key(&chat_id);
+    }
+
+    // Do the disk read OUTSIDE the lock — this was blocking every UI event.
+    // With 1000+ chats, every incoming message blocked the global state Mutex
+    // for the duration of a bincode deserialize, causing chat-switch lag.
+    let disk_msgs = if needs_disk_load {
+        Some(load_messages(&chat_id))
+    } else {
+        None
+    };
 
     // Update in-memory cache (fast) and queue async disk write (non-blocking).
-    // NEVER do disk I/O while holding the Mutex.
     let (
         existing_name,
         existing_unread,
@@ -3261,11 +3288,12 @@ fn persist_new_message(
     ) = {
         let mut s = state.lock().unwrap();
 
-        // If cache doesn't have this chat yet, load from disk first to avoid
-        // overwriting the full history with just the new message.
-        if !s.history.contains_key(&chat_id) {
-            let disk_msgs = load_messages(&chat_id);
-            s.history.insert(chat_id.clone(), disk_msgs);
+        // Insert any disk-loaded messages now (still fast — just a HashMap insert).
+        if let Some(loaded) = disk_msgs {
+            // Re-check; another concurrent path may have populated meanwhile.
+            if !s.history.contains_key(&chat_id) {
+                s.history.insert(chat_id.clone(), loaded);
+            }
         }
         s.touch_history(&chat_id);
         s.evict_old_histories();

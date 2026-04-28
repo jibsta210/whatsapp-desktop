@@ -141,9 +141,12 @@ name = "benchmark"
 required-features = ["danger-skip-tls-verify"]
 
 [profile.release]
-opt-level = "z"
+# opt-level=3 prioritizes runtime speed (was "z" = optimize for size,
+# trades ~30% runtime perf for smaller binary). On modern disks the size
+# difference is irrelevant; the perf difference is very visible.
+opt-level = 3
 debug = false
-lto = true
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
