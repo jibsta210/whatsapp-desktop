@@ -152,7 +152,9 @@ impl Client {
 
         let force_skdm = {
             use wacore::libsignal::store::sender_key_name::SenderKeyName;
-            let sender_address = own_jid.to_protocol_address();
+            // Match receive-side normalization (src/message.rs uses to_non_ad
+            // before to_protocol_address for sender_key namespacing).
+            let sender_address = own_jid.to_non_ad().to_protocol_address();
             let sender_key_name = SenderKeyName::new(to_str.clone(), sender_address.to_string());
 
             let device_guard = device_store_arc.read().await;
@@ -599,7 +601,12 @@ impl Client {
                 use wacore::libsignal::protocol::SenderKeyStore;
                 use wacore::libsignal::store::sender_key_name::SenderKeyName;
                 let mut device_guard = device_store_arc.write().await;
-                let sender_address = own_sending_jid.to_protocol_address();
+                // Normalize via to_non_ad to match the receive side's lookup
+                // namespace (see src/message.rs handle_group_decrypt). Without
+                // this, our outgoing sender_key is stored under a device-
+                // suffixed key but receivers look it up bare → they end up
+                // forcing SKDM redistribution every send.
+                let sender_address = own_sending_jid.to_non_ad().to_protocol_address();
                 let sender_key_name =
                     SenderKeyName::new(to_str.clone(), sender_address.to_string());
 
