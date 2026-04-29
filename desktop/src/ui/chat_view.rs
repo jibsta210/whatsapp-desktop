@@ -2498,18 +2498,26 @@ impl ChatViewPanel {
         // covers all 35 prepend ticks plus texture-load resizes.
         Self::force_scroll_to_bottom(&self.inner, 4);
 
-        // Force GTK4 to paint NOW. Without this, appending all 15 widgets
-        // synchronously inside a single event-loop iteration leaves the GL
-        // renderer with no incentive to ask the frame clock for a redraw —
-        // the bubble widgets are present and laid out, but the texture
-        // upload / paint pass doesn't fire until another event invalidates
-        // a region (which is why mouse-hover into the message pane was
-        // making the messages "appear" — the motion event triggered the
-        // redraw GTK had been deferring). queue_draw on both the box and
-        // the scrolled window flags both layers as dirty so the next frame
-        // tick actually composites them.
-        self.inner.messages_box.queue_draw();
-        self.inner.scroll.queue_draw();
+        // Pump the GTK main loop one iteration. queue_draw / queue_resize
+        // were not enough to make the bubbles paint without a mouse-hover
+        // first — the GL renderer was holding a cached render tree of the
+        // empty messages_box from when we cleared it during open_chat, and
+        // the bulk-append within one event-loop iteration didn't generate
+        // a window damage event the compositor (or GSK) considered worth
+        // redrawing for.
+        //
+        // Pumping one iteration here forces GTK to process pending layout,
+        // realize new widgets, and emit a render frame BEFORE this function
+        // returns. After this call, the next compositor frame callback has
+        // damage to redraw, and the bubbles paint without needing any user
+        // input to kick them.
+        //
+        // This is heavier than queue_draw but bounded: one iteration runs
+        // whatever's been queued (layout, paint, signal callbacks) and
+        // returns. We're already inside a UI event handler so the user is
+        // waiting on us anyway.
+        let main_ctx = glib::MainContext::default();
+        while main_ctx.iteration(false) {}
 
         // Stream older messages in. Each tick prepends 5 messages above the
         // visible ones using messages_box.prepend(...) so they appear above
