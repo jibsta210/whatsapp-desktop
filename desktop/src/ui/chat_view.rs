@@ -2505,23 +2505,23 @@ impl ChatViewPanel {
         // covers all 35 prepend ticks plus texture-load resizes.
         Self::force_scroll_to_bottom(&self.inner, 4);
 
-        // DIAG: trace bubbles HashMap size every 100ms for 3s so we can
-        // see the EXACT moment 35 entries vanish. eprintln! is used in
-        // addition to log::info because the previous test showed log lines
-        // never appearing — eprintln! goes straight to stderr.
+        // DIAG: trace bubbles HashMap size every 100ms via the SHARED inner
+        // (Rc clone) so we see the actual RefCell, not a snapshot clone.
+        // The previous version did `self.inner.bubbles.clone()` which on
+        // RefCell<HashMap> is a deep copy — the timer was logging a frozen
+        // snapshot from before the prepends ran, falsely reporting 15.
         eprintln!("DIAG TRACE timer SCHEDULED for chat={}", chat_id);
         {
-            let bubbles_trace = self.inner.bubbles.clone();
-            let msgs_box_trace = self.inner.messages_box.clone();
+            let inner_trace = self.inner.clone();
             let chat_id_trace = chat_id.to_string();
             let elapsed = std::rc::Rc::new(std::cell::Cell::new(0u32));
             let elapsed_clone = elapsed.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
                 let n = elapsed_clone.get() + 100;
                 elapsed_clone.set(n);
-                let bubbles_len = bubbles_trace.borrow().len();
+                let bubbles_len = inner_trace.bubbles.borrow().len();
                 let mut child_count = 0;
-                let mut child = msgs_box_trace.first_child();
+                let mut child = inner_trace.messages_box.first_child();
                 while let Some(c) = child {
                     child_count += 1;
                     child = c.next_sibling();
@@ -2538,27 +2538,28 @@ impl ChatViewPanel {
             });
         }
 
-        // DIAG: dump every child widget's type/name once after 1.5s so we
-        // can identify the 17 extras. children=32 vs bubbles=15 means there
-        // are widgets in messages_box that aren't bubbles — date separators
-        // would show up here, as would any leftover from previous chats.
+        // DIAG: dump every child widget's type/name once after 1.5s. Uses
+        // the SHARED inner (Rc clone) so we see the live RefCell — the
+        // previous version did self.inner.bubbles.clone() which deep-copied
+        // the HashMap and made the dump permanently see the pre-prepend
+        // 15-message snapshot, fabricating the "35 missing entries" result.
         {
             let chat_id_log = chat_id.to_string();
-            let msgs_box_log = self.inner.messages_box.clone();
-            let bubbles_log = self.inner.bubbles.clone();
+            let inner_dump = self.inner.clone();
             glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
                 use gtk4::prelude::*;
                 // Compare by widget_name (set to "bubble-{msg_id}" at create
                 // time). This avoids any pointer-typing issues that the
                 // previous comparison may have been hitting.
-                let bubble_names: std::collections::HashSet<String> = bubbles_log
+                let bubble_names: std::collections::HashSet<String> = inner_dump
+                    .bubbles
                     .borrow()
                     .keys()
                     .map(|id| format!("bubble-{id}"))
                     .collect();
                 let total_in_map = bubble_names.len();
                 let mut idx = 0;
-                let mut child = msgs_box_log.first_child();
+                let mut child = inner_dump.messages_box.first_child();
                 let mut total_children = 0usize;
                 let mut bubble_children_matched = 0usize;
                 let mut bubble_children_unmatched = 0usize;
