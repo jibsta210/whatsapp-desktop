@@ -2617,6 +2617,13 @@ impl ChatViewPanel {
     pub fn append_message(&self, msg: IncomingMessage) {
         let inner = &self.inner;
 
+        log::info!(
+            "DIAG append_message id={} chat={} from_me={} ts={} link_title={} contact_name={} thumb={}",
+            msg.id, msg.chat_id, msg.is_from_me, msg.timestamp,
+            msg.link_title.is_some(), msg.contact_name.is_some(),
+            msg.link_thumbnail_path.is_some()
+        );
+
         // Match the current chat — tolerant of LID/phone JID aliases so
         // that self-messages from phone (which may arrive as @lid when the
         // open chat is @s.whatsapp.net, or vice versa) still render.
