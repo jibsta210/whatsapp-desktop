@@ -748,8 +748,11 @@ impl RuntimeState {
     /// Evict least-recently-used chat histories to keep memory bounded.
     /// Keeps at most MAX_CACHED chats in memory. Evicted chats are saved
     /// to disk first (via queue_save_messages), then dropped.
+    /// Effectively unlimited — even with 5000 chats × 5000 messages each
+    /// at ~200 bytes/msg that's 5GB worst case but realistic is way under.
+    /// Eliminates disk hits on chat switching entirely.
     fn evict_old_histories(&mut self) {
-        const MAX_CACHED: usize = 25;
+        const MAX_CACHED: usize = 5000;
         let before = self.history.len();
         while self.history_lru.len() > MAX_CACHED {
             let evict_id = self.history_lru.remove(0);

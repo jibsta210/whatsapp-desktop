@@ -2629,27 +2629,41 @@ impl ChatViewPanel {
     /// Build a bubble for `msg` and move it to the TOP of messages_box.
     /// Used by load_history's incremental fill-in to add older messages
     /// above the visible window without re-rendering.
+    ///
+    /// Date separators are NOT inserted here — they'd land at the bottom of
+    /// the messages_box (since maybe_insert_date_separator only appends).
+    /// load_history does a final pass to insert correct separators once all
+    /// older messages are in place.
     fn prepend_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
         if inner.bubbles.borrow().contains_key(&msg.id) {
             return;
         }
-        // Append (which builds + appends), then move to the top by removing
-        // and re-inserting before the first child. GTK4 doesn't have a
-        // native prepend on Box; this is the standard pattern.
-        Self::append_bubble_to_inner(inner, msg.clone());
+        Self::append_bubble_to_inner_no_separator(inner, msg.clone());
         let bubble_widget = match inner.bubbles.borrow().get(&msg.id) {
             Some(b) => b.widget().clone().upcast::<gtk4::Widget>(),
             None => return,
         };
         inner.messages_box.remove(&bubble_widget);
-        if let Some(first) = inner.messages_box.first_child() {
-            inner.messages_box.insert_child_after(&bubble_widget, gtk4::Widget::NONE);
-            // insert_child_after with None inserts at position 0; if the
-            // first_child reference was stale, this still positions correctly.
-            let _ = first;
-        } else {
-            inner.messages_box.append(&bubble_widget);
-        }
+        inner
+            .messages_box
+            .insert_child_after(&bubble_widget, gtk4::Widget::NONE);
+    }
+
+    /// Identical to append_bubble_to_inner but skips the date-separator
+    /// insertion. Used by prepend path so separators don't land at the
+    /// bottom of the messages_box. The caller is responsible for adding
+    /// separators in the correct positions after the fill-in completes.
+    fn append_bubble_to_inner_no_separator(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
+        // Save the date state, suppress separator insertion, restore after.
+        let saved_date = inner.last_msg_date.borrow().clone();
+        // Stuff a "match" date so maybe_insert_date_separator returns early
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(msg.timestamp, 0)
+            .unwrap_or_default();
+        let local: chrono::DateTime<chrono::Local> = chrono::DateTime::from(dt);
+        *inner.last_msg_date.borrow_mut() = Some(local.date_naive());
+        Self::append_bubble_to_inner(inner, msg);
+        // Restore so future appends still get correct separators.
+        *inner.last_msg_date.borrow_mut() = saved_date;
     }
 
     fn append_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
