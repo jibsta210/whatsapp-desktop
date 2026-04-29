@@ -3864,19 +3864,32 @@ async fn handle_command(
         }
 
         WaCommand::LoadChat { chat_id, chat_name } => {
-            // Subscribe to presence for this chat (enables typing notifications)
-            if let Ok(jid) = chat_id.parse::<Jid>() {
-                if let Err(e) = client.presence().subscribe(&jid).await {
-                    log::debug!("Presence subscribe failed for {chat_id}: {e:#}");
+            // Fire presence subscribe in the background — chat switch must NOT
+            // wait for a network round-trip. Typing notifications start working
+            // ~50ms later, which is fine.
+            {
+                if let Ok(jid) = chat_id.parse::<Jid>() {
+                    let c = client.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = c.presence().subscribe(&jid).await {
+                            log::debug!("Presence subscribe failed: {e:#}");
+                        }
+                    });
                 }
             }
-            // Check in-memory cache first (no disk I/O).
-            let cached = {
+
+            // FAST PATH: only clone the last 50 messages from cache, not the
+            // entire history. For a 5000-msg chat the previous code allocated
+            // and copied a 5MB Vec on every chat switch.
+            let cached_last_50 = {
                 let s = state.lock().unwrap();
-                s.history.get(&chat_id).cloned()
+                s.history.get(&chat_id).map(|h| {
+                    let start = h.len().saturating_sub(50);
+                    h[start..].to_vec()
+                })
             };
 
-            let all_messages = if let Some(msgs) = cached {
+            let mut all_messages = if let Some(msgs) = cached_last_50 {
                 state.lock().unwrap().touch_history(&chat_id);
                 msgs
             } else {
@@ -3885,66 +3898,27 @@ async fn handle_command(
                 let disk_msgs = tokio::task::spawn_blocking(move || load_messages(&cid))
                     .await
                     .unwrap_or_default();
-                // Populate cache for next time + evict old entries
-                {
+                // Populate cache (full history kept) + take last 50 for display
+                let last_50 = {
                     let mut s = state.lock().unwrap();
-                    s.history.insert(chat_id.clone(), disk_msgs.clone());
+                    let start = disk_msgs.len().saturating_sub(50);
+                    let last_50 = disk_msgs[start..].to_vec();
+                    s.history.insert(chat_id.clone(), disk_msgs);
                     s.touch_history(&chat_id);
                     s.evict_old_histories();
-                }
-                disk_msgs
+                    last_50
+                };
+                last_50
             };
 
-            // Extract push_names from ALL loaded messages into contact_names
-            // (before truncation, so names from older messages are available)
-            {
-                let mut s = state.lock().unwrap();
-                let mut learned = 0u32;
-                for m in &all_messages {
-                    if is_valid_contact_name(&m.sender_name, &m.sender_id)
-                        && !m.sender_id.is_empty()
-                        && !m.is_from_me
-                    {
-                        if !s.contact_names.contains_key(&m.sender_id) {
-                            s.contact_names
-                                .insert(m.sender_id.clone(), m.sender_name.clone());
-                            learned += 1;
-                        }
-                    }
-                }
-                if learned > 0 {
-                    log::info!(
-                        "LoadChat {chat_id}: learned {learned} new contact names from message history"
-                    );
-                }
-            }
+            // Push_name learning — REMOVED from hot path. The startup scan in
+            // rebuild_contact_names_from_history already covers the entire
+            // message corpus once. Live messages add new names via the message
+            // handler. Re-scanning every chat switch was wasted work.
 
-            // Log poll vote state for debugging
-            {
-                let polls_with_votes: Vec<_> = all_messages
-                    .iter()
-                    .filter(|m| m.poll_question.is_some() && !m.poll_votes.is_empty())
-                    .map(|m| {
-                        format!(
-                            "{}({} voters)",
-                            &m.id[..8.min(m.id.len())],
-                            m.poll_votes.len()
-                        )
-                    })
-                    .collect();
-                if !polls_with_votes.is_empty() {
-                    log::info!("LoadChat {chat_id}: polls with votes: {polls_with_votes:?}");
-                }
-            }
-
-            // Filter for display only (doesn't affect persisted data), then take last 100
-            let mut all_messages: Vec<IncomingMessage> = all_messages
-                .into_iter()
-                .filter(|m| m.text.is_some() || m.media_type.is_some() || m.media_caption.is_some())
-                .collect();
+            // Filter for display + sort
+            all_messages.retain(|m| m.text.is_some() || m.media_type.is_some() || m.media_caption.is_some());
             all_messages.sort_by_key(|m| m.timestamp);
-            // Truncate early — resolve names only for the messages we'll display.
-            // 50 messages is enough for initial view; user can scroll up for more.
             if all_messages.len() > 50 {
                 all_messages = all_messages.split_off(all_messages.len() - 50);
             }
