@@ -1300,8 +1300,8 @@ impl ChatViewPanel {
                                                                 );
                                                                 return;
                                                             }
-                                                            if let Ok(tex) =
-                                                                gtk4::gdk::Texture::from_filename(
+                                                            if let Some(tex) =
+                                                                crate::ui::texture_cache::texture_from_filename(
                                                                     &path_for_close,
                                                                 )
                                                             {
@@ -1381,7 +1381,8 @@ impl ChatViewPanel {
                                     let av_path = std::path::PathBuf::from("wa_avatars")
                                         .join(format!("{safe}.jpg"));
                                     if av_path.exists() {
-                                        if let Ok(tex) = gtk4::gdk::Texture::from_filename(&av_path)
+                                        if let Some(tex) =
+                                            crate::ui::texture_cache::texture_from_filename(&av_path)
                                         {
                                             av.set_custom_image(Some(&tex));
                                         }
@@ -1563,7 +1564,7 @@ impl ChatViewPanel {
                 if paths.len() == 1 {
                     // Single file: show preview like before
                     let path_str = &paths[0];
-                    if let Ok(tex) = gtk4::gdk::Texture::from_filename(path_str) {
+                    if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path_str) {
                         inner_c.image_preview_pic.set_paintable(Some(&tex));
                     }
                     *inner_c.pending_image_path.borrow_mut() = Some(path_str.clone());
@@ -1666,8 +1667,10 @@ impl ChatViewPanel {
                                         if let Some(path) = file.path() {
                                             let path_str = path.to_string_lossy().to_string();
                                             // Show preview — try image first, fall back to file icon
-                                            if let Ok(tex) =
-                                                gtk4::gdk::Texture::from_filename(&path_str)
+                                            if let Some(tex) =
+                                                crate::ui::texture_cache::texture_from_filename(
+                                                    &path_str,
+                                                )
                                             {
                                                 inner_ccc
                                                     .image_preview_pic
@@ -4467,7 +4470,7 @@ fn do_reply(inner: &Rc<ChatViewInner>, msg: &IncomingMessage) {
 
     // Media thumbnail in reply bar (uses pre-resolved media_path)
     if let Some(ref path) = media_path {
-        if let Ok(tex) = gtk4::gdk::Texture::from_filename(path) {
+        if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path) {
             let thumb = gtk4::Picture::new();
             thumb.set_paintable(Some(&tex));
             thumb.set_size_request(42, 42);

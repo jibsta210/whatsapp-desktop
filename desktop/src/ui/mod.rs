@@ -9,5 +9,6 @@ pub mod profile_panel;
 pub mod quick_replies;
 pub mod runtime;
 pub mod settings;
+pub mod texture_cache;
 pub mod tray;
 pub mod window;

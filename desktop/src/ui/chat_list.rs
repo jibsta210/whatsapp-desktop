@@ -772,7 +772,7 @@ impl ChatListPanel {
     pub fn set_avatar(&self, chat_id: &str, path: &str) {
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
-            if let Ok(texture) = gtk4::gdk::Texture::from_filename(path) {
+            if let Some(texture) = crate::ui::texture_cache::texture_from_filename(path) {
                 row.avatar.set_custom_image(Some(&texture));
             }
         }

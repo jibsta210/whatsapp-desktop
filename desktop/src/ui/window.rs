@@ -543,7 +543,7 @@ impl MainWindow {
                     let safe = phone.replace(['/', '\\', '@', ':'], "_");
                     let path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
                     if path.exists() {
-                        if let Ok(tex) = gtk4::gdk::Texture::from_filename(&path) {
+                        if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&path) {
                             inner.own_avatar.set_custom_image(Some(&tex));
                         }
                     }
@@ -1242,7 +1242,7 @@ fn populate_rail_favourites(
         let safe = chat.id.replace(['/', '\\', '@', ':'], "_");
         let avatar_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
         if avatar_path.exists() {
-            if let Ok(tex) = gtk4::gdk::Texture::from_filename(&avatar_path) {
+            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&avatar_path) {
                 av.set_custom_image(Some(&tex));
             }
         }
@@ -1392,7 +1392,7 @@ fn open_own_profile_window(
         {
             let fname = entry.file_name().to_string_lossy().to_string();
             if fname.starts_with(own_phone) && fname.ends_with(".jpg") {
-                if let Ok(tex) = gtk4::gdk::Texture::from_filename(entry.path()) {
+                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(entry.path()) {
                     avatar.set_custom_image(Some(&tex));
                 }
                 break;
@@ -1428,8 +1428,13 @@ fn open_own_profile_window(
                 if let Ok(file) = result {
                     if let Some(path) = file.path() {
                         let path_str = path.to_string_lossy().to_string();
-                        // Update avatar preview immediately
-                        if let Ok(tex) = gtk4::gdk::Texture::from_filename(&path) {
+                        // Update avatar preview immediately. Bypass the cache here
+                        // because the user just picked a fresh file — we want the
+                        // exact bytes they chose, not whatever happened to share
+                        // this path's mtime in the cache. invalidate() ensures
+                        // the next call from elsewhere reloads too.
+                        crate::ui::texture_cache::invalidate(&path);
+                        if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&path) {
                             av2.set_custom_image(Some(&tex));
                         }
                         // Send to WhatsApp

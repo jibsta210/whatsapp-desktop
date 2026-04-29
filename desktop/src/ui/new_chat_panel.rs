@@ -320,7 +320,7 @@ impl NewChatPanel {
             let safe = chat.id.replace(['/', '\\', '@', ':'], "_");
             let avatar_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
             if avatar_path.exists() {
-                if let Ok(tex) = gtk4::gdk::Texture::from_filename(&avatar_path) {
+                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&avatar_path) {
                     av.set_custom_image(Some(&tex));
                 }
             }
@@ -363,7 +363,7 @@ impl NewChatPanel {
             let safe = jid.replace(['/', '\\', '@', ':'], "_");
             let avatar_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
             if avatar_path.exists() {
-                if let Ok(tex) = gtk4::gdk::Texture::from_filename(&avatar_path) {
+                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&avatar_path) {
                     av.set_custom_image(Some(&tex));
                 }
             }

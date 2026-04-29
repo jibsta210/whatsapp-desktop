@@ -647,7 +647,7 @@ impl ProfilePanel {
         let safe = chat_id.replace(['/', '\\', '@', ':'], "_");
         let path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
         if path.exists() {
-            if let Ok(tex) = gtk4::gdk::Texture::from_filename(&path) {
+            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&path) {
                 inner.avatar.set_custom_image(Some(&tex));
             }
         } else {
@@ -779,7 +779,7 @@ impl ProfilePanel {
                     lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".gif");
 
                 if (is_image || is_video) && media_count < 9 {
-                    if let Ok(tex) = gtk4::gdk::Texture::from_filename(path) {
+                    if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path) {
                         let pic = Picture::for_paintable(&tex);
                         pic.set_size_request(90, 90);
                         pic.set_content_fit(gtk4::ContentFit::Cover);
@@ -855,7 +855,7 @@ impl ProfilePanel {
             self.inner.about_section.set_visible(true);
         }
         if let Some(path) = avatar_path {
-            if let Ok(tex) = gtk4::gdk::Texture::from_filename(path) {
+            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path) {
                 self.inner.avatar.set_custom_image(Some(&tex));
             }
         }
@@ -909,7 +909,7 @@ impl ProfilePanel {
             let safe = g.id.replace(['/', '\\', '@', ':'], "_");
             let av_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
             if av_path.exists() {
-                if let Ok(tex) = gtk4::gdk::Texture::from_filename(&av_path) {
+                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&av_path) {
                     av.set_custom_image(Some(&tex));
                 }
             }
@@ -983,7 +983,7 @@ impl ProfilePanel {
             let safe = member.jid.replace(['/', '\\', '@', ':'], "_");
             let avatar_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
             if avatar_path.exists() {
-                if let Ok(tex) = gtk4::gdk::Texture::from_filename(&avatar_path) {
+                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&avatar_path) {
                     av.set_custom_image(Some(&tex));
                 }
             }

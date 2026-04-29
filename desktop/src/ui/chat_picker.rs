@@ -208,7 +208,7 @@ pub fn show_chat_picker_with_chats(
         let safe = chat.id.replace(['/', '\\', '@', ':'], "_");
         let av_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
         if av_path.exists() {
-            if let Ok(tex) = gtk4::gdk::Texture::from_filename(&av_path) {
+            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&av_path) {
                 av.set_custom_image(Some(&tex));
             }
         }

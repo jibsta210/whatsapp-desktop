@@ -238,7 +238,7 @@ impl MessageBubble {
             let mut thumb_loaded = false;
             // Source 1: direct quoted_media_path (set by our reply flow)
             if let Some(ref path) = msg.quoted_media_path {
-                if let Ok(tex) = gtk4::gdk::Texture::from_filename(path) {
+                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path) {
                     let thumb = gtk4::Picture::new();
                     thumb.set_paintable(Some(&tex));
                     thumb.set_size_request(72, 72);
@@ -257,7 +257,7 @@ impl MessageBubble {
                         // Try full ID first, then prefix
                         let full = media_dir.join(format!("{qid}.jpeg"));
                         if full.exists() {
-                            if let Ok(tex) = gtk4::gdk::Texture::from_filename(&full) {
+                            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&full) {
                                 let thumb = gtk4::Picture::new();
                                 thumb.set_paintable(Some(&tex));
                                 thumb.set_size_request(72, 72);
@@ -282,7 +282,8 @@ impl MessageBubble {
                                         || fname.ends_with(".png")
                                         || fname.ends_with(".webp"))
                                 {
-                                    if let Ok(tex) = gtk4::gdk::Texture::from_filename(entry.path())
+                                    if let Some(tex) =
+                                        crate::ui::texture_cache::texture_from_filename(entry.path())
                                     {
                                         let thumb = gtk4::Picture::new();
                                         thumb.set_paintable(Some(&tex));
@@ -1183,7 +1184,7 @@ impl MessageBubble {
     }
 
     pub fn set_avatar_image(&self, path: &str) {
-        if let Ok(texture) = gtk4::gdk::Texture::from_filename(path) {
+        if let Some(texture) = crate::ui::texture_cache::texture_from_filename(path) {
             self.avatar.set_custom_image(Some(&texture));
         }
     }
@@ -1303,8 +1304,7 @@ fn build_image_widget(
 
     // Probe dimensions from file to compute display size without loading full texture.
     // Falls back to max size if file can't be read.
-    let (display_w, display_h) = gtk4::gdk::Texture::from_filename(path)
-        .ok()
+    let (display_w, display_h) = crate::ui::texture_cache::texture_from_filename(path)
         .map(|t| {
             let iw = t.width();
             let ih = t.height();
@@ -1334,7 +1334,7 @@ fn build_image_widget(
         if p.paintable().is_some() {
             return;
         }
-        if let Ok(tex) = gtk4::gdk::Texture::from_filename(&path_owned) {
+        if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&path_owned) {
             p.set_paintable(Some(&tex));
         }
     });
@@ -1568,7 +1568,7 @@ fn build_gif_widget(container: &Box, path: &str) {
                 if !frame_path.exists() {
                     break;
                 }
-                if let Ok(tex) = gtk4::gdk::Texture::from_filename(&frame_path) {
+                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&frame_path) {
                     frames.push(tex);
                 }
             }
@@ -1677,7 +1677,7 @@ fn build_document_widget(container: &Box, path: &str) {
                 .status();
         }
         if std::path::Path::new(&thumb_path).exists() {
-            if let Ok(tex) = gtk4::gdk::Texture::from_filename(&thumb_path) {
+            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&thumb_path) {
                 let scale = (380.0 / tex.width() as f64)
                     .min(480.0 / tex.height() as f64)
                     .min(1.0);
