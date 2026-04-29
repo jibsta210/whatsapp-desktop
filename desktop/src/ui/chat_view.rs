@@ -2498,26 +2498,47 @@ impl ChatViewPanel {
         // covers all 35 prepend ticks plus texture-load resizes.
         Self::force_scroll_to_bottom(&self.inner, 4);
 
-        // Pump the GTK main loop one iteration. queue_draw / queue_resize
-        // were not enough to make the bubbles paint without a mouse-hover
-        // first — the GL renderer was holding a cached render tree of the
-        // empty messages_box from when we cleared it during open_chat, and
-        // the bulk-append within one event-loop iteration didn't generate
-        // a window damage event the compositor (or GSK) considered worth
-        // redrawing for.
+        // Force the frame clock to keep running for ~600ms after this load.
         //
-        // Pumping one iteration here forces GTK to process pending layout,
-        // realize new widgets, and emit a render frame BEFORE this function
-        // returns. After this call, the next compositor frame callback has
-        // damage to redraw, and the bubbles paint without needing any user
-        // input to kick them.
+        // ROOT CAUSE: On Wayland, the GTK frame clock is driven by the
+        // compositor's frame callbacks. The compositor only delivers a
+        // frame callback when the surface has damage. queue_draw should
+        // damage the surface, BUT — and this is the trap — when GSK's GL
+        // renderer evaluates "do we have new damage", it can decide the
+        // cached snapshot is still valid (especially for ScrolledWindow's
+        // viewport, which uses snapshot caching aggressively). No damage
+        // → no frame callback → frame clock pauses → animations freeze
+        // mid-state. Mouse motion bypasses this by generating actual
+        // input damage, which is why hover "fixes" the symptom.
         //
-        // This is heavier than queue_draw but bounded: one iteration runs
-        // whatever's been queued (layout, paint, signal callbacks) and
-        // returns. We're already inside a UI event handler so the user is
-        // waiting on us anyway.
-        let main_ctx = glib::MainContext::default();
-        while main_ctx.iteration(false) {}
+        // Compounding this, the 8ms prepend timer runs back-to-back
+        // creating 5 bubbles per tick (~30-50ms of CPU each). Even when
+        // the frame clock IS running, the timer immediately reschedules
+        // and starves the layout/paint pass.
+        //
+        // The fix is two-pronged:
+        //   1. add_tick_callback registers a per-frame callback. While
+        //      registered, the widget continuously requests frames from
+        //      the compositor, keeping the frame clock unpaused regardless
+        //      of damage state.
+        //   2. The prepend timer is moved to lower priority (below) so
+        //      the frame clock gets every chance to render between batches.
+        //
+        // We register the tick callback for ~600ms which covers the worst
+        // case: 35 prepends @ 8ms intervals + initial 15 paint + slack.
+        // After that we unregister so we're not burning frames forever.
+        {
+            let scroll = self.inner.scroll.clone();
+            let start = std::time::Instant::now();
+            scroll.clone().add_tick_callback(move |w, _clock| {
+                if start.elapsed() > std::time::Duration::from_millis(600) {
+                    glib::ControlFlow::Break
+                } else {
+                    w.queue_draw();
+                    glib::ControlFlow::Continue
+                }
+            });
+        }
 
         // Stream older messages in. Each tick prepends 5 messages above the
         // visible ones using messages_box.prepend(...) so they appear above
@@ -2528,7 +2549,12 @@ impl ChatViewPanel {
             let pending: Rc<RefCell<Vec<IncomingMessage>>> =
                 Rc::new(RefCell::new(older));
             let chat_id_owned = chat_id.to_string();
-            glib::timeout_add_local(std::time::Duration::from_millis(8), move || {
+            // 33ms interval gives the frame clock a 30fps budget to render
+            // between prepend batches. Previously 8ms, which back-to-back
+            // ran ~30-50ms of bubble construction and starved layout/paint.
+            // The user-visible symptom of starvation is mid-scroll freezes
+            // until input (mouse hover) forces the next frame.
+            glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
                 let Some(inner) = inner_w.upgrade() else {
                     return glib::ControlFlow::Break;
                 };
