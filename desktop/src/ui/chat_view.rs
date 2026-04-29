@@ -2499,6 +2499,60 @@ impl ChatViewPanel {
         // covers all 35 prepend ticks plus texture-load resizes.
         Self::force_scroll_to_bottom(&self.inner, 4);
 
+        // DIAG: dump every child widget's type/name once after 1.5s so we
+        // can identify the 17 extras. children=32 vs bubbles=15 means there
+        // are widgets in messages_box that aren't bubbles — date separators
+        // would show up here, as would any leftover from previous chats.
+        {
+            let chat_id_log = chat_id.to_string();
+            let msgs_box_log = self.inner.messages_box.clone();
+            let bubbles_log = self.inner.bubbles.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                use gtk4::prelude::*;
+                // Compare by widget_name (set to "bubble-{msg_id}" at create
+                // time). This avoids any pointer-typing issues that the
+                // previous comparison may have been hitting.
+                let bubble_names: std::collections::HashSet<String> = bubbles_log
+                    .borrow()
+                    .keys()
+                    .map(|id| format!("bubble-{id}"))
+                    .collect();
+                let total_in_map = bubble_names.len();
+                let mut idx = 0;
+                let mut child = msgs_box_log.first_child();
+                let mut total_children = 0usize;
+                let mut bubble_children_matched = 0usize;
+                let mut bubble_children_unmatched = 0usize;
+                while let Some(c) = child {
+                    let name = c.widget_name().to_string();
+                    let css = c.css_classes().join(",");
+                    let kind = c.type_().name();
+                    let is_bubble_tag = name.starts_with("bubble-");
+                    let in_map = bubble_names.contains(&name);
+                    if is_bubble_tag {
+                        if in_map {
+                            bubble_children_matched += 1;
+                        } else {
+                            bubble_children_unmatched += 1;
+                        }
+                    }
+                    log::info!(
+                        "DIAG child[{chat_id_log} #{idx}] kind={kind} name={name:?} \
+                         css=[{css}] in_bubbles_map={in_map}"
+                    );
+                    idx += 1;
+                    total_children += 1;
+                    child = c.next_sibling();
+                }
+                log::info!(
+                    "DIAG SUMMARY[{chat_id_log}] children={total_children} \
+                     bubble_widgets_matched={bubble_children_matched} \
+                     bubble_widgets_unmatched={bubble_children_unmatched} \
+                     bubbles_map_size={total_in_map}"
+                );
+            });
+        }
+
 
         // Stream older messages in. Each tick prepends 5 messages above the
         // visible ones using messages_box.prepend(...) so they appear above
@@ -2668,10 +2722,18 @@ impl ChatViewPanel {
     /// Date separators are NOT inserted here — they'd land at the bottom of
     /// the messages_box (since maybe_insert_date_separator only appends).
     fn prepend_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
+        let before = inner.bubbles.borrow().len();
         if inner.bubbles.borrow().contains_key(&msg.id) {
+            log::info!("DIAG prepend SKIP (dup id={}): bubbles={before}", msg.id);
             return;
         }
+        let msg_id = msg.id.clone();
         Self::append_bubble_to_inner_at(inner, msg, BubblePosition::Prepend);
+        let after = inner.bubbles.borrow().len();
+        let in_map = inner.bubbles.borrow().contains_key(&msg_id);
+        log::info!(
+            "DIAG prepend DONE (id={msg_id}): bubbles {before}→{after} in_map={in_map}"
+        );
     }
 
     fn append_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
@@ -2966,6 +3028,10 @@ impl ChatViewPanel {
             }
         }
 
+        // DIAG: tag the widget with the msg_id so the dump can compare by
+        // value instead of pointer. If pointer comparison was lying about
+        // prepended bubbles, this avoids the issue entirely.
+        bubble.widget().set_widget_name(&format!("bubble-{}", msg.id));
         match position {
             BubblePosition::Append => inner.messages_box.append(bubble.widget()),
             // insert_child_after(widget, NONE) inserts at the top of the box
