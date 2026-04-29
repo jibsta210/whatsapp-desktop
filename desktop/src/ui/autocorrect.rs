@@ -1302,159 +1302,6 @@ pub fn start_ai_corrector() {
 }
 
 /// Clean any leaked reasoning, tags, or meta-commentary from AI response.
-/// Detect URL-like, email-like, @mention, and code-like tokens that the AI
-/// should NOT rewrite, replace each with an opaque placeholder, and return
-/// the masked string plus a restoration map.
-///
-/// We use a hand-rolled scanner instead of regex to keep the dependency
-/// footprint small — full regex isn't worth it for these patterns.
-fn mask_protected_tokens(input: &str) -> (String, Vec<(String, String)>) {
-    let mut masked = String::with_capacity(input.len());
-    let mut restoration: Vec<(String, String)> = Vec::new();
-    let mut counter: u32 = 0;
-
-    // Iterate whitespace-separated tokens but preserve original spacing.
-    // We track the byte index so we can copy through interstitial whitespace
-    // and punctuation exactly as it appeared.
-    let mut chars = input.char_indices().peekable();
-    let bytes = input.as_bytes();
-
-    while let Some(&(idx, ch)) = chars.peek() {
-        // Pass through whitespace verbatim
-        if ch.is_whitespace() {
-            masked.push(ch);
-            chars.next();
-            continue;
-        }
-        // Find the end of the current "token" — bounded by whitespace.
-        let start = idx;
-        let mut end = idx + ch.len_utf8();
-        chars.next();
-        while let Some(&(i, c)) = chars.peek() {
-            if c.is_whitespace() {
-                break;
-            }
-            end = i + c.len_utf8();
-            chars.next();
-        }
-        let token = &input[start..end];
-
-        // Trim trailing punctuation we want to keep outside the protected
-        // region (e.g. "https://foo.com." should mask only the URL part).
-        let trail_trim = token
-            .rfind(|c: char| !matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '"' | '\''))
-            .map(|i| i + token[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(1))
-            .unwrap_or(token.len());
-        let core = &token[..trail_trim];
-        let trail = &token[trail_trim..];
-
-        // Trim a leading paren/bracket/quote
-        let lead_trim = core
-            .find(|c: char| !matches!(c, '(' | '[' | '"' | '\''))
-            .unwrap_or(0);
-        let lead = &core[..lead_trim];
-        let bare = &core[lead_trim..];
-
-        let is_protected = is_protected_token(bare);
-
-        if is_protected {
-            let placeholder = format!("__TOK{counter}__");
-            counter += 1;
-            masked.push_str(lead);
-            masked.push_str(&placeholder);
-            masked.push_str(trail);
-            restoration.push((placeholder, bare.to_string()));
-        } else {
-            masked.push_str(token);
-        }
-
-        // Copy any whitespace that was consumed-then-broken-out
-        if let Some(&(_, c)) = chars.peek() {
-            // Loop will handle next whitespace via the top of the while body
-            let _ = c; // no-op
-        }
-        // Bytes guard: if we somehow lost track, bail safely
-        if masked.len() > bytes.len() * 4 {
-            break;
-        }
-    }
-
-    (masked, restoration)
-}
-
-fn is_protected_token(t: &str) -> bool {
-    if t.len() < 4 {
-        return false;
-    }
-    // URLs
-    if t.starts_with("http://") || t.starts_with("https://") || t.starts_with("www.") {
-        return true;
-    }
-    // Email — must have @ and a dot after it
-    if let Some(at) = t.find('@') {
-        let after = &t[at + 1..];
-        if !after.is_empty() && after.contains('.') && !after.contains(' ') {
-            // and the local part should look like an identifier
-            let local = &t[..at];
-            if !local.is_empty()
-                && local
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
-            {
-                return true;
-            }
-        }
-    }
-    // Bare domain like "google.com" or "rentfaster.ca"
-    if !t.contains(' ')
-        && t.contains('.')
-        && t.chars().next().map(|c| c.is_alphanumeric()).unwrap_or(false)
-    {
-        // Heuristic: at least one dot, last part is 2-6 letters (TLD), no
-        // spaces, no commas.
-        if let Some(last_dot) = t.rfind('.') {
-            let tld = &t[last_dot + 1..];
-            if (2..=10).contains(&tld.len())
-                && tld.chars().all(|c| c.is_ascii_alphabetic())
-                && t.chars()
-                    .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_' | '/' | '?' | '=' | '&' | '#' | '+'))
-            {
-                return true;
-            }
-        }
-    }
-    // File paths starting with / or ~ or drive letter
-    if t.starts_with('/') || t.starts_with("~/") {
-        if t.contains('/') && t.len() > 5 {
-            return true;
-        }
-    }
-    // Phone numbers (+12345...)
-    if t.starts_with('+') && t.len() > 5
-        && t[1..].chars().all(|c| c.is_ascii_digit() || matches!(c, '-' | ' ' | '(' | ')'))
-    {
-        return true;
-    }
-    // @mention or #hashtag
-    if (t.starts_with('@') || t.starts_with('#')) && t.len() > 1 {
-        return true;
-    }
-    false
-}
-
-fn unmask_protected_tokens(text: &str, restoration: &[(String, String)]) -> String {
-    if restoration.is_empty() {
-        return text.to_string();
-    }
-    let mut out = text.to_string();
-    for (placeholder, original) in restoration {
-        if out.contains(placeholder.as_str()) {
-            out = out.replace(placeholder.as_str(), original);
-        }
-    }
-    out
-}
-
 fn clean_ai_response(raw: &str) -> String {
     let mut text = raw.trim().to_string();
 
@@ -1526,24 +1373,18 @@ fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRe
             continue;
         }
 
-        // Protect URLs, emails, @mentions, code-like tokens, file paths,
-        // and phone numbers from being rewritten. Replace each with an
-        // opaque placeholder before sending to the AI; restore after.
-        // Without this, valid-looking URLs get "corrected" (e.g. domain
-        // capitalized, query strings reflowed, www added).
-        let (masked_text, restoration) = mask_protected_tokens(text);
-
-        log::info!("AI autocorrect: sending {} chars ({} protected tokens)", masked_text.len(), restoration.len());
+        log::info!("AI autocorrect: sending '{text}'");
 
         let body = serde_json::json!({
             "systemInstruction": {
                 "parts": [{
-                    "text": "You are an autocorrect engine. Return ONLY the corrected text. No explanations. No reasoning. No change descriptions. No markup. No quotes. Fix spelling, typos, missing/swapped letters, split words, missing apostrophes, and capitalization. Preserve meaning, tone, and slang. Do NOT modify any token of the form __TOK<digits>__ — leave those tokens exactly as they appear."
+                    "text": "You are an autocorrect engine. Return ONLY the corrected text. No explanations. No reasoning. No change descriptions. No markup. No quotes. Fix spelling, typos, missing/swapped letters, split words, missing apostrophes, and capitalization. Preserve meaning, tone, and slang. \
+                    \nNEVER modify URLs (http://, https://, www.), email addresses, bare domain names (e.g. google.com, rentfaster.ca, store.example.org), file paths (/foo/bar, ~/x), phone numbers (+1...), @mentions, #hashtags, or any code-like token containing slashes/dots/colons. Copy these EXACTLY — every character, casing, query string, and punctuation must be byte-identical to the input. If a sentence has a URL plus a typo, fix only the typo."
                 }]
             },
             "contents": [{
                 "parts": [{
-                    "text": masked_text
+                    "text": text
                 }]
             }],
             "generationConfig": {
@@ -1562,9 +1403,7 @@ fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRe
                     if let Some(raw) =
                         json["candidates"][0]["content"]["parts"][0]["text"].as_str()
                     {
-                        let cleaned = clean_ai_response(raw);
-                        // Restore protected tokens (URLs, emails, etc.).
-                        let corrected = unmask_protected_tokens(&cleaned, &restoration);
+                        let corrected = clean_ai_response(raw);
                         log::info!("AI autocorrect: got '{corrected}'");
                         if corrected != req.full_text
                             && !corrected.is_empty()
