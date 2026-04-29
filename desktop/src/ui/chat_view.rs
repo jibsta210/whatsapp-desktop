@@ -2338,6 +2338,7 @@ impl ChatViewPanel {
         self.inner.input_view.buffer().set_text(&draft);
 
         // Clear message area and search/media state
+        log::info!("DIAG CLEAR open_chat[{}] bubbles_before={}", chat_id, self.inner.bubbles.borrow().len());
         remove_all_children(&self.inner.messages_box);
         self.inner.bubbles.borrow_mut().clear();
         self.inner.search_texts.borrow_mut().clear();
@@ -2438,6 +2439,11 @@ impl ChatViewPanel {
             .as_deref()
             .map(|id| id == chat_id)
             .unwrap_or(false);
+
+        log::info!(
+            "DIAG load_history ENTER chat={} is_current={} msg_count={} bubbles_now={}",
+            chat_id, is_current, messages.len(), self.inner.bubbles.borrow().len()
+        );
 
         if !is_current {
             return;
@@ -2922,6 +2928,7 @@ impl ChatViewPanel {
                     while let Some(child) = inner_c.messages_box.first_child() {
                         inner_c.messages_box.remove(&child);
                     }
+                    log::info!("DIAG CLEAR contact-card-msg-btn bubbles_before={}", inner_c.bubbles.borrow().len());
                     inner_c.bubbles.borrow_mut().clear();
                     inner_c
                         .bridge
@@ -3119,6 +3126,7 @@ impl ChatViewPanel {
         if !is_current {
             return;
         }
+        log::info!("DIAG CLEAR clear_chat[{}] bubbles_before={}", chat_id, self.inner.bubbles.borrow().len());
         remove_all_children(&self.inner.messages_box);
         self.inner.bubbles.borrow_mut().clear();
         let label = gtk4::Label::new(Some(
@@ -3806,6 +3814,7 @@ fn show_message_menu(
                 // Fully switch to the DM chat (clear old messages, set new ID)
                 *inner_c.current_chat_id.borrow_mut() = Some(dm_jid.clone());
                 inner_c.header_name.set_text(&sender_name);
+                log::info!("DIAG CLEAR menu-reply-dm bubbles_before={}", inner_c.bubbles.borrow().len());
                 remove_all_children(&inner_c.messages_box);
                 inner_c.bubbles.borrow_mut().clear();
                 inner_c.search_texts.borrow_mut().clear();
@@ -3864,6 +3873,7 @@ fn show_message_menu(
                 let sid = sender_id.clone();
                 *inner_c.current_chat_id.borrow_mut() = Some(sid.clone());
                 inner_c.header_name.set_text(&sender_name_c);
+                log::info!("DIAG CLEAR menu-message-user bubbles_before={}", inner_c.bubbles.borrow().len());
                 remove_all_children(&inner_c.messages_box);
                 inner_c.bubbles.borrow_mut().clear();
                 inner_c
