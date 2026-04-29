@@ -2443,31 +2443,6 @@ impl ChatViewPanel {
             return;
         }
 
-        // DIAGNOSTIC: log entry to load_history. If the cache-side log says
-        // "newest ts=X" and load_history says "rendering N messages, newest
-        // ts=X", and the user still sees missing-newest behavior, the issue
-        // isn't data — it's paint or layout. If newest ts in load_history
-        // is OLDER than what arrived later via append_message, we have a
-        // race where MessageReceived events were processed BEFORE the
-        // HistoryMessages event for the same chat.
-        let bubbles_already = self.inner.bubbles.borrow().len();
-        let widget_count = {
-            let mut n = 0;
-            let mut child = self.inner.messages_box.first_child();
-            while let Some(c) = child {
-                n += 1;
-                child = c.next_sibling();
-            }
-            n
-        };
-        log::info!(
-            "DIAG load_history[{chat_id}]: incoming {} msgs, newest ts={}, \
-             messages_box already has {} children, bubbles map has {}",
-            messages.len(),
-            messages.last().map(|m| m.timestamp).unwrap_or(0),
-            widget_count,
-            bubbles_already
-        );
 
         // Remove placeholder
         self.remove_placeholder();
@@ -2581,18 +2556,6 @@ impl ChatViewPanel {
 
     pub fn append_message(&self, msg: IncomingMessage) {
         let inner = &self.inner;
-
-        // DIAGNOSTIC: log every append. If the user clicks chat A and then
-        // sees newest messages "appear on hover", what's happening is
-        // probably that MessageReceived events for chat A are queued in
-        // event_rx and only drain over time, NOT that hover causes paint.
-        // This log will show whether append_message is being called at the
-        // moment the user perceives "missing" messages becoming visible.
-        log::info!(
-            "DIAG append_message[chat={} msg_id={} ts={} from_me={}] current_chat={:?}",
-            msg.chat_id, msg.id, msg.timestamp, msg.is_from_me,
-            inner.current_chat_id.borrow().as_deref()
-        );
 
         // Match the current chat — tolerant of LID/phone JID aliases so
         // that self-messages from phone (which may arrive as @lid when the
