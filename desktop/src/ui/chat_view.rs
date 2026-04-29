@@ -692,15 +692,27 @@ impl ChatViewPanel {
             inner.scroll.add_controller(sc);
         }
 
-        // When content height changes (layout/image load), auto-scroll if pending
+        // When content height changes (layout/image load/prepend), re-anchor
+        // to the bottom in two cases:
+        //   1. Force mode: scroll_pending > 0 (used by chat switch / send to
+        //      override even an out-of-position scroll).
+        //   2. Idle mode: at_bottom is true (the user hasn't scrolled away).
+        //      This is the durable lock — it keeps us pinned to the latest
+        //      message through long sequences of prepends or texture-load
+        //      resizes without needing to guess a pulse count up front.
+        // User-initiated scroll updates at_bottom via EventControllerScroll
+        // above, so scrolling up cleanly disables the auto-snap.
         {
             let sp = inner.scroll_pending.clone();
+            let at_b = inner.at_bottom.clone();
             let adj = inner.scroll.vadjustment();
             adj.connect_changed(move |a| {
                 let count = sp.get();
                 if count > 0 {
                     a.set_value(a.upper() - a.page_size());
                     sp.set(count - 1);
+                } else if at_b.get() {
+                    a.set_value(a.upper() - a.page_size());
                 }
             });
         }
@@ -2469,17 +2481,12 @@ impl ChatViewPanel {
         self.inner.at_bottom.set(true);
         self.inner.goto_latest_btn.set_visible(false);
 
-        // Pulse-based re-snap: each `vadjustment::changed` (fires when
-        // content height changes) re-anchors to bottom while pulses remain.
-        // We need enough pulses to ride out:
-        //   1. Initial layout pass for the 15 visible bubbles
-        //   2. Avatar texture loads resizing rows
-        //   3. The 8ms prepend ticks below (≈7 batches of 5 for the 35 olders)
-        // 16 covers all of that with headroom. Without this, the previous
-        // one-shot 0ms timeout would set `value` against a partially-laid-out
-        // `upper` and you'd land mid-chat instead of at the latest message
-        // until something forced a re-layout (mouse hover into the pane).
-        Self::force_scroll_to_bottom(&self.inner, 16);
+        // Mark as at-bottom and seed a few pulses for the initial layout +
+        // first prepends. The connect_changed handler will keep us anchored
+        // for as long as at_bottom remains true (i.e., until the user
+        // scrolls away), so we don't need to guess a pulse count that
+        // covers all 35 prepend ticks plus texture-load resizes.
+        Self::force_scroll_to_bottom(&self.inner, 4);
 
         // Stream older messages in. Each tick prepends 5 messages above the
         // visible ones using messages_box.prepend(...) so they appear above
