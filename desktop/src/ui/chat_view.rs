@@ -656,10 +656,12 @@ impl ChatViewPanel {
             send_group_ids: RefCell::new(None),
         });
 
-        // Poll AI autocorrect in-flight status to toggle the spinner
+        // Poll AI autocorrect in-flight status to toggle the spinner.
+        // 500ms is plenty — spinner is purely cosmetic feedback, no need to
+        // wake the main loop 10×/sec just to watch a flag.
         {
             let spinner = inner.ai_spinner.clone();
-            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
                 let correcting = crate::ui::autocorrect::is_correcting();
                 if correcting && !spinner.is_visible() {
                     spinner.set_visible(true);

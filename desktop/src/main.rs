@@ -94,6 +94,16 @@ fn main() {
     // as an env var before the toolkit reads it.
     apply_prescale(&data_dir);
 
+    // Force the GL renderer instead of Vulkan. On many Linux setups GTK4's
+    // Vulkan renderer constantly hits VK_SUBOPTIMAL_KHR and rebuilds the
+    // swapchain every few frames — this manifests as input lag, choppy
+    // hover highlights, and a generally "heavy" feel even though CPU is
+    // idle. The classic GL renderer is more stable for chat-like UIs.
+    // Users can override by setting GSK_RENDERER themselves before launch.
+    if std::env::var("GSK_RENDERER").is_err() {
+        unsafe { std::env::set_var("GSK_RENDERER", "gl") };
+    }
+
     env_logger::init();
 
     // Log panics to a file before aborting — so we can diagnose crashes
