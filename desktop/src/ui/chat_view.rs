@@ -2468,14 +2468,18 @@ impl ChatViewPanel {
         }
         self.inner.at_bottom.set(true);
         self.inner.goto_latest_btn.set_visible(false);
-        self.inner.scroll_pending.set(0);
 
-        // Snap to bottom in the next frame
-        let scroll = self.inner.scroll.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(0), move || {
-            let adj = scroll.vadjustment();
-            adj.set_value(adj.upper() - adj.page_size());
-        });
+        // Pulse-based re-snap: each `vadjustment::changed` (fires when
+        // content height changes) re-anchors to bottom while pulses remain.
+        // We need enough pulses to ride out:
+        //   1. Initial layout pass for the 15 visible bubbles
+        //   2. Avatar texture loads resizing rows
+        //   3. The 8ms prepend ticks below (≈7 batches of 5 for the 35 olders)
+        // 16 covers all of that with headroom. Without this, the previous
+        // one-shot 0ms timeout would set `value` against a partially-laid-out
+        // `upper` and you'd land mid-chat instead of at the latest message
+        // until something forced a re-layout (mouse hover into the pane).
+        Self::force_scroll_to_bottom(&self.inner, 16);
 
         // Stream older messages in. Each tick prepends 5 messages above the
         // visible ones using messages_box.prepend(...) so they appear above
