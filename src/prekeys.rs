@@ -77,11 +77,11 @@ impl Client {
             device_guard.backend.clone()
         };
 
+        // Pre-key IDs are 24-bit (max 16,777,215 per WA Web's NEXT_PK_ID).
         // Determine the starting ID using both the persistent counter AND the store max.
-        // Using max(counter, max_id+1) guards against crash-after-upload-before-persist:
-        // the counter would be stale, but the store already has the generated keys.
+        const MAX_PRE_KEY_ID: u32 = 16_777_215;
         let max_id = backend.get_max_prekey_id().await?;
-        let start_id = if device_snapshot.next_pre_key_id > 0 {
+        let mut start_id = if device_snapshot.next_pre_key_id > 0 {
             std::cmp::max(device_snapshot.next_pre_key_id, max_id + 1)
         } else {
             log::info!(
@@ -92,20 +92,30 @@ impl Client {
             max_id + 1
         };
 
+        // Wrap around when we run out of 24-bit ID space. Old pre-keys with
+        // IDs <= the consumed-server pointer have already been used; reusing
+        // those IDs is safe (the server will issue fresh ones from the
+        // upload, ignoring our local stale records). Without this reset,
+        // every startup after running out of IDs uploads ZERO keys and the
+        // session establishment from peers eventually fails.
+        if start_id > MAX_PRE_KEY_ID
+            || start_id.saturating_add(WANTED_PRE_KEY_COUNT as u32) > MAX_PRE_KEY_ID
+        {
+            log::warn!(
+                "Pre-key ID counter at {}, wrapping back to 1 (was hitting 24-bit ceiling)",
+                start_id
+            );
+            start_id = 1;
+        }
+
         let mut keys_to_upload = Vec::with_capacity(WANTED_PRE_KEY_COUNT);
         let mut key_pairs_to_upload = Vec::with_capacity(WANTED_PRE_KEY_COUNT);
 
         for i in 0..WANTED_PRE_KEY_COUNT {
             let pre_key_id = start_id + i as u32;
-
-            if pre_key_id > 16777215 {
-                log::warn!(
-                    "Pre-key ID {} exceeds maximum range, wrapping around",
-                    pre_key_id
-                );
+            if pre_key_id > MAX_PRE_KEY_ID {
                 break;
             }
-
             let key_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
             let pre_key_record = new_pre_key_record(pre_key_id, &key_pair);
 
