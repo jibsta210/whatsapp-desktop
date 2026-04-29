@@ -2505,6 +2505,34 @@ impl ChatViewPanel {
         // covers all 35 prepend ticks plus texture-load resizes.
         Self::force_scroll_to_bottom(&self.inner, 4);
 
+        // DIAG: trace bubbles HashMap size every 100ms for 3s so we can
+        // see the EXACT moment 35 entries vanish. Also trace child count.
+        {
+            let bubbles_trace = self.inner.bubbles.clone();
+            let msgs_box_trace = self.inner.messages_box.clone();
+            let chat_id_trace = chat_id.to_string();
+            let elapsed = std::cell::Cell::new(0u32);
+            glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
+                let n = elapsed.get() + 100;
+                elapsed.set(n);
+                let bubbles_len = bubbles_trace.borrow().len();
+                let mut child_count = 0;
+                let mut child = msgs_box_trace.first_child();
+                while let Some(c) = child {
+                    child_count += 1;
+                    child = c.next_sibling();
+                }
+                log::info!(
+                    "DIAG TRACE[{chat_id_trace} t+{n}ms] bubbles_map={bubbles_len} children={child_count}"
+                );
+                if n >= 3000 {
+                    glib::ControlFlow::Break
+                } else {
+                    glib::ControlFlow::Continue
+                }
+            });
+        }
+
         // DIAG: dump every child widget's type/name once after 1.5s so we
         // can identify the 17 extras. children=32 vs bubbles=15 means there
         // are widgets in messages_box that aren't bubbles — date separators
