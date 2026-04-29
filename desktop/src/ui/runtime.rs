@@ -3892,6 +3892,24 @@ async fn handle_command(
                 })
             };
 
+            // DIAGNOSTIC: log what's in the cache when LoadChat runs. We're
+            // tracking why "newest messages don't show until hover" — if the
+            // cache is missing the latest messages at this moment, that
+            // proves the data path is racing the network handler.
+            if let Some(ref msgs) = cached_last_50 {
+                let total_in_history: usize = state.lock().unwrap()
+                    .history.get(&chat_id).map(|h| h.len()).unwrap_or(0);
+                let last_ts = msgs.last().map(|m| m.timestamp).unwrap_or(0);
+                let last_id = msgs.last().map(|m| m.id.as_str()).unwrap_or("(none)");
+                log::info!(
+                    "DIAG LoadChat[{chat_id}]: cache has {total_in_history} total, \
+                     returning last {} (newest id={last_id} ts={last_ts})",
+                    msgs.len()
+                );
+            } else {
+                log::info!("DIAG LoadChat[{chat_id}]: cache MISS — loading from disk");
+            }
+
             let mut all_messages = if let Some(msgs) = cached_last_50 {
                 state.lock().unwrap().touch_history(&chat_id);
                 msgs
@@ -4062,6 +4080,13 @@ async fn handle_command(
                     .collect()
             };
 
+            // DIAGNOSTIC: log final messages count being sent to UI.
+            log::info!(
+                "DIAG HistoryMessages[{chat_id}]: sending {} messages to UI \
+                 (newest ts={})",
+                messages.len(),
+                messages.last().map(|m| m.timestamp).unwrap_or(0)
+            );
             let _ = tx
                 .send(WaEvent::HistoryMessages {
                     chat_id: chat_id.clone(),
