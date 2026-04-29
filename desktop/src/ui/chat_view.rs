@@ -2506,15 +2506,19 @@ impl ChatViewPanel {
         Self::force_scroll_to_bottom(&self.inner, 4);
 
         // DIAG: trace bubbles HashMap size every 100ms for 3s so we can
-        // see the EXACT moment 35 entries vanish. Also trace child count.
+        // see the EXACT moment 35 entries vanish. eprintln! is used in
+        // addition to log::info because the previous test showed log lines
+        // never appearing — eprintln! goes straight to stderr.
+        eprintln!("DIAG TRACE timer SCHEDULED for chat={}", chat_id);
         {
             let bubbles_trace = self.inner.bubbles.clone();
             let msgs_box_trace = self.inner.messages_box.clone();
             let chat_id_trace = chat_id.to_string();
-            let elapsed = std::cell::Cell::new(0u32);
+            let elapsed = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            let elapsed_clone = elapsed.clone();
             glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                let n = elapsed.get() + 100;
-                elapsed.set(n);
+                let n = elapsed_clone.get() + 100;
+                elapsed_clone.set(n);
                 let bubbles_len = bubbles_trace.borrow().len();
                 let mut child_count = 0;
                 let mut child = msgs_box_trace.first_child();
@@ -2522,8 +2526,9 @@ impl ChatViewPanel {
                     child_count += 1;
                     child = c.next_sibling();
                 }
-                log::info!(
-                    "DIAG TRACE[{chat_id_trace} t+{n}ms] bubbles_map={bubbles_len} children={child_count}"
+                eprintln!(
+                    "DIAG TRACE[{} t+{}ms] bubbles_map={} children={}",
+                    chat_id_trace, n, bubbles_len, child_count
                 );
                 if n >= 3000 {
                     glib::ControlFlow::Break
