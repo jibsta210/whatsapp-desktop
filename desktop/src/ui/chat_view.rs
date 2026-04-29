@@ -2704,6 +2704,7 @@ impl ChatViewPanel {
     }
 
     pub fn confirm_bubble(&self, tmp_id: &str, real_id: &str) {
+        log::info!("DIAG REMOVE confirm_bubble tmp={tmp_id} → real={real_id}");
         let mut bubbles = self.inner.bubbles.borrow_mut();
         if let Some(bubble) = bubbles.remove(tmp_id) {
             bubble.update_receipt(&ReceiptStatus::Sent);
@@ -3022,6 +3023,7 @@ impl ChatViewPanel {
                 || msg.contact_name.is_some();
             if has_new_data {
                 // Remove old bubble and fall through to create a new one
+                log::info!("DIAG REMOVE has_new_data id={}", msg.id);
                 let mut bubbles = inner.bubbles.borrow_mut();
                 if let Some(old) = bubbles.remove(&msg.id) {
                     inner.messages_box.remove(old.widget());
@@ -3157,7 +3159,7 @@ impl ChatViewPanel {
         }
         let mut bubbles = self.inner.bubbles.borrow_mut();
         log::info!(
-            "remove_message: {} bubbles in cache, looking for {msg_id}",
+            "DIAG REMOVE remove_message msg_id={msg_id} bubbles_in_cache={}",
             bubbles.len()
         );
         if let Some(bubble) = bubbles.remove(msg_id) {
