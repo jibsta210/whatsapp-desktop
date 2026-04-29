@@ -1378,8 +1378,12 @@ fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRe
         let body = serde_json::json!({
             "systemInstruction": {
                 "parts": [{
-                    "text": "You are an autocorrect engine. Return ONLY the corrected text. No explanations. No reasoning. No change descriptions. No markup. No quotes. Fix spelling, typos, missing/swapped letters, split words, missing apostrophes, and capitalization. Preserve meaning, tone, and slang. \
-                    \nNEVER modify URLs (http://, https://, www.), email addresses, bare domain names (e.g. google.com, rentfaster.ca, store.example.org), file paths (/foo/bar, ~/x), phone numbers (+1...), @mentions, #hashtags, or any code-like token containing slashes/dots/colons. Copy these EXACTLY — every character, casing, query string, and punctuation must be byte-identical to the input. If a sentence has a URL plus a typo, fix only the typo."
+                    "text": "Act as a savvy editor for a WhatsApp message input. Fix the user's bad typing and poor spelling so they look professional. Fix capitalization and punctuation. \
+                    \nDO NOT modify any nouns, hard numbers, URLs, acronyms, or slang when you are able to contextually identify them. \
+                    \nDo not expand contractions or short forms (e.g. leave 'don't' as 'don't', leave 'u' as 'u', leave 'rn' as 'rn'). \
+                    \nDo not correct internet slang (e.g. 'finna', 'no cap', 'slay', 'fr', 'tbh', 'lmk'). \
+                    \nOnly fix unintentional typos and missing essential punctuation. You may improve sentence structure, but DO NOT remove the original voice or vibe of the writer. \
+                    \nReturn ONLY the corrected text. No explanations, reasoning, change descriptions, markup, or surrounding quotes."
                 }]
             },
             "contents": [{
