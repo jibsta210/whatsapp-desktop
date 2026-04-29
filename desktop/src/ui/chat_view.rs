@@ -2498,6 +2498,19 @@ impl ChatViewPanel {
         // covers all 35 prepend ticks plus texture-load resizes.
         Self::force_scroll_to_bottom(&self.inner, 4);
 
+        // Force GTK4 to paint NOW. Without this, appending all 15 widgets
+        // synchronously inside a single event-loop iteration leaves the GL
+        // renderer with no incentive to ask the frame clock for a redraw —
+        // the bubble widgets are present and laid out, but the texture
+        // upload / paint pass doesn't fire until another event invalidates
+        // a region (which is why mouse-hover into the message pane was
+        // making the messages "appear" — the motion event triggered the
+        // redraw GTK had been deferring). queue_draw on both the box and
+        // the scrolled window flags both layers as dirty so the next frame
+        // tick actually composites them.
+        self.inner.messages_box.queue_draw();
+        self.inner.scroll.queue_draw();
+
         // Stream older messages in. Each tick prepends 5 messages above the
         // visible ones using messages_box.prepend(...) so they appear above
         // without disturbing the visible window. We use a Cell<Option<Vec>>
