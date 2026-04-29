@@ -36,6 +36,16 @@ fn remove_all_children(parent: &Box) {
     }
 }
 
+/// Where to insert a new bubble within messages_box.
+/// Used by append_bubble_to_inner_at to keep all bubble construction
+/// (gestures, hover wiring, avatar load, etc.) in one place while letting
+/// the caller pick top vs. bottom insertion.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BubblePosition {
+    Append,
+    Prepend,
+}
+
 #[derive(Clone)]
 pub struct ChatViewPanel {
     inner: Rc<ChatViewInner>,
@@ -2522,24 +2532,13 @@ impl ChatViewPanel {
                 let batch: Vec<_> = p.split_off(take);
                 drop(p);
                 // Prepend in reverse so the oldest of this batch ends up
-                // furthest from the visible window.
+                // furthest from the visible window. Direct insert-at-top
+                // (no append-then-move dance), so `upper` grows monotonically
+                // and the connect_changed handler keeps the bottom pinned
+                // while at_bottom is true.
                 for msg in batch.into_iter().rev() {
                     Self::prepend_bubble_to_inner(&inner, msg);
                 }
-                // Each prepend internally appends-then-removes-then-reinserts
-                // the bubble at the top, oscillating `upper` within a single
-                // synchronous block. The connect_changed handler snaps once
-                // for whatever upper it sees, which can be a transient value.
-                // Schedule a deferred snap on the next idle so it runs AFTER
-                // the layout pass has resolved the final content height.
-                let scroll_for_idle = inner.scroll.clone();
-                let at_b_for_idle = inner.at_bottom.clone();
-                glib::idle_add_local_once(move || {
-                    if at_b_for_idle.get() {
-                        let adj = scroll_for_idle.vadjustment();
-                        adj.set_value(adj.upper() - adj.page_size());
-                    }
-                });
                 glib::ControlFlow::Continue
             });
         }
@@ -2654,55 +2653,47 @@ impl ChatViewPanel {
         }
     }
 
-    /// Build a bubble for `msg` and move it to the TOP of messages_box.
+    /// Build a bubble for `msg` and insert it at the TOP of messages_box.
     /// Used by load_history's incremental fill-in to add older messages
-    /// above the visible window without re-rendering.
+    /// above the visible window. Inserts directly at the top without the
+    /// previous append-then-remove-then-reinsert dance, which was causing
+    /// the scrolled window's `upper` to flap (grow → shrink → grow) within
+    /// one synchronous block. GtkAdjustment auto-clamps `value` when `upper`
+    /// shrinks, so the brief shrink during the remove step pinned the
+    /// scroll a few message-heights above the true bottom — visibly leaving
+    /// chats short-scrolled by 5+ messages on every history load.
     ///
     /// Date separators are NOT inserted here — they'd land at the bottom of
     /// the messages_box (since maybe_insert_date_separator only appends).
-    /// load_history does a final pass to insert correct separators once all
-    /// older messages are in place.
     fn prepend_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
         if inner.bubbles.borrow().contains_key(&msg.id) {
             return;
         }
-        Self::append_bubble_to_inner_no_separator(inner, msg.clone());
-        let bubble_widget = match inner.bubbles.borrow().get(&msg.id) {
-            Some(b) => b.widget().clone().upcast::<gtk4::Widget>(),
-            None => return,
-        };
-        inner.messages_box.remove(&bubble_widget);
-        inner
-            .messages_box
-            .insert_child_after(&bubble_widget, gtk4::Widget::NONE);
-    }
-
-    /// Identical to append_bubble_to_inner but skips the date-separator
-    /// insertion. Used by prepend path so separators don't land at the
-    /// bottom of the messages_box. The caller is responsible for adding
-    /// separators in the correct positions after the fill-in completes.
-    fn append_bubble_to_inner_no_separator(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
-        // Save the date state, suppress separator insertion, restore after.
-        let saved_date = inner.last_msg_date.borrow().clone();
-        // Stuff a "match" date so maybe_insert_date_separator returns early
-        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(msg.timestamp, 0)
-            .unwrap_or_default();
-        let local: chrono::DateTime<chrono::Local> = chrono::DateTime::from(dt);
-        *inner.last_msg_date.borrow_mut() = Some(local.date_naive());
-        Self::append_bubble_to_inner(inner, msg);
-        // Restore so future appends still get correct separators.
-        *inner.last_msg_date.borrow_mut() = saved_date;
+        Self::append_bubble_to_inner_at(inner, msg, BubblePosition::Prepend);
     }
 
     fn append_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
+        Self::append_bubble_to_inner_at(inner, msg, BubblePosition::Append);
+    }
+
+    fn append_bubble_to_inner_at(
+        inner: &Rc<ChatViewInner>,
+        msg: IncomingMessage,
+        position: BubblePosition,
+    ) {
         // Dedup: if a bubble already exists for this msg id (e.g. optimistic bubble
         // was already confirmed via MessageConfirmed), skip creating a new one.
         if inner.bubbles.borrow().contains_key(&msg.id) {
             return;
         }
 
-        // Insert a date separator when the day changes
-        maybe_insert_date_separator(inner, msg.timestamp);
+        // Insert a date separator when the day changes — only on append.
+        // Prepend inserts at the top of the box, where any new separator
+        // would actually land at the BOTTOM (since maybe_insert_date_separator
+        // appends), producing the wrong order entirely.
+        if matches!(position, BubblePosition::Append) {
+            maybe_insert_date_separator(inner, msg.timestamp);
+        }
 
         let own_name = inner.own_name.borrow().clone();
         let bubble = MessageBubble::new(&msg, &own_name, &inner.bridge);
@@ -2966,12 +2957,24 @@ impl ChatViewPanel {
                 }
                 drop(bubbles);
             } else {
-                Self::scroll_if_at_bottom(inner);
+                if matches!(position, BubblePosition::Append) {
+                    Self::scroll_if_at_bottom(inner);
+                }
                 return;
             }
         }
 
-        inner.messages_box.append(bubble.widget());
+        match position {
+            BubblePosition::Append => inner.messages_box.append(bubble.widget()),
+            // insert_child_after(widget, NONE) inserts at the top of the box
+            // in one step. No append-then-remove dance, so `upper` only grows
+            // (never momentarily shrinks), and the auto-clamp on
+            // GtkAdjustment that was pinning the scroll position above the
+            // true bottom no longer fires.
+            BubblePosition::Prepend => inner
+                .messages_box
+                .insert_child_after(bubble.widget(), gtk4::Widget::NONE),
+        }
         inner.bubbles.borrow_mut().insert(msg.id.clone(), bubble);
         inner
             .search_texts
@@ -2984,8 +2987,14 @@ impl ChatViewPanel {
             Self::apply_search_filter(inner, &query);
         }
 
-        // Only auto-scroll if user is already at the bottom — never override their scroll position
-        Self::scroll_if_at_bottom(inner);
+        // Only the append path tries to auto-scroll. Prepend inserts above
+        // the visible viewport — the existing connect_changed handler will
+        // re-anchor the bottom while at_bottom is true, but we don't want
+        // to fire a redundant set_value here (it would race with the layout
+        // pass that hasn't happened yet for the just-inserted top widget).
+        if matches!(position, BubblePosition::Append) {
+            Self::scroll_if_at_bottom(inner);
+        }
     }
 
     pub fn set_media_loaded(
