@@ -2526,6 +2526,20 @@ impl ChatViewPanel {
                 for msg in batch.into_iter().rev() {
                     Self::prepend_bubble_to_inner(&inner, msg);
                 }
+                // Each prepend internally appends-then-removes-then-reinserts
+                // the bubble at the top, oscillating `upper` within a single
+                // synchronous block. The connect_changed handler snaps once
+                // for whatever upper it sees, which can be a transient value.
+                // Schedule a deferred snap on the next idle so it runs AFTER
+                // the layout pass has resolved the final content height.
+                let scroll_for_idle = inner.scroll.clone();
+                let at_b_for_idle = inner.at_bottom.clone();
+                glib::idle_add_local_once(move || {
+                    if at_b_for_idle.get() {
+                        let adj = scroll_for_idle.vadjustment();
+                        adj.set_value(adj.upper() - adj.page_size());
+                    }
+                });
                 glib::ControlFlow::Continue
             });
         }
