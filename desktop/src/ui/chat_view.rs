@@ -226,61 +226,54 @@ impl ChatViewPanel {
 
         // Bubble max-width as a percentage of the message pane width.
         // GTK4 CSS doesn't support percentage max-width, so we install a
-        // per-display CssProvider whose single rule we update each time
-        // the scroll widget's width changes. Bubbles grow/shrink with the
-        // window automatically, capped at a sensible upper bound (1100px)
-        // so on ultrawide displays text doesn't become awkward to scan.
+        // per-display CssProvider whose single rule we rewrite when the
+        // scroll widget's width crosses a bucket boundary.
+        //
+        // Implementation notes:
+        //   - Bucket size 32px keeps CSS rewrites infrequent during drag
+        //     (~30 buckets across the realistic range), which prevents
+        //     drag lag — load_from_string triggers a global style
+        //     invalidation that's expensive at 60Hz.
+        //   - queue_resize on messages_box after each rewrite forces GTK
+        //     to re-measure the bubbles with the new max-width; without
+        //     this, layout stays at the OLD measured sizes until something
+        //     else triggers re-measurement.
+        //   - Priority APPLICATION + 10 ensures we override the static
+        //     bubble rules from app.rs's APP_CSS (loaded at APPLICATION).
         {
             let provider = gtk4::CssProvider::new();
             if let Some(display) = gtk4::gdk::Display::default() {
                 gtk4::style_context_add_provider_for_display(
                     &display,
                     &provider,
-                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 10,
                 );
             }
-            let scroll_w = scroll.clone();
-            let provider_c = provider.clone();
-            let update_max_width = move || {
-                let pane_w = scroll_w.width();
-                if pane_w <= 0 {
-                    return;
-                }
-                // 65% of pane width, hard cap at 1100px, soft floor at 280px
-                let max_w = ((pane_w as f32 * 0.65) as i32).clamp(280, 1100);
-                let css = format!(
-                    "box.message-bubble-out, box.message-bubble-in {{ max-width: {max_w}px; }}"
-                );
-                provider_c.load_from_string(&css);
-            };
-            // Initial value (in case width is already known by realize time)
-            update_max_width();
-            // React to width changes (window resize, paned drag)
-            let upd1 = update_max_width.clone();
-            scroll.connect_notify_local(Some("width-request"), move |_, _| upd1());
-            let upd2 = update_max_width.clone();
-            scroll.connect_realize(move |_| upd2());
-            let upd3 = update_max_width;
-            scroll.connect_map(move |_| upd3());
-            // GTK4 doesn't notify on `width` directly for ScrolledWindow;
-            // hook the underlying allocation via a tick callback that
-            // re-evaluates if the cached width drifts. Cheap because we
-            // only update the CSS provider when the bucketed value
-            // actually changes.
-            let last_max: std::cell::Cell<i32> = std::cell::Cell::new(0);
+            let last_bucket: std::cell::Cell<i32> = std::cell::Cell::new(-1);
             let scroll_tick = scroll.clone();
+            let messages_box_tick = messages_box.clone();
             let provider_tick = provider.clone();
             scroll.add_tick_callback(move |_, _| {
                 let pane_w = scroll_tick.width();
-                if pane_w > 0 {
-                    let max_w = ((pane_w as f32 * 0.65) as i32).clamp(280, 1100);
-                    if (max_w - last_max.get()).abs() > 4 {
-                        last_max.set(max_w);
-                        let css = format!(
-                            "box.message-bubble-out, box.message-bubble-in {{ max-width: {max_w}px; }}"
-                        );
-                        provider_tick.load_from_string(&css);
-                    }
+                if pane_w <= 0 {
+                    return glib::ControlFlow::Continue;
+                }
+                // 65% of pane width, hard cap 1100px, soft floor 280px,
+                // bucketed to 32px so we don't rewrite CSS on every pixel.
+                let raw = (pane_w as f32 * 0.65) as i32;
+                let bucket = (raw / 32) * 32;
+                if bucket != last_bucket.get() {
+                    last_bucket.set(bucket);
+                    let max_w = bucket.clamp(280, 1100);
+                    let css = format!(
+                        "box.message-bubble-out, box.message-bubble-in \
+                         {{ max-width: {max_w}px; }}"
+                    );
+                    provider_tick.load_from_string(&css);
+                    // Force re-measurement so the new max-width takes
+                    // effect on the existing widget tree without waiting
+                    // for some unrelated event to invalidate layout.
+                    messages_box_tick.queue_resize();
                 }
                 glib::ControlFlow::Continue
             });
