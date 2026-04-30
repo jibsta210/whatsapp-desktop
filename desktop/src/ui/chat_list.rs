@@ -357,16 +357,11 @@ impl ChatListPanel {
                                     } else {
                                         crate::ui::runtime::display_name_from_jid(&cid)
                                     };
-                                    // Clear the search entry so the chat list
-                                    // returns to its normal state and focus
-                                    // can settle on the message input. See
-                                    // the row-activation handler for the full
-                                    // rationale.
-                                    if let Some(inner) = rows_ref.upgrade() {
-                                        if !inner.search_entry.text().is_empty() {
-                                            inner.search_entry.set_text("");
-                                        }
-                                    }
+                                    // Note: search_entry is left intact so
+                                    // the user can keep clicking through
+                                    // results without re-typing the query.
+                                    // Focus moves to the message input via
+                                    // on_select → open_chat → grab_focus.
                                     (os2)(cid.clone(), name.clone());
                                     br2.send_command(crate::bridge::WaCommand::LoadChat {
                                         chat_id: cid.clone(),
@@ -402,19 +397,13 @@ impl ChatListPanel {
                             .map(|(id, r)| (id.clone(), r.chat_name.clone()))
                     };
                     if let Some((chat_id, chat_name)) = found {
-                        // Clear chat-list search when a chat is picked.
-                        // Two reasons:
-                        // 1. UX: user is done filtering, no need to keep
-                        //    the partial query visible.
-                        // 2. Bug fix: SearchEntry retained keyboard focus
-                        //    through row-activation, intercepting Ctrl+V
-                        //    before our paste handler on input_view saw it.
-                        //    Text typing worked because TextView reclaims
-                        //    focus on first keystroke, but Ctrl+V didn't
-                        //    fire our image-clipboard reader.
-                        if !inner.search_entry.text().is_empty() {
-                            inner.search_entry.set_text("");
-                        }
+                        // Note: we deliberately DO NOT clear search_entry
+                        // here. Users browsing search results often click
+                        // through several matches; clearing forces them
+                        // to retype the query each time. Focus is moved
+                        // off the search entry by on_select (which calls
+                        // input_view.grab_focus in chat_view::open_chat),
+                        // so Ctrl+V reaches the message input correctly.
                         (inner.on_select)(chat_id.clone(), chat_name.clone());
                         // LoadChat + MarkRead are now handled by the on_select callback
                         let mut rows = inner.rows.borrow_mut();

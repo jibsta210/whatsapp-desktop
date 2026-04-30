@@ -2507,7 +2507,22 @@ impl ChatViewPanel {
         }
 
         // Focus the message input so user can start typing immediately
+        // (and so Ctrl+V hits the paste handler on input_view, not
+        // whatever widget happened to be focused before — e.g. the
+        // chat-list SearchEntry when picking from filtered results).
         self.inner.input_view.grab_focus();
+
+        // Belt-and-braces: idle-re-grab. When the chat is selected from
+        // a SearchEntry-filtered list, GTK can route focus back to the
+        // SearchEntry after the row-activated callback returns (the
+        // search entry was the user's last interactive widget). Without
+        // this idle pass, Ctrl+V immediately after click would hit the
+        // SearchEntry instead of input_view. Idle priority runs after
+        // all pending focus events have been processed.
+        let inp = self.inner.input_view.clone();
+        glib::idle_add_local_once(move || {
+            inp.grab_focus();
+        });
         true
     }
 
