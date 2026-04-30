@@ -4077,7 +4077,15 @@ async fn handle_command(
 
             // Async LID→phone resolution for unresolved group participant senders.
             // Uses usync (device-list query) which does a network round-trip and
-            // persists mappings. After resolving, re-sends updated messages to UI.
+            // persists mappings. The resolved names land in the cache so
+            // they appear correctly the next time this chat is loaded.
+            //
+            // We deliberately do NOT re-send a HistoryMessages event for
+            // the resolved names: the UI's append_bubble_to_inner_at dedups
+            // by msg.id and would skip the re-render anyway, but the
+            // redundant load_history call was tickling a GTK4 GL renderer
+            // paint bug that left group-chat bubbles invisible until the
+            // user hovered over the message pane.
             if !unresolved_lids.is_empty() && chat_id.ends_with("@g.us") {
                 log::info!(
                     "LoadChat {chat_id}: {} unresolved LID senders, triggering usync resolution",
@@ -4085,7 +4093,6 @@ async fn handle_command(
                 );
                 let client_c = client.clone();
                 let state_c = state.clone();
-                let tx_c = tx.clone();
                 let chat_id_c = chat_id.clone();
                 tokio::spawn(async move {
                     // Parse LID JIDs and query the server
@@ -4128,67 +4135,32 @@ async fn handle_command(
                                     let map = state_c.lock().unwrap().lid_to_phone.clone();
                                     tokio::task::spawn_blocking(move || save_lid_phone_map(&map));
                                 }
-
-                                // Re-resolve message sender names in cache and resend to UI.
-                                // Two-phase: first collect resolutions, then apply.
-                                let updated_msgs = {
-                                    let mut s = state_c.lock().unwrap();
-                                    // Phase 1: collect (jid → resolved name) while &s is immutable
-                                    let resolutions: HashMap<String, String> = unresolved_lids
+                                // Apply resolved names to cached messages so
+                                // the next load of this chat shows them
+                                // correctly. Do NOT re-fire HistoryMessages.
+                                let resolutions: HashMap<String, String> = {
+                                    let s = state_c.lock().unwrap();
+                                    unresolved_lids
                                         .iter()
                                         .map(|lid| {
                                             let name = resolve_sender_name(&s, lid);
                                             (lid.clone(), name)
                                         })
-                                        .collect();
-                                    // Phase 2: apply resolved names to cached messages
-                                    if let Some(msgs) = s.history.get_mut(&chat_id_c) {
-                                        for m in msgs.iter_mut() {
-                                            if let Some(resolved) =
-                                                resolutions.get(&m.sender_id)
+                                        .collect()
+                                };
+                                let mut s = state_c.lock().unwrap();
+                                if let Some(msgs) = s.history.get_mut(&chat_id_c) {
+                                    for m in msgs.iter_mut() {
+                                        if let Some(resolved) =
+                                            resolutions.get(&m.sender_id)
+                                        {
+                                            if !resolved.contains("@lid")
+                                                && *resolved != m.sender_name
                                             {
-                                                if !resolved.contains("@lid")
-                                                    && *resolved != m.sender_name
-                                                {
-                                                    m.sender_name = resolved.clone();
-                                                }
+                                                m.sender_name = resolved.clone();
                                             }
                                         }
                                     }
-                                    // Return the last 50 for display
-                                    s.history.get(&chat_id_c).map(|all| {
-                                        let mut filtered: Vec<_> = all
-                                            .iter()
-                                            .filter(|m| {
-                                                m.text.is_some()
-                                                    || m.media_type.is_some()
-                                                    || m.media_caption.is_some()
-                                            })
-                                            .cloned()
-                                            .collect();
-                                        filtered.sort_by_key(|m| m.timestamp);
-                                        if filtered.len() > 50 {
-                                            filtered =
-                                                filtered.split_off(filtered.len() - 50);
-                                        }
-                                        filtered
-                                    })
-                                };
-                                if let Some(messages) = updated_msgs {
-                                    let chat_name = state_c
-                                        .lock()
-                                        .unwrap()
-                                        .chat_names
-                                        .get(&chat_id_c)
-                                        .cloned()
-                                        .unwrap_or_default();
-                                    let _ = tx_c
-                                        .send(WaEvent::HistoryMessages {
-                                            chat_id: chat_id_c,
-                                            chat_name,
-                                            messages,
-                                        })
-                                        .await;
                                 }
                             }
                         }
