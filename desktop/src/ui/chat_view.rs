@@ -116,6 +116,13 @@ struct ChatViewInner {
     /// for non-image attachments. Updated each time we set a new
     /// pending file so the user can tell what's queued.
     preview_label: Label,
+    /// Per-chat pending attachment paths (image / document / GIF).
+    /// On chat switch, the current pending attachment is moved into
+    /// this map under the OLD chat id, and the NEW chat id's entry is
+    /// restored as the active pending. Drafts work the same way — see
+    /// `drafts` field. Without this, a screenshot pasted in chat A
+    /// would persist into chat B if you switched before sending.
+    pending_attachments: RefCell<HashMap<String, String>>,
     // Profile open callback (set by window)
     on_profile_open: RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>,
     // Emoji/GIF/Sticker panel
@@ -720,6 +727,7 @@ impl ChatViewPanel {
             image_preview_bar,
             image_preview_pic,
             preview_label: preview_label.clone(),
+            pending_attachments: RefCell::new(HashMap::new()),
             on_profile_open: RefCell::new(None),
             emoji_popover,
             gif_grid,
@@ -1690,6 +1698,12 @@ impl ChatViewPanel {
                 inner_clone
                     .preview_label
                     .set_markup("Press Enter to send, Escape to cancel");
+                // Drop the per-chat saved record so the cancellation
+                // sticks across chat switches (otherwise switching out
+                // and back would re-stage what the user just cancelled).
+                if let Some(cid) = inner_clone.current_chat_id.borrow().clone() {
+                    inner_clone.pending_attachments.borrow_mut().remove(&cid);
+                }
             });
         }
 
@@ -2000,6 +2014,9 @@ impl ChatViewPanel {
         let pending_image = inner.pending_image_path.borrow_mut().take();
         if let Some(image_path) = pending_image {
             inner.image_preview_bar.set_visible(false);
+            // Drop the per-chat saved record too — once sent, the chat
+            // shouldn't retain it for next-time-opened.
+            inner.pending_attachments.borrow_mut().remove(&chat_id);
             let buf = inner.input_view.buffer();
             let caption_text = buf
                 .text(&buf.start_iter(), &buf.end_iter(), false)
@@ -2359,7 +2376,24 @@ impl ChatViewPanel {
             if draft.trim().is_empty() {
                 self.inner.drafts.borrow_mut().remove(&old_chat_id);
             } else {
-                self.inner.drafts.borrow_mut().insert(old_chat_id, draft);
+                self.inner.drafts.borrow_mut().insert(old_chat_id.clone(), draft);
+            }
+
+            // ── Save pending attachment for the OUTGOING chat ──
+            // Without this, a paste/drop staged in chat A leaked into
+            // chat B when the user switched chats — pending_image_path
+            // was global, not per-chat.
+            let pending = self.inner.pending_image_path.borrow().clone();
+            if let Some(p) = pending {
+                self.inner
+                    .pending_attachments
+                    .borrow_mut()
+                    .insert(old_chat_id, p);
+            } else {
+                self.inner
+                    .pending_attachments
+                    .borrow_mut()
+                    .remove(&old_chat_id);
             }
         }
 
@@ -2392,6 +2426,33 @@ impl ChatViewPanel {
             .cloned()
             .unwrap_or_default();
         self.inner.input_view.buffer().set_text(&draft);
+
+        // ── Restore pending attachment for incoming chat ──
+        // Always reset the active pending state first so a stale
+        // attachment from the previous chat can't bleed through if this
+        // chat has none. set_pending_attachment handles paintable +
+        // label setup; clearing covers the no-pending case.
+        *self.inner.pending_image_path.borrow_mut() = None;
+        *self.inner.pending_gif_url.borrow_mut() = None;
+        self.inner.image_preview_bar.set_visible(false);
+        self.inner
+            .image_preview_pic
+            .set_paintable(None::<&gtk4::gdk::Paintable>);
+        self.inner
+            .preview_label
+            .set_markup("Press Enter to send, Escape to cancel");
+        if let Some(saved) = self
+            .inner
+            .pending_attachments
+            .borrow()
+            .get(&chat_id)
+            .cloned()
+        {
+            // Re-render the preview UI for the saved file via the same
+            // helper used by paste/drop/file-chooser, so the look is
+            // identical to how the user originally staged it.
+            set_pending_attachment(&self.inner, &saved);
+        }
 
         // Clear message area and search/media state
         remove_all_children(&self.inner.messages_box);
@@ -3766,6 +3827,15 @@ fn set_pending_attachment(inner: &Rc<ChatViewInner>, path_str: &str) {
     *inner.pending_gif_url.borrow_mut() = None;
     inner.image_preview_bar.set_visible(true);
     inner.input_view.grab_focus();
+    // Mirror to the per-chat record so the attachment survives chat
+    // switches (back-and-forth restores the same file in preview).
+    // The same record is removed on send / cancel.
+    if let Some(cid) = inner.current_chat_id.borrow().clone() {
+        inner
+            .pending_attachments
+            .borrow_mut()
+            .insert(cid, path_str.to_string());
+    }
 }
 
 fn maybe_insert_date_separator(inner: &Rc<ChatViewInner>, timestamp: i64) {

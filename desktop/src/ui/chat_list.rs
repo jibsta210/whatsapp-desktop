@@ -48,6 +48,11 @@ struct ChatListInner {
     /// Updated on every update_last_message. Keeps last 10 per chat.
     /// Wrapped in Rc so stealth hover closures can share it.
     recent_messages: Rc<RefCell<HashMap<String, Vec<IncomingMessage>>>>,
+    /// Stored so we can clear it programmatically when a chat is selected
+    /// from filtered results. Without clearing, the SearchEntry retains
+    /// keyboard focus across the row-activation, which intercepts Ctrl+V
+    /// before our paste handler on input_view sees it.
+    search_entry: SearchEntry,
 }
 
 impl ChatListPanel {
@@ -174,6 +179,7 @@ impl ChatListPanel {
             msg_results_section,
             msg_results_box,
             recent_messages: Rc::new(RefCell::new(HashMap::new())),
+            search_entry: search.clone(),
         });
 
         // Sort: pinned first, then newest
@@ -351,6 +357,16 @@ impl ChatListPanel {
                                     } else {
                                         crate::ui::runtime::display_name_from_jid(&cid)
                                     };
+                                    // Clear the search entry so the chat list
+                                    // returns to its normal state and focus
+                                    // can settle on the message input. See
+                                    // the row-activation handler for the full
+                                    // rationale.
+                                    if let Some(inner) = rows_ref.upgrade() {
+                                        if !inner.search_entry.text().is_empty() {
+                                            inner.search_entry.set_text("");
+                                        }
+                                    }
                                     (os2)(cid.clone(), name.clone());
                                     br2.send_command(crate::bridge::WaCommand::LoadChat {
                                         chat_id: cid.clone(),
@@ -386,6 +402,19 @@ impl ChatListPanel {
                             .map(|(id, r)| (id.clone(), r.chat_name.clone()))
                     };
                     if let Some((chat_id, chat_name)) = found {
+                        // Clear chat-list search when a chat is picked.
+                        // Two reasons:
+                        // 1. UX: user is done filtering, no need to keep
+                        //    the partial query visible.
+                        // 2. Bug fix: SearchEntry retained keyboard focus
+                        //    through row-activation, intercepting Ctrl+V
+                        //    before our paste handler on input_view saw it.
+                        //    Text typing worked because TextView reclaims
+                        //    focus on first keystroke, but Ctrl+V didn't
+                        //    fire our image-clipboard reader.
+                        if !inner.search_entry.text().is_empty() {
+                            inner.search_entry.set_text("");
+                        }
                         (inner.on_select)(chat_id.clone(), chat_name.clone());
                         // LoadChat + MarkRead are now handled by the on_select callback
                         let mut rows = inner.rows.borrow_mut();
