@@ -1273,11 +1273,12 @@ impl ChatViewPanel {
                                 );
                                 match texture.save_to_png(&tmp_path) {
                                     Ok(_) => {
-                                        inner_cc.image_preview_pic.set_paintable(Some(&texture));
-                                        *inner_cc.pending_image_path.borrow_mut() =
-                                            Some(tmp_path);
-                                        inner_cc.image_preview_bar.set_visible(true);
-                                        inner_cc.input_view.grab_focus();
+                                        // Route through the shared helper so paste,
+                                        // drag-drop, and file-chooser all reset stale
+                                        // preview state (label, paintable) the same way.
+                                        // Without this, pasting an image after a PDF
+                                        // drop kept the PDF filename label visible.
+                                        set_pending_attachment(&inner_cc, &tmp_path);
                                     }
                                     Err(e) => log::warn!("Paste: save_to_png failed: {e}"),
                                 }
@@ -1333,23 +1334,15 @@ impl ChatViewPanel {
                                                                 );
                                                                 return;
                                                             }
-                                                            if let Some(tex) =
-                                                                crate::ui::texture_cache::texture_from_filename(
-                                                                    &path_for_close,
-                                                                )
-                                                            {
-                                                                inner_done
-                                                                    .image_preview_pic
-                                                                    .set_paintable(Some(&tex));
-                                                            }
-                                                            *inner_done
-                                                                .pending_image_path
-                                                                .borrow_mut() =
-                                                                Some(path_for_close);
-                                                            inner_done
-                                                                .image_preview_bar
-                                                                .set_visible(true);
-                                                            inner_done.input_view.grab_focus();
+                                                            // Same helper as primary
+                                                            // paste path — resets label,
+                                                            // paintable, and gif-url so
+                                                            // the new attachment doesn't
+                                                            // share state with a stale one.
+                                                            set_pending_attachment(
+                                                                &inner_done,
+                                                                &path_for_close,
+                                                            );
                                                         }
                                                         Err(e) => log::warn!(
                                                             "Paste fallback: read_bytes failed: {e}"
