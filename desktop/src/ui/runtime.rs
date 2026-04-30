@@ -180,10 +180,15 @@ fn save_contact_names(names: &HashMap<String, String>) {
     write_bin(CONTACTS_FILE, names);
 }
 
-/// Check if a proposed "name" is a valid display name (not a raw JID).
-/// Strict: only rejects empty, name-equals-jid, or name-contains-@.
-/// Does NOT reject pure phone numbers like "+16472876066" — those are
-/// legitimate display fallbacks for unsaved contacts.
+/// Check if a proposed "name" is a valid display name (not a raw JID
+/// or a phone-format fallback).
+///
+/// We reject phone-format fallbacks like "+14168235004" because they are
+/// what `display_name_from_jid` produces when no real contact name is
+/// known. Storing those in `contact_names` poisons the cache: a real
+/// push_name arriving later won't replace the entry, and the chat shows
+/// as a phone number until app restart (which loads the contact name
+/// from a fresher source).
 fn is_valid_contact_name(name: &str, jid: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -192,6 +197,15 @@ fn is_valid_contact_name(name: &str, jid: &str) -> bool {
         return false;
     }
     if name.contains('@') {
+        return false;
+    }
+    // Reject phone-formatted fallbacks: "+1234567890" or pure digits.
+    if let Some(rest) = name.strip_prefix('+') {
+        if rest.chars().all(|c| c.is_ascii_digit()) && rest.len() >= 6 {
+            return false;
+        }
+    }
+    if name.chars().all(|c| c.is_ascii_digit()) && name.len() > 6 {
         return false;
     }
     true
@@ -210,17 +224,46 @@ fn is_valid_contact_name(name: &str, jid: &str) -> bool {
 pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
     let mut names = load_contact_names();
 
-    // One-time poison purge (gated by marker — runs once per user only)
-    let purge_marker = std::path::PathBuf::from(".contact_purge_v1");
+    // One-time poison purge (gated by marker — runs once per user only).
+    // v1: removed entries where name == JID
+    // v2: also remove phone-format fallback entries ("+1234567890") that
+    //     were leaking in because is_valid_contact_name used to accept
+    //     them, then preventing real push_names from replacing them.
+    let purge_marker_v1 = std::path::PathBuf::from(".contact_purge_v1");
+    let purge_marker_v2 = std::path::PathBuf::from(".contact_purge_v2");
     let mut purged = 0;
-    if !purge_marker.exists() {
+    if !purge_marker_v1.exists() {
         let before = names.len();
         names.retain(|jid, name| name != jid);
         purged = before - names.len();
         if purged > 0 {
-            log::info!("One-time purge: removed {purged} entries where name == JID");
+            log::info!("One-time purge v1: removed {purged} entries where name == JID");
         }
-        let _ = std::fs::write(&purge_marker, "done");
+        let _ = std::fs::write(&purge_marker_v1, "done");
+    }
+    if !purge_marker_v2.exists() {
+        let before = names.len();
+        names.retain(|_jid, name| {
+            // Reject "+12345..." phone format
+            if let Some(rest) = name.strip_prefix('+') {
+                if rest.chars().all(|c| c.is_ascii_digit()) && rest.len() >= 6 {
+                    return false;
+                }
+            }
+            // Reject pure-digit fallbacks too
+            if name.chars().all(|c| c.is_ascii_digit()) && name.len() > 6 {
+                return false;
+            }
+            true
+        });
+        let removed_v2 = before - names.len();
+        if removed_v2 > 0 {
+            log::info!(
+                "One-time purge v2: removed {removed_v2} phone-format poison entries"
+            );
+            purged += removed_v2;
+        }
+        let _ = std::fs::write(&purge_marker_v2, "done");
     }
 
     // The full message-history scan is expensive (1000+ files, bincode
@@ -3327,9 +3370,34 @@ fn persist_new_message(
     };
 
     // Resolve display name
+    //
+    // A name is "JID-like" / phone-fallback if it's NOT a real human-friendly
+    // name. This includes:
+    //   - raw JID strings ("14168235004@s.whatsapp.net")
+    //   - bare digit strings ("14168235004")
+    //   - the +country-code phone format produced by `display_name_from_jid`
+    //     ("+14168235004") — this was the missed case that left contacts
+    //     showing as phone numbers until app restart, because push_names
+    //     arriving via MessageReceived never replaced the existing phone
+    //     fallback.
+    let name_looks_like_phone_fallback = |s: &str| -> bool {
+        if s.contains('@') {
+            return true;
+        }
+        // "+1234567890" — starts with +, rest digits, length > 6 total
+        if let Some(rest) = s.strip_prefix('+') {
+            if rest.chars().all(|c| c.is_ascii_digit()) && rest.len() >= 6 {
+                return true;
+            }
+        }
+        // "1234567890" — pure digits
+        if s.chars().all(|c| c.is_ascii_digit()) && s.len() > 6 {
+            return true;
+        }
+        false
+    };
     let (resolved_name, name_is_new) = if let Some(ref existing_name) = existing_name {
-        let name_looks_like_jid = existing_name.contains('@')
-            || (existing_name.chars().all(|c| c.is_ascii_digit()) && existing_name.len() > 6);
+        let name_looks_like_jid = name_looks_like_phone_fallback(existing_name);
         if !is_group && name_looks_like_jid && !m.is_from_me && !m.sender_name.is_empty() {
             (m.sender_name.clone(), true)
         } else if !is_group && name_looks_like_jid {
