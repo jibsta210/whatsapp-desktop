@@ -328,6 +328,58 @@ progressbar.sync-progress progress {
     background-color: #00a884;
     border-radius: 2px;
 }
+
+/* ── New-bubble slide-in animation ─────────────────────────────────── */
+/* Outgoing (right-aligned) bubbles slide in from the right via animated
+ * margin-right (starts large negative, settles to baseline). Incoming
+ * bubbles slide in from the left via margin-start. Both use a spring
+ * cubic-bezier to land with a small overshoot bounce. The class is
+ * added by Rust on bubble creation and removed after ~360ms.
+ *
+ * Note: GTK4 CSS animations on margin work but reflow layout each
+ * frame, which is fine for a single bubble on send/receive. The 50-
+ * bubble bulk render in load_history all animates at once on chat
+ * switch — that is intentional, gives the chat a reveal feel. */
+@keyframes bubble-slide-in-right {
+    0%   { opacity: 0; margin-right: -120px; }
+    65%  { opacity: 1; margin-right:    8px; }
+    100% { opacity: 1; margin-right:    8px; }
+}
+@keyframes bubble-slide-in-left {
+    0%   { opacity: 0; margin-left: -120px; }
+    65%  { opacity: 1; margin-left:    8px; }
+    100% { opacity: 1; margin-left:    8px; }
+}
+box.bubble-enter.bubble-row-out {
+    animation: bubble-slide-in-right 0.36s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+box.bubble-enter.bubble-row-in {
+    animation: bubble-slide-in-left 0.36s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+/* System / centered bubbles (no left/right anchor) — fall back to a
+ * gentle vertical fade-in. */
+@keyframes bubble-fade-in {
+    0%   { opacity: 0; margin-top: -16px; }
+    100% { opacity: 1; margin-top: 3px;   }
+}
+box.bubble-enter:not(.bubble-row-out):not(.bubble-row-in) {
+    animation: bubble-fade-in 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ── Window / dialog open animation ────────────────────────────────── */
+/* GTK4 CSS only animates opacity reliably (no transform). Opacity
+ * fade-in keeps it subtle and smooth. Applied via .modal-fade class
+ * on dialogs/popovers we want animated. */
+@keyframes window-fade-in {
+    0%   { opacity: 0; }
+    100% { opacity: 1; }
+}
+window.modal-fade {
+    animation: window-fade-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+}
+popover.fade-popover contents {
+    animation: window-fade-in 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+}
 ";
 
 use crate::bridge::{Bridge, WaCommand, WaEvent};

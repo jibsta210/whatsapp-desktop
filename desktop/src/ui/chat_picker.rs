@@ -112,6 +112,7 @@ pub fn show_chat_picker_with_chats(
         .default_height(800)
         .modal(true)
         .build();
+    win.add_css_class("modal-fade");
     if let Some(p) = parent {
         win.set_transient_for(Some(p));
     }
@@ -120,10 +121,13 @@ pub fn show_chat_picker_with_chats(
 
     let search = SearchEntry::new();
     search.set_placeholder_text(Some("Search chats…"));
+    search.set_hexpand(true);
+    search.set_size_request(-1, 42);
+    search.add_css_class("search-rounded");
     search.set_margin_start(12);
     search.set_margin_end(12);
-    search.set_margin_top(12);
-    search.set_margin_bottom(8);
+    search.set_margin_top(14);
+    search.set_margin_bottom(10);
 
     let list = ListBox::new();
     list.add_css_class("navigation-sidebar");

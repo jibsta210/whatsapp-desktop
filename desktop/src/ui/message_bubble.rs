@@ -70,6 +70,14 @@ impl MessageBubble {
         root.set_margin_bottom(3);
         root.set_margin_start(8);
         root.set_margin_end(8);
+        // Root-level direction class — used by bubble-enter slide-in
+        // animation (chat_view.rs adds `bubble-enter`; CSS combines it
+        // with these to pick left vs right slide direction).
+        if msg.is_from_me {
+            root.add_css_class("bubble-row-out");
+        } else {
+            root.add_css_class("bubble-row-in");
+        }
 
         // ── System messages: centered gray text, no bubble/avatar ──
         if msg.is_system_message {

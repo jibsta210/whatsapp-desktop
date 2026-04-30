@@ -2182,6 +2182,9 @@ impl ChatViewPanel {
             // send is deferred until the AI finishes (max ~4s timeout).
             if let Some(bubble) = inner.bubbles.borrow().get(&tmp_id_for_pilafy) {
                 bubble.widget().add_css_class("pilafy");
+                log::info!("AC: applied pilafy class to bubble {}", tmp_id_for_pilafy);
+            } else {
+                log::warn!("AC: tmp bubble {} not found in HashMap", tmp_id_for_pilafy);
             }
 
             // Pulse animation is on the pilafy class itself — already added above.
@@ -2916,6 +2919,19 @@ impl ChatViewPanel {
         // (e.g. inspecting widget tree via GTK Inspector to find a bubble
         // by message id) and harmless to leave in.
         bubble.widget().set_widget_name(&format!("bubble-{}", msg.id));
+
+        // Slide-in animation: add bubble-enter class so the CSS keyframe
+        // animation plays on first paint, then schedule removal of the
+        // class so margin-top settles back to baseline.
+        bubble.widget().add_css_class("bubble-enter");
+        let bubble_w = bubble.widget().clone();
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(360),
+            move || {
+                bubble_w.remove_css_class("bubble-enter");
+            },
+        );
+
         match position {
             BubblePosition::Append => inner.messages_box.append(bubble.widget()),
             // insert_child_after(widget, NONE) inserts at the top of the box
