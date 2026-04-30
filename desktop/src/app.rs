@@ -243,22 +243,23 @@ button.ac-mode-btn:checked {
 }
 
 /* ── Pilafy: bubble breathes while AC waits, settles into final shape ── */
-/* The pilafy / pilafy-settle classes are added by Rust to the BUBBLE ROOT
- * (which has class .bubble-row-out). The visible pulse needs to apply to
- * the inner colored bubble (.message-bubble-out), so we use a descendant
- * combinator here. Padding/radius match the regular outgoing bubble so
- * the morph is just a subtle radius change, not a size jump. */
+/* While pulsing, the bubble takes on the libadwaita accent (same teal-
+ * blue as the send button) so it reads as waiting-to-send. On settle,
+ * it transitions to the final outgoing bubble green (#005c4b).
+ * accent_bg_color is the adwaita variable the send button uses, so the
+ * two stay in sync if the user theme changes. */
 @keyframes pilafy-pulse {
-    0%   { opacity: 1.0; background-color: #005c4b; }
-    50%  { opacity: 0.55; background-color: rgba(0, 92, 75, 0.45); }
-    100% { opacity: 1.0; background-color: #005c4b; }
+    0%   { opacity: 1.0;  background-color: @accent_bg_color; }
+    50%  { opacity: 0.55; background-color: alpha(@accent_bg_color, 0.45); }
+    100% { opacity: 1.0;  background-color: @accent_bg_color; }
 }
 box.bubble-row-out.pilafy box.message-bubble-out {
+    background-color: @accent_bg_color;
     /* Slightly more rounded than a normal bubble (asymmetric pill feel)
      * but same physical size — matches outgoing bubble padding so the
      * width and line-height don't change when settle removes the class. */
     border-radius: 18px 18px 6px 18px;
-    border: 1px solid rgba(255, 255, 255, 0.12);
+    border: 1px solid rgba(255, 255, 255, 0.18);
     animation: pilafy-pulse 1.0s ease-in-out infinite;
 }
 box.bubble-row-out.pilafy .dim-label {
@@ -266,19 +267,19 @@ box.bubble-row-out.pilafy .dim-label {
     transition: opacity 0.2s ease-out;
 }
 
-/* Phase 2: settle — radius springs back, gentle opacity flash */
+/* Phase 2: settle — fade from accent → final green, radius springs back */
 @keyframes pilafy-settle {
-    0%   { background-color: rgba(42, 57, 66, 0.6); opacity: 0.85; }
-    100% { background-color: #005c4b; opacity: 1.0; }
+    0%   { background-color: @accent_bg_color; opacity: 0.92; }
+    100% { background-color: #005c4b;          opacity: 1.0;  }
 }
 box.bubble-row-out.pilafy-settle box.message-bubble-out {
     border-radius: 8px 8px 2px 8px;
     border: 0;
-    animation: pilafy-settle 0.32s ease-out forwards;
+    animation: pilafy-settle 0.45s ease-out forwards;
 }
 box.bubble-row-out.pilafy-settle .dim-label {
     opacity: 1.0;
-    transition: opacity 0.25s ease-in 0.15s;
+    transition: opacity 0.3s ease-in 0.2s;
 }
 
 /* Stealth read popup */

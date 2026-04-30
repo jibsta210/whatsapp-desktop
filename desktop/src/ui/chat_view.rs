@@ -3615,6 +3615,7 @@ fn set_pending_attachment(inner: &Rc<ChatViewInner>, path_str: &str) {
         || lower.ends_with(".png")
         || lower.ends_with(".webp")
         || lower.ends_with(".gif");
+    let is_pdf = lower.ends_with(".pdf");
 
     // Always clear the old paintable first so a stale paste-screenshot
     // can't remain visible behind a non-image attachment.
@@ -3635,6 +3636,45 @@ fn set_pending_attachment(inner: &Rc<ChatViewInner>, path_str: &str) {
         inner
             .preview_label
             .set_markup("Press Enter to send, Escape to cancel");
+    } else if is_pdf {
+        // Render the first page via pdftocairo (same approach the inline
+        // bubble uses for received PDFs). Cache to <path>.thumb.png so a
+        // re-drop of the same file is instant. If pdftocairo is missing
+        // we silently fall through to the icon-only preview below.
+        let thumb_path = format!("{path_str}.thumb.png");
+        if !std::path::Path::new(&thumb_path).exists() {
+            let _ = std::process::Command::new("pdftocairo")
+                .args([
+                    "-png",
+                    "-f",
+                    "1",
+                    "-l",
+                    "1",
+                    "-scale-to",
+                    "380",
+                    "-singlefile",
+                    path_str,
+                    &format!("{path_str}.thumb"),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+        if let Some(tex) =
+            crate::ui::texture_cache::texture_from_filename(&thumb_path)
+        {
+            inner.image_preview_pic.set_paintable(Some(&tex));
+            let escaped = gtk4::glib::markup_escape_text(&filename);
+            inner.preview_label.set_markup(&format!(
+                "<b>📄 {escaped}</b>\n<small>Press Enter to send, Escape to cancel</small>"
+            ));
+        } else {
+            // pdftocairo failed (not installed?) — fall back to icon
+            let escaped = gtk4::glib::markup_escape_text(&filename);
+            inner.preview_label.set_markup(&format!(
+                "<b>📄 {escaped}</b>\n<small>Press Enter to send, Escape to cancel</small>"
+            ));
+        }
     } else {
         let icon = if lower.ends_with(".pdf") {
             "📄"
