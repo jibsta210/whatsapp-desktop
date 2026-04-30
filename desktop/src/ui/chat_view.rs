@@ -2323,9 +2323,23 @@ impl ChatViewPanel {
         // Clear send group mode when switching to a real chat
         *self.inner.send_group_ids.borrow_mut() = None;
         self.inner.header_name.set_text(chat_name);
-        // Clear group subtitle — it'll be set when GroupMembers arrives
-        self.inner.header_subtitle.set_text("");
-        self.inner.header_subtitle.set_visible(false);
+        // For group chats, pre-show the subtitle slot with a single space so
+        // its visibility/height is stable BEFORE GroupMembers arrives. Without
+        // this, GroupMembers landing after load_history flips the subtitle
+        // from hidden→visible, growing the header and shrinking the
+        // scrolled-window viewport AFTER bubbles are rendered. That layout
+        // shift triggered the GTK4 GL renderer paint bug — bubbles became
+        // invisible until a mouse hover damaged the surface. The race was
+        // visible as "sometimes the bug, sometimes not" depending on which
+        // event won the channel.
+        let is_group = chat_id.ends_with("@g.us");
+        if is_group {
+            self.inner.header_subtitle.set_text(" ");
+            self.inner.header_subtitle.set_visible(true);
+        } else {
+            self.inner.header_subtitle.set_text("");
+            self.inner.header_subtitle.set_visible(false);
+        }
 
         // ── Restore draft for incoming chat ──
         let draft = self
