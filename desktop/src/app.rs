@@ -246,37 +246,39 @@ button.ac-mode-btn:checked {
 /* The pilafy / pilafy-settle classes are added by Rust to the BUBBLE ROOT
  * (which has class .bubble-row-out). The visible pulse needs to apply to
  * the inner colored bubble (.message-bubble-out), so we use a descendant
- * combinator here. Previously the CSS used `box.message-bubble-out.pilafy`
- * which required both classes on the SAME widget — and they're on
- * different widgets — so the animation never actually fired. */
+ * combinator here. Padding/radius match the regular outgoing bubble so
+ * the morph is just a subtle radius change, not a size jump. */
 @keyframes pilafy-pulse {
     0%   { opacity: 1.0; background-color: #005c4b; }
-    50%  { opacity: 0.45; background-color: rgba(42, 57, 66, 0.6); }
+    50%  { opacity: 0.55; background-color: rgba(0, 92, 75, 0.45); }
     100% { opacity: 1.0; background-color: #005c4b; }
 }
 box.bubble-row-out.pilafy box.message-bubble-out {
-    border-radius: 9999px;
-    border: 1.5px solid rgba(255, 255, 255, 0.2);
-    padding: 10px 20px;
+    /* Slightly more rounded than a normal bubble (asymmetric pill feel)
+     * but same physical size — matches outgoing bubble padding so the
+     * width and line-height don't change when settle removes the class. */
+    border-radius: 18px 18px 6px 18px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
     animation: pilafy-pulse 1.0s ease-in-out infinite;
 }
 box.bubble-row-out.pilafy .dim-label {
-    opacity: 0.0;
+    opacity: 0.55;
+    transition: opacity 0.2s ease-out;
 }
 
-/* Phase 2: settle — only opacity+background-color are GTK4-animatable */
+/* Phase 2: settle — radius springs back, gentle opacity flash */
 @keyframes pilafy-settle {
-    0%   { background-color: rgba(42, 57, 66, 0.75); opacity: 0.85; }
+    0%   { background-color: rgba(42, 57, 66, 0.6); opacity: 0.85; }
     100% { background-color: #005c4b; opacity: 1.0; }
 }
 box.bubble-row-out.pilafy-settle box.message-bubble-out {
     border-radius: 8px 8px 2px 8px;
-    padding: 6px 8px 2px;
-    animation: pilafy-settle 0.4s ease-out forwards;
+    border: 0;
+    animation: pilafy-settle 0.32s ease-out forwards;
 }
 box.bubble-row-out.pilafy-settle .dim-label {
     opacity: 1.0;
-    transition: opacity 0.3s ease-in 0.2s;
+    transition: opacity 0.25s ease-in 0.15s;
 }
 
 /* Stealth read popup */

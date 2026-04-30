@@ -112,6 +112,10 @@ struct ChatViewInner {
     pending_gif_url: RefCell<Option<String>>,
     image_preview_bar: Box,
     image_preview_pic: gtk4::Picture,
+    /// Label inside the image preview bar that shows the filename/icon
+    /// for non-image attachments. Updated each time we set a new
+    /// pending file so the user can tell what's queued.
+    preview_label: Label,
     // Profile open callback (set by window)
     on_profile_open: RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>,
     // Emoji/GIF/Sticker panel
@@ -660,6 +664,7 @@ impl ChatViewPanel {
             pending_gif_url: RefCell::new(None),
             image_preview_bar,
             image_preview_pic,
+            preview_label: preview_label.clone(),
             on_profile_open: RefCell::new(None),
             emoji_popover,
             gif_grid,
@@ -1599,39 +1604,7 @@ impl ChatViewPanel {
                 }
 
                 if paths.len() == 1 {
-                    let path_str = &paths[0];
-                    let lower = path_str.to_lowercase();
-                    let is_image = lower.ends_with(".jpg")
-                        || lower.ends_with(".jpeg")
-                        || lower.ends_with(".png")
-                        || lower.ends_with(".webp")
-                        || lower.ends_with(".gif");
-
-                    // CRITICAL: clear the previous paintable BEFORE deciding
-                    // what to show. Otherwise a stale paste-screenshot
-                    // remains visible while pending_image_path is silently
-                    // updated to the dropped file — user sees screenshot
-                    // in preview bar, hits send, "their PDF" goes through
-                    // but the visible state lied to them.
-                    inner_c
-                        .image_preview_pic
-                        .set_paintable(None::<&gtk4::gdk::Paintable>);
-
-                    if is_image {
-                        if let Some(tex) =
-                            crate::ui::texture_cache::texture_from_filename(path_str)
-                        {
-                            inner_c.image_preview_pic.set_paintable(Some(&tex));
-                        }
-                    }
-                    // For documents/videos/etc. the paintable stays cleared
-                    // and the preview bar shows just the filename + cancel.
-                    // (image_preview_pic already has set_can_shrink so empty
-                    // paintable collapses to 0 height.)
-                    *inner_c.pending_image_path.borrow_mut() = Some(path_str.clone());
-                    *inner_c.pending_gif_url.borrow_mut() = None;
-                    inner_c.image_preview_bar.set_visible(true);
-                    inner_c.input_view.grab_focus();
+                    set_pending_attachment(&inner_c, &paths[0]);
                 } else {
                     // Multiple files: send each one immediately. The runtime
                     // side of SendImage detects file extension and routes
@@ -1662,6 +1635,13 @@ impl ChatViewPanel {
                 *inner_clone.pending_image_path.borrow_mut() = None;
                 *inner_clone.pending_gif_url.borrow_mut() = None;
                 inner_clone.image_preview_bar.set_visible(false);
+                // Clear stale state so the next attachment starts fresh.
+                inner_clone
+                    .image_preview_pic
+                    .set_paintable(None::<&gtk4::gdk::Paintable>);
+                inner_clone
+                    .preview_label
+                    .set_markup("Press Enter to send, Escape to cancel");
             });
         }
 
@@ -1731,25 +1711,7 @@ impl ChatViewPanel {
                                     if let Ok(file) = result {
                                         if let Some(path) = file.path() {
                                             let path_str = path.to_string_lossy().to_string();
-                                            // Show preview — try image first, fall back to file icon
-                                            if let Some(tex) =
-                                                crate::ui::texture_cache::texture_from_filename(
-                                                    &path_str,
-                                                )
-                                            {
-                                                inner_ccc
-                                                    .image_preview_pic
-                                                    .set_paintable(Some(&tex));
-                                            } else {
-                                                // Non-image file — show filename as preview
-                                                inner_ccc
-                                                    .image_preview_pic
-                                                    .set_paintable(None::<&gtk4::gdk::Paintable>);
-                                            }
-                                            *inner_ccc.pending_image_path.borrow_mut() =
-                                                Some(path_str);
-                                            inner_ccc.image_preview_bar.set_visible(true);
-                                            inner_ccc.input_view.grab_focus();
+                                            set_pending_attachment(&inner_ccc, &path_str);
                                         }
                                     }
                                 },
@@ -3640,6 +3602,82 @@ fn gen_tmp_id() -> String {
         .unwrap_or_default()
         .subsec_nanos();
     format!("tmp-{:08x}", nanos)
+}
+
+/// Stage a single file as the pending attachment in the preview bar.
+/// Shared by drag-drop and file-chooser paths so both render the same
+/// preview UI (image thumbnail OR filename + icon) and clear stale
+/// state consistently.
+fn set_pending_attachment(inner: &Rc<ChatViewInner>, path_str: &str) {
+    let lower = path_str.to_lowercase();
+    let is_image = lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".png")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".gif");
+
+    // Always clear the old paintable first so a stale paste-screenshot
+    // can't remain visible behind a non-image attachment.
+    inner
+        .image_preview_pic
+        .set_paintable(None::<&gtk4::gdk::Paintable>);
+
+    let filename = std::path::Path::new(path_str)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(path_str)
+        .to_string();
+
+    if is_image {
+        if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path_str) {
+            inner.image_preview_pic.set_paintable(Some(&tex));
+        }
+        inner
+            .preview_label
+            .set_markup("Press Enter to send, Escape to cancel");
+    } else {
+        let icon = if lower.ends_with(".pdf") {
+            "📄"
+        } else if lower.ends_with(".doc") || lower.ends_with(".docx") {
+            "📝"
+        } else if lower.ends_with(".xls")
+            || lower.ends_with(".xlsx")
+            || lower.ends_with(".csv")
+        {
+            "📊"
+        } else if lower.ends_with(".ppt") || lower.ends_with(".pptx") {
+            "📽"
+        } else if lower.ends_with(".zip")
+            || lower.ends_with(".rar")
+            || lower.ends_with(".7z")
+            || lower.ends_with(".tar")
+            || lower.ends_with(".gz")
+        {
+            "🗜"
+        } else if lower.ends_with(".mp4")
+            || lower.ends_with(".mov")
+            || lower.ends_with(".avi")
+            || lower.ends_with(".mkv")
+        {
+            "🎬"
+        } else if lower.ends_with(".mp3")
+            || lower.ends_with(".m4a")
+            || lower.ends_with(".wav")
+            || lower.ends_with(".ogg")
+        {
+            "🎵"
+        } else {
+            "📎"
+        };
+        let escaped = gtk4::glib::markup_escape_text(&filename);
+        inner.preview_label.set_markup(&format!(
+            "<b>{icon} {escaped}</b>\n<small>Press Enter to send, Escape to cancel</small>"
+        ));
+    }
+    *inner.pending_image_path.borrow_mut() = Some(path_str.to_string());
+    *inner.pending_gif_url.borrow_mut() = None;
+    inner.image_preview_bar.set_visible(true);
+    inner.input_view.grab_focus();
 }
 
 fn maybe_insert_date_separator(inner: &Rc<ChatViewInner>, timestamp: i64) {
