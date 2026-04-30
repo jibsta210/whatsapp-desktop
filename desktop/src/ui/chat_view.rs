@@ -224,6 +224,68 @@ impl ChatViewPanel {
         scroll.set_kinetic_scrolling(true);
         scroll.set_overlay_scrolling(true);
 
+        // Bubble max-width as a percentage of the message pane width.
+        // GTK4 CSS doesn't support percentage max-width, so we install a
+        // per-display CssProvider whose single rule we update each time
+        // the scroll widget's width changes. Bubbles grow/shrink with the
+        // window automatically, capped at a sensible upper bound (1100px)
+        // so on ultrawide displays text doesn't become awkward to scan.
+        {
+            let provider = gtk4::CssProvider::new();
+            if let Some(display) = gtk4::gdk::Display::default() {
+                gtk4::style_context_add_provider_for_display(
+                    &display,
+                    &provider,
+                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+                );
+            }
+            let scroll_w = scroll.clone();
+            let provider_c = provider.clone();
+            let update_max_width = move || {
+                let pane_w = scroll_w.width();
+                if pane_w <= 0 {
+                    return;
+                }
+                // 65% of pane width, hard cap at 1100px, soft floor at 280px
+                let max_w = ((pane_w as f32 * 0.65) as i32).clamp(280, 1100);
+                let css = format!(
+                    "box.message-bubble-out, box.message-bubble-in {{ max-width: {max_w}px; }}"
+                );
+                provider_c.load_from_string(&css);
+            };
+            // Initial value (in case width is already known by realize time)
+            update_max_width();
+            // React to width changes (window resize, paned drag)
+            let upd1 = update_max_width.clone();
+            scroll.connect_notify_local(Some("width-request"), move |_, _| upd1());
+            let upd2 = update_max_width.clone();
+            scroll.connect_realize(move |_| upd2());
+            let upd3 = update_max_width;
+            scroll.connect_map(move |_| upd3());
+            // GTK4 doesn't notify on `width` directly for ScrolledWindow;
+            // hook the underlying allocation via a tick callback that
+            // re-evaluates if the cached width drifts. Cheap because we
+            // only update the CSS provider when the bucketed value
+            // actually changes.
+            let last_max: std::cell::Cell<i32> = std::cell::Cell::new(0);
+            let scroll_tick = scroll.clone();
+            let provider_tick = provider.clone();
+            scroll.add_tick_callback(move |_, _| {
+                let pane_w = scroll_tick.width();
+                if pane_w > 0 {
+                    let max_w = ((pane_w as f32 * 0.65) as i32).clamp(280, 1100);
+                    if (max_w - last_max.get()).abs() > 4 {
+                        last_max.set(max_w);
+                        let css = format!(
+                            "box.message-bubble-out, box.message-bubble-in {{ max-width: {max_w}px; }}"
+                        );
+                        provider_tick.load_from_string(&css);
+                    }
+                }
+                glib::ControlFlow::Continue
+            });
+        }
+
         // "Go to latest" floating button — visible when user scrolls up
         // "Go to latest" button — floats above the scroll via Overlay
         let goto_latest_btn = Button::from_icon_name("go-down-symbolic");

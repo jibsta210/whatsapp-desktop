@@ -19,12 +19,14 @@ box.message-pane-bg { background-color: rgba(0, 0, 0, 0.45); }
 box.message-bubble-out {
     background-color: #005c4b;
     border-radius: 8px 8px 2px 8px;
-    max-width: 520px;
+    /* max-width is set dynamically per-display by chat_view.rs as a
+     * percentage of the message pane width — bubbles grow / shrink as
+     * the window is resized, with a hard cap so ultrawide displays
+     * don't produce hard-to-scan long lines. */
 }
 box.message-bubble-in {
     background-color: #202c33;
     border-radius: 8px 8px 8px 2px;
-    max-width: 520px;
 }
 box.message-bubble-out label,
 box.message-bubble-in label {

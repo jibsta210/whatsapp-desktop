@@ -154,6 +154,14 @@ impl MainWindow {
         paned.set_position(SIDEBAR_WIDTH);
         paned.set_shrink_start_child(false);
         paned.set_shrink_end_child(false);
+        // When the WINDOW is resized (drag corner / maximize), the sidebar
+        // stays at whatever width the user dragged it to via the internal
+        // divider — only the message panel grows. Without this, both panes
+        // share extra space proportionally, which made the chat list eat
+        // pixels it doesn't need on wide displays.
+        // The user can still resize the sidebar by dragging the divider.
+        paned.set_resize_start_child(false);
+        paned.set_resize_end_child(true);
 
         // Sync banner — pulsing progress bar shown while history syncs.
         // A progress bar pulses smoothly via the GTK animation framework,
