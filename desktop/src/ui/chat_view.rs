@@ -213,6 +213,12 @@ impl ChatViewPanel {
         scroll.set_vexpand(true);
         scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         scroll.set_child(Some(&messages_box));
+        // Enable kinetic scrolling so mouse-wheel ticks animate smoothly
+        // instead of jumping. Default is enabled for touch but mouse wheel
+        // may default to discrete jumps; setting it explicitly fixes the
+        // "jump and stop" feel reported by the user.
+        scroll.set_kinetic_scrolling(true);
+        scroll.set_overlay_scrolling(true);
 
         // "Go to latest" floating button — visible when user scrolls up
         // "Go to latest" button — floats above the scroll via Overlay
@@ -2484,29 +2490,26 @@ impl ChatViewPanel {
         // bottom while at_bottom remains true.
         Self::force_scroll_to_bottom(&self.inner, 4);
 
-        // BULLETPROOF PAINT FIX:
-        // After rendering, force a full re-realization of the messages_box
-        // by hiding + showing it. This is heavy-handed but works around
-        // GTK4's GL renderer occasionally not painting newly-rendered
-        // bubbles until a mouse hover damages the surface. The bug is
-        // intermittent because it depends on race conditions with async
-        // events (GroupMembers, AvatarReady, LID resolution) that may
-        // mutate parent layout AFTER load_history finishes.
+        // BULLETPROOF PAINT FIX (delayed past bubble-enter animation):
+        // GTK4's GL renderer occasionally fails to paint newly-rendered
+        // bubbles until something damages the surface. The bubble-enter
+        // CSS animations run for ~480ms on every new bubble, so during
+        // that window each frame produces damage and the renderer paints
+        // correctly. AFTER animations complete, async events (GroupMembers,
+        // ChatNameUpdated, AvatarReady) may still mutate parent layout
+        // and cause the cache-stale scenario that needs hide/show.
         //
-        // hide+show triggers an unmap/map cycle which forces GTK to
-        // rebuild the render tree from scratch. The scroll position is
-        // preserved because we re-anchor via force_scroll_to_bottom on
-        // the next frame tick.
+        // Fire the hide/show at +700ms — past the bubble animations so
+        // it doesn't interrupt them, but still soon enough to recover
+        // from late layout shifts before the user notices.
         {
             let inner_w = Rc::downgrade(&self.inner);
-            glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
+            glib::timeout_add_local_once(std::time::Duration::from_millis(700), move || {
                 let Some(inner) = inner_w.upgrade() else {
                     return;
                 };
                 inner.messages_box.set_visible(false);
                 inner.messages_box.set_visible(true);
-                // Re-snap to bottom after the hide/show cycle since the
-                // re-realization may reset scroll position.
                 let adj = inner.scroll.vadjustment();
                 adj.set_value(adj.upper() - adj.page_size());
                 inner.scroll_pending.set(2);
@@ -2922,11 +2925,12 @@ impl ChatViewPanel {
 
         // Slide-in animation: add bubble-enter class so the CSS keyframe
         // animation plays on first paint, then schedule removal of the
-        // class so margin-top settles back to baseline.
+        // class so margins settle back to baseline. 500ms covers the
+        // 480ms CSS animation duration with a small buffer.
         bubble.widget().add_css_class("bubble-enter");
         let bubble_w = bubble.widget().clone();
         glib::timeout_add_local_once(
-            std::time::Duration::from_millis(360),
+            std::time::Duration::from_millis(500),
             move || {
                 bubble_w.remove_css_class("bubble-enter");
             },

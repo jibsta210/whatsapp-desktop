@@ -242,36 +242,39 @@ button.ac-mode-btn:checked {
     color: #00a884;
 }
 
-/* ── Pilafy: input-pill bounces then morphs into chat bubble ── */
-/* Phase 1: pill — matches the input bar appearance (bounce via Rust) */
-/* Phase 1: pill shape + breathing pulse while AC processes */
+/* ── Pilafy: bubble breathes while AC waits, settles into final shape ── */
+/* The pilafy / pilafy-settle classes are added by Rust to the BUBBLE ROOT
+ * (which has class .bubble-row-out). The visible pulse needs to apply to
+ * the inner colored bubble (.message-bubble-out), so we use a descendant
+ * combinator here. Previously the CSS used `box.message-bubble-out.pilafy`
+ * which required both classes on the SAME widget — and they're on
+ * different widgets — so the animation never actually fired. */
 @keyframes pilafy-pulse {
     0%   { opacity: 1.0; background-color: #005c4b; }
     50%  { opacity: 0.45; background-color: rgba(42, 57, 66, 0.6); }
     100% { opacity: 1.0; background-color: #005c4b; }
 }
-box.message-bubble-out.pilafy {
+box.bubble-row-out.pilafy box.message-bubble-out {
     border-radius: 9999px;
     border: 1.5px solid rgba(255, 255, 255, 0.2);
     padding: 10px 20px;
     animation: pilafy-pulse 1.0s ease-in-out infinite;
 }
-box.message-bubble-out.pilafy .dim-label {
+box.bubble-row-out.pilafy .dim-label {
     opacity: 0.0;
 }
 
 /* Phase 2: settle — only opacity+background-color are GTK4-animatable */
-
 @keyframes pilafy-settle {
     0%   { background-color: rgba(42, 57, 66, 0.75); opacity: 0.85; }
     100% { background-color: #005c4b; opacity: 1.0; }
 }
-box.message-bubble-out.pilafy-settle {
+box.bubble-row-out.pilafy-settle box.message-bubble-out {
     border-radius: 8px 8px 2px 8px;
     padding: 6px 8px 2px;
     animation: pilafy-settle 0.4s ease-out forwards;
 }
-box.message-bubble-out.pilafy-settle .dim-label {
+box.bubble-row-out.pilafy-settle .dim-label {
     opacity: 1.0;
     transition: opacity 0.3s ease-in 0.2s;
 }
@@ -341,29 +344,29 @@ progressbar.sync-progress progress {
  * bubble bulk render in load_history all animates at once on chat
  * switch — that is intentional, gives the chat a reveal feel. */
 @keyframes bubble-slide-in-right {
-    0%   { opacity: 0; margin-right: -120px; }
-    65%  { opacity: 1; margin-right:    8px; }
+    0%   { opacity: 0; margin-right: -180px; }
+    70%  { opacity: 1; margin-right:    4px; }
     100% { opacity: 1; margin-right:    8px; }
 }
 @keyframes bubble-slide-in-left {
-    0%   { opacity: 0; margin-left: -120px; }
-    65%  { opacity: 1; margin-left:    8px; }
+    0%   { opacity: 0; margin-left: -180px; }
+    70%  { opacity: 1; margin-left:    4px; }
     100% { opacity: 1; margin-left:    8px; }
 }
 box.bubble-enter.bubble-row-out {
-    animation: bubble-slide-in-right 0.36s cubic-bezier(0.34, 1.56, 0.64, 1);
+    animation: bubble-slide-in-right 0.48s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 box.bubble-enter.bubble-row-in {
-    animation: bubble-slide-in-left 0.36s cubic-bezier(0.34, 1.56, 0.64, 1);
+    animation: bubble-slide-in-left 0.48s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 /* System / centered bubbles (no left/right anchor) — fall back to a
  * gentle vertical fade-in. */
 @keyframes bubble-fade-in {
-    0%   { opacity: 0; margin-top: -16px; }
-    100% { opacity: 1; margin-top: 3px;   }
+    0%   { opacity: 0; margin-top: -20px; }
+    100% { opacity: 1; margin-top:   3px; }
 }
 box.bubble-enter:not(.bubble-row-out):not(.bubble-row-in) {
-    animation: bubble-fade-in 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+    animation: bubble-fade-in 0.36s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 /* ── Window / dialog open animation ────────────────────────────────── */
@@ -372,13 +375,14 @@ box.bubble-enter:not(.bubble-row-out):not(.bubble-row-in) {
  * on dialogs/popovers we want animated. */
 @keyframes window-fade-in {
     0%   { opacity: 0; }
+    25%  { opacity: 0.05; }
     100% { opacity: 1; }
 }
 window.modal-fade {
-    animation: window-fade-in 0.22s cubic-bezier(0.16, 1, 0.3, 1);
+    animation: window-fade-in 0.32s cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 popover.fade-popover contents {
-    animation: window-fade-in 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    animation: window-fade-in 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 ";
 

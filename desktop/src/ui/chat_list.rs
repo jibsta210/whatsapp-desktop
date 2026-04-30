@@ -127,6 +127,8 @@ impl ChatListPanel {
 
         let scroll = ScrolledWindow::new();
         scroll.set_vexpand(true);
+        scroll.set_kinetic_scrolling(true);
+        scroll.set_overlay_scrolling(true);
         scroll.set_child(Some(&list_box));
 
         // ── Message search results section (hidden until query is typed) ──
