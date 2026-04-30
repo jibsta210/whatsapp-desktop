@@ -2323,23 +2323,9 @@ impl ChatViewPanel {
         // Clear send group mode when switching to a real chat
         *self.inner.send_group_ids.borrow_mut() = None;
         self.inner.header_name.set_text(chat_name);
-        // For group chats, pre-show the subtitle slot with a single space so
-        // its visibility/height is stable BEFORE GroupMembers arrives. Without
-        // this, GroupMembers landing after load_history flips the subtitle
-        // from hidden→visible, growing the header and shrinking the
-        // scrolled-window viewport AFTER bubbles are rendered. That layout
-        // shift triggered the GTK4 GL renderer paint bug — bubbles became
-        // invisible until a mouse hover damaged the surface. The race was
-        // visible as "sometimes the bug, sometimes not" depending on which
-        // event won the channel.
-        let is_group = chat_id.ends_with("@g.us");
-        if is_group {
-            self.inner.header_subtitle.set_text(" ");
-            self.inner.header_subtitle.set_visible(true);
-        } else {
-            self.inner.header_subtitle.set_text("");
-            self.inner.header_subtitle.set_visible(false);
-        }
+        // Clear group subtitle — it'll be set when GroupMembers arrives
+        self.inner.header_subtitle.set_text("");
+        self.inner.header_subtitle.set_visible(false);
 
         // ── Restore draft for incoming chat ──
         let draft = self
@@ -2494,6 +2480,35 @@ impl ChatViewPanel {
         // connect_changed handler will keep the scroll anchored to the
         // bottom while at_bottom remains true.
         Self::force_scroll_to_bottom(&self.inner, 4);
+
+        // BULLETPROOF PAINT FIX:
+        // After rendering, force a full re-realization of the messages_box
+        // by hiding + showing it. This is heavy-handed but works around
+        // GTK4's GL renderer occasionally not painting newly-rendered
+        // bubbles until a mouse hover damages the surface. The bug is
+        // intermittent because it depends on race conditions with async
+        // events (GroupMembers, AvatarReady, LID resolution) that may
+        // mutate parent layout AFTER load_history finishes.
+        //
+        // hide+show triggers an unmap/map cycle which forces GTK to
+        // rebuild the render tree from scratch. The scroll position is
+        // preserved because we re-anchor via force_scroll_to_bottom on
+        // the next frame tick.
+        {
+            let inner_w = Rc::downgrade(&self.inner);
+            glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
+                let Some(inner) = inner_w.upgrade() else {
+                    return;
+                };
+                inner.messages_box.set_visible(false);
+                inner.messages_box.set_visible(true);
+                // Re-snap to bottom after the hide/show cycle since the
+                // re-realization may reset scroll position.
+                let adj = inner.scroll.vadjustment();
+                adj.set_value(adj.upper() - adj.page_size());
+                inner.scroll_pending.set(2);
+            });
+        }
     }
 
     fn remove_placeholder(&self) {
@@ -3341,6 +3356,13 @@ impl ChatViewPanel {
     }
 
     /// Update the header name if this chat is currently open.
+    ///
+    /// Also forces a re-realization of messages_box because changing the
+    /// header text invalidates header layout, which can shrink the message
+    /// pane viewport AFTER bubbles are rendered — that triggered the GTK4
+    /// GL renderer paint bug where bubbles became invisible until hover.
+    /// Most visible on contacts whose name resolves slowly (phone number
+    /// → real name swap fires ChatNameUpdated post-load).
     pub fn update_chat_name(&self, chat_id: &str, name: &str) {
         let is_current = self
             .inner
@@ -3349,8 +3371,24 @@ impl ChatViewPanel {
             .as_deref()
             .map(|id| id == chat_id)
             .unwrap_or(false);
-        if is_current {
+        if is_current && self.inner.header_name.text() != name {
             self.inner.header_name.set_text(name);
+            // Hide/show messages_box on the next idle tick to force the
+            // GL renderer to rebuild its render tree after the header
+            // layout shift. This is the same workaround used at the end
+            // of load_history.
+            let inner_w = Rc::downgrade(&self.inner);
+            glib::idle_add_local_once(move || {
+                let Some(inner) = inner_w.upgrade() else {
+                    return;
+                };
+                inner.messages_box.set_visible(false);
+                inner.messages_box.set_visible(true);
+                let adj = inner.scroll.vadjustment();
+                if inner.at_bottom.get() {
+                    adj.set_value(adj.upper() - adj.page_size());
+                }
+            });
         }
     }
 
