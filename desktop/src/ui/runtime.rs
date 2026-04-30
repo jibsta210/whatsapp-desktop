@@ -4779,22 +4779,36 @@ async fn handle_command(
                                     })),
                                     ..Default::default()
                                 },
-                                Some(crate::bridge::MediaType::Document) => wa::Message {
-                                    document_message: Some(Box::new(
-                                        wa::message::DocumentMessage {
-                                            mimetype: Some("application/octet-stream".into()),
-                                            file_name: orig.media_filename.clone(),
-                                            url: Some(upload.url),
-                                            direct_path: Some(upload.direct_path),
-                                            media_key: Some(upload.media_key),
-                                            file_enc_sha256: Some(upload.file_enc_sha256),
-                                            file_sha256: Some(upload.file_sha256),
-                                            file_length: Some(upload.file_length),
-                                            context_info: Some(fwd_ctx),
-                                            ..Default::default()
-                                        },
-                                    )),
-                                    ..Default::default()
+                                Some(crate::bridge::MediaType::Document) => {
+                                    // Derive mime type from the original filename
+                                    // (preferred — preserves the user-visible
+                                    // extension) or fall back to the local path.
+                                    // Without this, recipients see all forwarded
+                                    // docs as `.bin` because the server defaults
+                                    // unknown mimetypes to application/octet-stream.
+                                    let mime_source = orig
+                                        .media_filename
+                                        .as_deref()
+                                        .unwrap_or(local_path)
+                                        .to_lowercase();
+                                    let mime = mime_from_extension(&mime_source);
+                                    wa::Message {
+                                        document_message: Some(Box::new(
+                                            wa::message::DocumentMessage {
+                                                mimetype: Some(mime),
+                                                file_name: orig.media_filename.clone(),
+                                                url: Some(upload.url),
+                                                direct_path: Some(upload.direct_path),
+                                                media_key: Some(upload.media_key),
+                                                file_enc_sha256: Some(upload.file_enc_sha256),
+                                                file_sha256: Some(upload.file_sha256),
+                                                file_length: Some(upload.file_length),
+                                                context_info: Some(fwd_ctx),
+                                                ..Default::default()
+                                            },
+                                        )),
+                                        ..Default::default()
+                                    }
                                 },
                                 Some(crate::bridge::MediaType::Audio) => wa::Message {
                                     audio_message: Some(Box::new(wa::message::AudioMessage {

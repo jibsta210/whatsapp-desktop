@@ -1560,11 +1560,20 @@ impl ChatViewPanel {
         // ── Drag and drop files (single or multiple) ──
         {
             let inner_c = inner.clone();
-            // Accept both single File and FileList for multi-file drops
+            // Accept both single File and FileList for multi-file drops.
+            // Some file managers (Files, Dolphin) advertise FileList for
+            // both single and multi drops, others (Thunar in some configs)
+            // only advertise gio::File for single drops. set_types accepts
+            // both — without it, a single-file drop from certain file
+            // managers would silently fail.
             let drop_target = gtk4::DropTarget::new(
                 gtk4::gdk::FileList::static_type(),
                 gtk4::gdk::DragAction::COPY,
             );
+            drop_target.set_types(&[
+                gtk4::gdk::FileList::static_type(),
+                gtk4::gio::File::static_type(),
+            ]);
             drop_target.connect_drop(move |_, value, _, _| {
                 let mut paths: Vec<String> = Vec::new();
 
@@ -1590,17 +1599,45 @@ impl ChatViewPanel {
                 }
 
                 if paths.len() == 1 {
-                    // Single file: show preview like before
                     let path_str = &paths[0];
-                    if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path_str) {
-                        inner_c.image_preview_pic.set_paintable(Some(&tex));
+                    let lower = path_str.to_lowercase();
+                    let is_image = lower.ends_with(".jpg")
+                        || lower.ends_with(".jpeg")
+                        || lower.ends_with(".png")
+                        || lower.ends_with(".webp")
+                        || lower.ends_with(".gif");
+
+                    // CRITICAL: clear the previous paintable BEFORE deciding
+                    // what to show. Otherwise a stale paste-screenshot
+                    // remains visible while pending_image_path is silently
+                    // updated to the dropped file — user sees screenshot
+                    // in preview bar, hits send, "their PDF" goes through
+                    // but the visible state lied to them.
+                    inner_c
+                        .image_preview_pic
+                        .set_paintable(None::<&gtk4::gdk::Paintable>);
+
+                    if is_image {
+                        if let Some(tex) =
+                            crate::ui::texture_cache::texture_from_filename(path_str)
+                        {
+                            inner_c.image_preview_pic.set_paintable(Some(&tex));
+                        }
                     }
+                    // For documents/videos/etc. the paintable stays cleared
+                    // and the preview bar shows just the filename + cancel.
+                    // (image_preview_pic already has set_can_shrink so empty
+                    // paintable collapses to 0 height.)
                     *inner_c.pending_image_path.borrow_mut() = Some(path_str.clone());
                     *inner_c.pending_gif_url.borrow_mut() = None;
                     inner_c.image_preview_bar.set_visible(true);
                     inner_c.input_view.grab_focus();
                 } else {
-                    // Multiple files: send each one immediately
+                    // Multiple files: send each one immediately. The runtime
+                    // side of SendImage detects file extension and routes
+                    // documents through the document_message path with the
+                    // correct mime type — so SendImage works for non-images
+                    // here despite the name.
                     if let Some(chat_id) = inner_c.current_chat_id.borrow().clone() {
                         for path_str in &paths {
                             let tmp_id = gen_tmp_id();
