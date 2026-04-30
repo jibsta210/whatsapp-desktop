@@ -2338,7 +2338,6 @@ impl ChatViewPanel {
         self.inner.input_view.buffer().set_text(&draft);
 
         // Clear message area and search/media state
-        log::info!("DIAG CLEAR open_chat[{}] bubbles_before={}", chat_id, self.inner.bubbles.borrow().len());
         remove_all_children(&self.inner.messages_box);
         self.inner.bubbles.borrow_mut().clear();
         self.inner.search_texts.borrow_mut().clear();
@@ -2440,11 +2439,6 @@ impl ChatViewPanel {
             .map(|id| id == chat_id)
             .unwrap_or(false);
 
-        log::info!(
-            "DIAG load_history ENTER chat={} is_current={} msg_count={} bubbles_now={}",
-            chat_id, is_current, messages.len(), self.inner.bubbles.borrow().len()
-        );
-
         if !is_current {
             return;
         }
@@ -2465,179 +2459,27 @@ impl ChatViewPanel {
             return;
         }
 
-        // INSTANT-OPEN strategy:
-        // 1. Render the LAST 15 messages synchronously — that's all the user
-        //    sees on first paint (chat scrolled to bottom).
-        // 2. Snap to bottom immediately — chat appears <16ms after switch.
-        // 3. Fill in older messages in idle ticks (5 per tick, 8ms apart) so
-        //    they're ready when the user scrolls up. UI never blocks.
+        // Render ALL messages synchronously, oldest first. We previously
+        // streamed older messages via a prepend timer to make first paint
+        // instant, but GTK4's GL renderer didn't reliably paint widgets
+        // inserted at the top via insert_child_after — they remained
+        // invisible until a mouse-hover damaged the surface. Switching to
+        // pure append (oldest → newest) keeps the renderer's render-tree
+        // invalidation working correctly.
         //
-        // Previously we appended ALL 50 messages synchronously before
-        // returning, which on GTK4 is ~3-5s of widget allocation + style
-        // invalidation cascade. That was the chat-switch lag.
-
-        let msgs_box = &self.inner.messages_box;
-        let total = messages.len();
-        let visible_count = total.min(15);
-        let split_at = total - visible_count;
-
-        // Pre-allocate the older messages first (off-screen, no flush)
-        // then the visible ones. Order matters: messages_box renders in
-        // append order, so older must come first.
-        let (older, visible) = {
-            let mut iter = messages.into_iter();
-            let older: Vec<_> = (&mut iter).take(split_at).collect();
-            let visible: Vec<_> = iter.collect();
-            (older, visible)
-        };
-
-        // Synchronous render of the visible window — must paint immediately
-        for msg in visible {
+        // Cost: ~100-300ms hitch on chat switch for 50 messages. Acceptable
+        // tradeoff vs. the "messages don't paint until hover" bug.
+        for msg in messages {
             self.append_message_inner(msg);
         }
         self.inner.at_bottom.set(true);
         self.inner.goto_latest_btn.set_visible(false);
 
-        // Mark as at-bottom and seed a few pulses for the initial layout +
-        // first prepends. The connect_changed handler will keep us anchored
-        // for as long as at_bottom remains true (i.e., until the user
-        // scrolls away), so we don't need to guess a pulse count that
-        // covers all 35 prepend ticks plus texture-load resizes.
+        // Mark as at-bottom and seed a few pulses for the initial layout
+        // and any async resizes (avatar texture loads). The
+        // connect_changed handler will keep the scroll anchored to the
+        // bottom while at_bottom remains true.
         Self::force_scroll_to_bottom(&self.inner, 4);
-
-        // DIAG: trace bubbles HashMap size every 100ms via the SHARED inner
-        // (Rc clone) so we see the actual RefCell, not a snapshot clone.
-        // The previous version did `self.inner.bubbles.clone()` which on
-        // RefCell<HashMap> is a deep copy — the timer was logging a frozen
-        // snapshot from before the prepends ran, falsely reporting 15.
-        eprintln!("DIAG TRACE timer SCHEDULED for chat={}", chat_id);
-        {
-            let inner_trace = self.inner.clone();
-            let chat_id_trace = chat_id.to_string();
-            let elapsed = std::rc::Rc::new(std::cell::Cell::new(0u32));
-            let elapsed_clone = elapsed.clone();
-            glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-                let n = elapsed_clone.get() + 100;
-                elapsed_clone.set(n);
-                let bubbles_len = inner_trace.bubbles.borrow().len();
-                let mut child_count = 0;
-                let mut child = inner_trace.messages_box.first_child();
-                while let Some(c) = child {
-                    child_count += 1;
-                    child = c.next_sibling();
-                }
-                eprintln!(
-                    "DIAG TRACE[{} t+{}ms] bubbles_map={} children={}",
-                    chat_id_trace, n, bubbles_len, child_count
-                );
-                if n >= 3000 {
-                    glib::ControlFlow::Break
-                } else {
-                    glib::ControlFlow::Continue
-                }
-            });
-        }
-
-        // DIAG: dump every child widget's type/name once after 1.5s. Uses
-        // the SHARED inner (Rc clone) so we see the live RefCell — the
-        // previous version did self.inner.bubbles.clone() which deep-copied
-        // the HashMap and made the dump permanently see the pre-prepend
-        // 15-message snapshot, fabricating the "35 missing entries" result.
-        {
-            let chat_id_log = chat_id.to_string();
-            let inner_dump = self.inner.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
-                use gtk4::prelude::*;
-                // Compare by widget_name (set to "bubble-{msg_id}" at create
-                // time). This avoids any pointer-typing issues that the
-                // previous comparison may have been hitting.
-                let bubble_names: std::collections::HashSet<String> = inner_dump
-                    .bubbles
-                    .borrow()
-                    .keys()
-                    .map(|id| format!("bubble-{id}"))
-                    .collect();
-                let total_in_map = bubble_names.len();
-                let mut idx = 0;
-                let mut child = inner_dump.messages_box.first_child();
-                let mut total_children = 0usize;
-                let mut bubble_children_matched = 0usize;
-                let mut bubble_children_unmatched = 0usize;
-                while let Some(c) = child {
-                    let name = c.widget_name().to_string();
-                    let css = c.css_classes().join(",");
-                    let kind = c.type_().name();
-                    let is_bubble_tag = name.starts_with("bubble-");
-                    let in_map = bubble_names.contains(&name);
-                    if is_bubble_tag {
-                        if in_map {
-                            bubble_children_matched += 1;
-                        } else {
-                            bubble_children_unmatched += 1;
-                        }
-                    }
-                    log::info!(
-                        "DIAG child[{chat_id_log} #{idx}] kind={kind} name={name:?} \
-                         css=[{css}] in_bubbles_map={in_map}"
-                    );
-                    idx += 1;
-                    total_children += 1;
-                    child = c.next_sibling();
-                }
-                log::info!(
-                    "DIAG SUMMARY[{chat_id_log}] children={total_children} \
-                     bubble_widgets_matched={bubble_children_matched} \
-                     bubble_widgets_unmatched={bubble_children_unmatched} \
-                     bubbles_map_size={total_in_map}"
-                );
-            });
-        }
-
-
-        // Stream older messages in. Each tick prepends 5 messages above the
-        // visible ones using messages_box.prepend(...) so they appear above
-        // without disturbing the visible window. We use a Cell<Option<Vec>>
-        // owned by the closure so we can pop incrementally.
-        if !older.is_empty() {
-            let inner_w = Rc::downgrade(&self.inner);
-            let pending: Rc<RefCell<Vec<IncomingMessage>>> =
-                Rc::new(RefCell::new(older));
-            let chat_id_owned = chat_id.to_string();
-            glib::timeout_add_local(std::time::Duration::from_millis(8), move || {
-                let Some(inner) = inner_w.upgrade() else {
-                    return glib::ControlFlow::Break;
-                };
-                // Bail out if user switched chats
-                let still_current = inner
-                    .current_chat_id
-                    .borrow()
-                    .as_deref()
-                    .map(|id| id == chat_id_owned)
-                    .unwrap_or(false);
-                if !still_current {
-                    return glib::ControlFlow::Break;
-                }
-                let mut p = pending.borrow_mut();
-                if p.is_empty() {
-                    return glib::ControlFlow::Break;
-                }
-                // Take the LAST 5 from the older slice (most recent of the
-                // remaining olders). They get prepended above the visible
-                // window so chronological order is preserved.
-                let take = p.len().saturating_sub(5);
-                let batch: Vec<_> = p.split_off(take);
-                drop(p);
-                // Prepend in reverse so the oldest of this batch ends up
-                // furthest from the visible window. Direct insert-at-top
-                // (no append-then-move dance), so `upper` grows monotonically
-                // and the connect_changed handler keeps the bottom pinned
-                // while at_bottom is true.
-                for msg in batch.into_iter().rev() {
-                    Self::prepend_bubble_to_inner(&inner, msg);
-                }
-                glib::ControlFlow::Continue
-            });
-        }
     }
 
     fn remove_placeholder(&self) {
@@ -2650,13 +2492,6 @@ impl ChatViewPanel {
 
     pub fn append_message(&self, msg: IncomingMessage) {
         let inner = &self.inner;
-
-        log::info!(
-            "DIAG append_message id={} chat={} from_me={} ts={} link_title={} contact_name={} thumb={}",
-            msg.id, msg.chat_id, msg.is_from_me, msg.timestamp,
-            msg.link_title.is_some(), msg.contact_name.is_some(),
-            msg.link_thumbnail_path.is_some()
-        );
 
         // Match the current chat — tolerant of LID/phone JID aliases so
         // that self-messages from phone (which may arrive as @lid when the
@@ -2745,7 +2580,6 @@ impl ChatViewPanel {
     }
 
     pub fn confirm_bubble(&self, tmp_id: &str, real_id: &str) {
-        log::info!("DIAG REMOVE confirm_bubble tmp={tmp_id} → real={real_id}");
         let mut bubbles = self.inner.bubbles.borrow_mut();
         if let Some(bubble) = bubbles.remove(tmp_id) {
             bubble.update_receipt(&ReceiptStatus::Sent);
@@ -2755,33 +2589,6 @@ impl ChatViewPanel {
         if let Some(text) = texts.remove(tmp_id) {
             texts.insert(real_id.to_string(), text);
         }
-    }
-
-    /// Build a bubble for `msg` and insert it at the TOP of messages_box.
-    /// Used by load_history's incremental fill-in to add older messages
-    /// above the visible window. Inserts directly at the top without the
-    /// previous append-then-remove-then-reinsert dance, which was causing
-    /// the scrolled window's `upper` to flap (grow → shrink → grow) within
-    /// one synchronous block. GtkAdjustment auto-clamps `value` when `upper`
-    /// shrinks, so the brief shrink during the remove step pinned the
-    /// scroll a few message-heights above the true bottom — visibly leaving
-    /// chats short-scrolled by 5+ messages on every history load.
-    ///
-    /// Date separators are NOT inserted here — they'd land at the bottom of
-    /// the messages_box (since maybe_insert_date_separator only appends).
-    fn prepend_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
-        let before = inner.bubbles.borrow().len();
-        if inner.bubbles.borrow().contains_key(&msg.id) {
-            log::info!("DIAG prepend SKIP (dup id={}): bubbles={before}", msg.id);
-            return;
-        }
-        let msg_id = msg.id.clone();
-        Self::append_bubble_to_inner_at(inner, msg, BubblePosition::Prepend);
-        let after = inner.bubbles.borrow().len();
-        let in_map = inner.bubbles.borrow().contains_key(&msg_id);
-        log::info!(
-            "DIAG prepend DONE (id={msg_id}): bubbles {before}→{after} in_map={in_map}"
-        );
     }
 
     fn append_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
@@ -2970,7 +2777,6 @@ impl ChatViewPanel {
                     while let Some(child) = inner_c.messages_box.first_child() {
                         inner_c.messages_box.remove(&child);
                     }
-                    log::info!("DIAG CLEAR contact-card-msg-btn bubbles_before={}", inner_c.bubbles.borrow().len());
                     inner_c.bubbles.borrow_mut().clear();
                     inner_c
                         .bridge
@@ -3064,7 +2870,6 @@ impl ChatViewPanel {
                 || msg.contact_name.is_some();
             if has_new_data {
                 // Remove old bubble and fall through to create a new one
-                log::info!("DIAG REMOVE has_new_data id={}", msg.id);
                 let mut bubbles = inner.bubbles.borrow_mut();
                 if let Some(old) = bubbles.remove(&msg.id) {
                     inner.messages_box.remove(old.widget());
@@ -3078,9 +2883,9 @@ impl ChatViewPanel {
             }
         }
 
-        // DIAG: tag the widget with the msg_id so the dump can compare by
-        // value instead of pointer. If pointer comparison was lying about
-        // prepended bubbles, this avoids the issue entirely.
+        // Tag the widget with the msg_id. Useful for runtime debugging
+        // (e.g. inspecting widget tree via GTK Inspector to find a bubble
+        // by message id) and harmless to leave in.
         bubble.widget().set_widget_name(&format!("bubble-{}", msg.id));
         match position {
             BubblePosition::Append => inner.messages_box.append(bubble.widget()),
@@ -3169,7 +2974,6 @@ impl ChatViewPanel {
         if !is_current {
             return;
         }
-        log::info!("DIAG CLEAR clear_chat[{}] bubbles_before={}", chat_id, self.inner.bubbles.borrow().len());
         remove_all_children(&self.inner.messages_box);
         self.inner.bubbles.borrow_mut().clear();
         let label = gtk4::Label::new(Some(
@@ -3200,7 +3004,7 @@ impl ChatViewPanel {
         }
         let mut bubbles = self.inner.bubbles.borrow_mut();
         log::info!(
-            "DIAG REMOVE remove_message msg_id={msg_id} bubbles_in_cache={}",
+            "remove_message: {} bubbles in cache, looking for {msg_id}",
             bubbles.len()
         );
         if let Some(bubble) = bubbles.remove(msg_id) {
@@ -3857,7 +3661,6 @@ fn show_message_menu(
                 // Fully switch to the DM chat (clear old messages, set new ID)
                 *inner_c.current_chat_id.borrow_mut() = Some(dm_jid.clone());
                 inner_c.header_name.set_text(&sender_name);
-                log::info!("DIAG CLEAR menu-reply-dm bubbles_before={}", inner_c.bubbles.borrow().len());
                 remove_all_children(&inner_c.messages_box);
                 inner_c.bubbles.borrow_mut().clear();
                 inner_c.search_texts.borrow_mut().clear();
@@ -3916,7 +3719,6 @@ fn show_message_menu(
                 let sid = sender_id.clone();
                 *inner_c.current_chat_id.borrow_mut() = Some(sid.clone());
                 inner_c.header_name.set_text(&sender_name_c);
-                log::info!("DIAG CLEAR menu-message-user bubbles_before={}", inner_c.bubbles.borrow().len());
                 remove_all_children(&inner_c.messages_box);
                 inner_c.bubbles.borrow_mut().clear();
                 inner_c
