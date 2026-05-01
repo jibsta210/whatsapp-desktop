@@ -2651,6 +2651,20 @@ impl ChatViewPanel {
     pub fn append_message(&self, msg: IncomingMessage) {
         let inner = &self.inner;
 
+        // DIAG: log every self-message arrival at the UI to correlate
+        // with the runtime-side log. If the runtime emitted but the UI
+        // never logs here, the event's getting dropped in the channel
+        // batch loop. If both log but the bubble doesn't appear, the
+        // chat-id match below is rejecting it.
+        if msg.is_from_me {
+            log::info!(
+                "DIAG self-msg at UI: id={} chat={} current={:?} text={:?}",
+                msg.id, msg.chat_id,
+                inner.current_chat_id.borrow().as_deref(),
+                msg.text.as_deref().unwrap_or("<media>")
+            );
+        }
+
         // Match the current chat — tolerant of LID/phone JID aliases so
         // that self-messages from phone (which may arrive as @lid when the
         // open chat is @s.whatsapp.net, or vice versa) still render.

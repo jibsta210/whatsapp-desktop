@@ -2290,6 +2290,21 @@ async fn handle_wa_event(
                         queue_lid_resolve(&lid_resolver_tx, &m.sender_id);
                     }
 
+                    // DIAG: log every self-message path with raw vs final
+                    // chat_id. This is the "self-message from phone missing
+                    // on desktop" debug — if the message arrives but lands
+                    // in a different chat than the one shown in the UI,
+                    // the user won't see it. Compare raw_chat (what the
+                    // phone sent) against m.chat_id (after our LID→phone
+                    // resolution) and the desktop's open chat.
+                    if m.is_from_me {
+                        log::info!(
+                            "DIAG self-msg from phone: id={} raw_chat={} final_chat={} text={:?}",
+                            m.id, raw_chat_dbg, m.chat_id,
+                            m.text.as_deref().unwrap_or("<media>")
+                        );
+                    }
+
                     WaEvent::MessageReceived(m)
                 }
                 None => return,
