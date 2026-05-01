@@ -348,15 +348,45 @@ impl Client {
         let participants = node.get_optional_child_by_tag(&["participants"]);
         if let Some(participants_node) = participants {
             let to_nodes = participants_node.get_children_by_tag("to");
+            // Resolve BOTH our PN and LID JIDs once before the loop. Phone
+            // fans out self-messages to other devices via <participants>
+            // and the per-device <to jid="…"> can be either PN or LID form
+            // depending on chat's addressing mode. Comparing only against
+            // PN dropped self-messages from DMs that fan out under LID,
+            // which the user observed as "messages I send from phone don't
+            // appear on desktop in DMs (groups work fine)".
+            let own_pn = self.get_pn().await;
+            let own_lid = self.get_lid().await;
+            let own_pn_str = own_pn.as_ref().map(|j| j.to_string());
+            let own_lid_str = own_lid.as_ref().map(|j| j.to_string());
+            // Also strip device suffix for comparison: a fanout target may
+            // include :device while our local jid may not (or vice versa).
+            let own_pn_base = own_pn.as_ref().map(|j| {
+                format!("{}@{}", j.user, j.server)
+            });
+            let own_lid_base = own_lid.as_ref().map(|j| {
+                format!("{}@{}", j.user, j.server)
+            });
             for to_node in to_nodes {
                 let to_jid = match to_node.attrs().optional_string("jid") {
                     Some(jid) => jid.to_string(),
                     None => continue,
                 };
-                let own_jid = self.get_pn().await;
-                if let Some(our_jid) = own_jid
-                    && to_jid == our_jid.to_string()
+                let to_base = if let (Some(at), Some(colon)) = (to_jid.find('@'), to_jid.find(':'))
                 {
+                    if colon < at {
+                        format!("{}{}", &to_jid[..colon], &to_jid[at..])
+                    } else {
+                        to_jid.clone()
+                    }
+                } else {
+                    to_jid.clone()
+                };
+                let matches_us = own_pn_str.as_deref() == Some(&to_jid)
+                    || own_lid_str.as_deref() == Some(&to_jid)
+                    || own_pn_base.as_deref() == Some(&to_base)
+                    || own_lid_base.as_deref() == Some(&to_base);
+                if matches_us {
                     let enc_children = to_node.get_children_by_tag("enc");
                     all_enc_nodes.extend(enc_children);
                 }
