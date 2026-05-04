@@ -252,6 +252,28 @@ impl Client {
             }
         };
 
+        // DIAG (catch-up self-msg bug): log every incoming message
+        // with is_from_me + offline flag so we can correlate
+        // resume-after-suspend behavior with which messages arrive.
+        // Inbound offline-queued messages flow through this same
+        // function but may have different node structure for the
+        // participant fan-out — this log tells us if the messages
+        // are even reaching the protocol layer.
+        let offline_attr = node
+            .attrs
+            .get("offline")
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        log::info!(
+            "DIAG msg arrival: id={} from_me={} chat={} sender={} offline={:?} has_participants={}",
+            info.id,
+            info.source.is_from_me,
+            info.source.chat,
+            info.source.sender,
+            offline_attr,
+            node.get_optional_child("participants").is_some()
+        );
+
         // Newsletters use <plaintext> instead of <enc> because they are not E2E encrypted.
         if info.source.chat.is_newsletter() {
             self.handle_newsletter_message(&node, &info).await;
