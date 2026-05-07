@@ -28,6 +28,19 @@ box.message-bubble-in {
     background-color: #202c33;
     border-radius: 8px 8px 8px 2px;
 }
+/* Send-mode toggle in the chat header tints itself by current protocol. */
+button.send-mode-wa { color: #00d26a; }       /* WhatsApp-green tint */
+button.send-mode-sms { color: #007aff; }      /* iOS-blue tint */
+
+/* SMS/MMS/RCS bubbles via Google Messages — iOS-blue out, slate-blue in.
+ * Combined with .message-bubble-out / -in so the per-direction shape still
+ * applies. */
+box.message-bubble-out.message-bubble-sms {
+    background-color: #007aff;
+}
+box.message-bubble-in.message-bubble-sms {
+    background-color: #3a506b;
+}
 box.message-bubble-out label,
 box.message-bubble-in label {
     color: #e9edef;

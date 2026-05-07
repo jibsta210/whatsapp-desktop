@@ -315,6 +315,9 @@ pub enum WaCommand {
         enabled: bool,
     },
     Logout,
+    /// Trigger a Google Messages re-pair: wipe auth, force the runtime to
+    /// run pairing flow again, and surface the QR in Settings.
+    GmessagesRepair,
     /// Set own profile picture from a file path
     SetProfilePicture { path: String },
     // ── Chat context-menu actions ──────────────────────────────────────────────
@@ -640,6 +643,179 @@ pub struct IncomingMessage {
     /// e.g. "You added ~Derek Bevilacqua", "John left"
     #[serde(default)]
     pub is_system_message: bool,
+}
+
+/// Origin protocol for an [`IncomingMessage`]. Derived at render time from
+/// `chat_id` — kept out of the struct itself because bincode 1.x doesn't
+/// tolerate added fields in on-disk serialized data, which would break the
+/// existing WhatsApp message history cache (`wa_messages/`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MessageSource {
+    #[default]
+    WhatsApp,
+    /// SMS / MMS / RCS via Google Messages (paired phone relay).
+    GoogleMessages,
+}
+
+/// Persistent per-chat send-protocol preference. For merged chats (contact
+/// has both WhatsApp and SMS), this controls which protocol the next
+/// outgoing text goes through. Stored in
+/// `<data_dir>/send_mode_prefs.json` as `{ chat_id: "whatsapp" | "sms" }`.
+///
+/// Default behavior when no preference exists: WhatsApp (richer features).
+pub mod send_mode {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    use std::sync::RwLock;
+
+    const FILE: &str = "send_mode_prefs.json";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Mode {
+        WhatsApp,
+        Sms,
+    }
+
+    impl Mode {
+        fn as_str(self) -> &'static str {
+            match self {
+                Mode::WhatsApp => "whatsapp",
+                Mode::Sms => "sms",
+            }
+        }
+        fn from_str(s: &str) -> Option<Self> {
+            match s {
+                "whatsapp" => Some(Mode::WhatsApp),
+                "sms" => Some(Mode::Sms),
+                _ => None,
+            }
+        }
+    }
+
+    fn map() -> &'static RwLock<HashMap<String, String>> {
+        static M: OnceLock<RwLock<HashMap<String, String>>> = OnceLock::new();
+        M.get_or_init(|| {
+            let map = std::fs::read_to_string(FILE)
+                .ok()
+                .and_then(|s| serde_json::from_str::<HashMap<String, String>>(&s).ok())
+                .unwrap_or_default();
+            RwLock::new(map)
+        })
+    }
+
+    /// Read the user's preference for `chat_id`. Returns None when the user
+    /// has never made a choice for this chat.
+    pub fn get(chat_id: &str) -> Option<Mode> {
+        map()
+            .read()
+            .ok()
+            .and_then(|m| m.get(chat_id).and_then(|s| Mode::from_str(s)))
+    }
+
+    /// Set and persist.
+    pub fn set(chat_id: &str, mode: Mode) {
+        if let Ok(mut m) = map().write() {
+            m.insert(chat_id.to_string(), mode.as_str().to_string());
+            // Persist eagerly — small file, infrequent change.
+            if let Ok(json) = serde_json::to_vec_pretty(&*m) {
+                let _ = std::fs::write(FILE, json);
+            }
+        }
+    }
+}
+
+/// Synthetic chat ID for the "Verification Codes" inbox — every incoming
+/// SMS detected as a 2FA / OTP code is routed here instead of opening a
+/// new chat per shortcode (TD, Aeroplan, Google, etc.). Searchable in one
+/// place; the originating sender is preserved in `IncomingMessage::sender_name`.
+pub const VERIFICATION_CODES_CHAT_ID: &str = "gm:verification-codes";
+
+/// Detect a 2FA / verification code in an SMS body. Returns the digits-only
+/// code if the message looks like a transactional auth code from a bank,
+/// service, or app. Requires both:
+///
+/// 1. A 4-8 digit run (with optional hyphen separator like Google's
+///    `123-456`)
+/// 2. Context keywords nearby — `"code"`, `"verify"`, `"OTP"`, `"PIN"`,
+///    `"passcode"`, `"auth"`, `"login"`, `"security"`, `"confirm"`, etc.
+///
+/// Filters out e.g. someone texting their jersey number.
+pub fn detect_two_factor_code(body: &str) -> Option<String> {
+    let lower = body.to_ascii_lowercase();
+    static KEYWORDS: &[&str] = &[
+        "code",
+        "verification",
+        "verify",
+        "verifying",
+        "otp",
+        "one-time",
+        "one time",
+        "passcode",
+        "pin",
+        "auth",
+        "authenticat",
+        "log in",
+        "login",
+        "sign in",
+        "signin",
+        "security",
+        "confirm",
+    ];
+    if !KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return None;
+    }
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut digits = String::new();
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c.is_ascii_digit() {
+                digits.push(c);
+                i += 1;
+            } else if c == '-' && (i + 1 < bytes.len()) && (bytes[i + 1] as char).is_ascii_digit() {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if digits.len() >= 4 && digits.len() <= 8 {
+            let prev_char: String = body[..start].chars().rev().take(3).collect();
+            if digits.len() == 4 && prev_char.contains('/') {
+                continue;
+            }
+            return Some(digits);
+        }
+    }
+    None
+}
+
+impl MessageSource {
+    /// Detect the source protocol from the chat ID prefix.
+    pub fn from_chat_id(chat_id: &str) -> Self {
+        if chat_id.starts_with("gm:") {
+            Self::GoogleMessages
+        } else {
+            Self::WhatsApp
+        }
+    }
+
+    /// Detect the source from any field that might carry the `gm:` tag.
+    /// Used by the bubble renderer because `chat_id` may be rewritten to
+    /// the WhatsApp JID after a Phase 2 merge — we still want the SMS
+    /// bubble blue. Both the chat_id and the message_id are checked.
+    pub fn from_message(chat_id: &str, message_id: &str) -> Self {
+        if chat_id.starts_with("gm:") || message_id.starts_with("gm:") {
+            Self::GoogleMessages
+        } else {
+            Self::WhatsApp
+        }
+    }
 }
 
 fn default_receipt_status() -> ReceiptStatus {

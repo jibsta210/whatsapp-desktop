@@ -20,7 +20,7 @@ use whatsapp_rust::{Client, Jid, RevokeType, TokioRuntime};
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
-use crate::bridge::{ChatSummary, IncomingMessage, ReceiptStatus, WaCommand, WaEvent};
+use crate::bridge::{ChatSummary, IncomingMessage, MessageSource, ReceiptStatus, WaCommand, WaEvent};
 
 // ── Persistence (bincode binary format) ──────────────────────────────────────
 
@@ -167,13 +167,27 @@ fn save_chats(chats: &[ChatSummary]) {
 }
 
 pub fn load_contact_names() -> HashMap<String, String> {
-    if let Some(names) = read_bin::<HashMap<String, String>>(CONTACTS_FILE) {
-        return names;
-    }
-    let Ok(data) = std::fs::read_to_string(CONTACTS_FILE_JSON) else {
-        return HashMap::new();
+    let map = if let Some(names) = read_bin::<HashMap<String, String>>(CONTACTS_FILE) {
+        names
+    } else if let Ok(data) = std::fs::read_to_string(CONTACTS_FILE_JSON) {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        HashMap::new()
     };
-    serde_json::from_str(&data).unwrap_or_default()
+    // Project names into the cross-protocol global directory.
+    crate::contacts::global().extend("whatsapp", map.iter().map(|(k, v)| (k.clone(), v.clone())));
+    // Also feed every WhatsApp chat_id (JID) into the directory so the
+    // Phase-2 merge-map lookup `other_chat_id(wa_jid, "gmessages")` can
+    // walk back via the digits index.
+    let global = crate::contacts::global();
+    for chat in load_chats() {
+        if chat.id.ends_with("@g.us") {
+            continue;
+        }
+        global.record_chat_id(&chat.id, "whatsapp", &chat.id);
+    }
+    global.save_if_dirty();
+    map
 }
 
 fn save_contact_names(names: &HashMap<String, String>) {
@@ -380,7 +394,38 @@ pub fn load_messages(chat_id: &str) -> Vec<IncomingMessage> {
     msgs
 }
 
-fn save_messages(chat_id: &str, messages: &[IncomingMessage]) {
+/// Update one chat-list row's preview/timestamp directly on disk without
+/// going through the WhatsApp runtime's owned `RuntimeState`. Used by the
+/// gmessages runtime so that when an SMS arrives for a merged WhatsApp
+/// chat, `wa_chats.bin` reflects the new preview after restart.
+///
+/// Only touches the row matching `chat_id`; if the row doesn't exist, this
+/// is a no-op (the SMS-only chat case is already handled by the gmessages
+/// runtime's own `gm_chats.bin`).
+pub fn touch_wa_chat_preview(chat_id: &str, preview: &str, timestamp: i64, is_from_me: bool) {
+    let mut chats = match read_bin::<Vec<ChatSummary>>(CHATS_FILE) {
+        Some(v) => v,
+        None => return,
+    };
+    let mut changed = false;
+    if let Some(c) = chats.iter_mut().find(|c| c.id == chat_id) {
+        // Only overwrite if newer than what's stored.
+        if timestamp > c.timestamp {
+            c.last_message = preview.to_string();
+            c.timestamp = timestamp;
+            if !is_from_me {
+                c.unread_count = c.unread_count.saturating_add(1);
+            }
+            changed = true;
+        }
+    }
+    if changed {
+        chats.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        write_bin(CHATS_FILE, &chats);
+    }
+}
+
+pub fn save_messages(chat_id: &str, messages: &[IncomingMessage]) {
     let dir = messages_dir();
     if !dir.exists() {
         let _ = std::fs::create_dir_all(&dir);
@@ -390,8 +435,28 @@ fn save_messages(chat_id: &str, messages: &[IncomingMessage]) {
 
 /// Append a single message to an existing chat's message file.
 /// Loads existing messages, appends (deduplicating by ID), and saves.
-fn save_messages_append(chat_id: &str, msg: &IncomingMessage) {
+///
+/// **Safeguard against schema-mismatch data loss**: if loading returned no
+/// messages but the on-disk file is non-trivially sized (>64 bytes), we
+/// REFUSE to save — overwriting that file with one message would destroy
+/// whatever's on disk. This guarded against a real incident where adding
+/// a new field to `IncomingMessage` made bincode silently fail to read,
+/// then the next message wiped the chat history.
+pub fn save_messages_append(chat_id: &str, msg: &IncomingMessage) {
     let mut messages = load_messages(chat_id);
+    if messages.is_empty() {
+        let path = messages_file(chat_id);
+        if let Ok(meta) = std::fs::metadata(&path)
+            && meta.len() > 64
+        {
+            log::error!(
+                "save_messages_append: refusing to save — load returned empty but {} is {} bytes (suspected schema mismatch). Skipping write to avoid destroying history.",
+                path.display(),
+                meta.len()
+            );
+            return;
+        }
+    }
     if !messages.iter().any(|m| m.id == msg.id) {
         messages.push(msg.clone());
         save_messages(chat_id, &messages);
@@ -1101,10 +1166,75 @@ impl RuntimeState {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, mut cmd_rx: UnboundedReceiver<WaCommand>) {
-    if let Err(e) = run_inner(event_tx.clone(), &mut cmd_rx).await {
+pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver<WaCommand>) {
+    // Sibling: Google Messages integration. No-op unless GMESSAGES_ENABLE=1.
+    let gm_data_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let gm_cmd_tx = crate::gmessages_runtime::spawn(&gm_data_dir, event_tx.clone());
+
+    // Fork the command stream: anything addressed to a `gm:` chat goes to
+    // the gmessages runtime; everything else flows to the WhatsApp runtime.
+    // If gmessages is disabled, we just forward everything to WhatsApp (the
+    // `gm_cmd_tx.is_none()` path below).
+    let (wa_cmd_tx, mut wa_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WaCommand>();
+    {
+        let mut cmd_rx = cmd_rx;
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                // GmessagesRepair is gm-routed regardless of chat_id (it
+                // has none).
+                let goes_to_gm = matches!(cmd, WaCommand::GmessagesRepair)
+                    || command_chat_id(&cmd)
+                        .map(crate::gmessages_runtime::is_gm_chat)
+                        .unwrap_or(false);
+                if goes_to_gm {
+                    if let Some(tx) = &gm_cmd_tx {
+                        let _ = tx.send(cmd);
+                    } else {
+                        log::warn!(
+                            "received gm-routed command but gmessages runtime is disabled — dropping"
+                        );
+                    }
+                } else if wa_cmd_tx.send(cmd).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    if let Err(e) = run_inner(event_tx.clone(), &mut wa_cmd_rx).await {
         log::error!("WhatsApp runtime error: {e:#}");
         let _ = event_tx.send(WaEvent::Disconnected(e.to_string())).await;
+    }
+}
+
+/// Extract the `chat_id` field from any [`WaCommand`] variant that has one,
+/// so the router can decide which runtime should handle it.
+fn command_chat_id(cmd: &WaCommand) -> Option<&str> {
+    match cmd {
+        WaCommand::SendText { chat_id, .. }
+        | WaCommand::SendReply { chat_id, .. }
+        | WaCommand::ResendMessage { chat_id, .. }
+        | WaCommand::DeleteForEveryone { chat_id, .. }
+        | WaCommand::LoadChat { chat_id, .. }
+        | WaCommand::SetTyping { chat_id, .. }
+        | WaCommand::MarkRead { chat_id }
+        | WaCommand::SetAutoMarkRead { chat_id, .. }
+        | WaCommand::ArchiveChat { chat_id, .. }
+        | WaCommand::MuteChat { chat_id, .. }
+        | WaCommand::PinChat { chat_id, .. }
+        | WaCommand::LabelChat { chat_id, .. }
+        | WaCommand::MarkUnread { chat_id }
+        | WaCommand::FavoriteChat { chat_id, .. }
+        | WaCommand::BlockContact { chat_id, .. }
+        | WaCommand::SendReaction { chat_id, .. }
+        | WaCommand::SendImage { chat_id, .. }
+        | WaCommand::SendGif { chat_id, .. }
+        | WaCommand::SendSticker { chat_id, .. }
+        | WaCommand::SendPoll { chat_id, .. }
+        | WaCommand::SendAudio { chat_id, .. } => Some(chat_id),
+        WaCommand::SendContact { to_chat_id, .. }
+        | WaCommand::ForwardMessage { to_chat_id, .. } => Some(to_chat_id),
+        _ => None,
     }
 }
 
@@ -3988,6 +4118,31 @@ async fn handle_command(
             // message corpus once. Live messages add new names via the message
             // handler. Re-scanning every chat switch was wasted work.
 
+            // Phase 2 merge: if this WhatsApp chat has a paired gmessages
+            // conversation, pull in the SMS messages from gm_<conv>.bin so
+            // they interleave with WhatsApp messages.
+            if let Some(gm_chat_id) = crate::contacts::global().other_chat_id(&chat_id, "gmessages") {
+                let gm_msgs = {
+                    let cid = gm_chat_id.clone();
+                    tokio::task::spawn_blocking(move || load_messages(&cid))
+                        .await
+                        .unwrap_or_default()
+                };
+                if !gm_msgs.is_empty() {
+                    log::debug!(
+                        "LoadChat {chat_id}: merging {} gm messages from {gm_chat_id}",
+                        gm_msgs.len()
+                    );
+                    let have: std::collections::HashSet<&str> =
+                        all_messages.iter().map(|m| m.id.as_str()).collect();
+                    let new: Vec<_> = gm_msgs
+                        .into_iter()
+                        .filter(|m| !have.contains(m.id.as_str()))
+                        .collect();
+                    all_messages.extend(new);
+                }
+            }
+
             // Filter for display + sort
             all_messages.retain(|m| m.text.is_some() || m.media_type.is_some() || m.media_caption.is_some());
             all_messages.sort_by_key(|m| m.timestamp);
@@ -4323,6 +4478,12 @@ async fn handle_command(
 
         WaCommand::Logout => {
             client.disconnect().await;
+        }
+
+        WaCommand::GmessagesRepair => {
+            // Routed to the gmessages runtime by the dispatcher; if it
+            // reaches here, gmessages is disabled. No-op.
+            log::debug!("WhatsApp runtime received GmessagesRepair (gm runtime disabled)");
         }
 
         WaCommand::SetProfilePicture { path } => {

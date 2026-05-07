@@ -23,6 +23,9 @@ whatsapp-rust-sqlite-storage = { path = "../storages/sqlite-storage" }
 whatsapp-rust-tokio-transport = { path = "../transports/tokio-transport" }
 whatsapp-rust-ureq-http-client = { path = "../http_clients/ureq-client" }
 
+# Google Messages (SMS/MMS/RCS) — paired phone relay protocol.
+gmessages-rust = { path = "../gmessages-rust" }
+
 # Utils
 anyhow = "1"
 tokio-util = { version = "0.7", features = ["rt"] }

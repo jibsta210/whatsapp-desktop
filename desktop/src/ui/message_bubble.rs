@@ -146,6 +146,19 @@ impl MessageBubble {
             row.set_halign(Align::Start);
             bubble.add_css_class("message-bubble-in");
         }
+        // Tag bubbles delivered via SMS/MMS/RCS so CSS can color them blue
+        // — distinguishes them from green WhatsApp bubbles in the unified
+        // chat list. Source is derived from chat_id OR message_id prefix:
+        // chat_id may be rewritten to a WhatsApp JID after a Phase 2 merge,
+        // but we tag the message_id with `gm:` at gmessages emit time so
+        // origin survives the redirect. Keeping source off the serialized
+        // struct preserves bincode compatibility with the wa_messages cache.
+        if matches!(
+            crate::bridge::MessageSource::from_message(&msg.chat_id, &msg.id),
+            crate::bridge::MessageSource::GoogleMessages
+        ) {
+            bubble.add_css_class("message-bubble-sms");
+        }
 
         // Inner content box — extra top padding so text doesn't crowd the chevron.
         // Set an explicit max width on the bubble so text labels can expand

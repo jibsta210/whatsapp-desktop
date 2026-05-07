@@ -193,7 +193,9 @@ impl SettingsHandle {
 pub fn show_settings_window(settings: &SettingsHandle, parent: Option<&gtk4::Window>) {
     let window = adw::PreferencesWindow::new();
     window.set_title(Some("Settings"));
-    window.set_default_size(500, 450);
+    // 800×700 fits the QR widget (280px) + page chrome without resizing,
+    // and works at every supported zoom level.
+    window.set_default_size(800, 700);
     window.set_modal(true);
     if let Some(p) = parent {
         window.set_transient_for(Some(p));
@@ -517,7 +519,231 @@ pub fn show_settings_window(settings: &SettingsHandle, parent: Option<&gtk4::Win
 
     window.add(&behave_page);
 
+    // ── Google Messages page (optional) ─────────────────────────────────
+    // Hidden unless the user has set GMESSAGES_ENABLE=1 (during the
+    // experimental phase) — once we're confident in the integration this
+    // gate goes away.
+    if std::env::var("GMESSAGES_ENABLE").as_deref() == Ok("1") {
+        let gm_page = build_gmessages_page();
+        window.add(&gm_page);
+    }
+
     window.present();
+}
+
+/// Build the Google Messages settings page. Renders a scannable QR in-app
+/// when pairing is required; status text + send-routing toggle otherwise.
+fn build_gmessages_page() -> adw::PreferencesPage {
+    use gtk4::prelude::*;
+
+    let page = adw::PreferencesPage::new();
+    page.set_title("SMS / Google Messages");
+    page.set_icon_name(Some("phone-symbolic"));
+
+    // ── Status group ────────────────────────────────────────────────────
+    let status = adw::PreferencesGroup::new();
+    status.set_title("Status");
+    status.set_description(Some(
+        "Pairs your desktop with the Google Messages app on your phone, \
+         relaying SMS, MMS, and RCS through it.",
+    ));
+
+    let auth_path = std::path::PathBuf::from("gmessages-auth.json");
+    let is_paired = std::fs::metadata(&auth_path)
+        .map(|m| m.len() > 100)
+        .unwrap_or(false);
+    let qr_url = crate::gm_qr_state::get();
+
+    let pair_row = adw::ActionRow::new();
+    pair_row.set_title("Pairing");
+    pair_row.set_subtitle(if qr_url.is_some() {
+        "Pairing required — scan the QR code below with Google Messages on your phone"
+    } else if is_paired {
+        "Paired — phone is relaying SMS to this desktop"
+    } else {
+        "Not paired"
+    });
+    let pair_btn = gtk4::Button::with_label(if is_paired { "Re-pair…" } else { "Pair…" });
+    pair_btn.set_valign(gtk4::Align::Center);
+    pair_btn.add_css_class("suggested-action");
+    pair_btn.connect_clicked(|_btn| {
+        // Wipe current auth and signal the runtime to enter pair flow.
+        // The runtime then publishes a fresh QR URL into gm_qr_state,
+        // which the polling loop above renders into the QR row in this
+        // same settings page.
+        let auth = std::path::PathBuf::from("gmessages-auth.json");
+        let _ = std::fs::remove_file(&auth);
+        crate::gm_qr_state::request_repair();
+    });
+    pair_row.add_suffix(&pair_btn);
+    pair_row.set_activatable_widget(Some(&pair_btn));
+    status.add(&pair_row);
+
+    // QR row that auto-updates: when the gm runtime publishes a fresh QR
+    // URL into `gm_qr_state`, we re-render. Polled because the runtime
+    // lives in another thread and dispatching glib idle callbacks back to
+    // the GTK main loop from there would require more plumbing.
+    let qr_row = adw::ActionRow::new();
+    qr_row.set_title("QR code");
+    qr_row.set_subtitle(
+        "Scan with Google Messages → Settings → Device pairing → QR code scanner",
+    );
+    let qr_holder = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    qr_holder.set_size_request(280, 280);
+    qr_holder.set_valign(gtk4::Align::Center);
+    qr_row.add_suffix(&qr_holder);
+    status.add(&qr_row);
+    page.add(&status);
+
+    // Initial render + 1Hz refresh until the page is destroyed.
+    let last_url = std::rc::Rc::new(std::cell::RefCell::new(qr_url.clone()));
+    refresh_qr_holder(&qr_holder, &qr_row, qr_url.as_deref());
+    {
+        let qr_holder = qr_holder.clone();
+        let qr_row = qr_row.clone();
+        let last_url = last_url.clone();
+        gtk4::glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
+            let cur = crate::gm_qr_state::get();
+            // Stop ticking once the widget has been destroyed.
+            if qr_holder.parent().is_none() {
+                return gtk4::glib::ControlFlow::Break;
+            }
+            if cur != *last_url.borrow() {
+                refresh_qr_holder(&qr_holder, &qr_row, cur.as_deref());
+                *last_url.borrow_mut() = cur;
+            }
+            gtk4::glib::ControlFlow::Continue
+        });
+    }
+
+    // ── Send-routing group ──────────────────────────────────────────────
+    let routing = adw::PreferencesGroup::new();
+    routing.set_title("Send routing");
+    routing.set_description(Some(
+        "When a contact is reachable on both WhatsApp and SMS, \
+         choose which protocol to use by default.",
+    ));
+
+    let row_default_wa = adw::SwitchRow::new();
+    row_default_wa.set_title("Prefer WhatsApp when available");
+    row_default_wa.set_subtitle(
+        "Off: send via SMS even if the contact has WhatsApp. \
+         On: send via WhatsApp if available, fall back to SMS otherwise.",
+    );
+    // Read from a simple config file in CWD (data dir). Default true.
+    let pref_path = std::path::PathBuf::from("gmessages-prefer-whatsapp");
+    let prefer_wa = !pref_path.exists() || std::fs::read_to_string(&pref_path).unwrap_or_default() != "0";
+    row_default_wa.set_active(prefer_wa);
+    row_default_wa.connect_active_notify(move |row| {
+        let v = if row.is_active() { "1" } else { "0" };
+        let _ = std::fs::write(&pref_path, v);
+    });
+    routing.add(&row_default_wa);
+    page.add(&routing);
+
+    // ── Storage group ──────────────────────────────────────────────────
+    let storage = adw::PreferencesGroup::new();
+    storage.set_title("Storage");
+
+    let purge_row = adw::ActionRow::new();
+    purge_row.set_title("Clear SMS cache");
+    purge_row.set_subtitle(
+        "Wipes locally cached SMS history and chat list (gm_*.bin). \
+         Messages re-download from your phone on next connect.",
+    );
+    let purge_btn = gtk4::Button::with_label("Clear");
+    purge_btn.set_valign(gtk4::Align::Center);
+    purge_btn.add_css_class("destructive-action");
+    purge_btn.connect_clicked(|_| {
+        let dir = std::path::PathBuf::from("wa_messages");
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                if let Some(name) = e.file_name().to_str()
+                    && name.starts_with("gm_")
+                {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+        let _ = std::fs::remove_file("gm_chats.bin");
+    });
+    purge_row.add_suffix(&purge_btn);
+    storage.add(&purge_row);
+    page.add(&storage);
+
+    page
+}
+
+/// Replace the contents of `holder` with either a QR widget for `url`, or
+/// an "already paired" placeholder when `url` is None.
+fn refresh_qr_holder(
+    holder: &gtk4::Box,
+    row: &adw::ActionRow,
+    url: Option<&str>,
+) {
+    use gtk4::prelude::*;
+    while let Some(child) = holder.first_child() {
+        holder.remove(&child);
+    }
+    if let Some(u) = url {
+        row.set_subtitle(
+            "Scan with Google Messages → Settings → Device pairing → QR code scanner",
+        );
+        holder.append(&render_qr_widget(u, 280));
+    } else {
+        row.set_subtitle("Already paired — no QR needed");
+        let label = gtk4::Label::new(Some("✓ Paired"));
+        label.add_css_class("dim-label");
+        label.set_valign(gtk4::Align::Center);
+        holder.append(&label);
+    }
+}
+
+/// Render a scannable QR code as a `gtk4::DrawingArea` of `size`×`size` px.
+/// Black-on-white with a 2-module quiet zone. Cairo draws each module as a
+/// filled rectangle; suitable for being scanned directly off a screen.
+fn render_qr_widget(url: &str, size: i32) -> gtk4::DrawingArea {
+    use gtk4::prelude::*;
+    use qrcode::{Color, QrCode};
+
+    let area = gtk4::DrawingArea::new();
+    area.set_content_width(size);
+    area.set_content_height(size);
+    area.set_valign(gtk4::Align::Center);
+    area.set_halign(gtk4::Align::Center);
+
+    // Encode once; if the URL is malformed, leave the area blank.
+    let code = match QrCode::new(url.as_bytes()) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("settings: failed to encode QR: {e}");
+            return area;
+        }
+    };
+    let modules = code.to_colors();
+    let width = code.width(); // # of modules per side
+    let quiet = 2_usize;
+    let total = width + quiet * 2;
+
+    area.set_draw_func(move |_, cr, w, h| {
+        let cell = (w.min(h) as f64) / total as f64;
+        // Background: white.
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        let _ = cr.paint();
+        // Modules: black.
+        cr.set_source_rgb(0.0, 0.0, 0.0);
+        for y in 0..width {
+            for x in 0..width {
+                if modules[y * width + x] == Color::Dark {
+                    let xx = (x + quiet) as f64 * cell;
+                    let yy = (y + quiet) as f64 * cell;
+                    cr.rectangle(xx, yy, cell, cell);
+                }
+            }
+        }
+        let _ = cr.fill();
+    });
+    area
 }
 
 /// Apply the selected theme via libadwaita's StyleManager.

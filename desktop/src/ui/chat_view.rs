@@ -61,6 +61,10 @@ struct ChatViewInner {
     typing_name: Label,
     header_name: Label,
     header_subtitle: Label,
+    /// Toggle button in the chat header that switches the send-target
+    /// protocol between WhatsApp and SMS for the current chat. Visible
+    /// only when the current chat has both protocols available.
+    send_mode_btn: Button,
     pin_banner: Box,
     bridge: Arc<Bridge>,
     current_chat_id: RefCell<Option<String>>,
@@ -173,6 +177,15 @@ impl ChatViewPanel {
         header_title_box.append(&header_name);
         header_title_box.append(&header_subtitle);
         header.set_title_widget(Some(&header_title_box));
+
+        // Send-mode toggle (WhatsApp ↔ SMS). Hidden by default; revealed
+        // when the open_chat() call detects a merged chat (contact has
+        // both protocols). Click cycles the per-chat preference.
+        let send_mode_btn = Button::from_icon_name("chat-message-new-symbolic");
+        send_mode_btn.add_css_class("flat");
+        send_mode_btn.set_tooltip_text(Some("Send via WhatsApp (click to switch to SMS)"));
+        send_mode_btn.set_visible(false);
+        header.pack_end(&send_mode_btn);
 
         // Favourite button
         let fav_button = Button::from_icon_name("starred-symbolic");
@@ -691,6 +704,7 @@ impl ChatViewPanel {
             typing_name,
             header_name,
             header_subtitle,
+            send_mode_btn: send_mode_btn.clone(),
             pin_banner,
             bridge,
             current_chat_id: RefCell::new(None),
@@ -840,6 +854,24 @@ impl ChatViewPanel {
                         glib::ControlFlow::Continue
                     }
                 });
+            });
+        }
+
+        // Send-mode toggle: cycle WhatsApp ↔ SMS for the current chat.
+        {
+            let inner_c = inner.clone();
+            send_mode_btn.connect_clicked(move |_btn| {
+                let Some(cid) = inner_c.current_chat_id.borrow().clone() else {
+                    return;
+                };
+                let current = crate::bridge::send_mode::get(&cid)
+                    .unwrap_or(crate::bridge::send_mode::Mode::WhatsApp);
+                let next = match current {
+                    crate::bridge::send_mode::Mode::WhatsApp => crate::bridge::send_mode::Mode::Sms,
+                    crate::bridge::send_mode::Mode::Sms => crate::bridge::send_mode::Mode::WhatsApp,
+                };
+                crate::bridge::send_mode::set(&cid, next);
+                ChatViewPanel::apply_send_mode_btn(&inner_c, &cid);
             });
         }
 
@@ -2228,8 +2260,9 @@ impl ChatViewPanel {
                     text: send_text,
                 });
             } else if let Some((quoted_msg_id, quoted_sender)) = reply_info {
+                let routed = ChatViewPanel::resolve_send_target(&chat_id);
                 bridge.send_command(WaCommand::SendReply {
-                    chat_id,
+                    chat_id: routed,
                     text: send_text,
                     quoted_msg_id,
                     quoted_sender,
@@ -2237,8 +2270,9 @@ impl ChatViewPanel {
                     mentioned_jids,
                 });
             } else {
+                let routed = ChatViewPanel::resolve_send_target(&chat_id);
                 bridge.send_command(WaCommand::SendText {
-                    chat_id,
+                    chat_id: routed,
                     text: send_text,
                     tmp_id,
                     mentioned_jids,
@@ -2337,6 +2371,79 @@ impl ChatViewPanel {
         self.inner.current_chat_id.borrow().clone()
     }
 
+    /// Update the send-mode toggle button's icon, tooltip and visibility
+    /// based on whether `chat_id` is a merged chat (contact has both
+    /// WhatsApp and SMS) and what the user's current preference is.
+    /// Hidden for chats that don't have a paired protocol.
+    fn apply_send_mode_btn(inner: &Rc<ChatViewInner>, chat_id: &str) {
+        // Determine if this chat is merged (has a sibling on the OTHER
+        // protocol). If gm: chat → look for whatsapp; else look for gm.
+        let is_gm_chat = chat_id.starts_with("gm:");
+        let target_source = if is_gm_chat { "whatsapp" } else { "gmessages" };
+        let has_pair = crate::contacts::global()
+            .other_chat_id(chat_id, target_source)
+            .is_some();
+        if !has_pair {
+            // Single-protocol chat — no choice to make.
+            inner.send_mode_btn.set_visible(false);
+            return;
+        }
+        let mode = crate::bridge::send_mode::get(chat_id).unwrap_or(
+            // For a gm: row, the natural default is SMS (you opened the
+            // SMS row, you probably want SMS); for a wa-jid row, default
+            // is WhatsApp. The user can flip it for either.
+            if is_gm_chat {
+                crate::bridge::send_mode::Mode::Sms
+            } else {
+                crate::bridge::send_mode::Mode::WhatsApp
+            },
+        );
+        inner.send_mode_btn.set_visible(true);
+        match mode {
+            crate::bridge::send_mode::Mode::WhatsApp => {
+                inner.send_mode_btn.set_icon_name("user-available-symbolic");
+                inner.send_mode_btn.set_tooltip_text(Some(
+                    "Sending via WhatsApp — click to switch to SMS",
+                ));
+                inner.send_mode_btn.remove_css_class("send-mode-sms");
+                inner.send_mode_btn.add_css_class("send-mode-wa");
+            }
+            crate::bridge::send_mode::Mode::Sms => {
+                inner.send_mode_btn.set_icon_name("phone-symbolic");
+                inner.send_mode_btn.set_tooltip_text(Some(
+                    "Sending via SMS — click to switch to WhatsApp",
+                ));
+                inner.send_mode_btn.remove_css_class("send-mode-wa");
+                inner.send_mode_btn.add_css_class("send-mode-sms");
+            }
+        }
+    }
+
+    /// For the currently-open chat, decide which chat_id to actually send
+    /// to based on the user's send-mode preference. For merged chats this
+    /// can flip between the WhatsApp JID and the gm: chat_id.
+    fn resolve_send_target(chat_id: &str) -> String {
+        let is_gm = chat_id.starts_with("gm:");
+        let target_source = if is_gm { "whatsapp" } else { "gmessages" };
+        let pair = crate::contacts::global().other_chat_id(chat_id, target_source);
+        let Some(pair) = pair else {
+            // Not merged — send to the chat as-is.
+            return chat_id.to_string();
+        };
+        let mode = crate::bridge::send_mode::get(chat_id).unwrap_or(
+            if is_gm {
+                crate::bridge::send_mode::Mode::Sms
+            } else {
+                crate::bridge::send_mode::Mode::WhatsApp
+            },
+        );
+        match mode {
+            crate::bridge::send_mode::Mode::WhatsApp if is_gm => pair, // gm row, send via WA
+            crate::bridge::send_mode::Mode::Sms if !is_gm => pair, // wa row, send via SMS
+            _ => chat_id.to_string(),
+        }
+    }
+
     /// Force scroll-to-bottom (for chat switch, send, history load).
     /// Fires on the next N vadjustment `changed` signals.
     fn force_scroll_to_bottom(inner: &ChatViewInner, pulses: u32) {
@@ -2412,6 +2519,8 @@ impl ChatViewPanel {
         *self.inner.current_chat_id.borrow_mut() = Some(chat_id.clone());
         // Clear send group mode when switching to a real chat
         *self.inner.send_group_ids.borrow_mut() = None;
+        // Update the WhatsApp/SMS toggle in the header for this chat.
+        ChatViewPanel::apply_send_mode_btn(&self.inner, &chat_id);
         self.inner.header_name.set_text(chat_name);
         // Clear group subtitle — it'll be set when GroupMembers arrives
         self.inner.header_subtitle.set_text("");

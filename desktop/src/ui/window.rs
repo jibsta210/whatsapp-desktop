@@ -582,10 +582,22 @@ impl MainWindow {
 
                 // Resolve phone-number chat names from contacts
                 for c in &mut chats {
-                    if !c.id.ends_with("@g.us") && c.name.starts_with('+') {
-                        // Chat name is still a phone number — look up contact name
+                    if !c.id.ends_with("@g.us")
+                        && (c.name.starts_with('+')
+                            || c.name.chars().all(|ch| !ch.is_alphabetic())
+                            || c.name == c.id)
+                    {
+                        // Chat name is still a phone number / unresolved.
+                        // Try, in order:
+                        //   1. WhatsApp's contact map keyed by JID
+                        //   2. Global cross-protocol directory (handles
+                        //      gm: chats that match a WhatsApp contact by
+                        //      phone digits, and vice versa)
                         if let Some(name) = contacts.get(&c.id) {
                             c.name = name.clone();
+                        } else if let Some(name) = crate::contacts::global().lookup(&c.id) {
+                            log::debug!("ChatsLoaded: resolved {} → {} via global directory", c.id, name);
+                            c.name = name;
                         }
                     }
                 }
@@ -820,7 +832,45 @@ impl MainWindow {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
-                let is_recent = (now_secs - msg.timestamp).abs() < 60;
+                // Some cached gm chat files were saved in milliseconds before
+                // the unit fix landed — accept either by detecting magnitude.
+                let msg_ts_secs = if msg.timestamp > 10_000_000_000 {
+                    msg.timestamp / 1000
+                } else {
+                    msg.timestamp
+                };
+                let is_recent = (now_secs - msg_ts_secs).abs() < 60;
+                // Diag log: every incoming MessageReceived for any chat. Helps
+                // pinpoint why notifications/sound/2FA weren't firing.
+                let is_gm = crate::bridge::MessageSource::from_message(&msg.chat_id, &msg.id)
+                    == crate::bridge::MessageSource::GoogleMessages;
+                log::debug!(
+                    "MessageReceived: chat={} id={} from_me={} ts={} now={} is_recent={} is_gm={} text={:?}",
+                    msg.chat_id,
+                    msg.id,
+                    msg.is_from_me,
+                    msg.timestamp,
+                    now_secs,
+                    is_recent,
+                    is_gm,
+                    msg.text.as_deref().map(|t| t.chars().take(40).collect::<String>()),
+                );
+                // Auto-detect 2FA codes in incoming SMS/RCS messages and pop
+                // them into the clipboard with an OSD-style notification.
+                if !msg.is_from_me
+                    && is_recent
+                    && let Some(text) = msg.text.as_deref()
+                {
+                    if let Some(code) = detect_two_factor_code(text) {
+                        let sender = inner
+                            .chat_list
+                            .chat_name(&msg.chat_id)
+                            .unwrap_or_else(|| msg.sender_name.clone());
+                        copy_2fa_code_with_osd(&inner.gtk_app, &code, &sender);
+                    } else {
+                        log::debug!("2FA scan: no code detected in text");
+                    }
+                }
                 if !msg.is_from_me && is_recent {
                     let is_active = inner.window.is_active();
                     if inner.settings.should_notify(is_active, is_current_chat) {
@@ -890,6 +940,39 @@ impl MainWindow {
                 inner
                     .chat_list
                     .set_typing(&chat_id, &sender_name, is_typing);
+                // Self-heal + cross-protocol: if this is a 1-on-1 chat
+                // whose row title is STILL a bare phone/JID, the typer's
+                // resolved name IS the chat name — retitle the row. We
+                // explicitly do NOT overwrite a real-looking name with a
+                // typing event's sender_name, because typing events often
+                // carry just the first name or even an initial (push_name
+                // not fully resolved yet), which previously regressed
+                // chats from "Saad Suleman" to "S".
+                let is_one_on_one = chat_id.ends_with("@s.whatsapp.net")
+                    || chat_id.ends_with("@lid")
+                    || chat_id.starts_with("gm:");
+                if is_one_on_one
+                    && !sender_name.is_empty()
+                    && sender_name.chars().any(|c| c.is_alphabetic())
+                    && !sender_name.starts_with('+')
+                {
+                    let current = inner.chat_list.chat_name(&chat_id).unwrap_or_default();
+                    let current_looks_unresolved = current.is_empty()
+                        || current.starts_with('+')
+                        || current.chars().all(|c| !c.is_alphabetic())
+                        || current == chat_id;
+                    if current_looks_unresolved {
+                        // Only NOW retitle — and even then, feed the global
+                        // directory regardless so cross-protocol lookups
+                        // can use it.
+                        crate::contacts::global().insert(&chat_id, &sender_name, "typing");
+                        inner.chat_list.update_chat_name(&chat_id, &sender_name);
+                    }
+                    // Always feed the directory; the insert() helper itself
+                    // refuses to downgrade an alphabetic name with a worse
+                    // alphabetic name based on length and recency, so this
+                    // is safe.
+                }
             }
             WaEvent::ReceiptUpdate { msg_id, status } => {
                 inner.chat_view.update_receipt(&msg_id, status);
@@ -1626,11 +1709,145 @@ fn open_own_profile_window(
 /// Send a desktop notification via GApplication (allows withdrawal later).
 /// Uses a stable per-chat notification ID so new messages replace old ones
 /// and can be dismissed when the chat is read.
+/// Robust cross-display clipboard set. GTK4's clipboard API on Wayland
+/// (COSMIC, GNOME, KDE) sometimes drops `set_text` calls when no window
+/// is focused or when the offer never gets registered with the
+/// compositor. We:
+///
+/// 1. Set the GTK clipboard (works on X11, mostly works on Wayland).
+/// 2. Pipe through `wl-copy` (Wayland) — overwrites the previous offer
+///    with one owned by an external process, which sticks even after
+///    our app loses focus.
+/// 3. Fall back to `xclip -selection clipboard` for X11.
+///
+/// All three are best-effort; failures are silent.
+fn set_clipboard_text(text: &str) {
+    // 1. GTK path (synchronous, sets ownership immediately).
+    if let Some(display) = gtk4::gdk::Display::default() {
+        display.clipboard().set_text(text);
+    }
+    // 2. wl-copy pipe (Wayland persists across focus loss).
+    use std::io::Write;
+    if let Ok(mut child) = std::process::Command::new("wl-copy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        // Don't wait — wl-copy forks a daemon that owns the offer.
+        let _ = child.wait();
+    }
+    // 3. xclip fallback for X11.
+    if std::env::var("WAYLAND_DISPLAY").is_err()
+        && let Ok(mut child) = std::process::Command::new("xclip")
+            .arg("-selection")
+            .arg("clipboard")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    {
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
+}
+
 fn send_desktop_notification(app: &adw::Application, chat_id: &str, title: &str, body: &str) {
     let notif = gtk4::gio::Notification::new(title);
     notif.set_body(Some(body));
     let notif_id = format!("chat-{}", chat_id.replace('@', "-").replace('.', "-"));
     app.send_notification(Some(&notif_id), &notif);
+}
+
+// 2FA detector lives in [`crate::bridge::detect_two_factor_code`] now —
+// the gmessages_runtime needs it pre-routing so verification SMS go to
+// the dedicated "Verification Codes" inbox instead of a per-shortcode chat.
+pub use crate::bridge::detect_two_factor_code;
+
+/// Copy `text` to the system clipboard and show an OSD-style notification.
+/// On COSMIC and other freedesktop-spec compliant DEs, the notification
+/// renders as a transient OSD overlay.
+pub fn copy_2fa_code_with_osd(app: &adw::Application, code: &str, sender: &str) {
+    set_clipboard_text(code);
+    // 2) Notification. Try GNotification first; in parallel fire a
+    //    notify-send so COSMIC OSD picks it up reliably even if the GTK
+    //    notification gets queued/grouped.
+    let notif = gtk4::gio::Notification::new("Verification code copied");
+    notif.set_body(Some(&format!("{code} from {sender} — paste with Ctrl+V")));
+    notif.set_priority(gtk4::gio::NotificationPriority::Urgent);
+    // Each invocation needs a unique ID so it doesn't replace a previous
+    // 2FA toast (or get coalesced).
+    let notif_id = format!(
+        "auth-code-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    app.send_notification(Some(&notif_id), &notif);
+    // Belt-and-braces: also fire `notify-send` with `-u critical -t 4000`
+    // for the OSD path. Spawned, non-blocking, ignores errors.
+    let _ = std::process::Command::new("notify-send")
+        .arg("-u").arg("critical")
+        .arg("-t").arg("4000")
+        .arg("-c").arg("im.received")
+        .arg("Verification code copied")
+        .arg(format!("{code} from {sender} — paste with Ctrl+V"))
+        .spawn();
+    log::info!("2FA code {code} from {sender} copied to clipboard");
+}
+
+#[cfg(test)]
+mod twofa_tests {
+    use super::detect_two_factor_code;
+
+    #[test]
+    fn google_format() {
+        assert_eq!(
+            detect_two_factor_code("G-123456 is your Google verification code."),
+            Some("123456".into())
+        );
+    }
+    #[test]
+    fn bank_format() {
+        assert_eq!(
+            detect_two_factor_code("Your one-time passcode is 4729. Do not share it."),
+            Some("4729".into())
+        );
+    }
+    #[test]
+    fn hyphenated() {
+        assert_eq!(
+            detect_two_factor_code("Your code is 123-456"),
+            Some("123456".into())
+        );
+    }
+    #[test]
+    fn ignores_friend_texts() {
+        assert_eq!(detect_two_factor_code("call me at 1234"), None);
+        assert_eq!(detect_two_factor_code("see you at 4pm, bring 5 beers"), None);
+    }
+    #[test]
+    fn ignores_long_runs() {
+        // Order numbers, account refs, etc. — too long to be 2FA.
+        assert_eq!(
+            detect_two_factor_code("verify your account 1234567890"),
+            None
+        );
+    }
+
+    #[test]
+    fn td_security_code_format() {
+        let body = "TD will not send you sign-in links by text. Beware of scams. \
+                    Do not reveal this code. We will not contact you for it. \
+                    Your security code is 065458.";
+        assert_eq!(detect_two_factor_code(body), Some("065458".into()));
+    }
 }
 
 /// Withdraw (dismiss) any notification for a chat — called when chat is opened or read.

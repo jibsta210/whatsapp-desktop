@@ -3,6 +3,9 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod app;
 mod bridge;
+mod contacts;
+mod gm_qr_state;
+mod gmessages_runtime;
 mod ui;
 
 use app::WhatsAppApp;

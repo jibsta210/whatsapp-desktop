@@ -443,13 +443,17 @@ impl ChatListPanel {
     }
 
     /// Remove rows whose IDs are not in the provided set.
+    ///
+    /// Chats whose IDs start with `gm:` (Google Messages) are skipped —
+    /// they're managed by the gmessages runtime, which doesn't contribute
+    /// to `keep_ids` so they'd be wrongly purged otherwise.
     pub fn remove_stale(&self, keep_ids: &std::collections::HashSet<&str>) {
         let inner = &self.inner;
         let stale_ids: Vec<String> = inner
             .rows
             .borrow()
             .keys()
-            .filter(|id| !keep_ids.contains(id.as_str()))
+            .filter(|id| !keep_ids.contains(id.as_str()) && !id.starts_with("gm:"))
             .cloned()
             .collect();
         for id in &stale_ids {
@@ -784,6 +788,10 @@ impl ChatListPanel {
     pub fn update_chat_name(&self, chat_id: &str, name: &str) {
         let mut rows = self.inner.rows.borrow_mut();
         if let Some(row) = rows.get_mut(chat_id) {
+            let old = row.chat_name.clone();
+            if old != name {
+                log::info!("update_chat_name: {chat_id}: {old:?} → {name:?}");
+            }
             row.chat_name = name.to_string();
             row.name_label.set_text(name);
         }
