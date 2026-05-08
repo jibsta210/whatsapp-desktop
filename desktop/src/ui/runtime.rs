@@ -174,8 +174,22 @@ pub fn load_contact_names() -> HashMap<String, String> {
     } else {
         HashMap::new()
     };
+    let global = crate::contacts::global();
     // Project names into the cross-protocol global directory.
-    crate::contacts::global().extend("whatsapp", map.iter().map(|(k, v)| (k.clone(), v.clone())));
+    global.extend("whatsapp", map.iter().map(|(k, v)| (k.clone(), v.clone())));
+    // Feed the LID→phone-JID resolution map into the directory so a chat
+    // labeled `137340286709870@lid` can resolve to its saved-contact name.
+    // Two effects per (lid, phone_jid) pair:
+    //   1. record the LID against the phone digits → lookup-by-LID works
+    //   2. if WhatsApp's contact map has a name for the LID OR the phone,
+    //      project it into the directory under the phone digits
+    let lid_phone = load_lid_phone_map();
+    for (lid, phone_jid) in &lid_phone {
+        global.record_lid_jid(phone_jid, lid);
+        if let Some(name) = map.get(lid).or_else(|| map.get(phone_jid)) {
+            global.insert(phone_jid, name, "whatsapp-lid-phone");
+        }
+    }
     // Also feed every WhatsApp chat_id (JID) into the directory so the
     // Phase-2 merge-map lookup `other_chat_id(wa_jid, "gmessages")` can
     // walk back via the digits index.

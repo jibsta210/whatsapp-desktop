@@ -38,24 +38,40 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-/// One contact entry. Persisted to disk so we never forget a name.
+/// One contact entry. Phone-number-keyed (digits only). All known
+/// identifiers for that person live on the same row — name from the
+/// phone book, every chat_id we've seen them under (WhatsApp JID,
+/// gmessages chat_id, etc.), and any anonymous LID JIDs WhatsApp has
+/// minted for them. Persisted; never forgets.
+///
+/// "Joe Mysak" → `+15551234567` → {
+///     name: "Joe Mysak",
+///     chat_ids: { "whatsapp": "15551234567@s.whatsapp.net", "gmessages": "gm:42" },
+///     lid_jids: ["137340286709870@lid"],
+/// }
+///
+/// Lookup works against any of those identifiers via the secondary
+/// indices on `ContactDirectory`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContactEntry {
     pub name: String,
     /// Unix seconds since epoch when this entry was last upgraded.
     pub updated_at: u64,
-    /// Set of upstream sources that have contributed this name (e.g.
-    /// `"whatsapp"`, `"gmessages"`). Used to debug provenance.
+    /// Upstream sources that contributed data to this entry (provenance).
     #[serde(default)]
     pub sources: HashSet<String>,
-    /// Chat-id-per-source mapping. The merge map for unified rows: when
-    /// gmessages and WhatsApp both reach the same person, both chat IDs
-    /// land here, and `canonical_chat_id()` resolves to WhatsApp first.
-    ///   `"whatsapp"` → `"14164000790@s.whatsapp.net"`
-    ///   `"gmessages"` → `"gm:14"`
-    /// Built up the first time we see each chat — never recomputed.
+    /// Per-source canonical chat id. WhatsApp uses phone JIDs here, not
+    /// LIDs — LIDs go in `lid_jids` so we don't pin a "primary" LID.
+    ///   `"whatsapp"`  → `"15551234567@s.whatsapp.net"`
+    ///   `"gmessages"` → `"gm:42"`
     #[serde(default)]
     pub chat_ids: std::collections::HashMap<String, String>,
+    /// Anonymous WhatsApp LID JIDs we've observed for this contact.
+    /// Populated whenever WhatsApp's lid→phone resolution fires for them
+    /// or when a chat row is created with a LID id and we later pin it
+    /// to a phone.
+    #[serde(default)]
+    pub lid_jids: HashSet<String>,
 }
 
 impl ContactEntry {
@@ -87,17 +103,17 @@ pub struct ContactDirectory {
 struct DirectoryInner {
     /// Canonical full-digits key → entry.
     by_digits: HashMap<String, ContactEntry>,
-    /// Secondary index: last-10-digits → canonical key. Built so
-    /// `+14164000790`, `14164000790`, and `4164000790` all hit the same
-    /// entry (covers country-code variants for NA-style 10-digit numbers).
-    /// Last 7 digits also indexed for very fuzzy fallback (e.g. local
-    /// numbers without area code), but only when unambiguous.
+    /// Secondary indices for fuzzy phone matching.
     by_suffix_10: HashMap<String, String>,
     by_suffix_7: HashMap<String, Vec<String>>,
-    /// Path the directory was loaded from / saves to. None when running
-    /// without persistence (tests).
+    /// `<lid_numeric>@lid` → canonical phone digits. Built when WhatsApp's
+    /// lid_phone map is fed into the directory; lets us look up a contact
+    /// by the LID JID WhatsApp shows in chat rows for not-yet-resolved
+    /// contacts.
+    by_lid: HashMap<String, String>,
+    /// Path the directory was loaded from / saves to.
     persist_path: Option<PathBuf>,
-    /// Whether the directory has been modified since the last save.
+    /// Whether modified since last save.
     dirty: bool,
 }
 
@@ -129,12 +145,16 @@ impl ContactDirectory {
             by_digits: HashMap::new(),
             by_suffix_10: HashMap::new(),
             by_suffix_7: HashMap::new(),
+            by_lid: HashMap::new(),
             persist_path: Some(path),
             dirty: false,
         };
         // Rebuild secondary indices from the loaded data.
         for (digits, entry) in by_digits {
             inner.add_indices(&digits);
+            for lid in &entry.lid_jids {
+                inner.by_lid.insert(lid.clone(), digits.clone());
+            }
             inner.by_digits.insert(digits, entry);
         }
         Self {
@@ -225,6 +245,45 @@ impl ContactDirectory {
         }
     }
 
+    /// Record that the WhatsApp LID JID `lid_jid` belongs to the contact
+    /// at `phone_key`. After this, looking up the contact by `lid_jid`
+    /// returns the same entry as looking up by phone.
+    ///
+    /// Idempotent. Persists.
+    pub fn record_lid_jid(&self, phone_key: &str, lid_jid: &str) {
+        let digits = digits_only(phone_key);
+        if digits.is_empty() || lid_jid.is_empty() {
+            return;
+        }
+        let mut inner = match self.inner.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let entry = inner.by_digits.entry(digits.clone()).or_insert_with(|| {
+            ContactEntry {
+                name: lid_jid.to_string(),
+                updated_at: now,
+                sources: HashSet::new(),
+                chat_ids: std::collections::HashMap::new(),
+                lid_jids: HashSet::new(),
+            }
+        });
+        if entry.lid_jids.insert(lid_jid.to_string()) {
+            inner.dirty = true;
+        }
+        inner.by_lid.insert(lid_jid.to_string(), digits.clone());
+        if digits.len() >= 10 {
+            let s10 = digits[digits.len() - 10..].to_string();
+            if !inner.by_suffix_10.contains_key(&s10) {
+                inner.add_indices(&digits);
+            }
+        }
+    }
+
     /// Record that `chat_id` belongs to the contact at `phone_key` on the
     /// given `source` (`"whatsapp"`, `"gmessages"`, …). Used the FIRST
     /// time we see a chat — subsequent calls are no-ops if the mapping
@@ -255,6 +314,7 @@ impl ContactDirectory {
                 updated_at: now,
                 sources: HashSet::new(),
                 chat_ids: std::collections::HashMap::new(),
+                lid_jids: HashSet::new(),
             }
         });
         entry.sources.insert(source.to_string());
@@ -321,14 +381,21 @@ impl ContactDirectory {
 
     /// Look up the full entry (for debugging or source-aware code).
     pub fn lookup_full(&self, key: &str) -> Option<ContactEntry> {
-        let digits = digits_only(key);
-        if digits.is_empty() {
-            return None;
-        }
         let inner = match self.inner.read() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
         };
+        // 0. LID JID lookup — `137340286709870@lid` → resolved phone digits.
+        if key.ends_with("@lid")
+            && let Some(canonical_digits) = inner.by_lid.get(key)
+            && let Some(entry) = inner.by_digits.get(canonical_digits)
+        {
+            return Some(entry.clone());
+        }
+        let digits = digits_only(key);
+        if digits.is_empty() {
+            return None;
+        }
         // 1. Exact full match.
         if let Some(entry) = inner.by_digits.get(&digits) {
             return Some(entry.clone());
@@ -409,6 +476,7 @@ fn inner_default_entry(name: &str, now: u64, source: &str) -> ContactEntry {
         updated_at: now,
         sources,
         chat_ids: std::collections::HashMap::new(),
+        lid_jids: HashSet::new(),
     }
 }
 
@@ -547,5 +615,20 @@ mod tests {
         let entry = dir.lookup_full("14164000790").unwrap();
         assert!(entry.sources.contains("whatsapp"));
         assert!(entry.sources.contains("gmessages"));
+    }
+
+    #[test]
+    fn lid_jid_resolves_to_named_contact() {
+        // Joe Mysak case: WhatsApp gives anonymous LID like
+        // `137340286709870@lid`. The lid→phone map links it to a phone
+        // JID, and ListContacts has a name for the phone. The directory
+        // should find the name when looked up by the raw LID JID.
+        let dir = ContactDirectory::new();
+        dir.insert("14164000790", "Joe Mysak", "whatsapp-listcontacts");
+        dir.record_lid_jid("14164000790@s.whatsapp.net", "137340286709870@lid");
+        assert_eq!(
+            dir.lookup("137340286709870@lid").as_deref(),
+            Some("Joe Mysak"),
+        );
     }
 }

@@ -1381,11 +1381,49 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
     } else {
         format!("{CHAT_PREFIX}{}", m.message_id)
     };
+    // Resolve sender name: prefer rich `sender_participant` data, then
+    // the global contact directory (which holds names from BOTH WhatsApp
+    // and gmessages contact lists), and only fall back to the raw
+    // `participant_id` if nothing else has a name. Without this, the
+    // chat list creates new rows with sender_name = participant_id, which
+    // for some carriers/SMS shortcodes is a malformed-looking digit string
+    // like `+137340286709870` even when the contact directory has the
+    // person saved by name.
+    let resolved_sender = {
+        let from_sp = m.sender_participant.as_ref().and_then(|sp| {
+            if !sp.full_name.is_empty() {
+                Some(sp.full_name.clone())
+            } else if !sp.first_name.is_empty() {
+                Some(sp.first_name.clone())
+            } else {
+                None
+            }
+        });
+        from_sp
+            .or_else(|| {
+                // Lookup by sender_participant.id.number first (richest),
+                // then by participant_id.
+                let candidate_keys = [
+                    m.sender_participant
+                        .as_ref()
+                        .and_then(|sp| sp.id.as_ref())
+                        .map(|id| id.number.clone())
+                        .filter(|s| !s.is_empty()),
+                    Some(m.participant_id.clone()).filter(|s| !s.is_empty()),
+                ];
+                let global = crate::contacts::global();
+                candidate_keys
+                    .into_iter()
+                    .flatten()
+                    .find_map(|k| global.lookup(&k))
+            })
+            .unwrap_or_else(|| m.participant_id.clone())
+    };
     Some(IncomingMessage {
         id: tagged_id,
         chat_id: format!("{CHAT_PREFIX}{}", m.conversation_id),
         sender_id: m.participant_id.clone(),
-        sender_name: m.participant_id.clone(),
+        sender_name: resolved_sender,
         text,
         media_type: media,
         timestamp: ts_s,

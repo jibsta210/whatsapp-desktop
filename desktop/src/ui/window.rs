@@ -580,25 +580,60 @@ impl MainWindow {
                 let contacts = crate::ui::runtime::load_contact_names();
                 let lid_map = crate::ui::runtime::load_lid_phone_map();
 
-                // Resolve phone-number chat names from contacts
+                // Resolve unresolved chat names against ALL the contact
+                // sources we have: WhatsApp's contact map (keyed by JID),
+                // the LID→phone resolution map, and the cross-protocol
+                // global directory. WhatsApp gives us anonymous LID JIDs
+                // like `137340286709870@lid` for first-time-message
+                // contacts; without LID→phone translation those rows
+                // stay labeled with the raw LID forever.
                 for c in &mut chats {
-                    if !c.id.ends_with("@g.us")
+                    let needs_resolve = !c.id.ends_with("@g.us")
                         && (c.name.starts_with('+')
+                            || c.name.contains("@lid")
+                            || c.name.contains("@s.whatsapp.net")
                             || c.name.chars().all(|ch| !ch.is_alphabetic())
-                            || c.name == c.id)
+                            || c.name == c.id);
+                    if !needs_resolve {
+                        continue;
+                    }
+                    // 1. Direct lookup by chat_id (works for phone JIDs).
+                    if let Some(name) = contacts.get(&c.id) {
+                        c.name = name.clone();
+                        continue;
+                    }
+                    // 2. LID → phone JID → contact name. Used when WhatsApp
+                    //    hands us an anonymous LID for a saved contact.
+                    if c.id.ends_with("@lid")
+                        && let Some(phone_jid) = lid_map.get(&c.id)
+                        && let Some(name) = contacts.get(phone_jid)
                     {
-                        // Chat name is still a phone number / unresolved.
-                        // Try, in order:
-                        //   1. WhatsApp's contact map keyed by JID
-                        //   2. Global cross-protocol directory (handles
-                        //      gm: chats that match a WhatsApp contact by
-                        //      phone digits, and vice versa)
-                        if let Some(name) = contacts.get(&c.id) {
-                            c.name = name.clone();
-                        } else if let Some(name) = crate::contacts::global().lookup(&c.id) {
-                            log::debug!("ChatsLoaded: resolved {} → {} via global directory", c.id, name);
-                            c.name = name;
-                        }
+                        log::debug!(
+                            "ChatsLoaded: resolved {} → {} via LID→phone map ({})",
+                            c.id, name, phone_jid
+                        );
+                        c.name = name.clone();
+                        continue;
+                    }
+                    // 3. Cross-protocol global directory (fuzzy phone match).
+                    if let Some(name) = crate::contacts::global().lookup(&c.id) {
+                        log::debug!(
+                            "ChatsLoaded: resolved {} → {} via global directory",
+                            c.id, name
+                        );
+                        c.name = name;
+                        continue;
+                    }
+                    // 4. For LIDs: also try fuzzy via the resolved phone.
+                    if c.id.ends_with("@lid")
+                        && let Some(phone_jid) = lid_map.get(&c.id)
+                        && let Some(name) = crate::contacts::global().lookup(phone_jid)
+                    {
+                        log::debug!(
+                            "ChatsLoaded: resolved {} → {} via LID→phone→global",
+                            c.id, name
+                        );
+                        c.name = name;
                     }
                 }
 

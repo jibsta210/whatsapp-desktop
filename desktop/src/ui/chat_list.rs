@@ -534,10 +534,35 @@ impl ChatListPanel {
                 .or(msg.media_caption.as_deref())
                 .unwrap_or("")
                 .to_string();
-            let name = if !msg.sender_name.is_empty() && !msg.is_from_me {
+            // Name resolution priority for a brand-new chat row:
+            //   1. msg.sender_name if it looks like a real name (alphabetic
+            //      and not a numeric internal ID like "6")
+            //   2. Cross-protocol global directory lookup by chat_id
+            //      (covers gm: chats whose phone is in WhatsApp contacts)
+            //   3. display_name_from_jid (WhatsApp JID → contact name)
+            //   4. msg.sender_name as a last resort (better than nothing)
+            let sender_looks_real = !msg.sender_name.is_empty()
+                && !msg.is_from_me
+                && msg.sender_name.chars().any(|c| c.is_alphabetic())
+                && !msg
+                    .sender_name
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '+' || c == ' ' || c == '(' || c == ')' || c == '-');
+            let name = if sender_looks_real {
                 msg.sender_name.clone()
+            } else if let Some(n) = crate::contacts::global().lookup(chat_id) {
+                n
             } else {
-                crate::ui::runtime::display_name_from_jid(chat_id)
+                let from_jid = crate::ui::runtime::display_name_from_jid(chat_id);
+                if from_jid.is_empty() || from_jid == chat_id {
+                    if msg.sender_name.is_empty() {
+                        chat_id.to_string()
+                    } else {
+                        msg.sender_name.clone()
+                    }
+                } else {
+                    from_jid
+                }
             };
             self.add_chat(crate::bridge::ChatSummary {
                 id: chat_id.to_string(),
@@ -789,9 +814,32 @@ impl ChatListPanel {
         let mut rows = self.inner.rows.borrow_mut();
         if let Some(row) = rows.get_mut(chat_id) {
             let old = row.chat_name.clone();
-            if old != name {
-                log::info!("update_chat_name: {chat_id}: {old:?} → {name:?}");
+            if old == name {
+                return;
             }
+            // Don't overwrite a fully-alphabetic, multi-word name with a
+            // shorter or numeric one. This guards against typing-event /
+            // sender_participant updates stomping a properly-resolved
+            // contact name (the "Craig Thompson → Jake Steinman" class
+            // of bug). The ContactDirectory has the same length-aware
+            // ranking; chat-list rows benefit from the same protection.
+            let old_words = old.split_whitespace().count();
+            let new_words = name.split_whitespace().count();
+            let old_alpha = old.chars().any(|c| c.is_alphabetic());
+            let new_alpha = name.chars().any(|c| c.is_alphabetic());
+            let is_downgrade = match (old_alpha, new_alpha) {
+                (true, false) => true,                // alpha → numeric: never
+                (true, true) => new_words < old_words // multi-word → fewer words
+                    || (new_words == old_words && name.len() < old.len()),
+                _ => false,
+            };
+            if is_downgrade {
+                log::info!(
+                    "update_chat_name: {chat_id}: REFUSED downgrade {old:?} → {name:?}"
+                );
+                return;
+            }
+            log::info!("update_chat_name: {chat_id}: {old:?} → {name:?}");
             row.chat_name = name.to_string();
             row.name_label.set_text(name);
         }
