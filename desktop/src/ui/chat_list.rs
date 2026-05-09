@@ -254,6 +254,16 @@ impl ChatListPanel {
                     return false;
                 }
 
+                // The synthetic Verification Codes inbox lives in the
+                // sidebar rail (always reachable). It only shows up in the
+                // main chat list when something fresh has landed there
+                // (unread > 0). Otherwise it's quiet space.
+                if id == crate::bridge::VERIFICATION_CODES_CHAT_ID
+                    && chat_row.unread_count.get() == 0
+                {
+                    return false;
+                }
+
                 let query = search_clone.text().to_lowercase();
                 if query.is_empty() {
                     return true;

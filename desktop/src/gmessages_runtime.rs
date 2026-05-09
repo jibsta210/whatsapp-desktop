@@ -452,10 +452,10 @@ async fn run(
                         .map(|c| conversation_to_summary(c, &contact_map))
                         .collect();
                     // Persist the chat-list cache so the next startup shows
-                    // gm chats instantly.
-                    if let Ok(bytes) = bincode::serialize(&summaries) {
-                        let _ = std::fs::write(&gm_chats_cache_path, &bytes);
-                    }
+                    // gm chats instantly. Persistence happens AFTER the
+                    // merge_map is built below, so we can exclude rows that
+                    // would be merged — otherwise the next startup hydrates
+                    // duplicates before merge data arrives.
                     // Build the merge map AND register chat IDs in the
                     // global contact directory. The directory becomes the
                     // persistent source of truth for cross-protocol merge —
@@ -495,6 +495,39 @@ async fn run(
                         global.save_if_dirty();
                     }
                     let mm_snap = merge_map.lock().await.clone();
+
+                    // Persist the cache NOW with merged rows excluded so the
+                    // next startup hydrates only chat rows that won't be
+                    // dedup'd later.
+                    let cache_summaries: Vec<&ChatSummary> = summaries
+                        .iter()
+                        .filter(|s| !mm_snap.contains_key(strip_prefix(&s.id)))
+                        .collect();
+                    if let Ok(bytes) =
+                        bincode::serialize(&cache_summaries.iter().copied().collect::<Vec<_>>())
+                    {
+                        let _ = std::fs::write(&gm_chats_cache_path, &bytes);
+                    }
+
+                    // First, evict stale gm rows that may have been hydrated
+                    // from gm_chats.bin cache on startup but should now be
+                    // merged into a WhatsApp row. Without this, the user
+                    // sees BOTH a gm:NN row AND the matching WA row, can
+                    // click the gm row, but messages get redirected by the
+                    // merge_map to the WA row's view — so they vanish into
+                    // the wrong chat. Emit ChatDeleted for each merged id.
+                    for conv_id in mm_snap.keys() {
+                        let stale_id = format!("{CHAT_PREFIX}{conv_id}");
+                        log::info!(
+                            "gmessages: evicting stale gm row {stale_id} (merged into {})",
+                            mm_snap.get(conv_id).map(|s| s.as_str()).unwrap_or("?")
+                        );
+                        let _ = event_tx
+                            .send(WaEvent::ChatDeleted {
+                                chat_id: stale_id,
+                            })
+                            .await;
+                    }
                     for summary in &summaries {
                         let conv_id = strip_prefix(&summary.id);
                         if mm_snap.contains_key(conv_id) {
