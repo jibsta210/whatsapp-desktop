@@ -130,6 +130,17 @@ fn main() {
         }
     }
 
+    // Default to info level so the runtime's status logs (gmessages /
+    // gaia / repair) make it into app.log. User can still override with
+    // RUST_LOG.
+    if std::env::var("RUST_LOG").is_err() {
+        unsafe {
+            std::env::set_var(
+                "RUST_LOG",
+                "info,gmessages_rust=debug,whatsapp_desktop=info,whatsapp_rust=warn",
+            );
+        }
+    }
     env_logger::init();
     log::info!(
         "whatsapp-desktop launched; logging to {} (prev run at {})",
