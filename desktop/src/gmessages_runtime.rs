@@ -588,6 +588,42 @@ async fn run(
 
     // Pump events + commands. select! lets us drive both directions.
     loop {
+        // Poll the cross-thread re-pair signals at the top of each loop
+        // iteration. Putting them inside a `select!` sleep arm starves
+        // them while events are flowing — the sleep is recreated each
+        // iteration and the events branch always wins.
+        if crate::gm_qr_state::take_repair_request() {
+            log::warn!("gmessages: re-pair requested from settings UI");
+            let _ = client.disconnect().await;
+            let _ = std::fs::remove_file(&auth_path);
+            if let Err(e) = run_pair_flow(&client, &auth_path, &mut events, &event_tx).await {
+                log::warn!("gmessages: re-pair failed: {e}");
+            } else if let Err(e) = client.connect().await {
+                log::warn!("gmessages: reconnect after re-pair failed: {e}");
+            }
+            continue;
+        }
+        if crate::gm_qr_state::take_gaia_request() {
+            log::warn!("gmessages: Gaia (Firefox cookies) pairing requested from settings UI");
+            let _ = event_tx
+                .send(WaEvent::ErrorToast(
+                    "Gaia pair: starting…".into(),
+                ))
+                .await;
+            let _ = client.disconnect().await;
+            let _ = std::fs::remove_file(&auth_path);
+            if let Err(e) =
+                run_gaia_pair_flow(&client, &auth_path, &mut events, &event_tx).await
+            {
+                log::warn!("gmessages: Gaia pairing failed: {e}");
+                let _ = event_tx
+                    .send(WaEvent::ErrorToast(format!("Gaia pairing failed: {e}")))
+                    .await;
+            } else if let Err(e) = client.connect().await {
+                log::warn!("gmessages: reconnect after Gaia pair failed: {e}");
+            }
+            continue;
+        }
         tokio::select! {
             Some(event) = events.recv() => {
                 let event_kind = describe_event(&event);
@@ -831,32 +867,11 @@ async fn run(
                     }
                 });
             }
-            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
-                if crate::gm_qr_state::take_repair_request() {
-                    log::warn!("gmessages: re-pair requested from settings UI");
-                    let _ = client.disconnect().await;
-                    let _ = std::fs::remove_file(&auth_path);
-                    if let Err(e) = run_pair_flow(&client, &auth_path, &mut events, &event_tx).await {
-                        log::warn!("gmessages: re-pair failed: {e}");
-                    } else if let Err(e) = client.connect().await {
-                        log::warn!("gmessages: reconnect after re-pair failed: {e}");
-                    }
-                } else if crate::gm_qr_state::take_gaia_request() {
-                    log::warn!("gmessages: Gaia (Firefox cookies) pairing requested from settings UI");
-                    let _ = client.disconnect().await;
-                    let _ = std::fs::remove_file(&auth_path);
-                    if let Err(e) =
-                        run_gaia_pair_flow(&client, &auth_path, &mut events, &event_tx).await
-                    {
-                        log::warn!("gmessages: Gaia pairing failed: {e}");
-                        let _ = event_tx
-                            .send(WaEvent::ErrorToast(format!("Gaia pairing failed: {e}")))
-                            .await;
-                    } else if let Err(e) = client.connect().await {
-                        log::warn!("gmessages: reconnect after Gaia pair failed: {e}");
-                    }
-                }
-            }
+            // 2-second tick used to wake the loop so the top-of-iteration
+            // signal polls (take_repair_request / take_gaia_request) get
+            // a chance to run when events are quiet. The actual checks
+            // live at the top of the loop body, not here.
+            _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
             else => {
                 log::info!("gmessages: all channels closed; shutting down");
                 return Ok(());

@@ -590,15 +590,19 @@ fn build_gmessages_page() -> adw::PreferencesPage {
     );
     let gaia_btn = gtk4::Button::with_label("Pair via Firefox");
     gaia_btn.set_valign(gtk4::Align::Center);
-    let parent_window = page.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
-    let parent_for_modal = parent_window.clone();
-    gaia_btn.connect_clicked(move |_btn| {
+    gaia_btn.connect_clicked(move |btn| {
         let auth = std::path::PathBuf::from("gmessages-auth.json");
         let _ = std::fs::remove_file(&auth);
         crate::gm_qr_state::request_gaia_pair();
-        // Spawn the polling loop that watches for the emoji prompt.
-        if let Some(win) = parent_for_modal.clone() {
+        // Look up the parent window at CLICK time — not at button-construction
+        // time, when the page isn't yet attached to its window.
+        if let Some(win) = btn
+            .root()
+            .and_then(|r| r.downcast::<gtk4::Window>().ok())
+        {
             spawn_gaia_emoji_watcher(win);
+        } else {
+            log::warn!("gaia: couldn't find parent window for emoji modal");
         }
     });
     gaia_row.add_suffix(&gaia_btn);
