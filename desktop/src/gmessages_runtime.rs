@@ -205,11 +205,36 @@ async fn run(
 ) -> Result<()> {
     let auth_path = resolve_auth_path(&data_dir);
     log::info!("gmessages: looking for auth file at {}", auth_path.display());
-    let auth = load_auth(&auth_path).await?;
+    let mut auth = load_auth(&auth_path).await?;
     if !auth.is_paired() {
         log::warn!("gmessages: auth file empty or missing — will run pairing flow now");
     } else {
         log::info!("gmessages: loaded auth (paired)");
+        // Refresh Firefox cookies. The cookies stored in auth.cookies are
+        // a snapshot from pair time. Firefox rotates session cookies
+        // (especially `__Secure-1PSIDTS`) every ~24h, so on a restart
+        // those snapshots are likely stale and the relay rejects with
+        // 401 → AuthRevoked → wiped auth. Re-reading from FF on every
+        // launch keeps us authenticated as long as the user's Firefox
+        // session is alive.
+        if auth.gaia_authuser.is_some() {
+            match gmessages_rust::cookies::read_default_firefox_cookies() {
+                Ok(fresh) => {
+                    log::info!(
+                        "gmessages: refreshed {} Firefox cookies on startup (was {})",
+                        fresh.len(),
+                        auth.cookies.len()
+                    );
+                    auth.cookies = fresh;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "gmessages: couldn't refresh FF cookies on startup ({e}); \
+                         falling back to stored snapshot — may need to re-pair if stale"
+                    );
+                }
+            }
+        }
     }
 
     // Build a phone→wa_chat_id index from the WhatsApp chat list cache.
@@ -313,11 +338,38 @@ async fn run(
         log::error!("gmessages: connect failed: {e}");
         // Stale auth — wipe it and run pairing fresh, then retry.
         if matches!(e, gmessages_rust::Error::AuthRevoked) {
-            log::warn!("gmessages: auth revoked — wiping stale auth file and re-pairing");
-            let _ = std::fs::remove_file(&auth_path);
-            // Reset in-memory auth so is_paired() returns false.
-            run_pair_flow(&client, &auth_path, &mut events, &event_tx).await?;
-            client.connect().await.context("gmessages: connect after re-pair")?;
+            // Before tearing the whole pair down: if this is a Gaia
+            // session, the most likely cause is rotated Firefox cookies
+            // (1PSIDTS rotates daily). Try a SECOND connect with fresh
+            // cookies before assuming we're permanently revoked.
+            let is_gaia = client
+                .auth_snapshot()
+                .await
+                .gaia_authuser
+                .is_some();
+            let mut recovered = false;
+            if is_gaia {
+                if let Ok(fresh) = gmessages_rust::cookies::read_default_firefox_cookies() {
+                    log::warn!(
+                        "gmessages: AuthRevoked — re-reading {} FF cookies and retrying connect",
+                        fresh.len()
+                    );
+                    client.set_cookies(fresh).await;
+                    if let Err(e2) = client.connect().await {
+                        log::warn!("gmessages: retry-with-fresh-cookies still failed: {e2}");
+                    } else {
+                        log::info!("gmessages: recovered with fresh cookies");
+                        recovered = true;
+                    }
+                }
+            }
+            if !recovered {
+                log::warn!("gmessages: auth revoked — wiping stale auth file and re-pairing");
+                let _ = std::fs::remove_file(&auth_path);
+                // Reset in-memory auth so is_paired() returns false.
+                run_pair_flow(&client, &auth_path, &mut events, &event_tx).await?;
+                client.connect().await.context("gmessages: connect after re-pair")?;
+            }
         } else {
             return Err(e.into());
         }
