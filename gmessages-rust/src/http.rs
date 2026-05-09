@@ -158,9 +158,15 @@ impl RelayHttp {
             {
                 return Err(Error::AuthRevoked);
             }
-            return Err(Error::Protocol(format!(
-                "HTTP {status} from {url}: {} bytes body",
+            // Log a snippet of the response body for diagnostics — Google's
+            // 400/500 responses usually carry a helpful explanation.
+            let preview = String::from_utf8_lossy(&body[..body.len().min(800)]).to_string();
+            log::warn!(
+                "http: HTTP {status} from {url} ({} bytes); body preview: {preview}",
                 body.len()
+            );
+            return Err(Error::Protocol(format!(
+                "HTTP {status} from {url}: {preview}"
             )));
         }
 
