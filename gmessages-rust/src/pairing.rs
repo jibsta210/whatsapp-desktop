@@ -1049,6 +1049,9 @@ pub mod gaia {
 
     /// POST `SignInGaia` with cookies. Sends our public key (PKIX-DER); the
     /// response carries the tachyon token and the device list.
+    ///
+    /// Reads `GMESSAGES_AUTHUSER` env var to pick which Google account when
+    /// the user has multiple signed into Firefox. Default 0 (first account).
     async fn sign_in_gaia_get_token(
         client: &Client,
         session_uuid: &str,
@@ -1074,9 +1077,39 @@ pub mod gaia {
             network: GOOGLE_NETWORK.into(),
         };
 
-        let resp: SignInGaiaResponse = client
-            .post_protobuf(urls::SIGN_IN_GAIA, &payload, ContentType::PBLite)
-            .await?;
+        // Multi-account selection: Google routes the request to whichever
+        // account is "default" unless we tell it otherwise. Read env var
+        // GMESSAGES_AUTHUSER=N (0..). Caller (UI) can read FF account list
+        // and set this before invoking pair.
+        let authuser = std::env::var("GMESSAGES_AUTHUSER").unwrap_or_else(|_| "0".into());
+        let url = format!("{}?authuser={authuser}", urls::SIGN_IN_GAIA);
+        log::info!("gaia: POST SignInGaia → {url} (cookies={})", {
+            let auth = client.inner.auth.lock().await;
+            auth.cookies.len()
+        });
+        let post_fut = client.post_protobuf::<_, SignInGaiaResponse>(
+            &url,
+            &payload,
+            ContentType::PBLite,
+        );
+        let resp: SignInGaiaResponse =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), post_fut).await {
+                Ok(Ok(r)) => {
+                    log::info!("gaia: SignInGaia HTTP returned ok");
+                    r
+                }
+                Ok(Err(e)) => {
+                    log::warn!("gaia: SignInGaia HTTP error: {e}");
+                    return Err(e);
+                }
+                Err(_) => {
+                    log::warn!("gaia: SignInGaia HTTP timed out after 30s");
+                    return Err(Error::Pairing(
+                        "SignInGaia POST timed out after 30s. Check the network and try again."
+                            .into(),
+                    ));
+                }
+            };
 
         // Persist token + device descriptors.
         let token_data = resp
