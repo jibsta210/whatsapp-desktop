@@ -102,6 +102,13 @@ pub fn take_gaia_request() -> bool {
     GAIA_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Read the flag without consuming it. Used by the QR-pair flow to
+/// detect that the user wants to abort and switch to Gaia, while
+/// leaving the flag set for the outer runtime loop to actually dispatch.
+pub fn peek_gaia_request() -> bool {
+    GAIA_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Set the verification emoji. The settings page polls this and shows the
 /// confirmation modal when it appears. Pass `None` once handled.
 pub fn set_gaia_emoji(emoji: Option<String>) {
