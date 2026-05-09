@@ -107,7 +107,35 @@ fn main() {
         unsafe { std::env::set_var("GSK_RENDERER", "gl") };
     }
 
+    // Tee stderr to a rotating-ish log file so we can diagnose runtime
+    // issues even when launched from Cosmic (which discards stderr).
+    // Truncate-on-launch: each launch starts fresh; the previous run is
+    // preserved as `app.log.prev`.
+    let log_path = data_dir.join("app.log");
+    let prev_log = data_dir.join("app.log.prev");
+    let _ = std::fs::rename(&log_path, &prev_log);
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+    {
+        // Use the file as stderr for everything that follows (env_logger,
+        // panic hook, eprintln!).
+        use std::os::unix::io::IntoRawFd;
+        let fd = file.into_raw_fd();
+        unsafe {
+            libc::dup2(fd, 2);
+            libc::close(fd);
+        }
+    }
+
     env_logger::init();
+    log::info!(
+        "whatsapp-desktop launched; logging to {} (prev run at {})",
+        log_path.display(),
+        prev_log.display()
+    );
 
     // Log panics to a file before aborting — so we can diagnose crashes
     // even when running without a terminal attached.

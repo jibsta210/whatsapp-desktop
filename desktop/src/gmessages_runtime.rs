@@ -1156,15 +1156,20 @@ async fn run_pair_flow(
 
     loop {
         // Escape hatch: if the user clicked "Pair via Firefox" while we
-        // were stuck on the QR flow, abort QR pair and return so the
-        // outer runtime loop can dispatch the Gaia request. We deliberately
-        // do NOT take the flag here — the outer loop's
-        // `take_gaia_request()` consumes it and starts the Gaia flow.
-        if crate::gm_qr_state::peek_gaia_request() {
+        // were stuck on the QR flow, abort the QR pair_task and run the
+        // Gaia flow inline. We CONSUME the flag here so the outer loop's
+        // `take_gaia_request()` is a no-op when we return — the work
+        // is already done.
+        if crate::gm_qr_state::take_gaia_request() {
             log::warn!("gmessages: QR pair flow aborting — Gaia pair requested");
             crate::gm_qr_state::set(None);
             pair_task.abort();
-            return Ok(());
+            // Surface the Starting status immediately so the dialog
+            // doesn't sit on whatever it was before.
+            crate::gm_qr_state::set_gaia_status(
+                crate::gm_qr_state::GaiaStatus::Starting,
+            );
+            return run_gaia_pair_flow(client, auth_path, events, event_tx).await;
         }
         let event = match tokio::time::timeout(
             std::time::Duration::from_millis(500),
