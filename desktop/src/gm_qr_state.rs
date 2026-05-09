@@ -17,6 +17,41 @@ struct State {
     /// `Some(true)` = confirmed match, `Some(false)` = rejected. The
     /// runtime polls + clears via `take_gaia_confirmation`.
     gaia_confirmation: Option<bool>,
+    /// Status of the in-flight Gaia pair attempt. Settings polls and
+    /// displays this in a status dialog. Not the same as gaia_emoji
+    /// (that's specific to the verification step).
+    gaia_status: GaiaStatus,
+}
+
+/// User-visible Gaia pairing progress.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum GaiaStatus {
+    #[default]
+    Idle,
+    Starting,
+    ReadingCookies,
+    ContactingGoogle,
+    Handshake,
+    WaitingForEmoji,
+    Finalizing,
+    Success,
+    Failed(String),
+}
+
+impl GaiaStatus {
+    pub fn human(&self) -> String {
+        match self {
+            Self::Idle => "Not started".to_string(),
+            Self::Starting => "Starting…".to_string(),
+            Self::ReadingCookies => "Reading Firefox cookies…".to_string(),
+            Self::ContactingGoogle => "Contacting Google…".to_string(),
+            Self::Handshake => "Handshake with phone…".to_string(),
+            Self::WaitingForEmoji => "Waiting for emoji confirmation…".to_string(),
+            Self::Finalizing => "Finalizing…".to_string(),
+            Self::Success => "Paired ✓".to_string(),
+            Self::Failed(why) => format!("Failed: {why}"),
+        }
+    }
 }
 
 static GLOBAL: OnceLock<RwLock<State>> = OnceLock::new();
@@ -94,4 +129,15 @@ pub fn answer_gaia_confirmation(confirmed: bool) {
 /// Runtime polls this to consume the user's answer.
 pub fn take_gaia_confirmation() -> Option<bool> {
     state().write().ok().and_then(|mut s| s.gaia_confirmation.take())
+}
+
+/// Runtime publishes status updates here; settings reads them via `get_gaia_status`.
+pub fn set_gaia_status(status: GaiaStatus) {
+    if let Ok(mut s) = state().write() {
+        s.gaia_status = status;
+    }
+}
+
+pub fn get_gaia_status() -> GaiaStatus {
+    state().read().map(|s| s.gaia_status.clone()).unwrap_or(GaiaStatus::Idle)
 }

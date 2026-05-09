@@ -605,22 +605,33 @@ async fn run(
         }
         if crate::gm_qr_state::take_gaia_request() {
             log::warn!("gmessages: Gaia (Firefox cookies) pairing requested from settings UI");
-            let _ = event_tx
-                .send(WaEvent::ErrorToast(
-                    "Gaia pair: starting…".into(),
-                ))
-                .await;
+            crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::Starting);
             let _ = client.disconnect().await;
             let _ = std::fs::remove_file(&auth_path);
-            if let Err(e) =
-                run_gaia_pair_flow(&client, &auth_path, &mut events, &event_tx).await
-            {
-                log::warn!("gmessages: Gaia pairing failed: {e}");
-                let _ = event_tx
-                    .send(WaEvent::ErrorToast(format!("Gaia pairing failed: {e}")))
-                    .await;
-            } else if let Err(e) = client.connect().await {
-                log::warn!("gmessages: reconnect after Gaia pair failed: {e}");
+            match run_gaia_pair_flow(&client, &auth_path, &mut events, &event_tx).await {
+                Ok(()) => {
+                    crate::gm_qr_state::set_gaia_status(
+                        crate::gm_qr_state::GaiaStatus::Finalizing,
+                    );
+                    if let Err(e) = client.connect().await {
+                        log::warn!("gmessages: reconnect after Gaia pair failed: {e}");
+                        crate::gm_qr_state::set_gaia_status(
+                            crate::gm_qr_state::GaiaStatus::Failed(format!(
+                                "reconnect failed: {e}"
+                            )),
+                        );
+                    } else {
+                        crate::gm_qr_state::set_gaia_status(
+                            crate::gm_qr_state::GaiaStatus::Success,
+                        );
+                    }
+                }
+                Err(e) => {
+                    log::warn!("gmessages: Gaia pairing failed: {e}");
+                    crate::gm_qr_state::set_gaia_status(
+                        crate::gm_qr_state::GaiaStatus::Failed(format!("{e}")),
+                    );
+                }
             }
             continue;
         }
@@ -1200,6 +1211,7 @@ async fn run_gaia_pair_flow(
     event_tx: &Sender<WaEvent>,
 ) -> Result<()> {
     log::info!("gmessages: gaia pair: reading Firefox cookies");
+    crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::ReadingCookies);
     let cookies = match gmessages_rust::cookies::read_default_firefox_cookies() {
         Ok(c) => c,
         Err(e) => {
@@ -1212,11 +1224,7 @@ async fn run_gaia_pair_flow(
     log::info!("gmessages: gaia pair: loaded {} cookies", cookies.len());
     client.set_cookies(cookies).await;
 
-    let _ = event_tx
-        .send(WaEvent::ErrorToast(
-            "Gaia pair: contacting Google… emoji confirmation will appear shortly.".into(),
-        ))
-        .await;
+    crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::ContactingGoogle);
 
     // Spawn pairing on a background task; pump events here.
     let pair_task = {
@@ -1228,12 +1236,10 @@ async fn run_gaia_pair_flow(
         match event {
             Event::PairingEmoji { emoji } => {
                 log::info!("gmessages: gaia pair: emoji = {emoji}");
+                crate::gm_qr_state::set_gaia_status(
+                    crate::gm_qr_state::GaiaStatus::WaitingForEmoji,
+                );
                 crate::gm_qr_state::set_gaia_emoji(Some(emoji.clone()));
-                let _ = event_tx
-                    .send(WaEvent::ErrorToast(format!(
-                        "Confirm this emoji on your phone: {emoji}  (open Settings to respond)"
-                    )))
-                    .await;
 
                 // Poll for the user's confirmation. Timeout matches the
                 // 5-minute window in pairing::gaia.

@@ -593,16 +593,19 @@ fn build_gmessages_page() -> adw::PreferencesPage {
     gaia_btn.connect_clicked(move |btn| {
         let auth = std::path::PathBuf::from("gmessages-auth.json");
         let _ = std::fs::remove_file(&auth);
+        crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::Starting);
         crate::gm_qr_state::request_gaia_pair();
-        // Look up the parent window at CLICK time — not at button-construction
-        // time, when the page isn't yet attached to its window.
+        // Show an IMMEDIATE status dialog so the user has visible
+        // confirmation that the click registered, regardless of how
+        // long the runtime takes to pick up the request. The dialog
+        // updates itself via timer poll (see start_gaia_status_dialog).
         if let Some(win) = btn
             .root()
             .and_then(|r| r.downcast::<gtk4::Window>().ok())
         {
-            spawn_gaia_emoji_watcher(win);
+            start_gaia_status_dialog(win);
         } else {
-            log::warn!("gaia: couldn't find parent window for emoji modal");
+            log::warn!("gaia: couldn't find parent window for status dialog");
         }
     });
     gaia_row.add_suffix(&gaia_btn);
@@ -804,56 +807,141 @@ fn zoom_label(level: f64) -> String {
     }
 }
 
-/// Watch `gm_qr_state::get_gaia_emoji()` and pop a confirmation dialog when
-/// the runtime asks the user to verify the UKEY2 emoji. The dialog wires
-/// Confirm/Reject back to the runtime via `answer_gaia_confirmation`.
+/// Pop a single non-blocking status dialog the moment Gaia pair is
+/// requested, and progress its body in place as `gm_qr_state::gaia_status`
+/// advances. When the runtime publishes an emoji to verify, swap the
+/// dialog into a Confirm/Reject prompt and forward the user's answer via
+/// `answer_gaia_confirmation`. Auto-closes ~3 seconds after Success or
+/// Failed.
 ///
-/// Polled at 4Hz; the timer self-cancels when the parent window is gone.
-pub fn spawn_gaia_emoji_watcher(parent: gtk4::Window) {
+/// Polled at 4Hz; the timer self-cancels once the dialog is gone.
+pub fn start_gaia_status_dialog(parent: gtk4::Window) {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    let dialog_open = Rc::new(RefCell::new(false));
-    let parent_weak = parent.downgrade();
+    use crate::gm_qr_state::GaiaStatus;
+
+    let dialog = adw::AlertDialog::new(
+        Some("Pair via Firefox"),
+        Some(&GaiaStatus::Starting.human()),
+    );
+    dialog.set_close_response("cancel");
+    dialog.add_response("cancel", "Cancel");
+    dialog.present(Some(&parent));
+
+    // Shared state between timer ticks: which response phase is the
+    // dialog currently in (status vs emoji-confirm), and the last status
+    // we rendered (avoid pointless setup-body churn).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        Status,
+        EmojiConfirm,
+        Closing,
+    }
+    let phase = Rc::new(RefCell::new(Phase::Status));
+    let last_rendered: Rc<RefCell<Option<GaiaStatus>>> = Rc::new(RefCell::new(None));
+    let close_at: Rc<RefCell<Option<std::time::Instant>>> = Rc::new(RefCell::new(None));
+
+    // Cancel button → reject the in-flight Gaia confirmation if it's
+    // waiting on us (pairing aborts) AND close the dialog. If pairing
+    // hasn't reached the emoji step yet, this just dismisses the dialog
+    // and lets the runtime continue (it will fail at the emoji step on
+    // its own timeout).
+    {
+        let phase = phase.clone();
+        dialog.connect_response(None, move |dlg, response| {
+            log::info!("gaia status dialog response: {response}");
+            if matches!(*phase.borrow(), Phase::EmojiConfirm) {
+                let confirmed = response == "confirm";
+                crate::gm_qr_state::answer_gaia_confirmation(confirmed);
+            } else if response == "cancel" {
+                // Best-effort abort if waiting at any other phase.
+                crate::gm_qr_state::answer_gaia_confirmation(false);
+            }
+            *phase.borrow_mut() = Phase::Closing;
+            dlg.close();
+        });
+    }
+
+    let dialog_weak = dialog.downgrade();
     gtk4::glib::timeout_add_local(
         std::time::Duration::from_millis(250),
         move || {
-            // Bail if parent window has been destroyed.
-            let Some(parent) = parent_weak.upgrade() else {
+            let Some(dialog) = dialog_weak.upgrade() else {
                 return gtk4::glib::ControlFlow::Break;
             };
-            if *dialog_open.borrow() {
+            if matches!(*phase.borrow(), Phase::Closing) {
+                return gtk4::glib::ControlFlow::Break;
+            }
+
+            // Auto-close after Success or Failed.
+            if let Some(t) = *close_at.borrow() {
+                if std::time::Instant::now() >= t {
+                    *phase.borrow_mut() = Phase::Closing;
+                    dialog.close();
+                    return gtk4::glib::ControlFlow::Break;
+                }
+            }
+
+            let status = crate::gm_qr_state::get_gaia_status();
+            let emoji = crate::gm_qr_state::get_gaia_emoji();
+
+            // Determine which phase we should be in.
+            let want_phase = if emoji.is_some()
+                && matches!(status, GaiaStatus::WaitingForEmoji)
+            {
+                Phase::EmojiConfirm
+            } else {
+                Phase::Status
+            };
+
+            // If switching INTO emoji-confirm, swap the responses.
+            if want_phase == Phase::EmojiConfirm
+                && *phase.borrow() != Phase::EmojiConfirm
+            {
+                let e = emoji.clone().unwrap_or_default();
+                dialog.set_heading(Some("Verify pairing emoji"));
+                dialog.set_body(&format!(
+                    "Your phone should be showing this emoji:\n\n\
+                     <span size=\"xx-large\">{e}</span>\n\n\
+                     Tap \"Yes, this matches\" on the phone, then click Confirm here.\n\
+                     If they don't match, click Reject."
+                ));
+                dialog.set_body_use_markup(true);
+                dialog.remove_response("cancel");
+                dialog.add_response("reject", "Reject");
+                dialog.add_response("confirm", "Confirm");
+                dialog.set_response_appearance(
+                    "confirm",
+                    adw::ResponseAppearance::Suggested,
+                );
+                dialog.set_response_appearance(
+                    "reject",
+                    adw::ResponseAppearance::Destructive,
+                );
+                dialog.set_default_response(Some("confirm"));
+                dialog.set_close_response("reject");
+                *phase.borrow_mut() = Phase::EmojiConfirm;
+                *last_rendered.borrow_mut() = Some(status);
                 return gtk4::glib::ControlFlow::Continue;
             }
-            let Some(emoji) = crate::gm_qr_state::get_gaia_emoji() else {
-                return gtk4::glib::ControlFlow::Continue;
-            };
-            *dialog_open.borrow_mut() = true;
-            let dialog = adw::AlertDialog::new(
-                Some("Verify pairing emoji"),
-                Some(&format!(
-                    "Your phone should be showing this emoji:\n\n\
-                     <span size=\"xx-large\">{emoji}</span>\n\n\
-                     Tap \"Yes, this matches\" on the phone, then click Confirm here.\n\
-                     If they don't match, click Reject — your session may be intercepted."
-                )),
-            );
-            dialog.set_body_use_markup(true);
-            dialog.add_response("reject", "Reject");
-            dialog.add_response("confirm", "Confirm");
-            dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
-            dialog.set_response_appearance("reject", adw::ResponseAppearance::Destructive);
-            dialog.set_default_response(Some("confirm"));
-            dialog.set_close_response("reject");
 
-            let dialog_open_c = dialog_open.clone();
-            dialog.connect_response(None, move |dlg, response| {
-                let confirmed = response == "confirm";
-                crate::gm_qr_state::answer_gaia_confirmation(confirmed);
-                *dialog_open_c.borrow_mut() = false;
-                dlg.close();
-            });
-            dialog.present(Some(&parent));
+            // Otherwise update the body to match the current status.
+            if want_phase == Phase::Status {
+                let stale = last_rendered.borrow().as_ref() != Some(&status);
+                if stale {
+                    dialog.set_body(&status.human());
+                    *last_rendered.borrow_mut() = Some(status.clone());
+                }
+                // Schedule auto-close for terminal states.
+                if matches!(status, GaiaStatus::Success | GaiaStatus::Failed(_))
+                    && close_at.borrow().is_none()
+                {
+                    *close_at.borrow_mut() =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+                }
+            }
+
             gtk4::glib::ControlFlow::Continue
         },
     );
