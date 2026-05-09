@@ -66,6 +66,14 @@ pub struct AuthData {
     /// Used by the desktop UI to display "Paired with foo@gmail.com".
     #[serde(default)]
     pub gaia_account_email: Option<String>,
+
+    /// `authuser` index for the Google account this client was paired
+    /// against (0, 1, 2, …). Set on the Gaia path. The relay routes
+    /// requests to this account via the `X-Goog-AuthUser` HTTP header;
+    /// without this stored, post-restart requests would default to
+    /// account 0 and the relay would reject the session.
+    #[serde(default)]
+    pub gaia_authuser: Option<u32>,
 }
 
 impl AuthData {
@@ -392,7 +400,13 @@ impl Client {
         Req: prost::Message + prost_reflect::ReflectMessage,
         Resp: prost::Message + prost_reflect::ReflectMessage + Default,
     {
-        let cookies = self.inner.auth.lock().await.cookies.clone();
-        self.inner.http.post::<Req, Resp>(url, req, ct, &cookies).await
+        let (cookies, authuser) = {
+            let auth = self.inner.auth.lock().await;
+            (auth.cookies.clone(), auth.gaia_authuser)
+        };
+        self.inner
+            .http
+            .post::<Req, Resp>(url, req, ct, &cookies, authuser)
+            .await
     }
 }

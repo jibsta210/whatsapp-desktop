@@ -64,12 +64,13 @@ impl RelayHttp {
         req: &Req,
         ct: ContentType,
         cookies: &HashMap<String, String>,
+        authuser: Option<u32>,
     ) -> Result<Resp>
     where
         Req: Message + ReflectMessage,
         Resp: Message + ReflectMessage + Default,
     {
-        self.post_inner(url, req, ct, cookies, false).await
+        self.post_inner(url, req, ct, cookies, authuser, false).await
     }
 
     pub async fn post_long<Req, Resp>(
@@ -78,12 +79,13 @@ impl RelayHttp {
         req: &Req,
         ct: ContentType,
         cookies: &HashMap<String, String>,
+        authuser: Option<u32>,
     ) -> Result<Resp>
     where
         Req: Message + ReflectMessage,
         Resp: Message + ReflectMessage + Default,
     {
-        self.post_inner(url, req, ct, cookies, true).await
+        self.post_inner(url, req, ct, cookies, authuser, true).await
     }
 
     async fn post_inner<Req, Resp>(
@@ -92,6 +94,7 @@ impl RelayHttp {
         req: &Req,
         ct: ContentType,
         cookies: &HashMap<String, String>,
+        authuser: Option<u32>,
         long_poll: bool,
     ) -> Result<Resp>
     where
@@ -111,7 +114,7 @@ impl RelayHttp {
         // Cookie + SAPISIDHASH + X-Goog-AuthUser, applied uniformly so
         // long-poll (which calls reqwest directly for the streaming
         // response) sees the same headers via the same helper.
-        headers::apply_cookie_auth(&mut headers, url, cookies);
+        headers::apply_cookie_auth(&mut headers, url, cookies, authuser);
 
         let client = if long_poll { &self.long } else { &self.short };
         let resp = client

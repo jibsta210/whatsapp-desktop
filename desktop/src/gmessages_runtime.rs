@@ -1268,15 +1268,34 @@ async fn run_gaia_pair_flow(
             res = &mut pair_task => {
                 match res {
                     Ok(Ok(())) => {
-                        log::info!("gmessages: gaia pair_task ended OK before PairSuccess event");
+                        log::info!("gmessages: gaia pair_task ended OK before PairSuccess event drained");
+                        // Biased select! catches pair_task completion before
+                        // events.recv() can pull the PairSuccess message off
+                        // the channel. Stamp Success status + clear emoji
+                        // here so the dialog can transition out of
+                        // "Pairing…" and auto-close.
+                        crate::gm_qr_state::set_gaia_status(
+                            crate::gm_qr_state::GaiaStatus::Success,
+                        );
+                        crate::gm_qr_state::set_gaia_emoji(None);
                         return Ok(());
                     }
                     Ok(Err(e)) => {
                         log::warn!("gmessages: gaia pair_task returned error: {e}");
+                        crate::gm_qr_state::set_gaia_emoji(None);
+                        crate::gm_qr_state::set_gaia_status(
+                            crate::gm_qr_state::GaiaStatus::Failed(format!("{e}")),
+                        );
                         anyhow::bail!("gaia pair: {e}");
                     }
                     Err(e) => {
                         log::warn!("gmessages: gaia pair_task panicked: {e}");
+                        crate::gm_qr_state::set_gaia_emoji(None);
+                        crate::gm_qr_state::set_gaia_status(
+                            crate::gm_qr_state::GaiaStatus::Failed(format!(
+                                "pair task panicked: {e}"
+                            )),
+                        );
                         anyhow::bail!("gaia pair task panicked: {e}");
                     }
                 }

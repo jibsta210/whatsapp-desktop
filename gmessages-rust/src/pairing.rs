@@ -928,7 +928,10 @@ pub mod gaia {
             std::env::set_var("GMESSAGES_AUTHUSER", chosen_authuser.to_string());
         }
         // Stash the chosen account's email on AuthData so the desktop
-        // UI can show "Paired with foo@gmail.com" later.
+        // UI can show "Paired with foo@gmail.com" later. Also stash the
+        // authuser index — without it, post-restart requests would lose
+        // the X-Goog-AuthUser header and the relay would reject our
+        // session as AuthRevoked.
         let chosen_email = accounts
             .iter()
             .find(|a| a.authuser == chosen_authuser)
@@ -936,6 +939,7 @@ pub mod gaia {
         {
             let mut auth = client.inner.auth.lock().await;
             auth.gaia_account_email = chosen_email.clone();
+            auth.gaia_authuser = Some(chosen_authuser);
         }
 
         // Generate fresh state so a previous pair attempt doesn't leak.

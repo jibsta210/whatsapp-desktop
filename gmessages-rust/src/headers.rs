@@ -70,15 +70,18 @@ pub fn sapisid_authorization(
 /// Specifically:
 /// - `Cookie: ...`
 /// - `Authorization: SAPISIDHASH ...` (from [`sapisid_authorization`])
-/// - `X-Goog-AuthUser: N` (from `GMESSAGES_AUTHUSER` env var, default 0)
+/// - `X-Goog-AuthUser: N` (from `authuser`, falling back to
+///   `GMESSAGES_AUTHUSER` env var, then 0)
 ///
-/// Centralized here so both [`crate::http::RelayHttp::post`] and the
-/// long-poll (which bypasses post_inner for the streaming response)
-/// produce identical headers.
+/// `authuser` is read from `AuthData.gaia_authuser` so it survives
+/// process restarts. Centralized here so both
+/// [`crate::http::RelayHttp::post`] and the long-poll (which bypasses
+/// post_inner for the streaming response) produce identical headers.
 pub fn apply_cookie_auth(
     headers: &mut HeaderMap,
     url: &str,
     cookies: &std::collections::HashMap<String, String>,
+    authuser: Option<u32>,
 ) {
     if cookies.is_empty() {
         return;
@@ -100,9 +103,11 @@ pub fn apply_cookie_auth(
             v,
         );
     }
-    if let Ok(authuser) = std::env::var("GMESSAGES_AUTHUSER")
-        && let Ok(v) = HeaderValue::from_str(&authuser)
-    {
+    let chosen = authuser
+        .map(|n| n.to_string())
+        .or_else(|| std::env::var("GMESSAGES_AUTHUSER").ok())
+        .unwrap_or_else(|| "0".to_string());
+    if let Ok(v) = HeaderValue::from_str(&chosen) {
         headers.insert(
             reqwest::header::HeaderName::from_static("x-goog-authuser"),
             v,

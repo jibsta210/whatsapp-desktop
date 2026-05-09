@@ -166,6 +166,7 @@ async fn run_long_poll(client: Client, connected: Arc<AtomicBool>) -> Result<()>
             }),
         };
         let cookies = auth.cookies.clone();
+        let authuser = auth.gaia_authuser;
         let url = if auth.has_cookies() {
             urls::RECEIVE_MESSAGES_GOOGLE
         } else {
@@ -181,7 +182,7 @@ async fn run_long_poll(client: Client, connected: Arc<AtomicBool>) -> Result<()>
         // X-Goog-AuthUser via the shared helper. Without the latter two
         // the clients6.google.com receive endpoint replies 401 and the
         // pair flow bails with AuthRevoked partway through.
-        crate::headers::apply_cookie_auth(&mut headers, url, &cookies);
+        crate::headers::apply_cookie_auth(&mut headers, url, &cookies, authuser);
         let req = client
             .inner
             .http

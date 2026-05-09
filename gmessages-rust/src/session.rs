@@ -262,11 +262,14 @@ pub async fn send_rpc_with_id<Req: prost::Message + ReflectMessage>(
     };
 
     // POST it.
-    let cookies = client.inner.auth.lock().await.cookies.clone();
+    let (cookies, authuser) = {
+        let auth = client.inner.auth.lock().await;
+        (auth.cookies.clone(), auth.gaia_authuser)
+    };
     let post_result = client
         .inner
         .http
-        .post::<OutgoingRpcMessage, OutgoingRpcResponse>(url, &payload, ContentType::PBLite, &cookies)
+        .post::<OutgoingRpcMessage, OutgoingRpcResponse>(url, &payload, ContentType::PBLite, &cookies, authuser)
         .await;
 
     if let Err(e) = post_result {
@@ -312,7 +315,7 @@ pub async fn send_unencrypted_rpc(
 ) -> Result<Vec<u8>> {
     let request_id = Uuid::new_v4().to_string();
 
-    let (session_id, tachyon_token, mobile, dest_reg_id, cookies) = {
+    let (session_id, tachyon_token, mobile, dest_reg_id, cookies, authuser) = {
         let session = client.inner.session.lock().await;
         let auth = client.inner.auth.lock().await;
         (
@@ -321,6 +324,7 @@ pub async fn send_unencrypted_rpc(
             auth.mobile.clone(),
             auth.dest_reg_id.clone(),
             auth.cookies.clone(),
+            auth.gaia_authuser,
         )
     };
 
@@ -382,6 +386,7 @@ pub async fn send_unencrypted_rpc(
             &payload,
             ContentType::PBLite,
             &cookies,
+            authuser,
         )
         .await;
     if let Err(e) = post_result {
@@ -798,11 +803,14 @@ pub async fn flush_acks(client: &Client) -> Result<()> {
     } else {
         urls::ACK_MESSAGES
     };
-    let cookies = client.inner.auth.lock().await.cookies.clone();
+    let (cookies, authuser) = {
+        let auth = client.inner.auth.lock().await;
+        (auth.cookies.clone(), auth.gaia_authuser)
+    };
     let _: OutgoingRpcResponse = client
         .inner
         .http
-        .post(url, &payload, ContentType::PBLite, &cookies)
+        .post(url, &payload, ContentType::PBLite, &cookies, authuser)
         .await?;
     Ok(())
 }
