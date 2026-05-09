@@ -1253,13 +1253,44 @@ async fn run_gaia_pair_flow(
 
     crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::ContactingGoogle);
 
-    // Spawn pairing on a background task; pump events here.
-    let pair_task = {
+    // Spawn pairing on a background task; pump events here AND watch
+    // pair_task itself, so when start_gaia_pairing returns Err early
+    // (e.g. SignInGaia 4xx, no PairFailed event ever fires) we don't
+    // sit forever in events.recv().
+    let mut pair_task = {
         let c = client.clone();
         tokio::spawn(async move { c.start_gaia_pairing().await })
     };
 
-    while let Some(event) = events.recv().await {
+    loop {
+        let event = tokio::select! {
+            biased;
+            res = &mut pair_task => {
+                match res {
+                    Ok(Ok(())) => {
+                        log::info!("gmessages: gaia pair_task ended OK before PairSuccess event");
+                        return Ok(());
+                    }
+                    Ok(Err(e)) => {
+                        log::warn!("gmessages: gaia pair_task returned error: {e}");
+                        anyhow::bail!("gaia pair: {e}");
+                    }
+                    Err(e) => {
+                        log::warn!("gmessages: gaia pair_task panicked: {e}");
+                        anyhow::bail!("gaia pair task panicked: {e}");
+                    }
+                }
+            }
+            ev = events.recv() => {
+                match ev {
+                    Some(e) => e,
+                    None => {
+                        log::warn!("gmessages: events channel closed during gaia pair");
+                        anyhow::bail!("gaia pair: events channel closed");
+                    }
+                }
+            }
+        };
         match event {
             Event::AvailableGoogleAccounts { accounts } => {
                 log::info!(
@@ -1351,6 +1382,7 @@ async fn run_gaia_pair_flow(
         }
     }
 
+    // PairSuccess fired — wait for the task to finish cleanly.
     pair_task
         .await
         .context("gmessages: gaia pair task panicked")?

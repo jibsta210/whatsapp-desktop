@@ -130,6 +130,17 @@ impl RelayHttp {
             {
                 headers.insert(HeaderName::from_static("authorization"), v);
             }
+            // Multi-account selector. Google identifies which signed-in
+            // account the request is for via the X-Goog-AuthUser HTTP
+            // header (0/1/2…). The endpoint is gRPC-style and explicitly
+            // refuses the same parameter on the URL. Source is
+            // GMESSAGES_AUTHUSER env var, set by the Gaia driver after
+            // the user picks an account.
+            if let Ok(authuser) = std::env::var("GMESSAGES_AUTHUSER")
+                && let Ok(v) = HeaderValue::from_str(&authuser)
+            {
+                headers.insert(HeaderName::from_static("x-goog-authuser"), v);
+            }
         }
 
         let client = if long_poll { &self.long } else { &self.short };

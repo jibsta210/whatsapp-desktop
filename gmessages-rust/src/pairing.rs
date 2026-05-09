@@ -1126,17 +1126,22 @@ pub mod gaia {
         };
 
         // Multi-account selection: Google routes the request to whichever
-        // account is "default" unless we tell it otherwise. Read env var
-        // GMESSAGES_AUTHUSER=N (0..). Caller (UI) can read FF account list
-        // and set this before invoking pair.
+        // account is "default" unless we tell it otherwise. The endpoint
+        // is gRPC-style and rejects `?authuser=N` as a query parameter
+        // ("Cannot bind query parameter") — it must be sent as the
+        // X-Goog-AuthUser HTTP header instead. We pass it through via
+        // the GMESSAGES_AUTHUSER env var; http.rs adds the header.
         let authuser = std::env::var("GMESSAGES_AUTHUSER").unwrap_or_else(|_| "0".into());
-        let url = format!("{}?authuser={authuser}", urls::SIGN_IN_GAIA);
-        log::info!("gaia: POST SignInGaia → {url} (cookies={})", {
-            let auth = client.inner.auth.lock().await;
-            auth.cookies.len()
-        });
+        log::info!(
+            "gaia: POST SignInGaia → {} authuser={authuser} (cookies={})",
+            urls::SIGN_IN_GAIA,
+            {
+                let auth = client.inner.auth.lock().await;
+                auth.cookies.len()
+            }
+        );
         let post_fut = client.post_protobuf::<_, SignInGaiaResponse>(
-            &url,
+            urls::SIGN_IN_GAIA,
             &payload,
             ContentType::PBLite,
         );
