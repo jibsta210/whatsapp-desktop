@@ -64,6 +64,52 @@ pub fn sapisid_authorization(
     }
 }
 
+/// Add the cookie-auth-specific headers to a HeaderMap when cookies
+/// are present and the URL targets a `clients6.google.com` endpoint.
+///
+/// Specifically:
+/// - `Cookie: ...`
+/// - `Authorization: SAPISIDHASH ...` (from [`sapisid_authorization`])
+/// - `X-Goog-AuthUser: N` (from `GMESSAGES_AUTHUSER` env var, default 0)
+///
+/// Centralized here so both [`crate::http::RelayHttp::post`] and the
+/// long-poll (which bypasses post_inner for the streaming response)
+/// produce identical headers.
+pub fn apply_cookie_auth(
+    headers: &mut HeaderMap,
+    url: &str,
+    cookies: &std::collections::HashMap<String, String>,
+) {
+    if cookies.is_empty() {
+        return;
+    }
+    let cookie_header = cookies
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if let Ok(v) = HeaderValue::from_str(&cookie_header) {
+        headers.insert(reqwest::header::HeaderName::from_static("cookie"), v);
+    }
+    if url.contains("clients6.google.com")
+        && let Some(auth) = sapisid_authorization(cookies, ORIGIN)
+        && let Ok(v) = HeaderValue::from_str(&auth)
+    {
+        headers.insert(
+            reqwest::header::HeaderName::from_static("authorization"),
+            v,
+        );
+    }
+    if let Ok(authuser) = std::env::var("GMESSAGES_AUTHUSER")
+        && let Ok(v) = HeaderValue::from_str(&authuser)
+    {
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-goog-authuser"),
+            v,
+        );
+    }
+}
+
 pub fn relay(content_type: &str, accept: &str) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert("sec-ch-ua", HeaderValue::from_static(SEC_UA));

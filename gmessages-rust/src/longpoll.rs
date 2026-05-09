@@ -176,22 +176,19 @@ async fn run_long_poll(client: Client, connected: Arc<AtomicBool>) -> Result<()>
         // Use the long client. We need the raw response stream, so go below
         // RelayHttp::post_long here and call reqwest directly.
         let body = crate::pblite::marshal(&payload)?;
-        let headers = crate::headers::relay(ContentType::PBLite.as_str(), "*/*");
-        let mut req = client
+        let mut headers = crate::headers::relay(ContentType::PBLite.as_str(), "*/*");
+        // For Gaia (cookie) auth, apply Cookie + SAPISIDHASH +
+        // X-Goog-AuthUser via the shared helper. Without the latter two
+        // the clients6.google.com receive endpoint replies 401 and the
+        // pair flow bails with AuthRevoked partway through.
+        crate::headers::apply_cookie_auth(&mut headers, url, &cookies);
+        let req = client
             .inner
             .http
             .long
             .post(url)
             .headers(headers)
             .body(body);
-        if !cookies.is_empty() {
-            let cookie_header = cookies
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("; ");
-            req = req.header("cookie", cookie_header);
-        }
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {

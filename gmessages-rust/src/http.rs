@@ -108,40 +108,10 @@ impl RelayHttp {
         };
 
         let mut headers = headers::relay(ct.as_str(), "*/*");
-        if !cookies.is_empty() {
-            let cookie_header = cookies
-                .iter()
-                .map(|(k, v)| format!("{k}={v}"))
-                .collect::<Vec<_>>()
-                .join("; ");
-            if let Ok(v) = HeaderValue::from_str(&cookie_header) {
-                headers.insert(HeaderName::from_static("cookie"), v);
-            }
-            // clients6.google.com endpoints (SignInGaia, RegisterRefresh,
-            // and the cookie-routed Messaging endpoints) reject requests
-            // with cookies but no SAPISIDHASH Authorization. Compute it
-            // from the SAPISID cookie + the messages.google.com origin.
-            if url.contains("clients6.google.com")
-                && let Some(auth) = headers::sapisid_authorization(
-                    cookies,
-                    headers::ORIGIN,
-                )
-                && let Ok(v) = HeaderValue::from_str(&auth)
-            {
-                headers.insert(HeaderName::from_static("authorization"), v);
-            }
-            // Multi-account selector. Google identifies which signed-in
-            // account the request is for via the X-Goog-AuthUser HTTP
-            // header (0/1/2…). The endpoint is gRPC-style and explicitly
-            // refuses the same parameter on the URL. Source is
-            // GMESSAGES_AUTHUSER env var, set by the Gaia driver after
-            // the user picks an account.
-            if let Ok(authuser) = std::env::var("GMESSAGES_AUTHUSER")
-                && let Ok(v) = HeaderValue::from_str(&authuser)
-            {
-                headers.insert(HeaderName::from_static("x-goog-authuser"), v);
-            }
-        }
+        // Cookie + SAPISIDHASH + X-Goog-AuthUser, applied uniformly so
+        // long-poll (which calls reqwest directly for the streaming
+        // response) sees the same headers via the same helper.
+        headers::apply_cookie_auth(&mut headers, url, cookies);
 
         let client = if long_poll { &self.long } else { &self.short };
         let resp = client
