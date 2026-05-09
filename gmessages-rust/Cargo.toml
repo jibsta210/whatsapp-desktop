@@ -10,6 +10,7 @@ default = []
 
 [dependencies]
 # Crypto
+sha1 = { workspace = true }
 aes = { workspace = true }
 aes-gcm = { workspace = true }
 ctr = { workspace = true }

@@ -117,6 +117,19 @@ impl RelayHttp {
             if let Ok(v) = HeaderValue::from_str(&cookie_header) {
                 headers.insert(HeaderName::from_static("cookie"), v);
             }
+            // clients6.google.com endpoints (SignInGaia, RegisterRefresh,
+            // and the cookie-routed Messaging endpoints) reject requests
+            // with cookies but no SAPISIDHASH Authorization. Compute it
+            // from the SAPISID cookie + the messages.google.com origin.
+            if url.contains("clients6.google.com")
+                && let Some(auth) = headers::sapisid_authorization(
+                    cookies,
+                    headers::ORIGIN,
+                )
+                && let Ok(v) = HeaderValue::from_str(&auth)
+            {
+                headers.insert(HeaderName::from_static("authorization"), v);
+            }
         }
 
         let client = if long_poll { &self.long } else { &self.short };

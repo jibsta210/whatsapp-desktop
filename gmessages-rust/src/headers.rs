@@ -11,6 +11,59 @@ pub const REFERER: &str = "https://messages.google.com/";
 
 use reqwest::header::{HeaderMap, HeaderValue};
 
+/// Compute the `SAPISIDHASH` Authorization header value used by Google's
+/// `clients6.google.com` cookie-bearing endpoints (e.g. SignInGaia).
+///
+/// Algorithm (from the Chromium source `google_apis/gaia/oauth2_access_token_fetcher_impl.cc`
+/// and many other public references):
+///
+/// 1. Take a UNIX timestamp in seconds (current time).
+/// 2. Concatenate `"{timestamp} {sapisid} {origin}"`.
+/// 3. SHA1 hex digest.
+/// 4. Header value = `"SAPISIDHASH {timestamp}_{hexdigest}"`.
+///
+/// `origin` is typically `"https://messages.google.com"` for our use.
+///
+/// We also build per-prefix variants (`SAPISID1PHASH`, `SAPISID3PHASH`)
+/// from the corresponding `__Secure-1PAPISID` / `__Secure-3PAPISID`
+/// cookies when they're present, separated by spaces — this is how
+/// chrome.google.com builds the header.
+pub fn sapisid_authorization(
+    cookies: &std::collections::HashMap<String, String>,
+    origin: &str,
+) -> Option<String> {
+    use sha1::{Digest, Sha1};
+    let timestamp = chrono::Utc::now().timestamp();
+    let mut parts = Vec::new();
+
+    let mut push = |prefix: &str, sapisid: &str| {
+        let mut h = Sha1::new();
+        h.update(format!("{timestamp} {sapisid} {origin}").as_bytes());
+        let digest = h.finalize();
+        let hex = digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        parts.push(format!("{prefix} {timestamp}_{hex}"));
+    };
+
+    if let Some(sapisid) = cookies.get("SAPISID") {
+        push("SAPISIDHASH", sapisid);
+    }
+    if let Some(sapisid_1p) = cookies.get("__Secure-1PAPISID") {
+        push("SAPISID1PHASH", sapisid_1p);
+    }
+    if let Some(sapisid_3p) = cookies.get("__Secure-3PAPISID") {
+        push("SAPISID3PHASH", sapisid_3p);
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
+}
+
 pub fn relay(content_type: &str, accept: &str) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert("sec-ch-ua", HeaderValue::from_static(SEC_UA));
