@@ -21,6 +21,12 @@ struct State {
     /// displays this in a status dialog. Not the same as gaia_emoji
     /// (that's specific to the verification step).
     gaia_status: GaiaStatus,
+    /// List of Google accounts found in the user's browser. The settings
+    /// page shows this as a dropdown when set.
+    available_accounts: Option<Vec<gmessages_rust::accounts::GoogleAccount>>,
+    /// User's chosen `authuser` index, if they've responded to the
+    /// account-picker. Runtime polls + clears via take_chosen_authuser.
+    chosen_authuser: Option<u32>,
 }
 
 /// User-visible Gaia pairing progress.
@@ -35,6 +41,7 @@ pub enum GaiaStatus {
     WaitingForEmoji,
     Finalizing,
     Success,
+    PickingAccount,
     Failed(String),
 }
 
@@ -49,6 +56,7 @@ impl GaiaStatus {
             Self::WaitingForEmoji => "Waiting for emoji confirmation…".to_string(),
             Self::Finalizing => "Finalizing…".to_string(),
             Self::Success => "Paired ✓".to_string(),
+            Self::PickingAccount => "Pick a Google account…".to_string(),
             Self::Failed(why) => format!("Failed: {why}"),
         }
     }
@@ -147,4 +155,30 @@ pub fn set_gaia_status(status: GaiaStatus) {
 
 pub fn get_gaia_status() -> GaiaStatus {
     state().read().map(|s| s.gaia_status.clone()).unwrap_or(GaiaStatus::Idle)
+}
+
+/// Runtime publishes the list of Google accounts; settings shows them as
+/// a dropdown. Pass `None` to clear.
+pub fn set_available_accounts(
+    accounts: Option<Vec<gmessages_rust::accounts::GoogleAccount>>,
+) {
+    if let Ok(mut s) = state().write() {
+        s.available_accounts = accounts;
+    }
+}
+
+pub fn get_available_accounts() -> Option<Vec<gmessages_rust::accounts::GoogleAccount>> {
+    state().read().ok().and_then(|s| s.available_accounts.clone())
+}
+
+/// Settings UI calls this when the user picks an account from the dropdown.
+pub fn answer_chosen_authuser(authuser: u32) {
+    if let Ok(mut s) = state().write() {
+        s.chosen_authuser = Some(authuser);
+    }
+}
+
+/// Runtime polls + consumes.
+pub fn take_chosen_authuser() -> Option<u32> {
+    state().write().ok().and_then(|mut s| s.chosen_authuser.take())
 }

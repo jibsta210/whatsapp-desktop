@@ -14,6 +14,14 @@ pub enum Event {
     /// finalizes. Caller responds via [`Client::confirm_pairing_emoji`].
     PairingEmoji { emoji: String },
 
+    /// Gaia pairing discovered the user has multiple Google accounts in
+    /// their browser. Caller must respond via
+    /// [`Client::choose_google_account`] with the chosen account's
+    /// `authuser` index.
+    AvailableGoogleAccounts {
+        accounts: Vec<crate::accounts::GoogleAccount>,
+    },
+
     /// Pairing finished successfully.
     PairSuccess,
 

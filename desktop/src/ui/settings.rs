@@ -835,6 +835,7 @@ pub fn start_gaia_status_dialog(parent: gtk4::Window) {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Phase {
         Status,
+        AccountPicker,
         EmojiConfirm,
         Closing,
     }
@@ -851,15 +852,39 @@ pub fn start_gaia_status_dialog(parent: gtk4::Window) {
         let phase = phase.clone();
         dialog.connect_response(None, move |dlg, response| {
             log::info!("gaia status dialog response: {response}");
-            if matches!(*phase.borrow(), Phase::EmojiConfirm) {
+            let cur_phase = *phase.borrow();
+            if matches!(cur_phase, Phase::EmojiConfirm) {
                 let confirmed = response == "confirm";
                 crate::gm_qr_state::answer_gaia_confirmation(confirmed);
+                *phase.borrow_mut() = Phase::Closing;
+                dlg.close();
+            } else if matches!(cur_phase, Phase::AccountPicker)
+                && response.starts_with("acct")
+                && let Ok(n) = response[4..].parse::<u32>()
+            {
+                crate::gm_qr_state::answer_chosen_authuser(n);
+                // Don't close — the dialog continues into Status phase.
+                // We don't have a clean "swap responses without closing"
+                // for AlertDialog except by setting heading/body and
+                // letting the timer re-render. Mark phase as Status so
+                // the timer transitions cleanly on next tick.
+                *phase.borrow_mut() = Phase::Status;
+                // Reset the responses to a single Cancel so the dialog
+                // doesn't keep showing 3 account buttons.
+                // (Done lazily by the next status render — set_body
+                // alone won't remove buttons. Simplest: just leave them
+                // disabled-ish via remove + add cancel.)
+                dlg.remove_response(response);
+                // Keep cancel; subsequent ticks will overwrite body.
+                dlg.set_heading(Some("Pair via Firefox"));
             } else if response == "cancel" {
-                // Best-effort abort if waiting at any other phase.
                 crate::gm_qr_state::answer_gaia_confirmation(false);
+                *phase.borrow_mut() = Phase::Closing;
+                dlg.close();
+            } else {
+                *phase.borrow_mut() = Phase::Closing;
+                dlg.close();
             }
-            *phase.borrow_mut() = Phase::Closing;
-            dlg.close();
         });
     }
 
@@ -886,14 +911,52 @@ pub fn start_gaia_status_dialog(parent: gtk4::Window) {
             let status = crate::gm_qr_state::get_gaia_status();
             let emoji = crate::gm_qr_state::get_gaia_emoji();
 
+            let accounts = crate::gm_qr_state::get_available_accounts();
+
             // Determine which phase we should be in.
             let want_phase = if emoji.is_some()
                 && matches!(status, GaiaStatus::WaitingForEmoji)
             {
                 Phase::EmojiConfirm
+            } else if accounts.is_some() && matches!(status, GaiaStatus::PickingAccount) {
+                Phase::AccountPicker
             } else {
                 Phase::Status
             };
+
+            // If switching INTO account-picker, build a list of radio
+            // rows showing each account's email + display name.
+            if want_phase == Phase::AccountPicker
+                && *phase.borrow() != Phase::AccountPicker
+            {
+                let list = accounts.unwrap();
+                dialog.set_heading(Some("Pick a Google account"));
+                dialog.set_body(
+                    "Several accounts are signed in. Choose the one that has Google Messages set up:",
+                );
+                dialog.set_body_use_markup(false);
+                // Replace responses: one per account (label = email).
+                dialog.remove_response("cancel");
+                dialog.remove_response("reject");
+                dialog.remove_response("confirm");
+                for acct in &list {
+                    let label = if acct.display_name.is_empty() {
+                        acct.email.clone()
+                    } else {
+                        format!("{}  ({})", acct.email, acct.display_name)
+                    };
+                    let id = format!("acct{}", acct.authuser);
+                    dialog.add_response(&id, &label);
+                }
+                dialog.add_response("cancel", "Cancel");
+                dialog.set_close_response("cancel");
+                if let Some(first) = list.first() {
+                    dialog.set_default_response(Some(&format!("acct{}", first.authuser)));
+                }
+                *phase.borrow_mut() = Phase::AccountPicker;
+                *last_rendered.borrow_mut() = Some(status);
+                return gtk4::glib::ControlFlow::Continue;
+            }
 
             // If switching INTO emoji-confirm, swap the responses.
             if want_phase == Phase::EmojiConfirm

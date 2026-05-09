@@ -1079,6 +1079,7 @@ fn describe_event(e: &Event) -> &'static str {
         Event::Ready => "Ready",
         Event::QrCode { .. } => "QrCode",
         Event::PairingEmoji { .. } => "PairingEmoji",
+        Event::AvailableGoogleAccounts { .. } => "AvailableGoogleAccounts",
         Event::PairSuccess => "PairSuccess",
         Event::PairFailed { .. } => "PairFailed",
         Event::PhoneNotResponding => "PhoneNotResponding",
@@ -1260,6 +1261,44 @@ async fn run_gaia_pair_flow(
 
     while let Some(event) = events.recv().await {
         match event {
+            Event::AvailableGoogleAccounts { accounts } => {
+                log::info!(
+                    "gmessages: gaia pair: {} accounts available",
+                    accounts.len()
+                );
+                crate::gm_qr_state::set_gaia_status(
+                    crate::gm_qr_state::GaiaStatus::PickingAccount,
+                );
+                crate::gm_qr_state::set_available_accounts(Some(accounts));
+                // Poll for the user's choice.
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+                let chosen = loop {
+                    if let Some(n) = crate::gm_qr_state::take_chosen_authuser() {
+                        break Some(n);
+                    }
+                    if std::time::Instant::now() > deadline {
+                        break None;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                };
+                crate::gm_qr_state::set_available_accounts(None);
+                match chosen {
+                    Some(n) => {
+                        log::info!("gmessages: gaia pair: user picked authuser={n}");
+                        client.choose_google_account(n).await;
+                        crate::gm_qr_state::set_gaia_status(
+                            crate::gm_qr_state::GaiaStatus::ContactingGoogle,
+                        );
+                    }
+                    None => {
+                        log::warn!("gmessages: gaia pair: account choice timeout");
+                        // Send 0 so the driver doesn't hang; will likely
+                        // fail downstream but better than infinite wait.
+                        client.choose_google_account(0).await;
+                    }
+                }
+            }
             Event::PairingEmoji { emoji } => {
                 log::info!("gmessages: gaia pair: emoji = {emoji}");
                 crate::gm_qr_state::set_gaia_status(
@@ -1417,6 +1456,7 @@ fn translate_event(event: Event) -> Vec<WaEvent> {
         )],
         Event::QrCode { url: _ }
         | Event::PairingEmoji { .. }
+        | Event::AvailableGoogleAccounts { .. }
         | Event::PairSuccess
         | Event::PairFailed { .. } => Vec::new(),
     }

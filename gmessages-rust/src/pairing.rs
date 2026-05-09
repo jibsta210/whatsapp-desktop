@@ -880,6 +880,54 @@ pub mod gaia {
             ));
         }
 
+        // Step 0: enumerate Google accounts. If multiple, ask the user
+        // which one to register against. We persist the choice via the
+        // GMESSAGES_AUTHUSER env var so subsequent SignInGaia in this
+        // process picks it up.
+        let cookies = client.inner.auth.lock().await.cookies.clone();
+        let accounts = match crate::accounts::list_google_accounts(&client.inner.http, &cookies)
+            .await
+        {
+            Ok(a) => a,
+            Err(e) => {
+                log::warn!("gaia: ListAccounts failed ({e}); falling back to authuser=0");
+                Vec::new()
+            }
+        };
+        log::info!("gaia: ListAccounts found {} account(s)", accounts.len());
+        for a in &accounts {
+            log::info!("gaia:   authuser={} email={}", a.authuser, a.email);
+        }
+        let chosen_authuser: u32 = match accounts.len() {
+            0 | 1 => accounts.first().map(|a| a.authuser).unwrap_or(0),
+            _ => {
+                // Multiple accounts — ask the user.
+                let (tx, rx) = tokio::sync::oneshot::channel::<u32>();
+                client.inner.session.lock().await.gaia_account_choice = Some(tx);
+                client.emit(crate::Event::AvailableGoogleAccounts {
+                    accounts: accounts.clone(),
+                });
+                match tokio::time::timeout(std::time::Duration::from_secs(5 * 60), rx).await {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(_)) => {
+                        return Err(Error::Pairing(
+                            "account-choice channel closed before user response".into(),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(Error::Pairing(
+                            "account choice timed out (no user response in 5 minutes)".into(),
+                        ));
+                    }
+                }
+            }
+        };
+        log::info!("gaia: using authuser={chosen_authuser}");
+        // Persist for sign_in_gaia_get_token (which reads the env var).
+        unsafe {
+            std::env::set_var("GMESSAGES_AUTHUSER", chosen_authuser.to_string());
+        }
+
         // Generate fresh state so a previous pair attempt doesn't leak.
         let pairing_attempt_id = Uuid::new_v4().to_string();
         let session_uuid = Uuid::new_v4().simple().to_string();

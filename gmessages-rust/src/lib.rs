@@ -34,6 +34,7 @@ pub mod gmproto;
 pub const PBLITE_FILE_DESCRIPTOR_SET_BYTES: &[u8] =
     include_bytes!("gmproto/file_descriptor_set.bin");
 
+pub mod accounts;
 pub mod client;
 pub mod cookies;
 pub mod crypto;

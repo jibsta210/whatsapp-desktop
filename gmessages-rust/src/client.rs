@@ -103,6 +103,10 @@ pub(crate) struct SessionState {
     /// `true` = user confirmed match; `false` = user rejected. Cleared on
     /// either response.
     pub gaia_emoji_confirm: Option<oneshot::Sender<bool>>,
+    /// Set during Gaia pairing while waiting on the user to pick which
+    /// Google account to register against. Holds the chosen `authuser`
+    /// index (0, 1, …).
+    pub gaia_account_choice: Option<oneshot::Sender<u32>>,
 }
 
 impl Default for SessionState {
@@ -116,6 +120,7 @@ impl Default for SessionState {
             skip_count: 0,
             pair_completion: None,
             gaia_emoji_confirm: None,
+            gaia_account_choice: None,
         }
     }
 }
@@ -234,6 +239,19 @@ impl Client {
         } else {
             log::warn!(
                 "confirm_pairing_emoji called but no Gaia pairing in progress (or already answered)"
+            );
+        }
+    }
+
+    /// Caller's response to [`Event::AvailableGoogleAccounts`]: pass the
+    /// `authuser` index of the chosen account. Idempotent.
+    pub async fn choose_google_account(&self, authuser: u32) {
+        let waiter = self.inner.session.lock().await.gaia_account_choice.take();
+        if let Some(tx) = waiter {
+            let _ = tx.send(authuser);
+        } else {
+            log::warn!(
+                "choose_google_account called but no Gaia pairing in progress (or already answered)"
             );
         }
     }
