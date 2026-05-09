@@ -841,6 +841,20 @@ async fn run(
                     } else if let Err(e) = client.connect().await {
                         log::warn!("gmessages: reconnect after re-pair failed: {e}");
                     }
+                } else if crate::gm_qr_state::take_gaia_request() {
+                    log::warn!("gmessages: Gaia (Firefox cookies) pairing requested from settings UI");
+                    let _ = client.disconnect().await;
+                    let _ = std::fs::remove_file(&auth_path);
+                    if let Err(e) =
+                        run_gaia_pair_flow(&client, &auth_path, &mut events, &event_tx).await
+                    {
+                        log::warn!("gmessages: Gaia pairing failed: {e}");
+                        let _ = event_tx
+                            .send(WaEvent::ErrorToast(format!("Gaia pairing failed: {e}")))
+                            .await;
+                    } else if let Err(e) = client.connect().await {
+                        log::warn!("gmessages: reconnect after Gaia pair failed: {e}");
+                    }
                 }
             }
             else => {
@@ -1038,7 +1052,7 @@ fn describe_event(e: &Event) -> &'static str {
     match e {
         Event::Ready => "Ready",
         Event::QrCode { .. } => "QrCode",
-        Event::PairingEmojis { .. } => "PairingEmojis",
+        Event::PairingEmoji { .. } => "PairingEmoji",
         Event::PairSuccess => "PairSuccess",
         Event::PairFailed { .. } => "PairFailed",
         Event::PhoneNotResponding => "PhoneNotResponding",
@@ -1155,6 +1169,109 @@ async fn run_pair_flow(
     Ok(())
 }
 
+/// Drive a Gaia (Google account) pairing flow.
+///
+/// 1. Read Google session cookies from the user's Firefox profile.
+/// 2. Hand them to the client.
+/// 3. Spawn `client.start_gaia_pairing()` on a background task.
+/// 4. Pump events: when `Event::PairingEmoji` arrives, publish to the
+///    settings page; poll `take_gaia_confirmation` for the user's answer
+///    and forward it via `client.confirm_pairing_emoji`.
+/// 5. Block until `Event::PairSuccess` or failure.
+async fn run_gaia_pair_flow(
+    client: &Arc<Client>,
+    auth_path: &Path,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    event_tx: &Sender<WaEvent>,
+) -> Result<()> {
+    log::info!("gmessages: gaia pair: reading Firefox cookies");
+    let cookies = match gmessages_rust::cookies::read_default_firefox_cookies() {
+        Ok(c) => c,
+        Err(e) => {
+            anyhow::bail!(
+                "gaia: couldn't read Firefox cookies: {e}. \
+                 Sign into https://messages.google.com/web/ in Firefox first."
+            );
+        }
+    };
+    log::info!("gmessages: gaia pair: loaded {} cookies", cookies.len());
+    client.set_cookies(cookies).await;
+
+    let _ = event_tx
+        .send(WaEvent::ErrorToast(
+            "Gaia pair: contacting Google… emoji confirmation will appear shortly.".into(),
+        ))
+        .await;
+
+    // Spawn pairing on a background task; pump events here.
+    let pair_task = {
+        let c = client.clone();
+        tokio::spawn(async move { c.start_gaia_pairing().await })
+    };
+
+    while let Some(event) = events.recv().await {
+        match event {
+            Event::PairingEmoji { emoji } => {
+                log::info!("gmessages: gaia pair: emoji = {emoji}");
+                crate::gm_qr_state::set_gaia_emoji(Some(emoji.clone()));
+                let _ = event_tx
+                    .send(WaEvent::ErrorToast(format!(
+                        "Confirm this emoji on your phone: {emoji}  (open Settings to respond)"
+                    )))
+                    .await;
+
+                // Poll for the user's confirmation. Timeout matches the
+                // 5-minute window in pairing::gaia.
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+                let confirmed = loop {
+                    if let Some(ans) = crate::gm_qr_state::take_gaia_confirmation() {
+                        break Some(ans);
+                    }
+                    if std::time::Instant::now() > deadline {
+                        break None;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                };
+                crate::gm_qr_state::set_gaia_emoji(None);
+                match confirmed {
+                    Some(b) => {
+                        log::info!("gmessages: gaia pair: user said matches={b}");
+                        client.confirm_pairing_emoji(b).await;
+                    }
+                    None => {
+                        log::warn!("gmessages: gaia pair: user did not confirm in time");
+                        client.confirm_pairing_emoji(false).await;
+                    }
+                }
+            }
+            Event::PairSuccess => {
+                log::info!(
+                    "gmessages: gaia paired; auth saved to {}",
+                    auth_path.display()
+                );
+                break;
+            }
+            Event::PairFailed { reason } => {
+                anyhow::bail!("gaia pair failed: {reason}");
+            }
+            Event::AuthRevoked => {
+                anyhow::bail!("gaia pair: auth revoked mid-flow");
+            }
+            other => log::debug!(
+                "gmessages: gaia pair: ignoring {}",
+                describe_event(&other)
+            ),
+        }
+    }
+
+    pair_task
+        .await
+        .context("gmessages: gaia pair task panicked")?
+        .context("gmessages: start_gaia_pairing returned error")?;
+    Ok(())
+}
+
 async fn load_auth(path: &Path) -> Result<AuthData> {
     if !path.exists() {
         return Ok(AuthData::default());
@@ -1252,7 +1369,7 @@ fn translate_event(event: Event) -> Vec<WaEvent> {
             "Google Messages auth revoked — re-pair required".into(),
         )],
         Event::QrCode { url: _ }
-        | Event::PairingEmojis { .. }
+        | Event::PairingEmoji { .. }
         | Event::PairSuccess
         | Event::PairFailed { .. } => Vec::new(),
     }

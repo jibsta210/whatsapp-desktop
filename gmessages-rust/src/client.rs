@@ -99,6 +99,10 @@ pub(crate) struct SessionState {
     /// PairCallback is invoked once when the phone sends `PairedData`. It is
     /// cleared after firing.
     pub pair_completion: Option<oneshot::Sender<crate::gmproto::authentication::PairedData>>,
+    /// Set during Gaia pairing while waiting on user emoji confirmation.
+    /// `true` = user confirmed match; `false` = user rejected. Cleared on
+    /// either response.
+    pub gaia_emoji_confirm: Option<oneshot::Sender<bool>>,
 }
 
 impl Default for SessionState {
@@ -111,6 +115,7 @@ impl Default for SessionState {
             recent_updates_ptr: 0,
             skip_count: 0,
             pair_completion: None,
+            gaia_emoji_confirm: None,
         }
     }
 }
@@ -198,6 +203,39 @@ impl Client {
     /// and call [`connect`](Self::connect)).
     pub async fn start_pairing(&self) -> Result<()> {
         crate::pairing::start_qr_pairing(self).await
+    }
+
+    /// Begin a fresh Gaia (Google account) pairing flow. Cookies must
+    /// already be installed via [`set_cookies`](Self::set_cookies).
+    ///
+    /// Emits [`Event::PairingEmoji`] partway through. Caller MUST invoke
+    /// [`confirm_pairing_emoji`](Self::confirm_pairing_emoji) once the user
+    /// confirms the same emoji appears on the phone. Then returns once
+    /// pairing is fully complete.
+    pub async fn start_gaia_pairing(&self) -> Result<()> {
+        crate::pairing::start_gaia_pairing(self).await
+    }
+
+    /// Install Google session cookies into [`AuthData::cookies`]. Used
+    /// before [`start_gaia_pairing`](Self::start_gaia_pairing). The expected
+    /// keys are listed in [`crate::cookies::GAIA_COOKIE_NAMES`].
+    pub async fn set_cookies(&self, cookies: std::collections::HashMap<String, String>) {
+        let mut auth = self.inner.auth.lock().await;
+        auth.cookies = cookies;
+    }
+
+    /// Caller's response to [`Event::PairingEmoji`]: `true` if the user
+    /// confirmed the displayed emoji matches the one on the phone, `false`
+    /// to abort pairing. Idempotent: only the first call has an effect.
+    pub async fn confirm_pairing_emoji(&self, matches: bool) {
+        let waiter = self.inner.session.lock().await.gaia_emoji_confirm.take();
+        if let Some(tx) = waiter {
+            let _ = tx.send(matches);
+        } else {
+            log::warn!(
+                "confirm_pairing_emoji called but no Gaia pairing in progress (or already answered)"
+            );
+        }
     }
 
     /// Connect using existing [`AuthData`] and start the long-poll receive loop.

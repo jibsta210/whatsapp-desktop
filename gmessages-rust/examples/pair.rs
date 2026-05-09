@@ -50,8 +50,8 @@ async fn main() -> anyhow::Result<()> {
             Event::Ready => {
                 println!("[long-poll connected, waiting for phone to scan QR…]");
             }
-            Event::PairingEmojis { emojis } => {
-                println!("[verify emojis] {}", emojis.join(" "));
+            Event::PairingEmoji { emoji } => {
+                println!("[verify emoji] {emoji}");
             }
             Event::PairSuccess => {
                 println!("[paired]");

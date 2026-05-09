@@ -49,6 +49,13 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa", "std", "arithmetic"] }
 elliptic-curve = { version = "0.13", default-features = false, features = ["sec1", "std"] }
 
+# Firefox cookie reader for Gaia pairing.
+# Use rusqlite 0.39 to match the workspace's libsqlite3-sys 0.35
+# (whatsapp-rust-sqlite-storage already pulls in libsqlite3-sys at that
+# version; cargo refuses two distinct major versions of a `links =` crate).
+rusqlite = { version = "0.37", features = ["bundled"] }
+tempfile = "3"
+
 [build-dependencies]
 prost-build = { workspace = true }
 prost-reflect-build = "0.16"
@@ -69,3 +76,6 @@ name = "send"
 
 [[example]]
 name = "chats"
+
+[[example]]
+name = "ff_cookies"

@@ -579,6 +579,32 @@ fn build_gmessages_page() -> adw::PreferencesPage {
     pair_row.set_activatable_widget(Some(&pair_btn));
     status.add(&pair_row);
 
+    // Persistent (Gaia) pairing row — uses Firefox cookies for a months-long
+    // session that doesn't need a phone scan. Falls back to QR (above) if
+    // the user isn't logged into messages.google.com in Firefox.
+    let gaia_row = adw::ActionRow::new();
+    gaia_row.set_title("Persistent login (Firefox cookies)");
+    gaia_row.set_subtitle(
+        "Pairs without scanning a QR. Requires being signed into \
+         messages.google.com in Firefox. Stays logged in for months.",
+    );
+    let gaia_btn = gtk4::Button::with_label("Pair via Firefox");
+    gaia_btn.set_valign(gtk4::Align::Center);
+    let parent_window = page.root().and_then(|r| r.downcast::<gtk4::Window>().ok());
+    let parent_for_modal = parent_window.clone();
+    gaia_btn.connect_clicked(move |_btn| {
+        let auth = std::path::PathBuf::from("gmessages-auth.json");
+        let _ = std::fs::remove_file(&auth);
+        crate::gm_qr_state::request_gaia_pair();
+        // Spawn the polling loop that watches for the emoji prompt.
+        if let Some(win) = parent_for_modal.clone() {
+            spawn_gaia_emoji_watcher(win);
+        }
+    });
+    gaia_row.add_suffix(&gaia_btn);
+    gaia_row.set_activatable_widget(Some(&gaia_btn));
+    status.add(&gaia_row);
+
     // QR row that auto-updates: when the gm runtime publishes a fresh QR
     // URL into `gm_qr_state`, we re-render. Polled because the runtime
     // lives in another thread and dispatching glib idle callbacks back to
@@ -772,4 +798,59 @@ fn zoom_label(level: f64) -> String {
     } else {
         format!("{:.0}%", level * 100.0)
     }
+}
+
+/// Watch `gm_qr_state::get_gaia_emoji()` and pop a confirmation dialog when
+/// the runtime asks the user to verify the UKEY2 emoji. The dialog wires
+/// Confirm/Reject back to the runtime via `answer_gaia_confirmation`.
+///
+/// Polled at 4Hz; the timer self-cancels when the parent window is gone.
+pub fn spawn_gaia_emoji_watcher(parent: gtk4::Window) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let dialog_open = Rc::new(RefCell::new(false));
+    let parent_weak = parent.downgrade();
+    gtk4::glib::timeout_add_local(
+        std::time::Duration::from_millis(250),
+        move || {
+            // Bail if parent window has been destroyed.
+            let Some(parent) = parent_weak.upgrade() else {
+                return gtk4::glib::ControlFlow::Break;
+            };
+            if *dialog_open.borrow() {
+                return gtk4::glib::ControlFlow::Continue;
+            }
+            let Some(emoji) = crate::gm_qr_state::get_gaia_emoji() else {
+                return gtk4::glib::ControlFlow::Continue;
+            };
+            *dialog_open.borrow_mut() = true;
+            let dialog = adw::AlertDialog::new(
+                Some("Verify pairing emoji"),
+                Some(&format!(
+                    "Your phone should be showing this emoji:\n\n\
+                     <span size=\"xx-large\">{emoji}</span>\n\n\
+                     Tap \"Yes, this matches\" on the phone, then click Confirm here.\n\
+                     If they don't match, click Reject — your session may be intercepted."
+                )),
+            );
+            dialog.set_body_use_markup(true);
+            dialog.add_response("reject", "Reject");
+            dialog.add_response("confirm", "Confirm");
+            dialog.set_response_appearance("confirm", adw::ResponseAppearance::Suggested);
+            dialog.set_response_appearance("reject", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("confirm"));
+            dialog.set_close_response("reject");
+
+            let dialog_open_c = dialog_open.clone();
+            dialog.connect_response(None, move |dlg, response| {
+                let confirmed = response == "confirm";
+                crate::gm_qr_state::answer_gaia_confirmation(confirmed);
+                *dialog_open_c.borrow_mut() = false;
+                dlg.close();
+            });
+            dialog.present(Some(&parent));
+            gtk4::glib::ControlFlow::Continue
+        },
+    );
 }

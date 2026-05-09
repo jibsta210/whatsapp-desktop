@@ -103,7 +103,9 @@ async fn handle_data_event(client: &Client, raw: &IncomingRpcMessage) -> Result<
     let msg_data = RpcMessageData::decode(&*raw.message_data)?;
     let request_id = msg_data.session_id.clone();
 
-    // Decrypt the body if it is encrypted.
+    // Decrypt the body if it is encrypted; otherwise pass through the
+    // `unencrypted_data` field (used by Gaia pairing replies, which arrive
+    // before request_crypto is set).
     let mut decrypted: Vec<u8> = Vec::new();
     if !msg_data.encrypted_data.is_empty() {
         let auth = client.inner.auth.lock().await;
@@ -112,6 +114,8 @@ async fn handle_data_event(client: &Client, raw: &IncomingRpcMessage) -> Result<
             .as_ref()
             .ok_or_else(|| Error::Crypto("missing request_crypto".into()))?;
         decrypted = crypto.decrypt(&msg_data.encrypted_data)?;
+    } else if !msg_data.unencrypted_data.is_empty() {
+        decrypted = msg_data.unencrypted_data.clone();
     }
 
     // Try to route to a waiting RPC.

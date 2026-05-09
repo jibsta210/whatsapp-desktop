@@ -9,9 +9,10 @@ pub enum Event {
     /// Pairing produced a QR string ready for the phone to scan.
     QrCode { url: String },
 
-    /// UKEY2 emoji verification: user must confirm the same emojis appear on
-    /// the phone before the pairing completes.
-    PairingEmojis { emojis: Vec<String> },
+    /// UKEY2 emoji verification (Gaia pairing): the user must confirm the
+    /// same emoji appears on both desktop and phone before pairing
+    /// finalizes. Caller responds via [`Client::confirm_pairing_emoji`].
+    PairingEmoji { emoji: String },
 
     /// Pairing finished successfully.
     PairSuccess,

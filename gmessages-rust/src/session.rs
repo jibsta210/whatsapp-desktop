@@ -296,6 +296,113 @@ pub async fn send_rpc_with_id<Req: prost::Message + ReflectMessage>(
     }
 }
 
+/// Variant of [`send_rpc`] for Gaia pairing: payload is sent as
+/// `unencrypted_proto_data` (no `request_crypto` needed yet) and the caller
+/// chooses an arbitrary `MessageType` (`Gaia2` for ClientInit,
+/// `BugleMessage` for ClientFinished).
+///
+/// The returned bytes are the response's `unencrypted_data` field — the
+/// caller is responsible for decoding into the expected proto.
+pub async fn send_unencrypted_rpc(
+    client: &Client,
+    action: ActionType,
+    message_type: MessageType,
+    body: &[u8],
+    timeout_dur: Duration,
+) -> Result<Vec<u8>> {
+    let request_id = Uuid::new_v4().to_string();
+
+    let (session_id, tachyon_token, mobile, dest_reg_id, cookies) = {
+        let session = client.inner.session.lock().await;
+        let auth = client.inner.auth.lock().await;
+        (
+            session.session_id.clone(),
+            auth.tachyon_auth_token.clone().unwrap_or_default(),
+            auth.mobile.clone(),
+            auth.dest_reg_id.clone(),
+            auth.cookies.clone(),
+        )
+    };
+
+    let inner = OutgoingRpcData {
+        request_id: request_id.clone(),
+        action: action as i32,
+        unencrypted_proto_data: body.to_vec(),
+        encrypted_proto_data: Vec::new(),
+        session_id,
+    };
+    let mut inner_buf = Vec::with_capacity(inner.encoded_len());
+    inner.encode(&mut inner_buf)?;
+
+    let dest_regs = match dest_reg_id {
+        Some(id) => vec![id],
+        None => Vec::new(),
+    };
+    let payload = OutgoingRpcMessage {
+        mobile,
+        data: Some(outgoing_rpc_message::Data {
+            request_id: request_id.clone(),
+            bugle_route: BugleRoute::DataEvent as i32,
+            message_data: inner_buf,
+            message_type_data: Some(outgoing_rpc_message::data::Type {
+                empty_arr: Some(EmptyArr {}),
+                message_type: message_type as i32,
+            }),
+        }),
+        auth: Some(outgoing_rpc_message::Auth {
+            request_id: request_id.clone(),
+            tachyon_auth_token: tachyon_token,
+            config_version: Some(config_version()),
+        }),
+        // 5 minutes — matches Go reference's CustomTTL of 300s for pairing
+        // messages (microseconds).
+        ttl: 300 * 1_000_000,
+        dest_registration_i_ds: dest_regs,
+    };
+
+    // Register the response waiter before posting.
+    let (tx, rx) = oneshot::channel();
+    {
+        let mut session = client.inner.session.lock().await;
+        session.response_waiters.insert(request_id.clone(), tx);
+    }
+
+    // Cookie path uses clients6.google.com; the URL is identical otherwise.
+    let url = if !cookies.is_empty() {
+        urls::SEND_MESSAGE_GOOGLE
+    } else {
+        urls::SEND_MESSAGE
+    };
+
+    let post_result = client
+        .inner
+        .http
+        .post::<OutgoingRpcMessage, OutgoingRpcResponse>(
+            url,
+            &payload,
+            ContentType::PBLite,
+            &cookies,
+        )
+        .await;
+    if let Err(e) = post_result {
+        let mut session = client.inner.session.lock().await;
+        session.response_waiters.remove(&request_id);
+        return Err(e);
+    }
+
+    match timeout(timeout_dur, rx).await {
+        Ok(Ok(resp)) => Ok(resp.decrypted),
+        Ok(Err(_)) => Err(Error::Protocol(format!(
+            "Gaia response waiter canceled for {request_id}"
+        ))),
+        Err(_) => {
+            let mut session = client.inner.session.lock().await;
+            session.response_waiters.remove(&request_id);
+            Err(Error::RpcTimeout("send_unencrypted_rpc"))
+        }
+    }
+}
+
 /// Send `text` to `to`. If `to` looks like an E.164 phone number (starts with
 /// `+`), resolves it to a conversation ID first via `GetOrCreateConversation`.
 /// Otherwise treats `to` as a literal `conversation_id` and skips the lookup.
