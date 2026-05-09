@@ -694,6 +694,16 @@ impl ChatListPanel {
 
     /// Extract phone number from JID (strips :device and @domain).
     fn phone_from_jid(jid: &str) -> String {
+        // Google Messages chat ids are `gm:<conversation_id>` — the
+        // colon separates the source-tag from the gmessages internal
+        // ID, NOT a device suffix on a phone number. If we naively
+        // split on `:` like we do for WhatsApp JIDs, every gm chat
+        // reduces to "gm" and they all dedup against each other,
+        // collapsing the entire gmessages portion of the chat list
+        // down to the last one inserted. Keep the full id in that case.
+        if jid.starts_with("gm:") {
+            return jid.to_string();
+        }
         let local = jid.split('@').next().unwrap_or(jid);
         local.split(':').next().unwrap_or(local).to_string()
     }
