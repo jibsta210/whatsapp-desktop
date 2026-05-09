@@ -60,6 +60,12 @@ pub struct AuthData {
     /// Persistent session UUID negotiated during a previous Connect.
     #[serde(default)]
     pub session_id: Option<String>,
+
+    /// Email of the Google account this client was paired against. Set
+    /// only on the Gaia (Firefox-cookie) path; absent for QR pairs.
+    /// Used by the desktop UI to display "Paired with foo@gmail.com".
+    #[serde(default)]
+    pub gaia_account_email: Option<String>,
 }
 
 impl AuthData {

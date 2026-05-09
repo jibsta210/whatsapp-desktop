@@ -927,6 +927,16 @@ pub mod gaia {
         unsafe {
             std::env::set_var("GMESSAGES_AUTHUSER", chosen_authuser.to_string());
         }
+        // Stash the chosen account's email on AuthData so the desktop
+        // UI can show "Paired with foo@gmail.com" later.
+        let chosen_email = accounts
+            .iter()
+            .find(|a| a.authuser == chosen_authuser)
+            .map(|a| a.email.clone());
+        {
+            let mut auth = client.inner.auth.lock().await;
+            auth.gaia_account_email = chosen_email.clone();
+        }
 
         // Generate fresh state so a previous pair attempt doesn't leak.
         let pairing_attempt_id = Uuid::new_v4().to_string();

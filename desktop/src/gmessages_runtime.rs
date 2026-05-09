@@ -1350,7 +1350,15 @@ async fn run_gaia_pair_flow(
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 };
-                crate::gm_qr_state::set_gaia_emoji(None);
+                // KEEP the emoji visible — the phone displays it AFTER we
+                // send CLIENT_FINISH, so the user needs to keep referring
+                // to the desktop emoji while they confirm on their phone.
+                // We clear it on PairSuccess / PairFailed below.
+                if matches!(confirmed, Some(true)) {
+                    crate::gm_qr_state::set_gaia_status(
+                        crate::gm_qr_state::GaiaStatus::AwaitingPhone,
+                    );
+                }
                 match confirmed {
                     Some(b) => {
                         log::info!("gmessages: gaia pair: user said matches={b}");
@@ -1367,12 +1375,30 @@ async fn run_gaia_pair_flow(
                     "gmessages: gaia paired; auth saved to {}",
                     auth_path.display()
                 );
+                // Set Success here too, since the escape-hatch path
+                // through run_pair_flow skips the outer-loop branch
+                // that would otherwise set it. Without this, the dialog
+                // sits at the previous status forever and looks "stuck".
+                crate::gm_qr_state::set_gaia_status(
+                    crate::gm_qr_state::GaiaStatus::Success,
+                );
+                crate::gm_qr_state::set_gaia_emoji(None);
                 break;
             }
             Event::PairFailed { reason } => {
+                crate::gm_qr_state::set_gaia_emoji(None);
+                crate::gm_qr_state::set_gaia_status(
+                    crate::gm_qr_state::GaiaStatus::Failed(reason.clone()),
+                );
                 anyhow::bail!("gaia pair failed: {reason}");
             }
             Event::AuthRevoked => {
+                crate::gm_qr_state::set_gaia_emoji(None);
+                crate::gm_qr_state::set_gaia_status(
+                    crate::gm_qr_state::GaiaStatus::Failed(
+                        "auth revoked mid-flow".into(),
+                    ),
+                );
                 anyhow::bail!("gaia pair: auth revoked mid-flow");
             }
             other => log::debug!(

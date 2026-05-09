@@ -584,11 +584,25 @@ fn build_gmessages_page() -> adw::PreferencesPage {
     // the user isn't logged into messages.google.com in Firefox.
     let gaia_row = adw::ActionRow::new();
     gaia_row.set_title("Persistent login (Firefox cookies)");
-    gaia_row.set_subtitle(
-        "Pairs without scanning a QR. Requires being signed into \
-         messages.google.com in Firefox. Stays logged in for months.",
-    );
-    let gaia_btn = gtk4::Button::with_label("Pair via Firefox");
+    // Pull the paired account's email out of the auth file (Gaia path
+    // stamps it on AuthData.gaia_account_email) so the row says "Paired
+    // with foo@gmail.com" instead of a generic "Paired".
+    let gaia_email = read_gaia_account_email();
+    let gaia_subtitle: String = match &gaia_email {
+        Some(email) => format!(
+            "Paired with {email}. Stays signed in as long as your Firefox \
+             session does — no QR scans needed."
+        ),
+        None => "Pairs without scanning a QR. Requires being signed into \
+             messages.google.com in Firefox. Stays logged in for months."
+            .to_string(),
+    };
+    gaia_row.set_subtitle(&gaia_subtitle);
+    let gaia_btn = gtk4::Button::with_label(if gaia_email.is_some() {
+        "Re-pair…"
+    } else {
+        "Pair via Firefox"
+    });
     gaia_btn.set_valign(gtk4::Align::Center);
     gaia_btn.connect_clicked(move |btn| {
         let auth = std::path::PathBuf::from("gmessages-auth.json");
@@ -898,6 +912,7 @@ pub fn start_gaia_status_dialog(parent: gtk4::Window) {
         Status,
         AccountPicker,
         EmojiConfirm,
+        AwaitingPhone,
         Closing,
     }
     let phase = Rc::new(RefCell::new(Phase::Status));
@@ -940,6 +955,10 @@ pub fn start_gaia_status_dialog(parent: gtk4::Window) {
                 && matches!(status, GaiaStatus::WaitingForEmoji)
             {
                 Phase::EmojiConfirm
+            } else if emoji.is_some()
+                && matches!(status, GaiaStatus::AwaitingPhone)
+            {
+                Phase::AwaitingPhone
             } else if accounts.is_some()
                 && matches!(status, GaiaStatus::PickingAccount)
             {
@@ -1009,6 +1028,17 @@ pub fn start_gaia_status_dialog(parent: gtk4::Window) {
                         row.append(&confirm);
                         actions_box_w.append(&row);
                     }
+                    Phase::AwaitingPhone => {
+                        let e = emoji.clone().unwrap_or_default();
+                        heading_w.set_label("Almost done — confirm on phone");
+                        body_w.set_markup(&format!(
+                            "<span size=\"xx-large\">{e}</span>\n\n\
+                             Your phone is now showing this emoji. \
+                             Tap <b>\"Yes, this matches\"</b> on the phone to finish pairing. \
+                             This window will close automatically once your phone confirms.",
+                        ));
+                        // No action buttons here — the next move is on the phone.
+                    }
                     Phase::Status => {
                         heading_w.set_label("Pair via Firefox");
                         body_w.set_label(&status.human());
@@ -1058,6 +1088,16 @@ pub fn start_gaia_status_dialog(parent: gtk4::Window) {
     // Ensure cancelled flag wired up (suppresses warnings about unused
     // capture if never inspected — kept for future use).
     let _ = cancelled;
+}
+
+/// Read the Gaia account's email from the persisted auth file, if any.
+/// Returns `None` if the file is missing, isn't valid JSON, or has no
+/// `gaia_account_email` (e.g. a QR-paired session).
+fn read_gaia_account_email() -> Option<String> {
+    let path = std::path::PathBuf::from("gmessages-auth.json");
+    let bytes = std::fs::read(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("gaia_account_email")?.as_str().map(|s| s.to_string())
 }
 
 /// Remove all children of a gtk4::Box.

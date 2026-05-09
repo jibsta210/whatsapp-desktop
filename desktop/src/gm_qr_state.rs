@@ -42,6 +42,7 @@ pub enum GaiaStatus {
     Finalizing,
     Success,
     PickingAccount,
+    AwaitingPhone,
     Failed(String),
 }
 
@@ -57,6 +58,7 @@ impl GaiaStatus {
             Self::Finalizing => "Finalizing…".to_string(),
             Self::Success => "Paired ✓".to_string(),
             Self::PickingAccount => "Pick a Google account…".to_string(),
+            Self::AwaitingPhone => "Now confirm on your phone…".to_string(),
             Self::Failed(why) => format!("Failed: {why}"),
         }
     }
