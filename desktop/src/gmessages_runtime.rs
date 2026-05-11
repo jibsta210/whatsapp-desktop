@@ -365,7 +365,12 @@ async fn run(
             }
             if !recovered {
                 log::warn!("gmessages: auth revoked — wiping stale auth file and re-pairing");
-                let _ = std::fs::remove_file(&auth_path);
+                // Intentionally NOT wiping the auth file — notify_auth_changed
+            // overwrites it with fresh contents on a successful re-pair,
+            // and if the new pair fails we'd rather keep the old (possibly
+            // recoverable) auth than be left with nothing. User asked for
+            // this explicitly: "why are you letting the auth file be
+            // deleted".
                 // Reset in-memory auth so is_paired() returns false.
                 run_pair_flow(&client, &auth_path, &mut events, &event_tx).await?;
                 client.connect().await.context("gmessages: connect after re-pair")?;
@@ -680,7 +685,12 @@ async fn run(
         if crate::gm_qr_state::take_repair_request() {
             log::warn!("gmessages: re-pair requested from settings UI");
             let _ = client.disconnect().await;
-            let _ = std::fs::remove_file(&auth_path);
+            // Intentionally NOT wiping the auth file — notify_auth_changed
+            // overwrites it with fresh contents on a successful re-pair,
+            // and if the new pair fails we'd rather keep the old (possibly
+            // recoverable) auth than be left with nothing. User asked for
+            // this explicitly: "why are you letting the auth file be
+            // deleted".
             if let Err(e) = run_pair_flow(&client, &auth_path, &mut events, &event_tx).await {
                 log::warn!("gmessages: re-pair failed: {e}");
             } else if let Err(e) = client.connect().await {
@@ -692,7 +702,12 @@ async fn run(
             log::warn!("gmessages: Gaia (Firefox cookies) pairing requested from settings UI");
             crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::Starting);
             let _ = client.disconnect().await;
-            let _ = std::fs::remove_file(&auth_path);
+            // Intentionally NOT wiping the auth file — notify_auth_changed
+            // overwrites it with fresh contents on a successful re-pair,
+            // and if the new pair fails we'd rather keep the old (possibly
+            // recoverable) auth than be left with nothing. User asked for
+            // this explicitly: "why are you letting the auth file be
+            // deleted".
             match run_gaia_pair_flow(&client, &auth_path, &mut events, &event_tx).await {
                 Ok(()) => {
                     crate::gm_qr_state::set_gaia_status(
@@ -759,7 +774,12 @@ async fn run(
                         log::warn!(
                             "gmessages: AuthRevoked recovery failed — wiping auth and re-pairing"
                         );
-                        let _ = std::fs::remove_file(&auth_path);
+                        // Intentionally NOT wiping the auth file — notify_auth_changed
+            // overwrites it with fresh contents on a successful re-pair,
+            // and if the new pair fails we'd rather keep the old (possibly
+            // recoverable) auth than be left with nothing. User asked for
+            // this explicitly: "why are you letting the auth file be
+            // deleted".
                         run_pair_flow(&client, &auth_path, &mut events, &event_tx).await?;
                         client.connect().await.context("gmessages: reconnect after re-pair")?;
                     }
@@ -979,7 +999,12 @@ async fn run(
                 if matches!(cmd, WaCommand::GmessagesRepair) {
                     log::warn!("gmessages: re-pair requested via WaCommand");
                     let _ = client.disconnect().await;
-                    let _ = std::fs::remove_file(&auth_path);
+                    // Intentionally NOT wiping the auth file — notify_auth_changed
+            // overwrites it with fresh contents on a successful re-pair,
+            // and if the new pair fails we'd rather keep the old (possibly
+            // recoverable) auth than be left with nothing. User asked for
+            // this explicitly: "why are you letting the auth file be
+            // deleted".
                     if let Err(e) = run_pair_flow(&client, &auth_path, &mut events, &event_tx).await {
                         log::warn!("gmessages: re-pair failed: {e}");
                     } else if let Err(e) = client.connect().await {
