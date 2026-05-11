@@ -205,35 +205,18 @@ async fn run(
 ) -> Result<()> {
     let auth_path = resolve_auth_path(&data_dir);
     log::info!("gmessages: looking for auth file at {}", auth_path.display());
-    let mut auth = load_auth(&auth_path).await?;
+    let auth = load_auth(&auth_path).await?;
     if !auth.is_paired() {
         log::warn!("gmessages: auth file empty or missing — will run pairing flow now");
     } else {
         log::info!("gmessages: loaded auth (paired)");
-        // Refresh Firefox cookies. The cookies stored in auth.cookies are
-        // a snapshot from pair time. Firefox rotates session cookies
-        // (especially `__Secure-1PSIDTS`) every ~24h, so on a restart
-        // those snapshots are likely stale and the relay rejects with
-        // 401 → AuthRevoked → wiped auth. Re-reading from FF on every
-        // launch keeps us authenticated as long as the user's Firefox
-        // session is alive.
+        // Prime the live-cookie cache so the first connect's HTTP call
+        // already has fresh cookies. Every subsequent request inside
+        // apply_cookie_auth re-reads from this cache (30s TTL) — the
+        // cookies stored on AuthData are no longer the source of truth.
         if auth.gaia_authuser.is_some() {
-            match gmessages_rust::cookies::read_default_firefox_cookies() {
-                Ok(fresh) => {
-                    log::info!(
-                        "gmessages: refreshed {} Firefox cookies on startup (was {})",
-                        fresh.len(),
-                        auth.cookies.len()
-                    );
-                    auth.cookies = fresh;
-                }
-                Err(e) => {
-                    log::warn!(
-                        "gmessages: couldn't refresh FF cookies on startup ({e}); \
-                         falling back to stored snapshot — may need to re-pair if stale"
-                    );
-                }
-            }
+            let n = gmessages_rust::cookies::get_cached_firefox_cookies().len();
+            log::info!("gmessages: primed live-cookie cache ({n} entries)");
         }
     }
 
@@ -381,49 +364,9 @@ async fn run(
     }
     log::info!("gmessages: connect() returned; long-poll task running in background");
 
-    // ── Background cookie-refresh task ──
-    // Firefox rotates session cookies (notably `__Secure-1PSIDTS`) on a
-    // ~daily cycle. If we sit on stale cookies, the next clients6.google.com
-    // request (token refresh, long-poll, send) returns 401 → AuthRevoked.
-    // Refreshing from FF every hour keeps our snapshot fresh well before
-    // FF rotates. Only runs for Gaia sessions; QR-paired clients don't
-    // use cookies.
-    {
-        let client = client.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
-            interval.tick().await; // first tick fires immediately; skip
-            loop {
-                interval.tick().await;
-                let is_gaia = client
-                    .auth_snapshot()
-                    .await
-                    .gaia_authuser
-                    .is_some();
-                if !is_gaia {
-                    continue;
-                }
-                match gmessages_rust::cookies::read_default_firefox_cookies() {
-                    Ok(fresh) => {
-                        log::info!(
-                            "gmessages: hourly Firefox-cookie refresh ({} cookies)",
-                            fresh.len()
-                        );
-                        client.set_cookies(fresh).await;
-                        // Persist the refreshed cookies to disk so a restart
-                        // before the next rotation still has good cookies.
-                        client.notify_auth_changed().await;
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "gmessages: hourly Firefox-cookie refresh failed: {e} \
-                             (continuing with stored cookies)"
-                        );
-                    }
-                }
-            }
-        });
-    }
+    // No more hourly background cookie-refresh task — apply_cookie_auth
+    // does a live FF read (cached with a 30s TTL) on every request that
+    // needs Google cookies, so the snapshot stays fresh automatically.
 
     // Pull contacts + conversation list so the desktop chat list has rows
     // with proper names. Order: contacts first (so we can resolve names

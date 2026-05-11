@@ -99,8 +99,12 @@ fn find_profile_in_root(root: &Path) -> Option<PathBuf> {
 /// Read Google session cookies from a Firefox profile. Returns an empty map
 /// if the user isn't signed into Google (no relevant cookies present).
 ///
-/// Firefox holds an exclusive lock on the cookie DB while running, so we
-/// copy it to a tempfile first. The cost is one ~1 MB file copy per call.
+/// Firefox holds an exclusive lock on the cookie DB while running. We copy
+/// all three SQLite files — `cookies.sqlite`, `cookies.sqlite-wal`, and
+/// `cookies.sqlite-shm` (if present) — into a tempdir so SQLite can
+/// reconstruct the WAL-up-to-date view. Without the WAL copy, freshly
+/// rotated cookies that Firefox hasn't checkpointed yet are invisible to
+/// us, and we end up using stale cookies for hours after each rotation.
 pub fn read_firefox_google_cookies(profile_dir: &Path) -> Result<HashMap<String, String>> {
     let src = profile_dir.join("cookies.sqlite");
     if !src.exists() {
@@ -110,16 +114,22 @@ pub fn read_firefox_google_cookies(profile_dir: &Path) -> Result<HashMap<String,
         )));
     }
 
-    let tmp = tempfile::Builder::new()
+    let tmp_dir = tempfile::Builder::new()
         .prefix("ffcookies-")
-        .suffix(".sqlite")
-        .tempfile()
-        .map_err(|e| Error::Pairing(format!("create tempfile: {e}")))?;
-    std::fs::copy(&src, tmp.path())
+        .tempdir()
+        .map_err(|e| Error::Pairing(format!("create tempdir: {e}")))?;
+    let tmp_main = tmp_dir.path().join("cookies.sqlite");
+    std::fs::copy(&src, &tmp_main)
         .map_err(|e| Error::Pairing(format!("copy cookies.sqlite: {e}")))?;
-
+    // Best-effort WAL copies — missing files just mean FF has checkpointed.
+    for sidecar in ["cookies.sqlite-wal", "cookies.sqlite-shm"] {
+        let sc_src = profile_dir.join(sidecar);
+        if sc_src.exists() {
+            let _ = std::fs::copy(&sc_src, tmp_dir.path().join(sidecar));
+        }
+    }
     let conn = Connection::open_with_flags(
-        tmp.path(),
+        &tmp_main,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| Error::Pairing(format!("open cookies DB: {e}")))?;
@@ -170,6 +180,67 @@ pub fn read_firefox_google_cookies(profile_dir: &Path) -> Result<HashMap<String,
     }
 
     Ok(out)
+}
+
+/// In-memory cache of the last live cookie read. Refreshed lazily by
+/// [`get_cached_firefox_cookies`] with a short TTL so per-request reads
+/// don't pummel SQLite during bursty traffic. The cache holds the
+/// last-successful read forever as a fallback for when Firefox is shut
+/// down — we'd rather use slightly-stale-but-recent cookies than nothing.
+struct CookieCache {
+    last_read: Option<std::time::Instant>,
+    cookies: HashMap<String, String>,
+}
+
+static COOKIE_CACHE: std::sync::OnceLock<std::sync::Mutex<CookieCache>> =
+    std::sync::OnceLock::new();
+
+/// Read Firefox cookies, using an in-memory cache with a 30s TTL. Always
+/// returns the freshest copy we can get; if the live read fails (FF shut
+/// down, lock contention, etc.) we fall back to whatever was last cached.
+/// Returns an empty map only if nothing has EVER succeeded.
+///
+/// This is the public hot path. Every HTTP request that needs Google
+/// cookies should go through here — no need to plumb cookie snapshots
+/// through `AuthData` anymore.
+pub fn get_cached_firefox_cookies() -> HashMap<String, String> {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    let cache = COOKIE_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(CookieCache {
+            last_read: None,
+            cookies: HashMap::new(),
+        })
+    });
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    // Fast path: cache hit.
+    if let Some(t) = guard.last_read
+        && t.elapsed() < TTL
+        && !guard.cookies.is_empty()
+    {
+        return guard.cookies.clone();
+    }
+    // Slow path: read live, update cache.
+    match read_default_firefox_cookies() {
+        Ok(fresh) => {
+            log::debug!(
+                "cookies: refreshed cache live from FF ({} entries)",
+                fresh.len()
+            );
+            guard.cookies = fresh.clone();
+            guard.last_read = Some(std::time::Instant::now());
+            fresh
+        }
+        Err(e) => {
+            log::warn!(
+                "cookies: live FF read failed ({e}); using cached {} entries",
+                guard.cookies.len()
+            );
+            guard.cookies.clone()
+        }
+    }
 }
 
 /// Convenience: find the default Firefox profile and read its Google cookies.

@@ -83,10 +83,22 @@ pub fn apply_cookie_auth(
     cookies: &std::collections::HashMap<String, String>,
     authuser: Option<u32>,
 ) {
-    if cookies.is_empty() {
+    // For Gaia (cookie-bearing) requests we ALWAYS prefer the live
+    // Firefox cookie jar over the in-memory snapshot — Firefox rotates
+    // `__Secure-1PSIDTS` and friends on its own schedule and the
+    // snapshot in `AuthData.cookies` goes stale. The cached live read
+    // has a 30s TTL so hot loops don't slam SQLite. If Firefox isn't
+    // running we fall back to the caller-supplied snapshot.
+    let live = crate::cookies::get_cached_firefox_cookies();
+    let chosen_cookies = if !live.is_empty() {
+        &live
+    } else {
+        cookies
+    };
+    if chosen_cookies.is_empty() {
         return;
     }
-    let cookie_header = cookies
+    let cookie_header = chosen_cookies
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
@@ -95,7 +107,7 @@ pub fn apply_cookie_auth(
         headers.insert(reqwest::header::HeaderName::from_static("cookie"), v);
     }
     if url.contains("clients6.google.com")
-        && let Some(auth) = sapisid_authorization(cookies, ORIGIN)
+        && let Some(auth) = sapisid_authorization(chosen_cookies, ORIGIN)
         && let Ok(v) = HeaderValue::from_str(&auth)
     {
         headers.insert(

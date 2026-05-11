@@ -95,44 +95,12 @@ pub async fn refresh_auth_token(client: &Client) -> Result<()> {
         message_type: 2, // matches Go's hardcoded value
     };
 
-    let resp: crate::gmproto::authentication::RegisterRefreshResponse = match client
+    // `apply_cookie_auth` (called inside post_protobuf for clients6 URLs)
+    // already does a live Firefox-cookie read with a 30s cache, so this
+    // POST always ships the freshest cookies. No per-call retry needed.
+    let resp: crate::gmproto::authentication::RegisterRefreshResponse = client
         .post_protobuf(crate::urls::REGISTER_REFRESH, &payload, crate::http::ContentType::PBLite)
-        .await
-    {
-        Ok(r) => r,
-        Err(Error::AuthRevoked) if client.inner.auth.lock().await.gaia_authuser.is_some() => {
-            // Stale Firefox cookies kill the refresh request before the
-            // token even gets to expire. Re-read cookies from FF and try
-            // ONCE more before giving up. This is the proactive step that
-            // keeps a 24h+ idle session alive without forcing a re-pair.
-            log::warn!(
-                "refresh_auth_token: 401 with stored cookies — re-reading FF cookies and retrying"
-            );
-            match crate::cookies::read_default_firefox_cookies() {
-                Ok(fresh) => {
-                    {
-                        let mut auth = client.inner.auth.lock().await;
-                        auth.cookies = fresh;
-                    }
-                    client.notify_auth_changed().await;
-                    client
-                        .post_protobuf(
-                            crate::urls::REGISTER_REFRESH,
-                            &payload,
-                            crate::http::ContentType::PBLite,
-                        )
-                        .await?
-                }
-                Err(e) => {
-                    log::warn!(
-                        "refresh_auth_token: FF cookie re-read failed: {e}; propagating AuthRevoked"
-                    );
-                    return Err(Error::AuthRevoked);
-                }
-            }
-        }
-        Err(e) => return Err(e),
-    };
+        .await?;
     let token_data = resp
         .token_data
         .ok_or_else(|| Error::Protocol("RegisterRefresh: missing token_data".into()))?;
