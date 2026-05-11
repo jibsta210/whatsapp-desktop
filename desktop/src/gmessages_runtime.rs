@@ -217,6 +217,26 @@ async fn run(
         if auth.gaia_authuser.is_some() {
             let n = gmessages_rust::cookies::get_cached_firefox_cookies().len();
             log::info!("gmessages: primed live-cookie cache ({n} entries)");
+
+            // Preventive: if Firefox hasn't refreshed Google session
+            // cookies in ~22h, force it to by opening
+            // messages.google.com. Avoids the 24h server-side TTL
+            // cliff that would otherwise force a re-pair after
+            // overnight idle. User asked for this explicitly: "we
+            // should test if we ever start the app and see cookies at
+            // 24 hours (call it 22 hours for safety) we should force
+            // firefox to spin up and resync".
+            if let Some(age) = gmessages_rust::cookies::rotating_cookie_max_age() {
+                let hours = age.as_secs() as f64 / 3600.0;
+                log::info!("gmessages: freshest rotating cookie is {hours:.1}h old");
+                if age > std::time::Duration::from_secs(22 * 3600) {
+                    log::warn!(
+                        "gmessages: cookies are {hours:.1}h old — launching Firefox to refresh"
+                    );
+                    spawn_firefox_to_refresh().await;
+                    wait_for_cookie_rotation(age).await;
+                }
+            }
         }
     }
 
@@ -2061,5 +2081,78 @@ pub fn conversation_to_summary(
         label: None,
         pinned_msg_id: None,
         auto_mark_read: false,
+    }
+}
+
+/// Tell Firefox to load https://messages.google.com/web/ — this triggers
+/// Google's session-refresh dance and rotates the daily session cookies
+/// (`__Secure-1PSIDTS`, `SIDCC`, etc.). If Firefox is already running it
+/// just opens a tab in the existing instance; otherwise it spawns FF.
+///
+/// Uses `firefox --new-tab` directly to avoid xdg-open's preference
+/// indirection (the user explicitly wants FF, not whatever the system
+/// default browser is). Detached so our process doesn't wait on FF.
+async fn spawn_firefox_to_refresh() {
+    use std::process::Command;
+    let url = "https://messages.google.com/web/";
+    // Try the direct binary first.
+    let result = Command::new("firefox")
+        .arg("--new-tab")
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    match result {
+        Ok(child) => {
+            // Don't wait — fire and forget. Drop the handle so the
+            // process is reparented to init when it outlives us.
+            std::mem::drop(child);
+            log::info!("gmessages: spawned `firefox --new-tab {url}`");
+        }
+        Err(e) => {
+            log::warn!(
+                "gmessages: couldn't spawn firefox directly ({e}); trying xdg-open"
+            );
+            let _ = Command::new("xdg-open")
+                .arg(url)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    }
+}
+
+/// Poll the Firefox cookie DB until one of our rotating cookies has a
+/// fresher creation timestamp than `baseline_age`, or until we've waited
+/// long enough that we should give up. We invalidate the in-memory
+/// cookie cache between polls so each check sees the live SQLite state.
+async fn wait_for_cookie_rotation(baseline_age: std::time::Duration) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        gmessages_rust::cookies::invalidate_cookie_cache();
+        if let Some(age) = gmessages_rust::cookies::rotating_cookie_max_age() {
+            if age < baseline_age {
+                log::info!(
+                    "gmessages: cookies rotated (now {}s old, was {}s) after {} poll(s)",
+                    age.as_secs(),
+                    baseline_age.as_secs(),
+                    attempt
+                );
+                return;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            log::warn!(
+                "gmessages: gave up waiting for cookie rotation after {} polls; \
+                 proceeding with possibly-stale cookies",
+                attempt
+            );
+            return;
+        }
     }
 }

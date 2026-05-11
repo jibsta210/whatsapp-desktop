@@ -182,6 +182,84 @@ pub fn read_firefox_google_cookies(profile_dir: &Path) -> Result<HashMap<String,
     Ok(out)
 }
 
+/// Cookies Google rotates daily as part of session refresh. If the
+/// freshest of these is more than ~22h old, the desktop is risking the
+/// server-side TTL cliff — we want to nudge Firefox to refresh them
+/// before that.
+const ROTATING_COOKIES: &[&str] = &[
+    "__Secure-1PSIDTS",
+    "__Secure-3PSIDTS",
+    "__Secure-1PSIDCC",
+    "__Secure-3PSIDCC",
+    "SIDCC",
+];
+
+/// Find the age of the freshest "rotating" Google session cookie. A
+/// small age means Firefox refreshed cookies recently (we're healthy);
+/// a large age means Firefox hasn't touched the session in a while and
+/// the cookies may be approaching server-side expiry. Returns `None` if
+/// no rotating cookies are present (user not signed in, or Firefox not
+/// installed).
+pub fn rotating_cookie_max_age() -> Option<std::time::Duration> {
+    let profile = find_default_firefox_profile()?;
+    let src = profile.join("cookies.sqlite");
+    if !src.exists() {
+        return None;
+    }
+    let tmp_dir = tempfile::Builder::new().prefix("ffage-").tempdir().ok()?;
+    let tmp_main = tmp_dir.path().join("cookies.sqlite");
+    std::fs::copy(&src, &tmp_main).ok()?;
+    for sidecar in ["cookies.sqlite-wal", "cookies.sqlite-shm"] {
+        let sc_src = profile.join(sidecar);
+        if sc_src.exists() {
+            let _ = std::fs::copy(&sc_src, tmp_dir.path().join(sidecar));
+        }
+    }
+    let conn = Connection::open_with_flags(
+        &tmp_main,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let placeholders = (0..ROTATING_COOKIES.len())
+        .map(|i| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // creationTime in moz_cookies is microseconds since UNIX epoch.
+    let sql = format!(
+        "SELECT MAX(creationTime) FROM moz_cookies \
+         WHERE host LIKE '%.google.com' AND name IN ({placeholders})"
+    );
+    let params: Vec<&dyn rusqlite::ToSql> = ROTATING_COOKIES
+        .iter()
+        .map(|s| s as &dyn rusqlite::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql).ok()?;
+    let max_creation_us: i64 = stmt
+        .query_row(&*params, |row| row.get::<_, Option<i64>>(0))
+        .ok()??;
+    if max_creation_us <= 0 {
+        return None;
+    }
+    let creation_secs = (max_creation_us / 1_000_000) as u64;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(std::time::Duration::from_secs(now_secs.saturating_sub(creation_secs)))
+}
+
+/// Forcefully invalidate the in-memory cookie cache so the next
+/// `get_cached_firefox_cookies` call hits SQLite. Used after we trigger
+/// Firefox to refresh — we want the very next request to pick up any
+/// new rotations FF just performed.
+pub fn invalidate_cookie_cache() {
+    if let Some(c) = COOKIE_CACHE.get() {
+        if let Ok(mut g) = c.lock() {
+            g.last_read = None;
+        }
+    }
+}
+
 /// In-memory cache of the last live cookie read. Refreshed lazily by
 /// [`get_cached_firefox_cookies`] with a short TTL so per-request reads
 /// don't pummel SQLite during bursty traffic. The cache holds the
