@@ -381,6 +381,50 @@ async fn run(
     }
     log::info!("gmessages: connect() returned; long-poll task running in background");
 
+    // ── Background cookie-refresh task ──
+    // Firefox rotates session cookies (notably `__Secure-1PSIDTS`) on a
+    // ~daily cycle. If we sit on stale cookies, the next clients6.google.com
+    // request (token refresh, long-poll, send) returns 401 → AuthRevoked.
+    // Refreshing from FF every hour keeps our snapshot fresh well before
+    // FF rotates. Only runs for Gaia sessions; QR-paired clients don't
+    // use cookies.
+    {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+            interval.tick().await; // first tick fires immediately; skip
+            loop {
+                interval.tick().await;
+                let is_gaia = client
+                    .auth_snapshot()
+                    .await
+                    .gaia_authuser
+                    .is_some();
+                if !is_gaia {
+                    continue;
+                }
+                match gmessages_rust::cookies::read_default_firefox_cookies() {
+                    Ok(fresh) => {
+                        log::info!(
+                            "gmessages: hourly Firefox-cookie refresh ({} cookies)",
+                            fresh.len()
+                        );
+                        client.set_cookies(fresh).await;
+                        // Persist the refreshed cookies to disk so a restart
+                        // before the next rotation still has good cookies.
+                        client.notify_auth_changed().await;
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "gmessages: hourly Firefox-cookie refresh failed: {e} \
+                             (continuing with stored cookies)"
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     // Pull contacts + conversation list so the desktop chat list has rows
     // with proper names. Order: contacts first (so we can resolve names
     // when building summaries), then conversations.

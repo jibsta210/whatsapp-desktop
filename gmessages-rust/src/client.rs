@@ -206,7 +206,11 @@ impl Client {
 
     /// Invoke the auth-changed callback, if registered. Called internally
     /// after pairing and after each successful token refresh.
-    pub(crate) async fn notify_auth_changed(&self) {
+    /// Fire the auth-changed callback registered by
+    /// [`Self::set_auth_changed_callback`]. Used internally after pairing
+    /// and token refresh; also exposed so the desktop runtime can persist
+    /// after out-of-band updates like a background cookie refresh.
+    pub async fn notify_auth_changed(&self) {
         let cb_opt = self.inner.on_auth_changed.lock().await.clone();
         if let Some(cb) = cb_opt {
             let snapshot = self.inner.auth.lock().await.clone();
