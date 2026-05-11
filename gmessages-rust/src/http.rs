@@ -131,6 +131,30 @@ impl RelayHttp {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.split(';').next().unwrap_or("").trim().to_string())
             .unwrap_or_default();
+
+        // Self-rotation: capture any Set-Cookie headers Google sent back
+        // and merge into the live cookie cache. This is how the desktop
+        // session stays fresh without needing to spin Firefox back up —
+        // Google routinely refreshes session cookies opportunistically
+        // (`__Secure-1PSIDTS` etc.) on responses, and we just need to
+        // honor them.
+        if url.contains("clients6.google.com")
+            || url.contains("instantmessaging-pa")
+            || url.contains("messages.google.com")
+        {
+            let set_cookies: Vec<&str> = resp
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            if !set_cookies.is_empty() {
+                let parsed =
+                    crate::cookies::parse_set_cookie_headers(set_cookies.iter().copied());
+                crate::cookies::merge_into_cache(parsed);
+            }
+        }
+
         let body = resp.bytes().await?;
 
         if !status.is_success() {

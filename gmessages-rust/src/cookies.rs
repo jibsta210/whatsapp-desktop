@@ -260,6 +260,68 @@ pub fn invalidate_cookie_cache() {
     }
 }
 
+/// Merge a batch of cookie updates (typically parsed from `Set-Cookie`
+/// response headers) directly into the in-memory cache. Marks the cache
+/// as fresh, so the next request uses these new values without hitting
+/// SQLite again.
+///
+/// This is how we "rotate cookies ourselves" while running: any Google
+/// response that includes `Set-Cookie: __Secure-1PSIDTS=NEW; ...`
+/// (which Google sends opportunistically to refresh the session) gets
+/// captured here and the next request ships the new value. No need to
+/// spin up Firefox just to nudge a rotation.
+pub fn merge_into_cache(updates: HashMap<String, String>) {
+    if updates.is_empty() {
+        return;
+    }
+    let cache = COOKIE_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(CookieCache {
+            last_read: None,
+            cookies: HashMap::new(),
+        })
+    });
+    if let Ok(mut g) = cache.lock() {
+        let mut changed = 0;
+        for (k, v) in updates {
+            // Only honor names we already know about — avoids polluting
+            // the cache with tracking cookies / consent cookies / etc.
+            // we don't care about. If a brand-new rotating cookie shows
+            // up that we DON'T know about yet, add it here.
+            if GAIA_COOKIE_NAMES.contains(&k.as_str()) {
+                if g.cookies.get(&k) != Some(&v) {
+                    changed += 1;
+                }
+                g.cookies.insert(k, v);
+            }
+        }
+        if changed > 0 {
+            g.last_read = Some(std::time::Instant::now());
+            log::debug!(
+                "cookies: merged {changed} rotated cookie(s) from response (cache now {} entries)",
+                g.cookies.len()
+            );
+        }
+    }
+}
+
+/// Parse a list of `Set-Cookie` header values (`"name=value; Domain=...; Path=..."`)
+/// into a name → value map. Best-effort: malformed entries are skipped.
+pub fn parse_set_cookie_headers<'a>(values: impl IntoIterator<Item = &'a str>) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for raw in values {
+        // The cookie name/value pair is everything up to the first `;`.
+        let pair = raw.split(';').next().unwrap_or(raw).trim();
+        if let Some((name, value)) = pair.split_once('=') {
+            let name = name.trim();
+            let value = value.trim();
+            if !name.is_empty() && !value.is_empty() {
+                out.insert(name.to_string(), value.to_string());
+            }
+        }
+    }
+    out
+}
+
 /// In-memory cache of the last live cookie read. Refreshed lazily by
 /// [`get_cached_firefox_cookies`] with a short TTL so per-request reads
 /// don't pummel SQLite during bursty traffic. The cache holds the

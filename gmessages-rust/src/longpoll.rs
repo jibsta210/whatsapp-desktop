@@ -205,6 +205,22 @@ async fn run_long_poll(client: Client, connected: Arc<AtomicBool>) -> Result<()>
         };
 
         let status = resp.status();
+        // Capture any Set-Cookie rotation Google sent on the long-poll
+        // response — this keeps our cookie cache fresh while the
+        // long-poll is the only HTTP traffic on the socket.
+        {
+            let set_cookies: Vec<&str> = resp
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .collect();
+            if !set_cookies.is_empty() {
+                let parsed =
+                    crate::cookies::parse_set_cookie_headers(set_cookies.iter().copied());
+                crate::cookies::merge_into_cache(parsed);
+            }
+        }
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             client.emit(Event::AuthRevoked);
             return Err(Error::AuthRevoked);
