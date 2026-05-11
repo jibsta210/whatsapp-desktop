@@ -726,11 +726,43 @@ async fn run(
                 log::info!("gmessages → desktop: received {event_kind}");
 
                 if matches!(event, Event::AuthRevoked) {
-                    log::warn!("gmessages: AuthRevoked received — wiping stale auth and re-pairing");
-                    let _ = std::fs::remove_file(&auth_path);
+                    log::warn!("gmessages: AuthRevoked received — attempting recovery");
                     let _ = client.disconnect().await;
-                    run_pair_flow(&client, &auth_path, &mut events, &event_tx).await?;
-                    client.connect().await.context("gmessages: reconnect after re-pair")?;
+                    // First-line defense for Gaia sessions: Firefox may
+                    // have rotated session cookies since the long-poll
+                    // started. Re-read them and reconnect before tearing
+                    // the pair down. Without this, every cookie rotation
+                    // wipes the user's session and forces a re-pair.
+                    let is_gaia = client
+                        .auth_snapshot()
+                        .await
+                        .gaia_authuser
+                        .is_some();
+                    let mut recovered = false;
+                    if is_gaia
+                        && let Ok(fresh) =
+                            gmessages_rust::cookies::read_default_firefox_cookies()
+                    {
+                        log::warn!(
+                            "gmessages: AuthRevoked recovery — re-read {} FF cookies; retrying connect",
+                            fresh.len()
+                        );
+                        client.set_cookies(fresh).await;
+                        if let Err(e) = client.connect().await {
+                            log::warn!("gmessages: retry-with-fresh-cookies still failed: {e}");
+                        } else {
+                            log::info!("gmessages: AuthRevoked recovery — reconnected with fresh cookies");
+                            recovered = true;
+                        }
+                    }
+                    if !recovered {
+                        log::warn!(
+                            "gmessages: AuthRevoked recovery failed — wiping auth and re-pairing"
+                        );
+                        let _ = std::fs::remove_file(&auth_path);
+                        run_pair_flow(&client, &auth_path, &mut events, &event_tx).await?;
+                        client.connect().await.context("gmessages: reconnect after re-pair")?;
+                    }
                     continue;
                 }
 
