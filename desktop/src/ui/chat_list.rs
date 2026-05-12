@@ -504,7 +504,14 @@ impl ChatListPanel {
                 // disk when the user reads on phone before reopening desktop.)
                 row.set_unread(chat.unread_count);
 
-                // Only update preview + timestamp if incoming is newer
+                // Update timestamp INDEPENDENTLY of preview. The two used
+                // to be coupled by an && — but the server sometimes hands
+                // us a chat with a fresh timestamp and an empty
+                // last_message (e.g. outgoing RCS where display_content
+                // isn't filled). If we skipped both updates in that case,
+                // the chat stayed at its old sort position even though a
+                // newer message had arrived. Now timestamp moves the row
+                // up; preview only updates when there's actually text.
                 let existing_ts = self
                     .inner
                     .timestamps
@@ -512,16 +519,23 @@ impl ChatListPanel {
                     .get(&chat.id)
                     .copied()
                     .unwrap_or(0);
-                if chat.timestamp >= existing_ts && !chat.last_message.is_empty() {
-                    row.update_preview(&chat.last_message, chat.timestamp);
-                    drop(rows);
+                let mut moved = false;
+                if chat.timestamp > existing_ts {
+                    if !chat.last_message.is_empty() {
+                        row.update_preview(&chat.last_message, chat.timestamp);
+                    } else {
+                        // Just bump the timestamp displayed on the row.
+                        row.update_preview_timestamp(chat.timestamp);
+                    }
+                    moved = true;
+                }
+                drop(rows);
+                if moved {
                     self.inner
                         .timestamps
                         .borrow_mut()
                         .insert(chat.id.clone(), chat.timestamp);
                     self.inner.list_box.invalidate_sort();
-                } else {
-                    drop(rows);
                 }
                 self.inner.list_box.invalidate_filter();
                 return;
@@ -1839,6 +1853,13 @@ impl ChatRow {
 
     fn update_preview(&self, text: &str, timestamp: i64) {
         self.preview_label.set_text(text);
+        self.time_label.set_text(&format_timestamp(timestamp));
+    }
+
+    /// Update only the displayed timestamp, leaving preview text alone.
+    /// Used when the server sends a fresh `last_message_timestamp` but
+    /// no usable `display_content` (e.g. some outgoing RCS).
+    fn update_preview_timestamp(&self, timestamp: i64) {
         self.time_label.set_text(&format_timestamp(timestamp));
     }
 
