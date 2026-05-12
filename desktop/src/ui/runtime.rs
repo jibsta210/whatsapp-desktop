@@ -685,13 +685,26 @@ fn resolve_sender_name(s: &RuntimeState, sender_jid: &str) -> String {
             return name.clone();
         }
     }
-    // 6. For LID JIDs with no resolution, try to at least show the phone number
+    // 6. Cross-protocol global directory: fuzzy phone matching (full digits,
+    //    last 10, last 7). This is where SMS/gmessages contacts merge in,
+    //    and also covers WhatsApp numbers stored under a slightly-different
+    //    JID format than what we have in `contact_names` (the most common
+    //    cause of "quoted message shows raw phone but timeline shows real
+    //    name" — they take different code paths).
+    if let Some(name) = crate::contacts::global().lookup(sender_jid) {
+        // Sanity check: the global may sometimes hand back a placeholder
+        // that still looks like a raw JID. Treat that as a miss.
+        if !name.contains('@') && !name.is_empty() {
+            return name;
+        }
+    }
+    // 7. For LID JIDs with no resolution, try to at least show the phone number
     if sender_jid.ends_with("@lid") {
         if let Some(phone) = s.lid_to_phone.get(sender_jid) {
             return display_name_from_jid(phone);
         }
     }
-    // 7. Formatted phone number fallback
+    // 8. Formatted phone number fallback
     display_name_from_jid(sender_jid)
 }
 
