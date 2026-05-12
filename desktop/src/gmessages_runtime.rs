@@ -503,7 +503,12 @@ async fn run(
             *contact_cache.lock().await = contact_map.clone();
 
             log::info!("gmessages: fetching conversation list to seed chat rows");
-            match client.list_conversations(50).await {
+            // Fetch a generous window. `list_conversations(50)` used to be the
+            // limit and silently dropped every gm chat past the top 50 from
+            // the cache, so anything you hadn't messaged recently
+            // disappeared on every restart. 1000 covers any plausible
+            // SMS history.
+            match client.list_conversations(1000).await {
                 Ok(resp) => {
                     log::info!("gmessages: got {} conversations", resp.conversations.len());
                     let summaries: Vec<ChatSummary> = resp
@@ -556,16 +561,58 @@ async fn run(
                     }
                     let mm_snap = merge_map.lock().await.clone();
 
-                    // Persist the cache NOW with merged rows excluded so the
-                    // next startup hydrates only chat rows that won't be
-                    // dedup'd later.
-                    let cache_summaries: Vec<&ChatSummary> = summaries
-                        .iter()
-                        .filter(|s| !mm_snap.contains_key(strip_prefix(&s.id)))
-                        .collect();
-                    if let Ok(bytes) =
-                        bincode::serialize(&cache_summaries.iter().copied().collect::<Vec<_>>())
+                    // Persist the cache NOW. CRITICAL: this MERGES into
+                    // the previous cache instead of overwriting. The
+                    // server's list_conversations returns at most N
+                    // chats per call (top N by recency). If we
+                    // overwrote, every chat past the top N silently
+                    // dropped off the cache and never came back on
+                    // restart — exactly the "SMS not persisting across
+                    // restart" the user has been chasing.
+                    //
+                    // Merge semantics:
+                    //   - For chats in the FRESH response, fresh wins.
+                    //   - For chats in the OLD cache but absent from
+                    //     the fresh response, keep the old entry (still
+                    //     a real chat, server just didn't include it).
+                    //   - Always exclude entries that are now merged
+                    //     (in mm_snap) — those are absorbed by the WA row.
+                    use std::collections::HashMap as StdHashMap;
+                    let mut merged_cache: StdHashMap<String, ChatSummary> = StdHashMap::new();
+                    // Seed with the OLD cache contents (if any).
+                    if let Ok(old_bytes) = std::fs::read(&gm_chats_cache_path)
+                        && let Ok(old_cached) =
+                            bincode::deserialize::<Vec<ChatSummary>>(&old_bytes)
                     {
+                        for s in old_cached {
+                            if !mm_snap.contains_key(strip_prefix(&s.id)) {
+                                merged_cache.insert(s.id.clone(), s);
+                            }
+                        }
+                    }
+                    // Overlay the fresh response (fresh wins).
+                    for s in &summaries {
+                        if mm_snap.contains_key(strip_prefix(&s.id)) {
+                            // Merged into a WA row — drop it from the
+                            // gm cache so it doesn't get hydrated again.
+                            merged_cache.remove(&s.id);
+                            continue;
+                        }
+                        merged_cache.insert(s.id.clone(), s.clone());
+                    }
+                    let mut to_persist: Vec<ChatSummary> =
+                        merged_cache.into_values().collect();
+                    // Sort by timestamp desc so the file is stable + easy
+                    // to inspect.
+                    to_persist
+                        .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                    log::info!(
+                        "gmessages: persisting {} chats to cache (fresh: {}, merge_map: {})",
+                        to_persist.len(),
+                        summaries.len(),
+                        mm_snap.len(),
+                    );
+                    if let Ok(bytes) = bincode::serialize(&to_persist) {
                         let _ = std::fs::write(&gm_chats_cache_path, &bytes);
                     }
 
