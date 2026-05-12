@@ -831,6 +831,23 @@ impl ChatListPanel {
     }
 
     pub fn update_chat_name(&self, chat_id: &str, name: &str) {
+        self.update_chat_name_inner(chat_id, name, false);
+    }
+
+    /// Like [`update_chat_name`] but bypasses the downgrade-refusal
+    /// heuristic. Use this for AUTHORITATIVE sources (gm conversation
+    /// refresh, contact-list sync, user-typed rename) where the new name
+    /// is known good — even if it's shorter / fewer words than the
+    /// previous one. Without this, a chat that got mis-titled with the
+    /// user's own name (e.g. "Jake Steinman") from a sender lookup on
+    /// the user's outgoing SMS could never be retitled to the actual
+    /// contact name ("Clayton") because the heuristic considers the
+    /// shorter name a "downgrade".
+    pub fn update_chat_name_authoritative(&self, chat_id: &str, name: &str) {
+        self.update_chat_name_inner(chat_id, name, true);
+    }
+
+    fn update_chat_name_inner(&self, chat_id: &str, name: &str, authoritative: bool) {
         let mut rows = self.inner.rows.borrow_mut();
         if let Some(row) = rows.get_mut(chat_id) {
             let old = row.chat_name.clone();
@@ -843,23 +860,29 @@ impl ChatListPanel {
             // contact name (the "Craig Thompson → Jake Steinman" class
             // of bug). The ContactDirectory has the same length-aware
             // ranking; chat-list rows benefit from the same protection.
-            let old_words = old.split_whitespace().count();
-            let new_words = name.split_whitespace().count();
-            let old_alpha = old.chars().any(|c| c.is_alphabetic());
-            let new_alpha = name.chars().any(|c| c.is_alphabetic());
-            let is_downgrade = match (old_alpha, new_alpha) {
-                (true, false) => true,                // alpha → numeric: never
-                (true, true) => new_words < old_words // multi-word → fewer words
-                    || (new_words == old_words && name.len() < old.len()),
-                _ => false,
-            };
-            if is_downgrade {
-                log::info!(
-                    "update_chat_name: {chat_id}: REFUSED downgrade {old:?} → {name:?}"
-                );
-                return;
+            // Authoritative callers skip this check.
+            if !authoritative {
+                let old_words = old.split_whitespace().count();
+                let new_words = name.split_whitespace().count();
+                let old_alpha = old.chars().any(|c| c.is_alphabetic());
+                let new_alpha = name.chars().any(|c| c.is_alphabetic());
+                let is_downgrade = match (old_alpha, new_alpha) {
+                    (true, false) => true,                // alpha → numeric: never
+                    (true, true) => new_words < old_words // multi-word → fewer words
+                        || (new_words == old_words && name.len() < old.len()),
+                    _ => false,
+                };
+                if is_downgrade {
+                    log::info!(
+                        "update_chat_name: {chat_id}: REFUSED downgrade {old:?} → {name:?}"
+                    );
+                    return;
+                }
             }
-            log::info!("update_chat_name: {chat_id}: {old:?} → {name:?}");
+            log::info!(
+                "update_chat_name{auth}: {chat_id}: {old:?} → {name:?}",
+                auth = if authoritative { "(auth)" } else { "" }
+            );
             row.chat_name = name.to_string();
             row.name_label.set_text(name);
         }

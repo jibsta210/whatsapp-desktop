@@ -1785,10 +1785,20 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
     // participant_id field is unreliable for this — server fills it with
     // the sender's number, which equals OUR number for outbound messages.
     let status = m.message_status.as_ref().map(|s| s.status).unwrap_or(0);
-    let is_from_me = (1..=22).contains(&status);
+    // Outgoing message statuses are 1-22 (sent, sending, delivered, read,
+    // etc); incoming start at 100. RCS messages from the user's phone
+    // occasionally arrive with status outside 1-22 (e.g. 0 = uninitialized
+    // for a still-sending RCS), so also fall back to checking the rich
+    // sender_participant proto — if it's flagged `is_me`, treat as own.
+    let sp_is_me = m
+        .sender_participant
+        .as_ref()
+        .map(|sp| sp.is_me)
+        .unwrap_or(false);
+    let is_from_me = (1..=22).contains(&status) || sp_is_me;
     let ts_s = gm_timestamp_to_unix_s(m.timestamp);
     log::debug!(
-        "gmessages msg: id={} conv={} raw_ts={} → s={} ({}); from_me={}",
+        "gmessages msg: id={} conv={} raw_ts={} → s={} ({}); status={status} sp_is_me={sp_is_me} from_me={is_from_me}",
         m.message_id,
         m.conversation_id,
         m.timestamp,
@@ -1796,7 +1806,6 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
         chrono::DateTime::from_timestamp(ts_s, 0)
             .map(|dt| dt.to_rfc3339())
             .unwrap_or_else(|| "<invalid>".into()),
-        is_from_me,
     );
     let _ = MessageSource::GoogleMessages; // keep import meaningful in match arms below
     // Tag the message ID with `gm:` so the bubble renderer can identify the

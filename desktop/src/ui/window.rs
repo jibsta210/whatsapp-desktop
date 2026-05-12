@@ -1042,7 +1042,15 @@ impl MainWindow {
                 }
             }
             WaEvent::ChatNameUpdated { chat_id, name } => {
-                inner.chat_list.update_chat_name(&chat_id, &name);
+                // Authoritative: gm conversation refresh / WA contact sync /
+                // user rename. Bypasses the downgrade-refusal heuristic that
+                // protects against speculative typing-event renames, so a
+                // chat that got mis-titled "Jake Steinman" from a sender
+                // lookup on the user's own SMS can still be retitled
+                // "Clayton" when the actual conversation name comes through.
+                inner
+                    .chat_list
+                    .update_chat_name_authoritative(&chat_id, &name);
                 inner.chat_view.update_chat_name(&chat_id, &name);
                 inner.profile_panel.update_name(&chat_id, &name);
             }
