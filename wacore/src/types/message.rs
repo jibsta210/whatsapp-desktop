@@ -95,6 +95,39 @@ impl EditAttribute {
     pub fn to_string_val(&self) -> &str {
         self.as_str()
     }
+
+    /// Recover the wire `edit` value from a cached protobuf so the retry path can
+    /// re-emit `edit="N"` on resends. The original `subtype` (used by WA Web's
+    /// `editAttribute`) isn't persisted, so `key.from_me` is used as a proxy to
+    /// distinguish admin-vs-sender revoke: WA Web sets `from_me=false` on the
+    /// revoke proto's `MessageKey` when an admin revokes someone else's message.
+    pub fn infer_from_message(msg: &waproto::whatsapp::Message) -> Option<Self> {
+        use waproto::whatsapp::message::protocol_message::Type as ProtocolType;
+
+        // The operation signal can be nested under any neutral wrapper.
+        let msg = crate::send::unwrap_message(msg);
+
+        if msg.pin_in_chat_message.is_some() {
+            return Some(Self::PinInChat);
+        }
+        if msg.edited_message.is_some() {
+            return Some(Self::MessageEdit);
+        }
+        if let Some(pm) = msg.protocol_message.as_deref() {
+            if pm.r#type == Some(ProtocolType::Revoke as i32) {
+                let from_me = pm.key.as_ref().and_then(|k| k.from_me).unwrap_or(false);
+                return Some(if from_me {
+                    Self::SenderRevoke
+                } else {
+                    Self::AdminRevoke
+                });
+            }
+            if pm.r#type == Some(ProtocolType::MessageEdit as i32) || pm.edited_message.is_some() {
+                return Some(Self::MessageEdit);
+            }
+        }
+        None
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -207,5 +240,153 @@ mod tests {
         // Should NOT add decrypt-fail="hide"
         assert!(!should_add_decrypt_fail_hide(&EditAttribute::Empty));
         assert!(!should_add_decrypt_fail_hide(&EditAttribute::AdminRevoke));
+    }
+
+    #[test]
+    fn infer_from_message_admin_revoke() {
+        let msg = waproto::whatsapp::Message {
+            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
+                key: Some(waproto::whatsapp::MessageKey {
+                    from_me: Some(false),
+                    ..Default::default()
+                }),
+                r#type: Some(waproto::whatsapp::message::protocol_message::Type::Revoke as i32),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            EditAttribute::infer_from_message(&msg),
+            Some(EditAttribute::AdminRevoke)
+        );
+    }
+
+    #[test]
+    fn infer_from_message_sender_revoke() {
+        let msg = waproto::whatsapp::Message {
+            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
+                key: Some(waproto::whatsapp::MessageKey {
+                    from_me: Some(true),
+                    ..Default::default()
+                }),
+                r#type: Some(waproto::whatsapp::message::protocol_message::Type::Revoke as i32),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            EditAttribute::infer_from_message(&msg),
+            Some(EditAttribute::SenderRevoke)
+        );
+    }
+
+    #[test]
+    fn infer_from_message_top_level_edit() {
+        let msg = waproto::whatsapp::Message {
+            edited_message: Some(Box::new(waproto::whatsapp::message::FutureProofMessage {
+                message: Some(Box::new(waproto::whatsapp::Message::default())),
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            EditAttribute::infer_from_message(&msg),
+            Some(EditAttribute::MessageEdit)
+        );
+    }
+
+    #[test]
+    fn infer_from_message_legacy_edit() {
+        let msg = waproto::whatsapp::Message {
+            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
+                edited_message: Some(Box::new(waproto::whatsapp::Message::default())),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            EditAttribute::infer_from_message(&msg),
+            Some(EditAttribute::MessageEdit)
+        );
+    }
+
+    #[test]
+    fn infer_from_message_message_edit_sender() {
+        let msg = waproto::whatsapp::Message {
+            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
+                key: Some(waproto::whatsapp::MessageKey {
+                    from_me: Some(true),
+                    ..Default::default()
+                }),
+                r#type: Some(
+                    waproto::whatsapp::message::protocol_message::Type::MessageEdit as i32,
+                ),
+                edited_message: Some(Box::new(waproto::whatsapp::Message::default())),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            EditAttribute::infer_from_message(&msg),
+            Some(EditAttribute::MessageEdit)
+        );
+    }
+
+    #[test]
+    fn infer_from_message_plain_returns_none() {
+        let msg = waproto::whatsapp::Message {
+            conversation: Some("plain".into()),
+            ..Default::default()
+        };
+        assert_eq!(EditAttribute::infer_from_message(&msg), None);
+    }
+
+    #[test]
+    fn infer_from_message_unwraps_neutral_wrappers() {
+        let inner_revoke = waproto::whatsapp::Message {
+            protocol_message: Some(Box::new(waproto::whatsapp::message::ProtocolMessage {
+                key: Some(waproto::whatsapp::MessageKey {
+                    from_me: Some(false),
+                    ..Default::default()
+                }),
+                r#type: Some(waproto::whatsapp::message::protocol_message::Type::Revoke as i32),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let wrapped = waproto::whatsapp::Message {
+            ephemeral_message: Some(Box::new(waproto::whatsapp::message::FutureProofMessage {
+                message: Some(Box::new(inner_revoke)),
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            EditAttribute::infer_from_message(&wrapped),
+            Some(EditAttribute::AdminRevoke)
+        );
+
+        // Same for pin wrapped in view_once and device_sent (double nesting).
+        let inner_pin = waproto::whatsapp::Message {
+            pin_in_chat_message: Some(waproto::whatsapp::message::PinInChatMessage::default()),
+            ..Default::default()
+        };
+        let wrapped_pin = waproto::whatsapp::Message {
+            device_sent_message: Some(Box::new(waproto::whatsapp::message::DeviceSentMessage {
+                destination_jid: Some(String::new()),
+                message: Some(Box::new(waproto::whatsapp::Message {
+                    view_once_message: Some(Box::new(
+                        waproto::whatsapp::message::FutureProofMessage {
+                            message: Some(Box::new(inner_pin)),
+                        },
+                    )),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            EditAttribute::infer_from_message(&wrapped_pin),
+            Some(EditAttribute::PinInChat)
+        );
     }
 }

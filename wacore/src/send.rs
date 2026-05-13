@@ -50,8 +50,9 @@ pub fn extract_ciphertext(msg: CiphertextMessage) -> Option<(&'static str, bool,
 }
 
 /// Unwrap wrapper message types to reach the inner message.
-/// Matches WA Web's getUnwrappedProtobufMessage (EProtoUtils.js:19-35).
-fn unwrap_message(msg: &wa::Message) -> &wa::Message {
+/// Matches WA Web's getUnwrappedProtobufMessage. Does not unwrap
+/// `edited_message`; that field is itself a signal callers may need.
+pub(crate) fn unwrap_message(msg: &wa::Message) -> &wa::Message {
     macro_rules! try_unwrap {
         ($($field:ident),+ $(,)?) => {
             $(
@@ -204,6 +205,20 @@ pub fn media_type_from_message(msg: &wa::Message) -> Option<&'static str> {
         return Some("url");
     }
     None
+}
+
+/// Canonical rule for `decrypt-fail="hide"` on outgoing `<enc>` nodes.
+/// Shared by DM fanout, group SKDM and group SKMSG so the three paths can't drift.
+/// `AdminRevoke` is excluded because the server drops revoke stanzas carrying the
+/// hide attribute.
+pub fn should_hide_decrypt_fail_for_send(
+    edit: Option<&crate::types::message::EditAttribute>,
+    msg: &wa::Message,
+) -> bool {
+    edit.is_some_and(|e| {
+        *e != crate::types::message::EditAttribute::Empty
+            && *e != crate::types::message::EditAttribute::AdminRevoke
+    }) || should_hide_decrypt_fail(msg)
 }
 
 /// Infrastructure messages get decrypt-fail="hide" so recipients don't see
@@ -859,10 +874,7 @@ pub async fn prepare_dm_stanza<
     let mut participant_nodes = Vec::with_capacity(total_devices);
     let mut includes_prekey_message = false;
 
-    let hide_decrypt_fail = edit
-        .as_ref()
-        .is_some_and(|e| *e != crate::types::message::EditAttribute::Empty)
-        || should_hide_decrypt_fail(message);
+    let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
 
     let mediatype = media_type_from_message(message);
 
@@ -995,6 +1007,7 @@ pub async fn prepare_dm_retry_stanza<S, I>(
     message_id: String,
     retry_count: u8,
     account: Option<&wa::AdvSignedDeviceIdentity>,
+    edit: Option<crate::types::message::EditAttribute>,
 ) -> Result<Node>
 where
     S: crate::libsignal::protocol::SessionStore,
@@ -1037,12 +1050,20 @@ where
         );
     }
 
-    Ok(NodeBuilder::new("message")
+    let mut stanza_builder = NodeBuilder::new("message")
         .attr("to", to_jid)
         .attr("id", message_id)
-        .attr("type", stanza_type_from_message(message))
-        .children(children)
-        .build())
+        .attr("type", stanza_type_from_message(message));
+
+    // Without `edit`, the resend looks like a normal message and the client never
+    // applies the revoke/edit.
+    if let Some(e) = edit
+        && e != crate::types::message::EditAttribute::Empty
+    {
+        stanza_builder = stanza_builder.attr("edit", e.to_string_val());
+    }
+
+    Ok(stanza_builder.children(children).build())
 }
 
 /// Pairwise-encrypted retry stanza for a single group participant.
@@ -1060,6 +1081,7 @@ pub async fn prepare_group_retry_stanza<S, I>(
     retry_count: u8,
     account: Option<&wa::AdvSignedDeviceIdentity>,
     addressing_mode: crate::types::message::AddressingMode,
+    edit: Option<crate::types::message::EditAttribute>,
 ) -> Result<Node>
 where
     S: crate::libsignal::protocol::SessionStore,
@@ -1103,6 +1125,14 @@ where
 
     // WA Web always sets addressing_mode for groups (MsgCreateDeviceStanza.js:131-135)
     stanza_builder = stanza_builder.attr("addressing_mode", addressing_mode.as_str());
+
+    // Without `edit`, the resend looks like a normal message and the client never
+    // applies the revoke/edit.
+    if let Some(e) = edit
+        && e != crate::types::message::EditAttribute::Empty
+    {
+        stanza_builder = stanza_builder.attr("edit", e.to_string_val());
+    }
 
     Ok(stanza_builder.children(children).build())
 }
@@ -1323,13 +1353,17 @@ pub async fn prepare_group_stanza<
         // WA Web's GroupSkmsgJob wraps ensureE2ESessions in try/catch — logs error
         // but does NOT rethrow. SKDM distribution failure must not prevent the group
         // message from being sent. Only successfully encrypted devices are tracked.
+        // Must match the rule applied to the main skmsg payload below: if SKDM carries
+        // `decrypt-fail="hide"` but the payload does not (e.g. AdminRevoke), recipients
+        // without a sender key never decrypt the skmsg and the revoke is silently dropped.
+        let skdm_hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
         match encrypt_for_devices(
             runtime,
             stores,
             resolver,
             distribution_list,
             &skdm_plaintext_to_encrypt,
-            true,
+            skdm_hide_decrypt_fail,
             None,
         )
         .await
@@ -1381,10 +1415,7 @@ pub async fn prepare_group_stanza<
     let skmsg_ciphertext = skmsg.into_serialized();
 
     let mediatype = media_type_from_message(message);
-    let hide_decrypt_fail = (edit.as_ref().is_some_and(|e| {
-        *e != crate::types::message::EditAttribute::Empty
-            && *e != crate::types::message::EditAttribute::AdminRevoke
-    })) || should_hide_decrypt_fail(message);
+    let hide_decrypt_fail = should_hide_decrypt_fail_for_send(edit.as_ref(), message);
 
     let mut enc_builder = NodeBuilder::new("enc")
         .attr("v", stanza::ENC_VERSION)
@@ -2842,6 +2873,7 @@ mod tests {
                 1,
                 None,
                 AddressingMode::Pn,
+                None,
             )
             .await
             .unwrap();
@@ -2891,6 +2923,7 @@ mod tests {
                 &wa::Message::default(),
                 "dm-retry-1".into(),
                 1,
+                None,
                 None,
             )
             .await
@@ -2948,6 +2981,7 @@ mod tests {
                 "dm-retry-2".into(),
                 2,
                 Some(&acc),
+                None,
             )
             .await
             .unwrap();
@@ -2984,6 +3018,7 @@ mod tests {
                 2,
                 Some(&acc),
                 AddressingMode::Pn,
+                None,
             )
             .await
             .unwrap();
@@ -3023,6 +3058,7 @@ mod tests {
                 3,
                 Some(&wa::AdvSignedDeviceIdentity::default()),
                 AddressingMode::Lid,
+                None,
             )
             .await
             .unwrap();
@@ -3035,6 +3071,74 @@ mod tests {
                     .as_ref(),
                 "lid"
             );
+        }
+
+        #[tokio::test]
+        async fn group_retry_preserves_edit_attribute() {
+            let (mut ss, mut is, jid) = setup_session().await;
+            let group: Jid = "120363098765432100@g.us".parse().unwrap();
+            let p: Jid = jid.to_string().parse().unwrap();
+            let n = prepare_group_retry_stanza(
+                &mut ss,
+                &mut is,
+                group,
+                p.clone(),
+                p,
+                &wa::Message::default(),
+                "revoke-1".into(),
+                1,
+                None,
+                AddressingMode::Lid,
+                Some(crate::types::message::EditAttribute::AdminRevoke),
+            )
+            .await
+            .unwrap();
+            assert_eq!(n.attrs().optional_string("edit").unwrap().as_ref(), "8");
+        }
+
+        #[tokio::test]
+        async fn dm_retry_preserves_edit_attribute() {
+            let (mut ss, mut is, jid) = setup_session().await;
+            let to: Jid = "559922223333@s.whatsapp.net".parse().unwrap();
+            let requester: Jid = jid.to_string().parse().unwrap();
+            let n = prepare_dm_retry_stanza(
+                &mut ss,
+                &mut is,
+                to,
+                requester.clone(),
+                requester,
+                &wa::Message::default(),
+                "edit-1".into(),
+                1,
+                None,
+                Some(crate::types::message::EditAttribute::MessageEdit),
+            )
+            .await
+            .unwrap();
+            assert_eq!(n.attrs().optional_string("edit").unwrap().as_ref(), "1");
+        }
+
+        #[tokio::test]
+        async fn retry_without_edit_omits_attribute() {
+            let (mut ss, mut is, jid) = setup_session().await;
+            let group: Jid = "120363098765432100@g.us".parse().unwrap();
+            let p: Jid = jid.to_string().parse().unwrap();
+            let n = prepare_group_retry_stanza(
+                &mut ss,
+                &mut is,
+                group,
+                p.clone(),
+                p,
+                &wa::Message::default(),
+                "plain-1".into(),
+                1,
+                None,
+                AddressingMode::Lid,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(n.attrs().optional_string("edit").is_none());
         }
     }
 
