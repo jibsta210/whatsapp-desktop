@@ -1073,8 +1073,9 @@ async fn run(
                 }
                 let client = client.clone();
                 let event_tx = event_tx.clone();
+                let merge_map = merge_map.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_command(&client, &event_tx, cmd).await {
+                    if let Err(e) = handle_command(&client, &event_tx, &merge_map, cmd).await {
                         log::warn!("gmessages: command error: {e:#}");
                     }
                 });
@@ -1093,7 +1094,12 @@ async fn run(
 }
 
 /// Handle a `WaCommand` whose `chat_id` belongs to a gmessages chat.
-async fn handle_command(client: &Arc<Client>, event_tx: &Sender<WaEvent>, cmd: WaCommand) -> Result<()> {
+async fn handle_command(
+    client: &Arc<Client>,
+    event_tx: &Sender<WaEvent>,
+    merge_map: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
+    cmd: WaCommand,
+) -> Result<()> {
     use crate::bridge::IncomingMessage;
     match cmd {
         WaCommand::SendText { chat_id, text, tmp_id, .. } => {
@@ -1252,12 +1258,58 @@ async fn handle_command(client: &Arc<Client>, event_tx: &Sender<WaEvent>, cmd: W
                 .await;
         }
         WaCommand::MarkRead { chat_id } => {
-            let conv = strip_prefix(&chat_id);
-            // mark_read needs the message_id; without it we can't dispatch
-            // a useful API call. The UI invokes this on chat-open with no
-            // specific message — for gmessages we'd need the latest message
-            // id, which we don't track yet. Skip for now.
-            log::debug!("gmessages: MarkRead for {conv} — not yet implemented");
+            // Resolve `chat_id` to a gm conversation_id. Two cases:
+            //
+            // 1. `gm:N` — direct (unmerged gm chat). conv = N.
+            // 2. A WhatsApp JID — could be a MERGED gm chat. Look up
+            //    the merge_map in reverse: any conv that mapped to
+            //    this WA jid. There may be more than one (multiple
+            //    gm threads for same person eventually merged into
+            //    one WA row) — mark all of them read.
+            //
+            // Without this, every list_conversations() on restart
+            // still flags `unread=true` on conversations the user
+            // already read on the desktop, and they keep popping
+            // back into the Unread filter.
+            let mut convs: Vec<String> = Vec::new();
+            if is_gm_chat(&chat_id) {
+                convs.push(strip_prefix(&chat_id).to_string());
+            } else {
+                let mm = merge_map.lock().await;
+                for (conv, target) in mm.iter() {
+                    if target == &chat_id {
+                        convs.push(conv.clone());
+                    }
+                }
+            }
+            if convs.is_empty() {
+                // Not a gm-relevant chat. Silently ignore (this gets
+                // fanned out to every MarkRead now, so WhatsApp-only
+                // chats land here too).
+                return Ok(());
+            }
+
+            // We need a message_id per conv. Load whatever we have
+            // persisted under the rendered chat_id (post-redirect, so
+            // merged chats share one file). Find the most recent
+            // message tagged with `gm:` — that's a gm message.
+            let messages = crate::ui::runtime::load_messages(&chat_id);
+            let latest_gm_msg_id = messages
+                .iter()
+                .rev()
+                .find_map(|m| m.id.strip_prefix(CHAT_PREFIX).map(|s| s.to_string()));
+            let Some(msg_id) = latest_gm_msg_id else {
+                log::debug!(
+                    "gmessages: MarkRead for {chat_id} — no persisted gm messages, skipping"
+                );
+                return Ok(());
+            };
+            for conv in convs {
+                log::info!("gmessages: marking {conv} read via msg {msg_id}");
+                if let Err(e) = client.mark_read(&conv, &msg_id).await {
+                    log::warn!("gmessages: mark_read({conv}) failed: {e}");
+                }
+            }
         }
         WaCommand::SetTyping { chat_id, is_typing } => {
             let conv = strip_prefix(&chat_id);

@@ -1242,6 +1242,17 @@ pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver
                     || command_chat_id(&cmd)
                         .map(crate::gmessages_runtime::is_gm_chat)
                         .unwrap_or(false);
+                // MarkRead needs FAN-OUT: a merged gm conversation is
+                // rendered under its WA JID, so the UI fires MarkRead
+                // with that WA chat_id. Without also sending to gm, the
+                // gm relay never learns we read the SMS and re-marks
+                // it unread on every restart's list_conversations.
+                // WaCommand doesn't derive Clone, so fish out just the
+                // chat_id and rebuild a fresh MarkRead for the fan-out.
+                let fanout_chat_id: Option<String> = match &cmd {
+                    WaCommand::MarkRead { chat_id } => Some(chat_id.clone()),
+                    _ => None,
+                };
                 if goes_to_gm {
                     if let Some(tx) = &gm_cmd_tx {
                         let _ = tx.send(cmd);
@@ -1250,8 +1261,15 @@ pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver
                             "received gm-routed command but gmessages runtime is disabled — dropping"
                         );
                     }
-                } else if wa_cmd_tx.send(cmd).is_err() {
-                    break;
+                } else {
+                    if let Some(chat_id) = fanout_chat_id
+                        && let Some(tx) = &gm_cmd_tx
+                    {
+                        let _ = tx.send(WaCommand::MarkRead { chat_id });
+                    }
+                    if wa_cmd_tx.send(cmd).is_err() {
+                        break;
+                    }
                 }
             }
         });
