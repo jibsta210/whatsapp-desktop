@@ -585,6 +585,35 @@ fn mime_from_extension(lower_path: &str) -> String {
     mime.to_string()
 }
 
+/// Resolve a LID JID (`12345@lid`) or any "speculative" JID to the
+/// CANONICAL WhatsApp phone JID for that contact (`12345@s.whatsapp.net`),
+/// if one is known. Returns `None` if there's no mapping — caller should
+/// fall back to whatever JID they had.
+///
+/// Used by "Reply privately" / "Message user" actions in group chats:
+/// without this, we'd open a new DM under the participant's LID, which
+/// becomes a SECOND chat row distinct from any existing chat the user
+/// has with that contact under their phone JID. Server fanout of our
+/// outgoing message lands in the phone-JID chat anyway, so the LID row
+/// just collects orphan copies.
+pub fn lid_to_canonical_phone_jid(maybe_lid: &str) -> Option<String> {
+    // 1. Global cross-protocol directory: stores phone digits with all
+    //    known JID variants on the same entry.
+    if let Some(entry) = crate::contacts::global().lookup_full(maybe_lid)
+        && let Some(jid) = entry.chat_ids.get("whatsapp")
+    {
+        return Some(jid.clone());
+    }
+    // 2. On-disk lid_to_phone map (built from previous sessions).
+    if maybe_lid.ends_with("@lid") {
+        let map = load_lid_phone_map();
+        if let Some(phone) = map.get(maybe_lid) {
+            return Some(phone.clone());
+        }
+    }
+    None
+}
+
 pub fn display_name_from_jid(jid: &str) -> String {
     if let Some(user) = jid.strip_suffix("@s.whatsapp.net") {
         // Strip device suffix (e.g., "12345:5" → "12345")

@@ -1000,12 +1000,21 @@ async fn run(
                         );
                         im.chat_id = VERIFICATION_CODES_CHAT_ID.into();
                     }
-                    // STEP 1: persist using the (post-2FA-routing) chat_id.
+                    // STEP 1: rewrite chat_id for UI routing (gm:N → wa_jid)
+                    // if this conversation is merged into a WhatsApp row.
+                    // CRITICAL: this MUST happen BEFORE persistence, so the
+                    // message file path matches where it'll be rendered.
+                    // Previously we persisted first and then redirected —
+                    // SMS got saved to wa_messages/gm_6101.bin but the
+                    // chat list rendered it under wa_messages/<wa_jid>.bin,
+                    // and on restart the WA chat row loaded the wrong
+                    // file and your SMS appeared "lost".
+                    redirect_chat_id(&mut wa_event, &mm);
+                    // STEP 2: persist using the FINAL chat_id (post-2FA,
+                    // post-merge-redirect). Path == render target.
                     if let WaEvent::MessageReceived(im) = &wa_event {
                         crate::ui::runtime::save_messages_append(&im.chat_id, im);
                     }
-                    // STEP 2: rewrite chat_id for UI routing if merged.
-                    redirect_chat_id(&mut wa_event, &mm);
                     // STEP 3: if the redirect targeted a WhatsApp chat row,
                     // update wa_chats.bin so the preview/timestamp survive
                     // a restart. Without this, on next launch the chat list

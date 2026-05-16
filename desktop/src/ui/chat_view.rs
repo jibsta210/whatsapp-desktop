@@ -4081,7 +4081,18 @@ fn show_message_menu(
             let msg_c = msg.clone();
             let pop = popover.clone();
             btn.connect_clicked(move |_| {
-                let dm_jid = msg_c.sender_id.clone();
+                // Resolve LID → canonical phone JID. Without this we'd open
+                // the DM under the participant's LID, which becomes a
+                // SECOND chat row separate from any existing thread under
+                // their phone JID. Server fanout of the outgoing message
+                // lands in the phone-JID chat anyway — so the LID row
+                // ends up half-populated and the user sees the same
+                // person under two rows. Symptom reported as
+                // "from a group chat I click message privately... it made
+                // 2 chats in 1".
+                let raw_jid = msg_c.sender_id.clone();
+                let dm_jid = crate::ui::runtime::lid_to_canonical_phone_jid(&raw_jid)
+                    .unwrap_or(raw_jid);
                 let sender_name = if msg_c.sender_name.is_empty() {
                     crate::ui::runtime::display_name_from_jid(&dm_jid)
                 } else {
@@ -4090,6 +4101,11 @@ fn show_message_menu(
                 // Fully switch to the DM chat (clear old messages, set new ID)
                 *inner_c.current_chat_id.borrow_mut() = Some(dm_jid.clone());
                 inner_c.header_name.set_text(&sender_name);
+                // Clear the group-participant subtitle that was left over
+                // from the previous chat — otherwise the private DM shows
+                // the original group's member list under the contact name.
+                inner_c.header_subtitle.set_text("");
+                inner_c.header_subtitle.set_visible(false);
                 remove_all_children(&inner_c.messages_box);
                 inner_c.bubbles.borrow_mut().clear();
                 inner_c.search_texts.borrow_mut().clear();
@@ -4144,10 +4160,15 @@ fn show_message_menu(
             let sender_name_c = sender_display.clone();
             let pop = popover.clone();
             btn.connect_clicked(move |_| {
-                // Switch chat view to the DM
-                let sid = sender_id.clone();
+                // Same LID → phone JID resolution as "Reply privately"
+                // above. Prevents the duplicate-chat-row bug.
+                let sid = crate::ui::runtime::lid_to_canonical_phone_jid(&sender_id)
+                    .unwrap_or_else(|| sender_id.clone());
                 *inner_c.current_chat_id.borrow_mut() = Some(sid.clone());
                 inner_c.header_name.set_text(&sender_name_c);
+                // Clear leftover group-participant subtitle from prev chat.
+                inner_c.header_subtitle.set_text("");
+                inner_c.header_subtitle.set_visible(false);
                 remove_all_children(&inner_c.messages_box);
                 inner_c.bubbles.borrow_mut().clear();
                 inner_c
