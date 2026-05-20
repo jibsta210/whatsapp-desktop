@@ -1337,144 +1337,46 @@ impl ChatViewPanel {
             inner.input_view.add_controller(key_ctrl);
         }
 
-        // ── Ctrl+V paste handler for images — shows preview, Enter to send ──
+        // ── Ctrl+V paste handler: robust text + image paste ──
+        // We OWN Ctrl+V on the input completely. COSMIC's compositor
+        // clipboard is young and intermittently drops the first read of
+        // an offer — both text AND images fail every few attempts when
+        // left to GTK's native TextView paste. So we do all reads here,
+        // explicitly, with a short retry/backoff that recovers the
+        // dropped reads. The handler always returns Stop so the flaky
+        // native paste never also runs.
         {
             let inner_c = inner.clone();
+            let iv_paste = inner.input_view.clone();
             let paste_ctrl = gtk4::EventControllerKey::new();
             paste_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
             paste_ctrl.connect_key_pressed(move |_, key, _, modifier| {
-                if key == gtk4::gdk::Key::v
-                    && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+                if !(key == gtk4::gdk::Key::v
+                    && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK))
                 {
-                    let Some(display) = gtk4::gdk::Display::default() else {
-                        log::warn!("Paste: no default display");
-                        return gtk4::glib::Propagation::Proceed;
-                    };
-                    let clipboard = display.clipboard();
-                    // CRITICAL: only intercept the paste when the clipboard
-                    // actually holds an image. On Wayland a clipboard offer
-                    // (`wl_data_offer`) is consumed when read — firing
-                    // `read_texture_async` on a TEXT-only clipboard races
-                    // the TextView's own native text-paste read for the
-                    // same offer, and the text paste silently loses. That's
-                    // the "copy works in other apps but not ours" bug.
-                    // For text, do nothing here and let the TextView's
-                    // built-in Ctrl+V handler run untouched.
-                    let formats = clipboard.formats();
-                    let has_image = formats.contain_mime_type("image/png")
-                        || formats.contain_mime_type("image/jpeg")
-                        || formats.contain_mime_type("image/gif")
-                        || formats.contain_mime_type("image/webp")
-                        || formats.contain_mime_type("image/bmp")
-                        || formats.contain_mime_type("image/tiff");
-                    if !has_image {
-                        log::info!(
-                            "Paste: clipboard has no image format — letting TextView paste text natively"
-                        );
-                        return gtk4::glib::Propagation::Proceed;
-                    }
-                    log::info!("Paste handler: Ctrl+V with image content, reading texture");
-                    let inner_cc = inner_c.clone();
-                    // Primary path: read as GDK texture. Works for images
-                    // copied from most apps on X11 and Wayland.
-                    clipboard.read_texture_async(None::<&gtk4::gio::Cancellable>, move |result| {
-                        match result {
-                            Ok(Some(texture)) => {
-                                log::info!("Paste: got texture from clipboard");
-                                let tmp_path = format!(
-                                    "/tmp/wa_paste_{}.png",
-                                    std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis()
-                                );
-                                match texture.save_to_png(&tmp_path) {
-                                    Ok(_) => {
-                                        // Route through the shared helper so paste,
-                                        // drag-drop, and file-chooser all reset stale
-                                        // preview state (label, paintable) the same way.
-                                        // Without this, pasting an image after a PDF
-                                        // drop kept the PDF filename label visible.
-                                        set_pending_attachment(&inner_cc, &tmp_path);
-                                    }
-                                    Err(e) => log::warn!("Paste: save_to_png failed: {e}"),
-                                }
-                            }
-                            Ok(None) => {
-                                log::info!("Paste: no texture on clipboard (likely text paste)");
-                            }
-                            Err(e) => {
-                                // Common when clipboard has image in MIME type GDK
-                                // can't decode directly (e.g. image/jpeg on some
-                                // Wayland compositors). Try reading raw bytes.
-                                log::info!(
-                                    "Paste: read_texture_async failed ({e}), trying raw bytes fallback"
-                                );
-                                let display_fb = gtk4::gdk::Display::default();
-                                if let Some(d) = display_fb {
-                                    let cb = d.clipboard();
-                                    let inner_fb = inner_cc.clone();
-                                    cb.read_async(
-                                        &["image/png", "image/jpeg", "image/webp", "image/gif"],
-                                        gtk4::glib::Priority::DEFAULT,
-                                        None::<&gtk4::gio::Cancellable>,
-                                        move |res| {
-                                            let Ok((stream, mime)) = res else {
-                                                log::warn!("Paste fallback: no image MIME on clipboard");
-                                                return;
-                                            };
-                                            log::info!("Paste fallback: got {mime} stream");
-                                            use gtk4::gio::prelude::*;
-                                            let ext = mime.split('/').nth(1).unwrap_or("png");
-                                            let tmp_path = format!(
-                                                "/tmp/wa_paste_{}.{}",
-                                                std::time::SystemTime::now()
-                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                    .unwrap_or_default()
-                                                    .as_millis(),
-                                                ext
-                                            );
-                                            let path_for_close = tmp_path.clone();
-                                            let inner_done = inner_fb.clone();
-                                            stream.read_bytes_async(
-                                                10 * 1024 * 1024, // 10MB cap
-                                                gtk4::glib::Priority::DEFAULT,
-                                                None::<&gtk4::gio::Cancellable>,
-                                                move |read_res| {
-                                                    match read_res {
-                                                        Ok(bytes) => {
-                                                            if let Err(e) =
-                                                                std::fs::write(&path_for_close, &bytes)
-                                                            {
-                                                                log::warn!(
-                                                                    "Paste fallback: write failed: {e}"
-                                                                );
-                                                                return;
-                                                            }
-                                                            // Same helper as primary
-                                                            // paste path — resets label,
-                                                            // paintable, and gif-url so
-                                                            // the new attachment doesn't
-                                                            // share state with a stale one.
-                                                            set_pending_attachment(
-                                                                &inner_done,
-                                                                &path_for_close,
-                                                            );
-                                                        }
-                                                        Err(e) => log::warn!(
-                                                            "Paste fallback: read_bytes failed: {e}"
-                                                        ),
-                                                    }
-                                                },
-                                            );
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                    });
+                    return gtk4::glib::Propagation::Proceed;
                 }
-                gtk4::glib::Propagation::Proceed
+                let Some(display) = gtk4::gdk::Display::default() else {
+                    log::warn!("Paste: no default display");
+                    return gtk4::glib::Propagation::Proceed;
+                };
+                let clipboard = display.clipboard();
+                let formats = clipboard.formats();
+                let has_image = formats.contain_mime_type("image/png")
+                    || formats.contain_mime_type("image/jpeg")
+                    || formats.contain_mime_type("image/gif")
+                    || formats.contain_mime_type("image/webp")
+                    || formats.contain_mime_type("image/bmp")
+                    || formats.contain_mime_type("image/tiff");
+                if has_image {
+                    log::info!("Paste: image content detected — reading texture");
+                    paste_clipboard_image(clipboard, inner_c.clone(), 0);
+                } else {
+                    log::info!("Paste: reading clipboard text");
+                    paste_clipboard_text(clipboard, iv_paste.clone(), inner_c.clone(), 0);
+                }
+                // We handled it — never let the (flaky) native paste run.
+                gtk4::glib::Propagation::Stop
             });
             inner.input_view.add_controller(paste_ctrl);
         }
@@ -3857,6 +3759,151 @@ fn gen_tmp_id() -> String {
         .unwrap_or_default()
         .subsec_nanos();
     format!("tmp-{:08x}", nanos)
+}
+
+/// Max retries for a flaky clipboard read on COSMIC. Each retry waits
+/// `60ms * (attempt+1)`, so total worst-case wait is ~360ms across 4
+/// attempts — fast enough to feel instant, slow enough to ride out the
+/// compositor dropping the first offer read.
+const PASTE_MAX_RETRIES: u32 = 3;
+
+/// Read clipboard TEXT and insert it at the input cursor (replacing any
+/// selection — standard paste semantics). Retries on empty/error because
+/// COSMIC's clipboard intermittently drops the first read of an offer.
+///
+/// On total failure for text, falls back ONCE to an image read — handles
+/// the case where `formats()` returned a stale/empty view and the
+/// clipboard actually held an image.
+fn paste_clipboard_text(
+    clipboard: gtk4::gdk::Clipboard,
+    iv: gtk4::TextView,
+    inner: Rc<ChatViewInner>,
+    attempt: u32,
+) {
+    let cb_retry = clipboard.clone();
+    clipboard.read_text_async(None::<&gtk4::gio::Cancellable>, move |res| {
+        match res {
+            Ok(Some(text)) if !text.is_empty() => {
+                let buffer = iv.buffer();
+                if let Some((mut s, mut e)) = buffer.selection_bounds() {
+                    buffer.delete(&mut s, &mut e);
+                }
+                buffer.insert_at_cursor(text.as_str());
+                log::info!("Paste: inserted {} chars (attempt {attempt})", text.len());
+            }
+            _ if attempt < PASTE_MAX_RETRIES => {
+                log::info!(
+                    "Paste: text read empty/failed (attempt {attempt}) — retrying"
+                );
+                let delay =
+                    std::time::Duration::from_millis(60 * (attempt as u64 + 1));
+                gtk4::glib::timeout_add_local_once(delay, move || {
+                    paste_clipboard_text(cb_retry, iv, inner, attempt + 1);
+                });
+            }
+            _ => {
+                // Text genuinely failed after all retries. Last resort:
+                // the clipboard may actually hold an image that
+                // formats() didn't report. Try one image read.
+                log::warn!(
+                    "Paste: text read exhausted retries — trying image as last resort"
+                );
+                paste_clipboard_image(cb_retry, inner, 0);
+            }
+        }
+    });
+}
+
+/// Read clipboard IMAGE content and stage it as a pending attachment.
+/// Tries a GDK texture read first, then a raw-bytes read for MIME types
+/// GDK can't decode directly. Retries the whole thing on COSMIC's
+/// intermittent dropped reads.
+fn paste_clipboard_image(
+    clipboard: gtk4::gdk::Clipboard,
+    inner: Rc<ChatViewInner>,
+    attempt: u32,
+) {
+    let cb_retry = clipboard.clone();
+    clipboard.read_texture_async(None::<&gtk4::gio::Cancellable>, move |result| {
+        match result {
+            Ok(Some(texture)) => {
+                let tmp_path = format!(
+                    "/tmp/wa_paste_{}.png",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                );
+                match texture.save_to_png(&tmp_path) {
+                    Ok(_) => {
+                        log::info!("Paste: image staged from texture (attempt {attempt})");
+                        set_pending_attachment(&inner, &tmp_path);
+                    }
+                    Err(e) => log::warn!("Paste: save_to_png failed: {e}"),
+                }
+            }
+            Ok(None) | Err(_) => {
+                // Texture decode unavailable — fall back to a raw-bytes
+                // read of the common image MIME types.
+                use gtk4::gio::prelude::*;
+                let inner_fb = inner.clone();
+                let cb_for_bytes = cb_retry.clone();
+                cb_retry.read_async(
+                    &["image/png", "image/jpeg", "image/webp", "image/gif"],
+                    gtk4::glib::Priority::DEFAULT,
+                    None::<&gtk4::gio::Cancellable>,
+                    move |res| {
+                        let Ok((stream, mime)) = res else {
+                            // Raw read also failed — retry the whole
+                            // image paste if we have attempts left.
+                            if attempt < PASTE_MAX_RETRIES {
+                                log::info!(
+                                    "Paste: image read failed (attempt {attempt}) — retrying"
+                                );
+                                let delay = std::time::Duration::from_millis(
+                                    60 * (attempt as u64 + 1),
+                                );
+                                gtk4::glib::timeout_add_local_once(delay, move || {
+                                    paste_clipboard_image(cb_for_bytes, inner_fb, attempt + 1);
+                                });
+                            } else {
+                                log::warn!("Paste: image read exhausted retries");
+                            }
+                            return;
+                        };
+                        let ext = mime.split('/').nth(1).unwrap_or("png");
+                        let tmp_path = format!(
+                            "/tmp/wa_paste_{}.{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis(),
+                            ext
+                        );
+                        let inner_done = inner_fb.clone();
+                        stream.read_bytes_async(
+                            10 * 1024 * 1024,
+                            gtk4::glib::Priority::DEFAULT,
+                            None::<&gtk4::gio::Cancellable>,
+                            move |read_res| match read_res {
+                                Ok(bytes) => {
+                                    if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+                                        log::warn!("Paste: write failed: {e}");
+                                        return;
+                                    }
+                                    log::info!("Paste: image staged from raw {mime}");
+                                    set_pending_attachment(&inner_done, &tmp_path);
+                                }
+                                Err(e) => {
+                                    log::warn!("Paste: read_bytes failed: {e}")
+                                }
+                            },
+                        );
+                    },
+                );
+            }
+        }
+    });
 }
 
 /// Stage a single file as the pending attachment in the preview bar.
