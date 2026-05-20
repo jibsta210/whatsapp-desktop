@@ -956,63 +956,9 @@ async fn run(
                                     })
                                     .await;
                             }
-
-                            // ── Live merge ──
-                            // list_conversations (which builds merge_map)
-                            // only runs at startup. An SMS thread that
-                            // becomes active mid-session — from someone
-                            // who's ALSO a WhatsApp contact — would
-                            // otherwise spawn a SECOND chat row that
-                            // never merges into the WhatsApp one. Here,
-                            // the moment we see an incoming gm message
-                            // whose sender phone matches an existing
-                            // WhatsApp chat, merge the conversation and
-                            // evict the stale gm row.
-                            if let Some(id) = &sp.id
-                                && !id.number.is_empty()
-                            {
-                                let conv_id = m.conversation_id.clone();
-                                let already = merge_map
-                                    .lock()
-                                    .await
-                                    .contains_key(&conv_id);
-                                if !already {
-                                    let gm_id = format!("{CHAT_PREFIX}{conv_id}");
-                                    let unified = unified_chat_id(
-                                        &gm_id,
-                                        Some(&id.number),
-                                        &phone_to_wa_chat,
-                                    );
-                                    if unified != gm_id {
-                                        log::info!(
-                                            "gmessages: live-MERGE {gm_id} → {unified} (phone {})",
-                                            id.number
-                                        );
-                                        merge_map
-                                            .lock()
-                                            .await
-                                            .insert(conv_id.clone(), unified.clone());
-                                        global.record_chat_id(
-                                            &id.number,
-                                            "whatsapp",
-                                            &unified,
-                                        );
-                                        // Drop the stale standalone gm
-                                        // row if one was already created
-                                        // by an earlier message.
-                                        let _ = event_tx
-                                            .send(WaEvent::ChatDeleted {
-                                                chat_id: gm_id,
-                                            })
-                                            .await;
-                                    }
-                                }
-                            }
                         }
                     }
                     global.save_if_dirty();
-                    // (merge_map is snapshotted further below, after the
-                    // live-merge additions above, right before the redirect.)
                     for m in messages {
                         let downloads = pending_downloads(m, &data_dir);
                         for (media_id, key, dest, kind) in downloads {
