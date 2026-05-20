@@ -1337,14 +1337,16 @@ impl ChatViewPanel {
             inner.input_view.add_controller(key_ctrl);
         }
 
-        // ── Ctrl+V paste handler: robust text + image paste ──
-        // We OWN Ctrl+V on the input completely. COSMIC's compositor
-        // clipboard is young and intermittently drops the first read of
-        // an offer — both text AND images fail every few attempts when
-        // left to GTK's native TextView paste. So we do all reads here,
-        // explicitly, with a short retry/backoff that recovers the
-        // dropped reads. The handler always returns Stop so the flaky
-        // native paste never also runs.
+        // ── Ctrl+V paste handler ──
+        // We OWN Ctrl+V on the input. GTK4's native clipboard read is
+        // broken under COSMIC — the app is a native Wayland client, but
+        // the GTK4 ↔ cosmic-comp `wl_data_device` path drops reads (both
+        // text and images, not transiently — it just doesn't work
+        // reliably). `wl-paste` from wl-clipboard talks the
+        // focus-independent `wlr-data-control` protocol instead and
+        // reads the COSMIC clipboard correctly, so we shell out to it.
+        // If wl-clipboard isn't installed we fall back to the GTK
+        // native read (paste_clipboard_text / _image).
         {
             let inner_c = inner.clone();
             let iv_paste = inner.input_view.clone();
@@ -1356,26 +1358,9 @@ impl ChatViewPanel {
                 {
                     return gtk4::glib::Propagation::Proceed;
                 }
-                let Some(display) = gtk4::gdk::Display::default() else {
-                    log::warn!("Paste: no default display");
-                    return gtk4::glib::Propagation::Proceed;
-                };
-                let clipboard = display.clipboard();
-                let formats = clipboard.formats();
-                let has_image = formats.contain_mime_type("image/png")
-                    || formats.contain_mime_type("image/jpeg")
-                    || formats.contain_mime_type("image/gif")
-                    || formats.contain_mime_type("image/webp")
-                    || formats.contain_mime_type("image/bmp")
-                    || formats.contain_mime_type("image/tiff");
-                if has_image {
-                    log::info!("Paste: image content detected — reading texture");
-                    paste_clipboard_image(clipboard, inner_c.clone(), 0);
-                } else {
-                    log::info!("Paste: reading clipboard text");
-                    paste_clipboard_text(clipboard, iv_paste.clone(), inner_c.clone(), 0);
-                }
-                // We handled it — never let the (flaky) native paste run.
+                log::info!("Paste: Ctrl+V — reading clipboard via wl-paste");
+                paste_via_wl_clipboard(iv_paste.clone(), inner_c.clone());
+                // We handled it — never let the (broken) native paste run.
                 gtk4::glib::Propagation::Stop
             });
             inner.input_view.add_controller(paste_ctrl);
@@ -3766,6 +3751,166 @@ fn gen_tmp_id() -> String {
 /// attempts — fast enough to feel instant, slow enough to ride out the
 /// compositor dropping the first offer read.
 const PASTE_MAX_RETRIES: u32 = 3;
+
+/// Outcome of a `wl-paste` clipboard read.
+enum WlPasteResult {
+    /// Plain text — insert at cursor.
+    Text(String),
+    /// Image written to this tmp path — stage as pending attachment.
+    ImageFile(String),
+    /// wl-paste ran fine but the clipboard had nothing usable.
+    Empty,
+    /// wl-paste is not installed / failed to run — caller should fall
+    /// back to the GTK-native clipboard path.
+    Unavailable,
+}
+
+/// Read the Wayland clipboard by shelling out to `wl-paste` (wl-clipboard).
+/// This uses the `wlr-data-control` protocol, which — unlike GTK4's
+/// `wl_data_device` path — is focus-independent and works reliably under
+/// cosmic-comp. Blocking; MUST be called off the GTK main thread.
+fn run_wl_paste() -> WlPasteResult {
+    use std::process::Command;
+    // 1. Enumerate offered MIME types.
+    let types_out = Command::new("wl-paste").arg("--list-types").output();
+    let types = match types_out {
+        Ok(o) if o.status.success() => {
+            String::from_utf8_lossy(&o.stdout).to_string()
+        }
+        Ok(o) => {
+            // Non-zero exit usually means "clipboard empty".
+            log::info!(
+                "Paste: wl-paste --list-types exited {} (clipboard likely empty)",
+                o.status
+            );
+            return WlPasteResult::Empty;
+        }
+        Err(e) => {
+            log::warn!("Paste: wl-paste not runnable ({e}) — falling back to GTK");
+            return WlPasteResult::Unavailable;
+        }
+    };
+    let type_set: Vec<&str> = types.lines().map(|l| l.trim()).collect();
+
+    // 2. Prefer image when present.
+    const IMAGE_MIMES: &[&str] =
+        &["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif", "image/bmp"];
+    if let Some(mime) = IMAGE_MIMES.iter().find(|m| type_set.contains(m)) {
+        match Command::new("wl-paste").arg("--type").arg(mime).output() {
+            Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+                let ext = mime.rsplit('/').next().unwrap_or("png");
+                let path = format!(
+                    "/tmp/wa_paste_{}.{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis(),
+                    ext
+                );
+                match std::fs::write(&path, &o.stdout) {
+                    Ok(_) => return WlPasteResult::ImageFile(path),
+                    Err(e) => {
+                        log::warn!("Paste: writing pasted image failed: {e}");
+                        return WlPasteResult::Empty;
+                    }
+                }
+            }
+            Ok(_) => return WlPasteResult::Empty,
+            Err(e) => {
+                log::warn!("Paste: wl-paste image read failed: {e}");
+                return WlPasteResult::Empty;
+            }
+        }
+    }
+
+    // 3. Otherwise read text. `--no-newline` drops the trailing newline
+    //    wl-paste would otherwise append.
+    let has_text = type_set.iter().any(|t| {
+        *t == "text/plain;charset=utf-8"
+            || *t == "text/plain"
+            || *t == "UTF8_STRING"
+            || *t == "STRING"
+            || *t == "TEXT"
+    });
+    if has_text {
+        match Command::new("wl-paste")
+            .arg("--no-newline")
+            .arg("--type")
+            .arg("text/plain;charset=utf-8")
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                let text = String::from_utf8_lossy(&o.stdout).to_string();
+                if text.is_empty() {
+                    return WlPasteResult::Empty;
+                }
+                return WlPasteResult::Text(text);
+            }
+            // Fall through to a typeless read if the explicit type failed.
+            _ => {
+                if let Ok(o) = Command::new("wl-paste").arg("--no-newline").output()
+                    && o.status.success()
+                {
+                    let text = String::from_utf8_lossy(&o.stdout).to_string();
+                    if !text.is_empty() {
+                        return WlPasteResult::Text(text);
+                    }
+                }
+            }
+        }
+    }
+    WlPasteResult::Empty
+}
+
+/// Ctrl+V entry point. Runs `wl-paste` on a worker thread, then applies
+/// the result on the GTK main loop. Falls back to the GTK-native
+/// clipboard path if wl-clipboard isn't installed.
+fn paste_via_wl_clipboard(iv: gtk4::TextView, inner: Rc<ChatViewInner>) {
+    let (tx, rx) = async_channel::bounded::<WlPasteResult>(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(run_wl_paste());
+    });
+    glib::MainContext::default().spawn_local(async move {
+        let Ok(result) = rx.recv().await else {
+            return;
+        };
+        match result {
+            WlPasteResult::Text(text) => {
+                let buffer = iv.buffer();
+                if let Some((mut s, mut e)) = buffer.selection_bounds() {
+                    buffer.delete(&mut s, &mut e);
+                }
+                buffer.insert_at_cursor(&text);
+                log::info!("Paste: inserted {} chars via wl-paste", text.len());
+            }
+            WlPasteResult::ImageFile(path) => {
+                log::info!("Paste: staged image via wl-paste: {path}");
+                set_pending_attachment(&inner, &path);
+            }
+            WlPasteResult::Empty => {
+                log::info!("Paste: wl-paste — clipboard had nothing usable");
+            }
+            WlPasteResult::Unavailable => {
+                // wl-clipboard missing — use the GTK-native path.
+                log::info!("Paste: falling back to GTK-native clipboard read");
+                if let Some(display) = gtk4::gdk::Display::default() {
+                    let clipboard = display.clipboard();
+                    let formats = clipboard.formats();
+                    let has_image = formats.contain_mime_type("image/png")
+                        || formats.contain_mime_type("image/jpeg")
+                        || formats.contain_mime_type("image/gif")
+                        || formats.contain_mime_type("image/webp")
+                        || formats.contain_mime_type("image/bmp");
+                    if has_image {
+                        paste_clipboard_image(clipboard, inner, 0);
+                    } else {
+                        paste_clipboard_text(clipboard, iv, inner, 0);
+                    }
+                }
+            }
+        }
+    });
+}
 
 /// Read clipboard TEXT and insert it at the input cursor (replacing any
 /// selection — standard paste semantics). Retries on empty/error because
