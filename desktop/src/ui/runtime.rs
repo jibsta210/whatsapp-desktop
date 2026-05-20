@@ -439,12 +439,78 @@ pub fn touch_wa_chat_preview(chat_id: &str, preview: &str, timestamp: i64, is_fr
     }
 }
 
+/// Persist a chat's messages, **preserving cross-protocol history**.
+///
+/// A single `wa_messages/<id>.bin` file can hold both WhatsApp messages
+/// *and* Google Messages (SMS/RCS) messages: once a contact's WhatsApp
+/// chat and SMS thread are merged into one row, both protocols render
+/// from — and persist into — the same file.
+///
+/// The trap: each runtime only owns ONE protocol's view. The WhatsApp
+/// runtime saves a WhatsApp-only `s.history`; the gmessages runtime saves
+/// an SMS set. A blind overwrite lets whichever runtime saves last wipe
+/// the other's messages — the long-standing "my SMS keep disappearing on
+/// restart" bug.
+///
+/// Rule enforced here: `messages` is authoritative **only for the
+/// protocol(s) it actually contains**. Any on-disk message whose protocol
+/// is absent from `messages` is carried over. The merged result is sorted
+/// by timestamp so the two streams interleave chronologically.
+///
+/// The per-message protocol comes from [`crate::bridge::MessageSource::from_message`]
+/// (the `gm:` tag on the chat_id / message_id) — no on-disk schema change
+/// required. This is strictly a superset of a blind overwrite: it never
+/// drops a message that a blind write would have kept.
 pub fn save_messages(chat_id: &str, messages: &[IncomingMessage]) {
+    use crate::bridge::MessageSource;
     let dir = messages_dir();
     if !dir.exists() {
         let _ = std::fs::create_dir_all(&dir);
     }
-    write_bin_path(&messages_file(chat_id), &messages.to_vec());
+    let path = messages_file(chat_id);
+
+    // Read whatever is already on disk in the current ("WA02") format.
+    // Use `read_bin_path` (NOT `load_messages`) — `load_messages` calls
+    // back into `save_messages` for legacy-format migration, so going
+    // through it here would recurse.
+    let existing = read_bin_path::<Vec<IncomingMessage>>(&path).unwrap_or_default();
+
+    let final_msgs: Vec<IncomingMessage> = if existing.is_empty() {
+        // Nothing to protect (new file, or legacy/corrupt format that the
+        // caller is about to rewrite). Write verbatim.
+        messages.to_vec()
+    } else {
+        let new_has_wa = messages
+            .iter()
+            .any(|m| MessageSource::from_message(&m.chat_id, &m.id) == MessageSource::WhatsApp);
+        let new_has_gm = messages.iter().any(|m| {
+            MessageSource::from_message(&m.chat_id, &m.id) == MessageSource::GoogleMessages
+        });
+        let new_ids: std::collections::HashSet<&str> =
+            messages.iter().map(|m| m.id.as_str()).collect();
+        // Keep on-disk messages whose protocol the caller did NOT supply
+        // (and which aren't superseded by an incoming copy of the same id).
+        let mut merged: Vec<IncomingMessage> = existing
+            .iter()
+            .filter(|m| {
+                if new_ids.contains(m.id.as_str()) {
+                    return false;
+                }
+                match MessageSource::from_message(&m.chat_id, &m.id) {
+                    MessageSource::WhatsApp => !new_has_wa,
+                    MessageSource::GoogleMessages => !new_has_gm,
+                }
+            })
+            .cloned()
+            .collect();
+        merged.extend(messages.iter().cloned());
+        // Stable sort: interleaves the preserved + incoming streams by time
+        // while keeping each stream's internal order for equal timestamps.
+        merged.sort_by_key(|m| m.timestamp);
+        merged
+    };
+
+    write_bin_path(&path, &final_msgs);
 }
 
 /// Append a single message to an existing chat's message file.
