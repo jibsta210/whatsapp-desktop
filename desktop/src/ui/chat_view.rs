@@ -1346,12 +1346,34 @@ impl ChatViewPanel {
                 if key == gtk4::gdk::Key::v
                     && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
                 {
-                    log::info!("Paste handler: Ctrl+V detected, checking clipboard");
                     let Some(display) = gtk4::gdk::Display::default() else {
                         log::warn!("Paste: no default display");
                         return gtk4::glib::Propagation::Proceed;
                     };
                     let clipboard = display.clipboard();
+                    // CRITICAL: only intercept the paste when the clipboard
+                    // actually holds an image. On Wayland a clipboard offer
+                    // (`wl_data_offer`) is consumed when read — firing
+                    // `read_texture_async` on a TEXT-only clipboard races
+                    // the TextView's own native text-paste read for the
+                    // same offer, and the text paste silently loses. That's
+                    // the "copy works in other apps but not ours" bug.
+                    // For text, do nothing here and let the TextView's
+                    // built-in Ctrl+V handler run untouched.
+                    let formats = clipboard.formats();
+                    let has_image = formats.contain_mime_type("image/png")
+                        || formats.contain_mime_type("image/jpeg")
+                        || formats.contain_mime_type("image/gif")
+                        || formats.contain_mime_type("image/webp")
+                        || formats.contain_mime_type("image/bmp")
+                        || formats.contain_mime_type("image/tiff");
+                    if !has_image {
+                        log::info!(
+                            "Paste: clipboard has no image format — letting TextView paste text natively"
+                        );
+                        return gtk4::glib::Propagation::Proceed;
+                    }
+                    log::info!("Paste handler: Ctrl+V with image content, reading texture");
                     let inner_cc = inner_c.clone();
                     // Primary path: read as GDK texture. Works for images
                     // copied from most apps on X11 and Wayland.
