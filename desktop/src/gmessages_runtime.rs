@@ -81,6 +81,73 @@ pub fn strip_prefix(chat_id: &str) -> &str {
     chat_id.strip_prefix(CHAT_PREFIX).unwrap_or(chat_id)
 }
 
+/// Incrementally upsert one gm chat's entry in `gm_chats.bin`.
+///
+/// `gm_chats.bin` used to be written ONLY by `list_conversations`, which
+/// runs once per startup. Any SMS chat created or updated mid-session
+/// therefore never reached disk and vanished from the chat list on the
+/// next restart. This keeps the cache current message-by-message:
+/// load → upsert the one entry → write back. The file is small (tens of
+/// KB) and SMS volume is low, so a full rewrite per message is fine.
+fn upsert_gm_chat_cache(
+    path: &Path,
+    chat_id: &str,
+    preview: &str,
+    timestamp: i64,
+    is_from_me: bool,
+    sender_name: &str,
+) {
+    let mut cache: Vec<ChatSummary> = std::fs::read(path)
+        .ok()
+        .and_then(|b| bincode::deserialize(&b).ok())
+        .unwrap_or_default();
+
+    if let Some(existing) = cache.iter_mut().find(|c| c.id == chat_id) {
+        // Move forward only — an out-of-order older message in a batch
+        // must not rewrite a newer preview / timestamp.
+        if timestamp >= existing.timestamp {
+            existing.last_message = preview.to_string();
+            existing.timestamp = timestamp;
+        }
+        if is_from_me {
+            existing.unread_count = 0;
+        }
+        // Never overwrite an existing (likely better-resolved) name.
+    } else {
+        // Brand-new gm chat. Best-effort name: an incoming message's
+        // resolved sender name if it looks real, else the conversation
+        // id as a placeholder — the next `list_conversations` overlays
+        // the authoritative name.
+        let name = if !is_from_me
+            && !sender_name.is_empty()
+            && sender_name.chars().any(|c| c.is_alphabetic())
+        {
+            sender_name.to_string()
+        } else {
+            strip_prefix(chat_id).to_string()
+        };
+        cache.push(ChatSummary {
+            id: chat_id.to_string(),
+            name,
+            last_message: preview.to_string(),
+            timestamp,
+            unread_count: if is_from_me { 0 } else { 1 },
+            is_group: false,
+            is_muted: false,
+            is_pinned: false,
+            is_archived: false,
+            is_favorite: false,
+            label: None,
+            pinned_msg_id: None,
+            auto_mark_read: false,
+        });
+    }
+
+    if let Ok(bytes) = bincode::serialize(&cache) {
+        let _ = std::fs::write(path, bytes);
+    }
+}
+
 /// Build phone-digits → wa_chat_id (JID) index from the persisted WhatsApp
 /// chat list. Used to detect gm chats that should merge into existing
 /// WhatsApp chats for the same person.
@@ -1042,6 +1109,38 @@ async fn run(
                             &preview,
                             im.timestamp,
                             im.is_from_me,
+                        );
+                    }
+                    // STEP 4: for an UNMERGED gm chat (chat_id still
+                    // `gm:N` after redirect), incrementally update
+                    // gm_chats.bin. The cache was previously written
+                    // ONLY by list_conversations (once per startup), so
+                    // any SMS chat created or updated mid-session never
+                    // made it to disk and vanished on the next restart.
+                    // This keeps the cache current message-by-message.
+                    if let WaEvent::MessageReceived(im) = &wa_event
+                        && is_gm_chat(&im.chat_id)
+                    {
+                        let preview = im
+                            .text
+                            .clone()
+                            .or_else(|| im.media_caption.clone())
+                            .unwrap_or_else(|| match im.media_type {
+                                Some(crate::bridge::MediaType::Image) => "📷 Photo".into(),
+                                Some(crate::bridge::MediaType::Video) => "🎥 Video".into(),
+                                Some(crate::bridge::MediaType::Audio) => "🎵 Audio".into(),
+                                Some(crate::bridge::MediaType::Document) => "📄 Document".into(),
+                                Some(crate::bridge::MediaType::Sticker) => "🎭 Sticker".into(),
+                                Some(crate::bridge::MediaType::Gif) => "🎞 GIF".into(),
+                                None => String::new(),
+                            });
+                        upsert_gm_chat_cache(
+                            &gm_chats_cache_path,
+                            &im.chat_id,
+                            &preview,
+                            im.timestamp,
+                            im.is_from_me,
+                            &im.sender_name,
                         );
                     }
                     log::info!(

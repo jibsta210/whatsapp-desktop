@@ -604,6 +604,9 @@ impl ChatListPanel {
                 auto_mark_read: false,
             });
         }
+        // Set inside the row block; consumed after `drop(rows)` to gate
+        // the timestamp/sort update.
+        let mut is_newer = false;
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             let doc_preview: String;
@@ -656,7 +659,25 @@ impl ChatListPanel {
             } else {
                 clean
             };
-            row.update_preview(&preview, msg.timestamp);
+            // Only let this message become the row's "latest" (preview +
+            // sort timestamp) if it's actually NEWER than what we have.
+            // gmessages delivers messages in batches — opening an SMS
+            // thread pulls in old history — and processing an older
+            // message last would otherwise rewrite the preview to stale
+            // text AND sink the whole chat to the bottom of the list
+            // (sort key = timestamp). That's the "chat vanished from the
+            // list after I clicked it" bug.
+            let existing_ts = self
+                .inner
+                .timestamps
+                .borrow()
+                .get(chat_id)
+                .copied()
+                .unwrap_or(0);
+            is_newer = msg.timestamp >= existing_ts;
+            if is_newer {
+                row.update_preview(&preview, msg.timestamp);
+            }
             // Cache message for stealth peek (keep last 10)
             {
                 let mut cache = self.inner.recent_messages.borrow_mut();
@@ -688,11 +709,15 @@ impl ChatListPanel {
                 row.typing_box.set_visible(false);
             }
         }
-        self.inner
-            .timestamps
-            .borrow_mut()
-            .insert(chat_id.to_string(), msg.timestamp);
-        self.inner.list_box.invalidate_sort();
+        // Move the sort timestamp FORWARD only — never let an
+        // out-of-order older message in a batch drag the chat down.
+        if is_newer {
+            self.inner
+                .timestamps
+                .borrow_mut()
+                .insert(chat_id.to_string(), msg.timestamp);
+            self.inner.list_box.invalidate_sort();
+        }
         self.inner.list_box.invalidate_filter();
     }
 
