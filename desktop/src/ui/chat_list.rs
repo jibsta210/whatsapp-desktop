@@ -633,7 +633,11 @@ impl ChatListPanel {
                     Some(crate::bridge::MediaType::Gif) => "🎞 GIF",
                     None => "",
                 });
-            // Strip any remaining @JID mentions from preview
+            // Resolve any raw @JID mentions in the preview to the
+            // contact's name. Message bodies carry mentions as
+            // `@<jid-digits>` (the protocol form); the bubble renderer
+            // resolves them, and the chat-list preview must too — else
+            // a "@agnes" mention shows as the generic "@user".
             let clean = if content.contains('@') {
                 let mut c = content.to_string();
                 for word in content.split_whitespace() {
@@ -645,7 +649,15 @@ impl ChatListPanel {
                             .map(|ch| ch.is_ascii_digit())
                             .unwrap_or(false)
                     {
-                        c = c.replace(word, "@user");
+                        let jid_part = &word[1..];
+                        // Global cross-protocol directory does digits /
+                        // last-10 / last-7 / LID-JID resolution.
+                        let replacement = crate::contacts::global()
+                            .lookup(jid_part)
+                            .filter(|n| !n.is_empty() && !n.contains('@'))
+                            .map(|n| format!("@{n}"))
+                            .unwrap_or_else(|| "@user".to_string());
+                        c = c.replace(word, &replacement);
                     }
                 }
                 c
