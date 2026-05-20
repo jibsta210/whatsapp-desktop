@@ -1358,10 +1358,12 @@ fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRe
         .timeout_read(std::time::Duration::from_secs(8))
         .timeout_write(std::time::Duration::from_secs(5))
         .build();
-    // Use gemini-2.5-flash-lite for speed — no thinking overhead, ~1s responses.
-    // gemini-3-flash-preview wastes 100-300 "thinking" tokens per request.
+    // `gemini-flash-latest` is Google's maintained alias that always
+    // resolves to the newest Flash model — so autocorrect tracks the
+    // current generation without us hard-coding a version string that
+    // goes stale. (User asked to move to the "new flash" model.)
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key={api_key}"
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
     );
 
     while let Ok(req) = rx.recv() {
