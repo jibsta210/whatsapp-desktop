@@ -1335,8 +1335,13 @@ async fn handle_command(
                         }
                     }
                     // Persist the merged set so future restarts see the same
-                    // ordering.
-                    crate::ui::runtime::save_messages(&chat_id, &merged);
+                    // ordering. Scoped to SMS — a WhatsApp save for this
+                    // (possibly merged) chat must not be able to drop it.
+                    crate::ui::runtime::save_messages_scoped(
+                        &chat_id,
+                        crate::bridge::MessageSource::GoogleMessages,
+                        &merged,
+                    );
                 }
                 Err(e) => log::warn!("gmessages: fetch_messages failed (using disk cache only): {e}"),
             }
