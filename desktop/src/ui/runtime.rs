@@ -2786,10 +2786,16 @@ async fn handle_wa_event(
                 "MarkChatAsReadUpdate: {chat_id} read={is_read} full_sync={}",
                 update.from_full_sync
             );
-            // For full sync events, only process "read" updates (clearing badges
-            // is always safe). Skip "unread" from full sync since the server's
-            // unread_count in history sync is more authoritative.
-            if update.from_full_sync && !is_read {
+            // Ignore ALL full-sync mark-read/unread mutations. The app-state
+            // log only records the last time the user *explicitly* read or
+            // unread a chat — it is stale the moment new messages arrive.
+            // Replaying it on every startup zeroed the unread badge of every
+            // chat the user had ever read, including ones with fresh unread
+            // messages ("0 unread on every reopen"). The history sync's
+            // `conv.unread_count` is the authoritative current read state —
+            // let it win. Live (non-full-sync) MarkChatAsRead updates and
+            // ReadSelf receipts still clear badges in real time.
+            if update.from_full_sync {
                 return;
             }
             if is_read {
