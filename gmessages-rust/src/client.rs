@@ -382,6 +382,21 @@ impl Client {
         crate::session::download_media(self, media_id, decryption_key).await
     }
 
+    /// Upload and send a media attachment (image / video / audio) as an
+    /// MMS/RCS message. `data` is the raw file bytes. Returns the temporary
+    /// message id; the phone echoes the real message via the long-poll.
+    pub async fn send_media(
+        &self,
+        conversation_id: &str,
+        data: &[u8],
+        file_name: &str,
+        mime: &str,
+        caption: Option<&str>,
+    ) -> Result<String> {
+        let media = crate::session::upload_media(self, data, file_name, mime).await?;
+        crate::session::send_media(self, conversation_id, media, caption).await
+    }
+
     /// Resolve an E.164 phone number to a conversation ID, creating the
     /// conversation if needed.
     pub async fn get_or_create_conversation(&self, phone: &str) -> Result<String> {

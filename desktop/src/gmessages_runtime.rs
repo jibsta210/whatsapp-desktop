@@ -97,6 +97,37 @@ fn gm_media_dest(media_id: &str, mime: &str, data_dir: &Path) -> PathBuf {
     data_dir.join("gm_media").join(format!("{media_id}.{ext}"))
 }
 
+/// Best-effort MIME type from a file path's extension. Used when sending
+/// an outbound MMS — the relay needs a content type for the attachment.
+fn guess_mime(path: &str) -> String {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "heic" | "heif" => "image/heic",
+        "mp4" | "m4v" => "video/mp4",
+        "3gp" | "3gpp" => "video/3gpp",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "aac" => "audio/aac",
+        "ogg" | "oga" => "audio/ogg",
+        "amr" => "audio/amr",
+        "wav" => "audio/wav",
+        "pdf" => "application/pdf",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 /// Incrementally upsert one gm chat's entry in `gm_chats.bin`.
 ///
 /// `gm_chats.bin` used to be written ONLY by `list_conversations`, which
@@ -1484,6 +1515,116 @@ async fn handle_command(
                     });
                 }
                 Err(e) => log::warn!("gmessages: send_reaction failed: {e}"),
+            }
+        }
+        WaCommand::SendImage {
+            chat_id,
+            path,
+            caption,
+            tmp_id,
+        } => {
+            let conv = strip_prefix(&chat_id).to_string();
+            let data = match tokio::fs::read(&path).await {
+                Ok(d) => d,
+                Err(e) => {
+                    log::warn!("gmessages: SendImage cannot read {path}: {e}");
+                    let _ = event_tx
+                        .send(WaEvent::MessageFailed {
+                            msg_id: tmp_id,
+                            chat_id,
+                        })
+                        .await;
+                    return Ok(());
+                }
+            };
+            let mime = guess_mime(&path);
+            let file_name = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "image".to_string());
+            log::info!(
+                "gmessages: SendImage {file_name} ({mime}, {} bytes) → {conv}",
+                data.len()
+            );
+            match client
+                .send_media(&conv, &data, &file_name, &mime, caption.as_deref())
+                .await
+            {
+                Ok(real_tmp) => {
+                    let tagged = format!("{CHAT_PREFIX}{real_tmp}");
+                    // Re-key the optimistic bubble to the relay's id.
+                    let _ = event_tx
+                        .send(WaEvent::MessageConfirmed {
+                            tmp_id: tmp_id.clone(),
+                            real_id: tagged.clone(),
+                            chat_id: chat_id.clone(),
+                        })
+                        .await;
+                    // Echo it back as a received message so it shows + is
+                    // cached immediately. We still have the file locally, so
+                    // point media_local_path straight at it. The phone also
+                    // echoes the real message via the long-poll, which
+                    // dedups by message_id.
+                    let now_s = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let kind = if mime.starts_with("video/") {
+                        MediaType::Video
+                    } else if mime.starts_with("audio/") {
+                        MediaType::Audio
+                    } else if mime == "image/gif" {
+                        MediaType::Gif
+                    } else if mime.starts_with("image/") {
+                        MediaType::Image
+                    } else {
+                        MediaType::Document
+                    };
+                    let echo = IncomingMessage {
+                        id: tagged,
+                        chat_id: chat_id.clone(),
+                        sender_id: String::new(),
+                        sender_name: String::new(),
+                        text: None,
+                        media_type: Some(kind),
+                        timestamp: now_s,
+                        is_from_me: true,
+                        quoted_msg_id: None,
+                        quoted_text: None,
+                        quoted_sender: None,
+                        is_forwarded: false,
+                        forwarding_score: 0,
+                        reactions: vec![],
+                        media_local_path: Some(path.clone()),
+                        media_filename: Some(file_name),
+                        media_caption: caption.clone(),
+                        contact_name: None,
+                        contact_vcard: None,
+                        link_title: None,
+                        link_description: None,
+                        link_url: None,
+                        link_thumbnail_path: None,
+                        quoted_media_path: None,
+                        poll_question: None,
+                        poll_options: vec![],
+                        poll_selectable: 0,
+                        poll_secret: vec![],
+                        poll_votes: vec![],
+                        receipt_status: ReceiptStatus::Sent,
+                        is_edited: false,
+                        is_system_message: false,
+                    };
+                    let _ = event_tx.send(WaEvent::MessageReceived(echo)).await;
+                }
+                Err(e) => {
+                    log::warn!("gmessages: SendImage failed: {e}");
+                    let _ = event_tx
+                        .send(WaEvent::MessageFailed {
+                            msg_id: tmp_id,
+                            chat_id,
+                        })
+                        .await;
+                }
             }
         }
         other => {

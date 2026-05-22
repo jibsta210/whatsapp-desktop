@@ -598,6 +598,288 @@ pub async fn download_media(
     Ok(plain)
 }
 
+/// Map a MIME type to the Google Messages `MediaFormats` enum value.
+fn mime_to_media_format(mime: &str) -> i32 {
+    use crate::gmproto::conversations::MediaFormats as F;
+    let f = match mime {
+        "image/jpeg" => F::ImageJpeg,
+        "image/jpg" => F::ImageJpg,
+        "image/png" => F::ImagePng,
+        "image/gif" => F::ImageGif,
+        "image/bmp" | "image/x-ms-bmp" => F::ImageXMsBmp,
+        "video/mp4" => F::VideoMp4,
+        "video/3gpp" => F::Video3gpp,
+        "video/webm" => F::VideoWebm,
+        "audio/aac" => F::AudioAac,
+        "audio/amr" => F::AudioAmr,
+        "audio/mpeg" | "audio/mp3" => F::AudioMp3,
+        "audio/mp4" => F::AudioMp4,
+        "audio/ogg" => F::AudioOgg,
+        "application/pdf" => F::AppPdf,
+        _ if mime.starts_with("image/") => F::ImageUnspecified,
+        _ if mime.starts_with("video/") => F::VideoUnspecified,
+        _ if mime.starts_with("audio/") => F::AudioUnspecified,
+        _ => F::AppUnspecified,
+    };
+    f as i32
+}
+
+/// Build headers for the resumable media-upload endpoint. Mirrors
+/// `util.NewMediaUploadHeaders` in the Go reference.
+fn media_upload_headers(
+    content_length: &str,
+    command: &str,
+    offset: Option<&str>,
+    content_type: Option<&str>,
+    protocol: Option<&str>,
+) -> reqwest::header::HeaderMap {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+    let mut h = HeaderMap::new();
+    h.insert("sec-ch-ua", HeaderValue::from_static(crate::headers::SEC_UA));
+    if let Some(p) = protocol
+        && let Ok(v) = HeaderValue::from_str(p)
+    {
+        h.insert(HeaderName::from_static("x-goog-upload-protocol"), v);
+    }
+    if let Ok(v) = HeaderValue::from_str(content_length) {
+        h.insert(
+            HeaderName::from_static("x-goog-upload-header-content-length"),
+            v,
+        );
+    }
+    h.insert(
+        "sec-ch-ua-mobile",
+        HeaderValue::from_static(crate::headers::SEC_UA_MOBILE),
+    );
+    h.insert(
+        "user-agent",
+        HeaderValue::from_static(crate::headers::USER_AGENT),
+    );
+    if let Some(ct) = content_type
+        && let Ok(v) = HeaderValue::from_str(ct)
+    {
+        h.insert(
+            HeaderName::from_static("x-goog-upload-header-content-type"),
+            v,
+        );
+    }
+    h.insert(
+        "content-type",
+        HeaderValue::from_static("application/x-www-form-urlencoded;charset=UTF-8"),
+    );
+    if let Ok(v) = HeaderValue::from_str(command) {
+        h.insert(HeaderName::from_static("x-goog-upload-command"), v);
+    }
+    if let Some(off) = offset
+        && let Ok(v) = HeaderValue::from_str(off)
+    {
+        h.insert(HeaderName::from_static("x-goog-upload-offset"), v);
+    }
+    h.insert(
+        "sec-ch-ua-platform",
+        HeaderValue::from_static("\"Android\""),
+    );
+    h.insert("accept", HeaderValue::from_static("*/*"));
+    h.insert("origin", HeaderValue::from_static(crate::headers::ORIGIN));
+    h.insert("sec-fetch-site", HeaderValue::from_static("cross-site"));
+    h.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
+    h.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
+    h.insert("referer", HeaderValue::from_static(crate::headers::REFERER));
+    h.insert(
+        "accept-language",
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    h
+}
+
+/// Encrypt and upload a media file, returning a `MediaContent` ready to
+/// embed in a `SendMessageRequest`. Two-step resumable upload, mirroring
+/// `pkg/libgm/media.go`:
+///   1. POST the base64 `StartMediaUploadRequest` → receive an upload URL.
+///   2. POST the encrypted bytes to that URL → receive the media id.
+pub async fn upload_media(
+    client: &Client,
+    data: &[u8],
+    file_name: &str,
+    mime: &str,
+) -> Result<crate::gmproto::conversations::MediaContent> {
+    use crate::gmproto::client::{StartMediaUploadRequest, UploadMediaResponse};
+    use base64::Engine;
+
+    if let Err(e) = refresh_auth_token(client).await {
+        log::warn!("upload_media: token refresh failed (continuing): {e}");
+    }
+
+    // Encrypt with a fresh 32-byte AES-GCM key (chunked format — the same
+    // format `download_media` decrypts).
+    let decryption_key: Vec<u8> = rand::random::<[u8; 32]>().to_vec();
+    let encrypted = crate::crypto::aesgcm::encrypt(&decryption_key, data)?;
+    let enc_len = encrypted.len().to_string();
+    log::info!(
+        "upload_media: {} plaintext → {} encrypted bytes ({mime})",
+        data.len(),
+        encrypted.len()
+    );
+
+    // ── Step 1: start the resumable upload ──
+    let (tachyon_token, network, mobile) = {
+        let auth = client.inner.auth.lock().await;
+        (
+            auth.tachyon_auth_token.clone().unwrap_or_default(),
+            auth.auth_network().to_string(),
+            auth.mobile.clone(),
+        )
+    };
+    let start_req = StartMediaUploadRequest {
+        attachment_type: 1,
+        auth_data: Some(AuthMessage {
+            request_id: Uuid::new_v4().to_string(),
+            tachyon_auth_token: tachyon_token,
+            network,
+            config_version: Some(config_version()),
+        }),
+        mobile,
+    };
+    let mut start_bytes = Vec::with_capacity(start_req.encoded_len());
+    start_req.encode(&mut start_bytes)?;
+    let start_b64 = base64::engine::general_purpose::STANDARD.encode(&start_bytes);
+
+    let resp = client
+        .inner
+        .http
+        .short
+        .post(crate::urls::UPLOAD_MEDIA)
+        .headers(media_upload_headers(
+            &enc_len,
+            "start",
+            None,
+            Some(mime),
+            Some("resumable"),
+        ))
+        .body(start_b64.into_bytes())
+        .send()
+        .await?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(Error::AuthRevoked);
+    }
+    if !status.is_success() {
+        return Err(Error::Protocol(format!("upload_media start: HTTP {status}")));
+    }
+    let upload_url = resp
+        .headers()
+        .get("x-goog-upload-url")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .ok_or_else(|| Error::Protocol("upload_media: no x-goog-upload-url header".into()))?;
+
+    // ── Step 2: upload the encrypted bytes and finalize ──
+    let resp = client
+        .inner
+        .http
+        .short
+        .post(&upload_url)
+        .headers(media_upload_headers(
+            &enc_len,
+            "upload, finalize",
+            Some("0"),
+            Some(mime),
+            None,
+        ))
+        .body(encrypted)
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(Error::Protocol(format!(
+            "upload_media finalize: HTTP {status}"
+        )));
+    }
+    let resp_bytes = resp.bytes().await?;
+    // The finalize response is an `UploadMediaResponse` protobuf — sometimes
+    // standard-base64-wrapped. Try raw protobuf first, then base64.
+    let upload_resp = match UploadMediaResponse::decode(&*resp_bytes) {
+        Ok(r) => r,
+        Err(_) => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&resp_bytes)
+                .map_err(|e| {
+                    Error::Protocol(format!("upload_media: response not protobuf/base64: {e}"))
+                })?;
+            UploadMediaResponse::decode(&*decoded)
+                .map_err(|e| Error::Protocol(format!("upload_media: bad response: {e}")))?
+        }
+    };
+    let media_id = upload_resp
+        .media
+        .map(|m| m.media_id)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::Protocol("upload_media: empty media_id in response".into()))?;
+    log::info!("upload_media: success media_id={media_id}");
+
+    Ok(crate::gmproto::conversations::MediaContent {
+        format: mime_to_media_format(mime),
+        media_id,
+        media_name: file_name.to_string(),
+        size: data.len() as i64,
+        decryption_key,
+        mime_type: mime.to_string(),
+        ..Default::default()
+    })
+}
+
+/// Send a media message (MMS / RCS attachment). `media` comes from
+/// [`upload_media`]. An optional `caption` is sent as a second text part.
+pub async fn send_media(
+    client: &Client,
+    to: &str,
+    media: crate::gmproto::conversations::MediaContent,
+    caption: Option<&str>,
+) -> Result<String> {
+    let conversation_id = if to.starts_with('+') {
+        get_or_create_conversation(client, to).await?
+    } else {
+        to.to_string()
+    };
+    let tmp_id = format!("tmp_{:012}", rand::random::<u64>() % 1_000_000_000_000u64);
+
+    let mut infos = vec![MessageInfo {
+        action_message_id: None,
+        data: Some(message_info::Data::MediaContent(media)),
+    }];
+    if let Some(cap) = caption.filter(|c| !c.is_empty()) {
+        infos.push(MessageInfo {
+            action_message_id: None,
+            data: Some(message_info::Data::MessageContent(MessageContent {
+                content: cap.to_string(),
+            })),
+        });
+    }
+
+    let payload = MessagePayload {
+        tmp_id: tmp_id.clone(),
+        conversation_id: conversation_id.clone(),
+        tmp_id2: tmp_id.clone(),
+        message_payload_content: None,
+        message_info: infos,
+        participant_id: String::new(),
+    };
+    let req = SendMessageRequest {
+        conversation_id: conversation_id.clone(),
+        tmp_id: tmp_id.clone(),
+        message_payload: Some(payload),
+        sim_payload: None,
+        force_rcs: false,
+        reply: None,
+    };
+    let resp_bytes = send_rpc::<SendMessageRequest>(client, ActionType::SendMessage, Some(&req), true)
+        .await?
+        .ok_or_else(|| Error::Protocol("send_media: no response".into()))?;
+    let resp = SendMessageResponse::decode(&*resp_bytes.decrypted).map_err(Error::from)?;
+    log::info!("send_media: response status={}", resp.status);
+    Ok(tmp_id)
+}
+
 /// List all contacts known to Google Messages on the phone. Used to
 /// resolve participant phone numbers into contact names.
 pub async fn list_contacts(
