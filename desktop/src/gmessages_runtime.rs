@@ -1025,11 +1025,30 @@ async fn run(
                         }
                     }
                     global.save_if_dirty();
+                    let dl_mm = merge_map.lock().await.clone();
                     for m in messages {
                         let downloads = pending_downloads(m, &data_dir);
+                        if m.r#type != 1 {
+                            log::info!(
+                                "gm media diag: download pass msg={} type={} info_entries={} → {} download(s)",
+                                m.message_id,
+                                m.r#type,
+                                m.message_info.len(),
+                                downloads.len(),
+                            );
+                        }
                         for (media_id, key, dest, kind) in downloads {
-                            let chat_id = format!("{CHAT_PREFIX}{}", m.conversation_id);
-                            let msg_id = m.message_id.clone();
+                            // chat_id and msg_id must match where the bubble
+                            // actually lives: the merged WhatsApp jid if this
+                            // conversation is merged (else the gm: chat id),
+                            // and the gm:-tagged message id the bubble is
+                            // keyed by. Emitting the raw ids meant downloaded
+                            // media never attached to its bubble.
+                            let chat_id = dl_mm
+                                .get(&m.conversation_id)
+                                .cloned()
+                                .unwrap_or_else(|| format!("{CHAT_PREFIX}{}", m.conversation_id));
+                            let msg_id = format!("{CHAT_PREFIX}{}", m.message_id);
                             let client = client.clone();
                             let event_tx = event_tx.clone();
                             tokio::spawn(async move {
@@ -2191,6 +2210,21 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
                 text = Some(c.content.clone());
             }
             Some(message_info::Data::MediaContent(mc)) => {
+                log::info!(
+                    "gm media diag: msg={} type={} fmt={} media_id={:?} key_len={} \
+                     mime={:?} name={:?} size={} inline_bytes={} thumb_id={:?} thumb_key_len={}",
+                    m.message_id,
+                    m.r#type,
+                    mc.format,
+                    mc.media_id,
+                    mc.decryption_key.len(),
+                    mc.mime_type,
+                    mc.media_name,
+                    mc.size,
+                    mc.media_data.len(),
+                    mc.thumbnail_media_id,
+                    mc.thumbnail_decryption_key.len(),
+                );
                 let mime = mc.mime_type.as_str();
                 media = Some(if mime.starts_with("image/") {
                     if mime == "image/gif" { MediaType::Gif } else { MediaType::Image }
