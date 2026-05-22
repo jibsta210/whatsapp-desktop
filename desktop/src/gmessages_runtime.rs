@@ -81,6 +81,22 @@ pub fn strip_prefix(chat_id: &str) -> &str {
     chat_id.strip_prefix(CHAT_PREFIX).unwrap_or(chat_id)
 }
 
+/// Data dir for the gmessages runtime, captured once at `run()` start so
+/// free functions (e.g. `message_to_incoming`) can resolve `gm_media/`
+/// paths without threading it through every call site.
+static GM_DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Deterministic on-disk path for a downloaded gm media blob. Mirrors the
+/// naming `pending_downloads` uses so a path computed here finds the file
+/// the downloader actually wrote.
+fn gm_media_dest(media_id: &str, mime: &str, data_dir: &Path) -> PathBuf {
+    let ext = match mime.split_once('/').map(|(_, sub)| sub) {
+        Some(s) if !s.is_empty() => s,
+        _ => "bin",
+    };
+    data_dir.join("gm_media").join(format!("{media_id}.{ext}"))
+}
+
 /// Incrementally upsert one gm chat's entry in `gm_chats.bin`.
 ///
 /// `gm_chats.bin` used to be written ONLY by `list_conversations`, which
@@ -270,6 +286,8 @@ async fn run(
     event_tx: Sender<WaEvent>,
     mut cmd_rx: TokioUnboundedReceiver<WaCommand>,
 ) -> Result<()> {
+    // Capture the data dir so free functions can resolve gm_media/ paths.
+    let _ = GM_DATA_DIR.set(data_dir.clone());
     let auth_path = resolve_auth_path(&data_dir);
     log::info!("gmessages: looking for auth file at {}", auth_path.display());
     let auth = load_auth(&auth_path).await?;
@@ -1419,6 +1437,55 @@ async fn handle_command(
                 log::warn!("gmessages: set_typing failed: {e}");
             }
         }
+        WaCommand::SendReaction {
+            chat_id,
+            msg_id,
+            emoji,
+            ..
+        } => {
+            let conv = strip_prefix(&chat_id).to_string();
+            let raw_msg_id = strip_prefix(&msg_id).to_string();
+            // Google Messages reaction action: 1 = Add, 2 = Remove. The UI
+            // sends an empty emoji to clear an existing reaction.
+            let action = if emoji.is_empty() { 2 } else { 1 };
+            log::info!(
+                "gmessages: SendReaction {emoji:?} on msg {raw_msg_id} (action {action})"
+            );
+            match client.send_reaction(&conv, &raw_msg_id, &emoji, action).await {
+                Ok(()) => {
+                    // Optimistic UI update — show it immediately rather than
+                    // waiting for the phone's long-poll echo.
+                    let _ = event_tx
+                        .send(WaEvent::ReactionUpdated {
+                            chat_id: chat_id.clone(),
+                            msg_id: msg_id.clone(),
+                            emoji: emoji.clone(),
+                        })
+                        .await;
+                    // Persist directly so the reaction survives a restart —
+                    // the long-poll echo path doesn't re-save existing
+                    // messages, so without this it would be lost.
+                    let cid = chat_id.clone();
+                    let mid = msg_id.clone();
+                    let emo = emoji.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut msgs = crate::ui::runtime::load_messages(&cid);
+                        if let Some(m) = msgs.iter_mut().find(|m| m.id == mid) {
+                            m.reactions.retain(|(who, _)| who != "me");
+                            if !emo.is_empty() {
+                                m.reactions.push(("me".to_string(), emo));
+                            }
+                            crate::ui::runtime::save_messages_scoped(
+                                &cid,
+                                MessageSource::GoogleMessages,
+                                &msgs,
+                            );
+                        }
+                    });
+                }
+                Err(e) => log::warn!("gmessages: send_reaction failed: {e}"),
+            }
+        }
         other => {
             log::debug!(
                 "gmessages: dropping unsupported command for gm chat: {}",
@@ -1906,12 +1973,7 @@ fn pending_downloads(m: &GmMessage, data_dir: &Path) -> Vec<(String, Vec<u8>, Pa
             && !mc.media_id.is_empty()
             && !mc.decryption_key.is_empty()
         {
-            let ext = match mc.mime_type.split_once('/').map(|(_, sub)| sub) {
-                Some(s) if !s.is_empty() => s.to_string(),
-                _ => "bin".into(),
-            };
-            let filename = format!("{}.{}", mc.media_id, ext);
-            let dest = media_root.join(filename);
+            let dest = gm_media_dest(&mc.media_id, &mc.mime_type, data_dir);
             let mime = mc.mime_type.as_str();
             let kind = if mime.starts_with("image/") {
                 if mime == "image/gif" { MediaType::Gif } else { MediaType::Image }
@@ -1963,6 +2025,7 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
     let mut text: Option<String> = None;
     let mut media: Option<MediaType> = None;
     let mut media_filename: Option<String> = None;
+    let mut media_local_path: Option<String> = None;
 
     for info in &m.message_info {
         match &info.data {
@@ -1982,6 +2045,17 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
                 });
                 if !mc.media_name.is_empty() {
                     media_filename = Some(mc.media_name.clone());
+                }
+                // If this blob was already downloaded, point at it so the
+                // image renders on restart / chat re-open without waiting
+                // for a fresh MediaReady event.
+                if !mc.media_id.is_empty()
+                    && let Some(dir) = GM_DATA_DIR.get()
+                {
+                    let p = gm_media_dest(&mc.media_id, mime, dir);
+                    if p.exists() {
+                        media_local_path = Some(p.to_string_lossy().into_owned());
+                    }
                 }
             }
             _ => {}
@@ -2091,7 +2165,7 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
                 if unicode.is_empty() { None } else { Some((participants, unicode)) }
             })
             .collect(),
-        media_local_path: None,
+        media_local_path,
         media_filename,
         media_caption: None,
         contact_name: None,
