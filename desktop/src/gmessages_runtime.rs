@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_channel::Sender;
-use gmessages_rust::gmproto::conversations::{Message as GmMessage, message_info};
+use gmessages_rust::gmproto::conversations::{Message as GmMessage, MediaContent, message_info};
 use gmessages_rust::{AuthData, Client, Event};
 use tokio::sync::mpsc::UnboundedReceiver as TokioUnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender as TokioUnboundedSender;
@@ -2141,16 +2141,33 @@ fn translate_event(event: Event) -> Vec<WaEvent> {
 /// Pull pending downloads off a gmessages `Message`. Returns
 /// `(media_id, decryption_key, dest_path)` triples. Caller should fetch +
 /// decrypt each, then emit `WaEvent::MediaReady` when done.
+/// The downloadable (id, key) for a MediaContent. Prefers the full-size
+/// blob; falls back to the thumbnail when no full blob is provided — RCS
+/// images frequently arrive thumbnail-only (the full `media_id` stays
+/// empty and only `thumbnail_media_id` + `thumbnail_decryption_key` are
+/// populated). Without the fallback those images never download.
+fn media_blob_ref(mc: &MediaContent) -> Option<(&str, &[u8])> {
+    if !mc.media_id.is_empty() && !mc.decryption_key.is_empty() {
+        Some((mc.media_id.as_str(), mc.decryption_key.as_slice()))
+    } else if !mc.thumbnail_media_id.is_empty() && !mc.thumbnail_decryption_key.is_empty() {
+        Some((
+            mc.thumbnail_media_id.as_str(),
+            mc.thumbnail_decryption_key.as_slice(),
+        ))
+    } else {
+        None
+    }
+}
+
 fn pending_downloads(m: &GmMessage, data_dir: &Path) -> Vec<(String, Vec<u8>, PathBuf, MediaType)> {
     let media_root = data_dir.join("gm_media");
     let _ = std::fs::create_dir_all(&media_root);
     let mut out = Vec::new();
     for info in &m.message_info {
         if let Some(message_info::Data::MediaContent(mc)) = &info.data
-            && !mc.media_id.is_empty()
-            && !mc.decryption_key.is_empty()
+            && let Some((blob_id, blob_key)) = media_blob_ref(mc)
         {
-            let dest = gm_media_dest(&mc.media_id, &mc.mime_type, data_dir);
+            let dest = gm_media_dest(blob_id, &mc.mime_type, data_dir);
             let mime = mc.mime_type.as_str();
             let kind = if mime.starts_with("image/") {
                 if mime == "image/gif" { MediaType::Gif } else { MediaType::Image }
@@ -2161,7 +2178,7 @@ fn pending_downloads(m: &GmMessage, data_dir: &Path) -> Vec<(String, Vec<u8>, Pa
             } else {
                 MediaType::Document
             };
-            out.push((mc.media_id.clone(), mc.decryption_key.clone(), dest, kind));
+            out.push((blob_id.to_string(), blob_key.to_vec(), dest, kind));
         }
     }
     out
@@ -2240,11 +2257,12 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
                 }
                 // If this blob was already downloaded, point at it so the
                 // image renders on restart / chat re-open without waiting
-                // for a fresh MediaReady event.
-                if !mc.media_id.is_empty()
+                // for a fresh MediaReady event. Uses the same id resolution
+                // as the downloader (full blob, else thumbnail).
+                if let Some((blob_id, _)) = media_blob_ref(mc)
                     && let Some(dir) = GM_DATA_DIR.get()
                 {
-                    let p = gm_media_dest(&mc.media_id, mime, dir);
+                    let p = gm_media_dest(blob_id, mime, dir);
                     if p.exists() {
                         media_local_path = Some(p.to_string_lossy().into_owned());
                     }
