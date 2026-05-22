@@ -992,6 +992,26 @@ pub async fn send_reaction(
     Ok(())
 }
 
+/// Ask the phone to make the full-size version of an image available.
+/// RCS image messages are relayed with only a thumbnail (the full
+/// `media_id` is empty); after this request the phone re-relays the
+/// message carrying a real `media_id`, which then downloads via the
+/// normal media path.
+pub async fn get_full_size_image(
+    client: &Client,
+    message_id: &str,
+    action_message_id: &str,
+) -> Result<()> {
+    use crate::gmproto::client::GetFullSizeImageRequest;
+    let req = GetFullSizeImageRequest {
+        message_id: message_id.into(),
+        action_message_id: action_message_id.into(),
+    };
+    send_rpc::<GetFullSizeImageRequest>(client, ActionType::GetFullSizeImage, Some(&req), true)
+        .await?;
+    Ok(())
+}
+
 /// Fetch the latest `count` messages of a conversation. Pass `cursor` from a
 /// previous response to page backwards.
 pub async fn fetch_messages(

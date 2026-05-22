@@ -426,6 +426,11 @@ async fn run(
     // batches we've already forwarded.
     let mut recent_msgs = RecentMsgRing::default();
 
+    // Message ids we've already sent a full-size-image request for, so a
+    // thumbnail re-relayed several times only triggers one request.
+    let mut requested_full_image: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     // Pin the synthetic "Verification Codes" inbox at the top of the chat
     // list. All 2FA / OTP SMS get routed here instead of creating a new
     // per-shortcode chat row (TD, Aeroplan, Google, Uber, etc.). Searchable
@@ -1037,7 +1042,7 @@ async fn run(
                                 downloads.len(),
                             );
                         }
-                        for (media_id, key, dest, kind) in downloads {
+                        for pm in downloads {
                             // chat_id and msg_id must match where the bubble
                             // actually lives: the merged WhatsApp jid if this
                             // conversation is merged (else the gm: chat id),
@@ -1049,6 +1054,31 @@ async fn run(
                                 .cloned()
                                 .unwrap_or_else(|| format!("{CHAT_PREFIX}{}", m.conversation_id));
                             let msg_id = format!("{CHAT_PREFIX}{}", m.message_id);
+                            // RCS images arrive thumbnail-only — ask the
+                            // phone to upload the full-size version. It
+                            // re-relays the message with a real media_id,
+                            // which then downloads via this same path.
+                            // Request once per message.
+                            if pm.is_thumbnail
+                                && requested_full_image.insert(m.message_id.clone())
+                            {
+                                let client = client.clone();
+                                let raw_msg = m.message_id.clone();
+                                let ami = pm.action_message_id.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        client.get_full_size_image(&raw_msg, &ami).await
+                                    {
+                                        log::warn!(
+                                            "gmessages: get_full_size_image failed: {e}"
+                                        );
+                                    }
+                                });
+                            }
+                            let media_id = pm.blob_id;
+                            let key = pm.key;
+                            let dest = pm.dest;
+                            let kind = pm.kind;
                             let client = client.clone();
                             let event_tx = event_tx.clone();
                             tokio::spawn(async move {
@@ -2141,31 +2171,46 @@ fn translate_event(event: Event) -> Vec<WaEvent> {
 /// Pull pending downloads off a gmessages `Message`. Returns
 /// `(media_id, decryption_key, dest_path)` triples. Caller should fetch +
 /// decrypt each, then emit `WaEvent::MediaReady` when done.
-/// The downloadable (id, key) for a MediaContent. Prefers the full-size
-/// blob; falls back to the thumbnail when no full blob is provided — RCS
-/// images frequently arrive thumbnail-only (the full `media_id` stays
-/// empty and only `thumbnail_media_id` + `thumbnail_decryption_key` are
-/// populated). Without the fallback those images never download.
-fn media_blob_ref(mc: &MediaContent) -> Option<(&str, &[u8])> {
+/// The downloadable `(id, key, is_thumbnail)` for a MediaContent. Prefers
+/// the full-size blob; falls back to the thumbnail when no full blob is
+/// provided — RCS images frequently arrive thumbnail-only (the full
+/// `media_id` stays empty and only `thumbnail_media_id` +
+/// `thumbnail_decryption_key` are populated). `is_thumbnail` tells the
+/// caller it should also request the full-size image.
+fn media_blob_ref(mc: &MediaContent) -> Option<(&str, &[u8], bool)> {
     if !mc.media_id.is_empty() && !mc.decryption_key.is_empty() {
-        Some((mc.media_id.as_str(), mc.decryption_key.as_slice()))
+        Some((mc.media_id.as_str(), mc.decryption_key.as_slice(), false))
     } else if !mc.thumbnail_media_id.is_empty() && !mc.thumbnail_decryption_key.is_empty() {
         Some((
             mc.thumbnail_media_id.as_str(),
             mc.thumbnail_decryption_key.as_slice(),
+            true,
         ))
     } else {
         None
     }
 }
 
-fn pending_downloads(m: &GmMessage, data_dir: &Path) -> Vec<(String, Vec<u8>, PathBuf, MediaType)> {
+/// One downloadable attachment pulled off an incoming gm `Message`.
+struct PendingMedia {
+    blob_id: String,
+    key: Vec<u8>,
+    dest: PathBuf,
+    kind: MediaType,
+    /// True when only a thumbnail was available — the caller should also
+    /// ask the phone for the full-size image.
+    is_thumbnail: bool,
+    /// `MessageInfo.action_message_id`, needed for the full-size request.
+    action_message_id: String,
+}
+
+fn pending_downloads(m: &GmMessage, data_dir: &Path) -> Vec<PendingMedia> {
     let media_root = data_dir.join("gm_media");
     let _ = std::fs::create_dir_all(&media_root);
     let mut out = Vec::new();
     for info in &m.message_info {
         if let Some(message_info::Data::MediaContent(mc)) = &info.data
-            && let Some((blob_id, blob_key)) = media_blob_ref(mc)
+            && let Some((blob_id, blob_key, is_thumbnail)) = media_blob_ref(mc)
         {
             let dest = gm_media_dest(blob_id, &mc.mime_type, data_dir);
             let mime = mc.mime_type.as_str();
@@ -2178,7 +2223,14 @@ fn pending_downloads(m: &GmMessage, data_dir: &Path) -> Vec<(String, Vec<u8>, Pa
             } else {
                 MediaType::Document
             };
-            out.push((blob_id.to_string(), blob_key.to_vec(), dest, kind));
+            out.push(PendingMedia {
+                blob_id: blob_id.to_string(),
+                key: blob_key.to_vec(),
+                dest,
+                kind,
+                is_thumbnail,
+                action_message_id: info.action_message_id.clone().unwrap_or_default(),
+            });
         }
     }
     out
@@ -2259,7 +2311,7 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
                 // image renders on restart / chat re-open without waiting
                 // for a fresh MediaReady event. Uses the same id resolution
                 // as the downloader (full blob, else thumbnail).
-                if let Some((blob_id, _)) = media_blob_ref(mc)
+                if let Some((blob_id, _, _)) = media_blob_ref(mc)
                     && let Some(dir) = GM_DATA_DIR.get()
                 {
                     let p = gm_media_dest(blob_id, mime, dir);

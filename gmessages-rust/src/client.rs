@@ -350,6 +350,17 @@ impl Client {
         crate::session::send_reaction(self, conversation_id, message_id, emoji, action).await
     }
 
+    /// Ask the phone to upload the full-size version of an image that
+    /// arrived thumbnail-only (RCS). The phone re-relays the message with
+    /// a real `media_id` afterwards.
+    pub async fn get_full_size_image(
+        &self,
+        message_id: &str,
+        action_message_id: &str,
+    ) -> Result<()> {
+        crate::session::get_full_size_image(self, message_id, action_message_id).await
+    }
+
     /// Fetch the most recent `count` messages of a conversation.
     pub async fn fetch_messages(
         &self,
