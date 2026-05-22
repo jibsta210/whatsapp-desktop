@@ -94,7 +94,24 @@ fn gm_media_dest(media_id: &str, mime: &str, data_dir: &Path) -> PathBuf {
         Some(s) if !s.is_empty() => s,
         _ => "bin",
     };
-    data_dir.join("gm_media").join(format!("{media_id}.{ext}"))
+    // Google media ids contain '/' (e.g. "<uuid>/<blob>"), which would turn
+    // the filename into a nested path whose parent dir doesn't exist — the
+    // write then fails with ENOENT and the media silently never saves.
+    // Flatten any path-unsafe character to '_'.
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let safe_id = sanitize(media_id);
+    let safe_ext = sanitize(ext);
+    data_dir.join("gm_media").join(format!("{safe_id}.{safe_ext}"))
 }
 
 /// Best-effort MIME type from a file path's extension. Used when sending
