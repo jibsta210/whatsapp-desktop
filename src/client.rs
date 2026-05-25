@@ -1819,17 +1819,23 @@ impl Client {
             }
 
             // === Passive Tasks (mimics WhatsApp Web's PassiveTaskManager) ===
-            // WhatsApp Web executes passive tasks (like PreKey upload) BEFORE sending the active IQ.
+            // WhatsApp Web executes passive tasks (like PreKey upload) BEFORE
+            // sending the active IQ — but ONLY when the server actually needs
+            // more keys (count-guarded).
             //
-            // Force pre-key upload on every startup. Non-force skips upload if the
-            // server has enough of our keys, but that leaves the phone with a stale
-            // cached session when this desktop was last paired. When the session
-            // is stale, phone-sent group messages fail with NoSession errors and
-            // retry receipts get ignored (phone thinks its session is still valid).
-            // Forcing fresh keys invalidates the phone's cached session so it
-            // rebuilds + re-sends sender key distribution messages properly.
+            // Previously this passed `force=true` to "invalidate the phone's
+            // cached session" so retried sender-key-distribution messages
+            // would land. That reasoning is wrong: one-time prekeys do not
+            // affect existing sessions — sessions are anchored on the
+            // identity key + signed prekey, not the consumed one-time keys.
+            // Force-uploading 812 fresh keys on every connect burned the
+            // 24-bit prekey ID space in months, eventually wrapping the
+            // counter and breaking every incoming session establishment
+            // (MAC failures, "No session found", undecryptable messages).
+            // WA Web doesn't force here — count guard + the prekey_low
+            // notification handler cover the legitimate "low keys" path.
             check_generation!();
-            if let Err(e) = client_clone.upload_pre_keys(true).await {
+            if let Err(e) = client_clone.upload_pre_keys(false).await {
                 warn!("Failed to upload pre-keys during startup: {e:?}");
             }
 
