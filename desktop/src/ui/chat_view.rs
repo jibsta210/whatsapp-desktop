@@ -3791,14 +3791,62 @@ fn run_wl_paste() -> WlPasteResult {
         }
     };
     let type_set: Vec<&str> = types.lines().map(|l| l.trim()).collect();
+    log::info!("Paste: wl-paste offered types = {type_set:?}");
 
-    // 2. Prefer image when present.
-    const IMAGE_MIMES: &[&str] =
-        &["image/png", "image/jpeg", "image/jpg", "image/webp", "image/gif", "image/bmp"];
-    if let Some(mime) = IMAGE_MIMES.iter().find(|m| type_set.contains(m)) {
-        match Command::new("wl-paste").arg("--type").arg(mime).output() {
+    // 2. Prefer image when present. Match generously — different source
+    //    apps advertise wildly different MIME sets. Some only offer
+    //    common variants (image/png), others toss in less standard ones
+    //    (image/x-MS-bmp, image/heif, application/x-qt-image with the
+    //    bytes actually being PNG). Rule: take the FIRST preferred
+    //    well-supported format if present, else any `image/*` MIME
+    //    (skipping svg+xml — that's vector XML, not a bitmap we can
+    //    send), else fall back to the Qt-internal blob if that's all
+    //    the source offers (its bytes are usually a real PNG).
+    const PREFERRED_IMAGE_MIMES: &[&str] = &[
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+        "image/webp",
+        "image/gif",
+        "image/bmp",
+        "image/x-MS-bmp",
+        "image/heif",
+        "image/heic",
+        "image/tiff",
+    ];
+    let chosen_mime: Option<String> = PREFERRED_IMAGE_MIMES
+        .iter()
+        .find(|m| type_set.contains(m))
+        .map(|m| (*m).to_string())
+        .or_else(|| {
+            type_set
+                .iter()
+                .find(|t| t.starts_with("image/") && **t != "image/svg+xml")
+                .map(|t| (*t).to_string())
+        })
+        .or_else(|| {
+            type_set
+                .iter()
+                .find(|t| **t == "application/x-qt-image")
+                .map(|t| (*t).to_string())
+        });
+
+    if let Some(mime) = chosen_mime {
+        log::info!("Paste: choosing image MIME {mime}");
+        // Filename extension hint. Don't worry about being wrong — the
+        // send path inspects the bytes for the real format.
+        let ext = match mime.as_str() {
+            "image/png" | "application/x-qt-image" => "png",
+            "image/jpeg" | "image/jpg" => "jpg",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            "image/bmp" | "image/x-MS-bmp" => "bmp",
+            "image/heif" | "image/heic" => "heic",
+            "image/tiff" => "tiff",
+            other => other.rsplit('/').next().unwrap_or("bin"),
+        };
+        match Command::new("wl-paste").arg("--type").arg(&mime).output() {
             Ok(o) if o.status.success() && !o.stdout.is_empty() => {
-                let ext = mime.rsplit('/').next().unwrap_or("png");
                 let path = format!(
                     "/tmp/wa_paste_{}.{}",
                     std::time::SystemTime::now()
@@ -3808,14 +3856,27 @@ fn run_wl_paste() -> WlPasteResult {
                     ext
                 );
                 match std::fs::write(&path, &o.stdout) {
-                    Ok(_) => return WlPasteResult::ImageFile(path),
+                    Ok(_) => {
+                        log::info!(
+                            "Paste: staged image via wl-paste ({} bytes): {path}",
+                            o.stdout.len()
+                        );
+                        return WlPasteResult::ImageFile(path);
+                    }
                     Err(e) => {
                         log::warn!("Paste: writing pasted image failed: {e}");
                         return WlPasteResult::Empty;
                     }
                 }
             }
-            Ok(_) => return WlPasteResult::Empty,
+            Ok(o) => {
+                log::warn!(
+                    "Paste: wl-paste image read returned exit={} stdout_len={}",
+                    o.status,
+                    o.stdout.len()
+                );
+                return WlPasteResult::Empty;
+            }
             Err(e) => {
                 log::warn!("Paste: wl-paste image read failed: {e}");
                 return WlPasteResult::Empty;
