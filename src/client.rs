@@ -1819,23 +1819,29 @@ impl Client {
             }
 
             // === Passive Tasks (mimics WhatsApp Web's PassiveTaskManager) ===
-            // WhatsApp Web executes passive tasks (like PreKey upload) BEFORE
-            // sending the active IQ — but ONLY when the server actually needs
-            // more keys (count-guarded).
             //
-            // Previously this passed `force=true` to "invalidate the phone's
-            // cached session" so retried sender-key-distribution messages
-            // would land. That reasoning is wrong: one-time prekeys do not
-            // affect existing sessions — sessions are anchored on the
-            // identity key + signed prekey, not the consumed one-time keys.
-            // Force-uploading 812 fresh keys on every connect burned the
-            // 24-bit prekey ID space in months, eventually wrapping the
-            // counter and breaking every incoming session establishment
-            // (MAC failures, "No session found", undecryptable messages).
-            // WA Web doesn't force here — count guard + the prekey_low
-            // notification handler cover the legitimate "low keys" path.
+            // Force pre-key upload ONCE per process startup. Whatever the
+            // exact server mechanism is — empirically, uploading fresh keys
+            // prompts the phone to drop its cached session with this device
+            // and re-establish, which is the only reliable way to get the
+            // phone to re-emit SenderKeyDistributionMessages in groups
+            // post-pair. Without this, the phone's group messages stay
+            // perpetually undecryptable: the pkmsg-carrying-SKDM can't be
+            // decrypted (no session), so the SKDM never lands, so the
+            // sender-key never lands, so the skmsg never decrypts, and the
+            // retry-receipt loop spins forever.
+            //
+            // Previously this ran with `force=true` on every *reconnect*,
+            // which over months of heavy use burned the 24-bit prekey ID
+            // space and wrapped the counter — also catastrophic. The
+            // compromise: force exactly once per process lifetime. Server
+            // sees fresh keys once, phone re-keys once, ID counter
+            // advances by one batch per app start (not per reconnect),
+            // which leaves the 24-bit space safe for ~decades.
             check_generation!();
-            if let Err(e) = client_clone.upload_pre_keys(false).await {
+            static PHONE_SESSION_KICK_DONE: AtomicBool = AtomicBool::new(false);
+            let needs_force = !PHONE_SESSION_KICK_DONE.swap(true, Ordering::Relaxed);
+            if let Err(e) = client_clone.upload_pre_keys(needs_force).await {
                 warn!("Failed to upload pre-keys during startup: {e:?}");
             }
 
