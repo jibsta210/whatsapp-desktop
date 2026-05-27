@@ -607,6 +607,26 @@ impl ChatListPanel {
         // Set inside the row block; consumed after `drop(rows)` to gate
         // the timestamp/sort update.
         let mut is_newer = false;
+        let row_existed: bool;
+        let existing_ts_dbg: i64;
+        {
+            let rows_snap = self.inner.rows.borrow();
+            row_existed = rows_snap.contains_key(chat_id);
+        }
+        existing_ts_dbg = self
+            .inner
+            .timestamps
+            .borrow()
+            .get(chat_id)
+            .copied()
+            .unwrap_or(0);
+        if msg.is_from_me {
+            log::info!(
+                "update_last_message[self]: chat={chat_id} msg_ts={} existing_ts={existing_ts_dbg} row_existed={row_existed} preview={:?}",
+                msg.timestamp,
+                msg.text.as_deref().unwrap_or("<media>"),
+            );
+        }
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             let doc_preview: String;
@@ -687,6 +707,12 @@ impl ChatListPanel {
                 .copied()
                 .unwrap_or(0);
             is_newer = msg.timestamp >= existing_ts;
+            if msg.is_from_me {
+                log::info!(
+                    "update_last_message[self]: chat={chat_id} is_newer={is_newer} (msg_ts={} >= existing_ts={existing_ts})",
+                    msg.timestamp
+                );
+            }
             if is_newer {
                 row.update_preview(&preview, msg.timestamp);
             }

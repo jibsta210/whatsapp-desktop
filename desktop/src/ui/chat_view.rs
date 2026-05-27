@@ -2734,10 +2734,14 @@ impl ChatViewPanel {
         };
 
         if !is_current {
+            // Bubble doesn't go in the wrong chat view. The chat list still
+            // updates via update_last_message() on the same WaEvent, and the
+            // message is persisted to s.history — opening the chat shows it.
+            // Demoted to debug: this log line previously fired on every
+            // self-message-not-in-current-chat and made it look broken.
             if msg.is_from_me {
-                log::info!(
-                    "append_message: self-message for chat={} doesn't match current={:?} \
-                     — message will be in history but not rendered now",
+                log::debug!(
+                    "append_message: self-message for chat={} not current ({:?}) — chat list still updates",
                     msg.chat_id,
                     inner.current_chat_id.borrow().as_deref()
                 );
