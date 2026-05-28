@@ -2753,18 +2753,6 @@ impl ChatViewPanel {
         self.remove_placeholder();
 
         self.append_message_inner(msg);
-
-        // GTK4 GL-renderer paint-cache workaround. A bubble appended from an
-        // async event (a message arriving over the network) is added to the
-        // widget tree but frequently never painted — it stays invisible
-        // until some unrelated event invalidates the renderer's cache. Local
-        // sends don't hit this because they happen inside an input event
-        // that already triggers a relayout. A hide/show cycle on the message
-        // box forces GTK to re-allocate + re-realize so the new bubble draws.
-        // Both calls happen within one main-loop iteration, so no frame ever
-        // renders in the hidden state — there is no visible flicker.
-        self.inner.messages_box.set_visible(false);
-        self.inner.messages_box.set_visible(true);
     }
 
     fn append_message_inner(&self, msg: IncomingMessage) {
