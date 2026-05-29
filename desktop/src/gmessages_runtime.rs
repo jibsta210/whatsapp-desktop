@@ -1194,6 +1194,14 @@ async fn run(
                     // post-merge-redirect). Path == render target.
                     if let WaEvent::MessageReceived(im) = &wa_event {
                         crate::ui::runtime::save_messages_append(&im.chat_id, im);
+                        // The WhatsApp runtime caches each chat's history in
+                        // memory and serves chat-opens from that cache without
+                        // re-reading disk. We're a separate thread and can't
+                        // touch that cache, so flag the chat: LoadChat will
+                        // reconcile this just-written message from disk on the
+                        // next open instead of showing stale history (which is
+                        // why merged SMS used to vanish until an app restart).
+                        crate::ui::runtime::mark_gm_dirty(&im.chat_id);
                     }
                     // STEP 3: if the redirect targeted a WhatsApp chat row,
                     // update wa_chats.bin so the preview/timestamp survive
@@ -1726,7 +1734,14 @@ fn describe_wa_event(e: &WaEvent) -> String {
             "MessageReceived(chat_id={}, from={}, body={:?})",
             im.chat_id,
             if im.is_from_me { "<self>" } else { im.sender_id.as_str() },
-            im.text.as_deref().map(|s| if s.len() > 40 { &s[..40] } else { s }),
+            // Truncate to 40 *chars*, not bytes. `&s[..40]` panics when byte
+            // 40 lands inside a multi-byte char (smart quote, emoji, accent)
+            // — that crashed the whole gmessages task on a real message (see
+            // crash.log). char_indices yields valid byte boundaries.
+            im.text.as_deref().map(|s| match s.char_indices().nth(40) {
+                Some((i, _)) => &s[..i],
+                None => s,
+            }),
         ),
         WaEvent::TypingIndicator { chat_id, is_typing, .. } => {
             format!("TypingIndicator(chat_id={chat_id}, on={is_typing})")

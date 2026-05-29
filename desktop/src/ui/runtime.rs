@@ -446,6 +446,33 @@ pub fn touch_wa_chat_preview(chat_id: &str, preview: &str, timestamp: i64, is_fr
 /// other's update.
 static MSG_FILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Chats whose on-disk message file was updated by the **gmessages** runtime
+/// — a separate thread that can't reach this runtime's in-memory `s.history`.
+/// `load_chat`'s fast path serves the cached last-50 on a hit and never
+/// re-reads disk, so without this an SMS/MMS the gm runtime appended to disk
+/// stays invisible in the open conversation until an app restart forces a
+/// cache miss. The gm runtime flags the chat here on every write; `LoadChat`
+/// reconciles from disk on the next open for any flagged chat, then clears it.
+static GM_DIRTY_CHATS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+/// Flag a chat as having gm-written, cache-unseen messages on disk. Called by
+/// the gmessages runtime after it appends an incoming SMS/MMS to disk.
+pub fn mark_gm_dirty(chat_id: &str) {
+    GM_DIRTY_CHATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(chat_id.to_string());
+}
+
+/// Clear and return whether `chat_id` was flagged dirty by the gm runtime.
+fn take_gm_dirty(chat_id: &str) -> bool {
+    GM_DIRTY_CHATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(chat_id)
+}
+
 /// Plain overwrite of a chat's message file. Used **only** for in-place
 /// format migration (legacy → "WA02"), where `messages` already IS the
 /// file's full content for every protocol. Every real save goes through
@@ -4279,6 +4306,42 @@ async fn handle_command(
                             log::debug!("Presence subscribe failed: {e:#}");
                         }
                     });
+                }
+            }
+
+            // RECONCILE gm-written disk messages into the in-memory cache.
+            // The gmessages runtime appends incoming SMS/MMS straight to this
+            // chat's disk file but can't update our `s.history` cache (separate
+            // thread). The fast path below serves the cached last-50 without
+            // touching disk, so those messages would be invisible until an app
+            // restart. For any chat the gm runtime flagged dirty, merge the
+            // disk file into the cache now — union by id, never dropping
+            // anything already in memory (e.g. a just-arrived WhatsApp message
+            // not yet flushed). Only fires for flagged chats, so the common
+            // chat-switch stays disk-free.
+            if take_gm_dirty(&chat_id) {
+                let cid = chat_id.clone();
+                let disk_msgs = tokio::task::spawn_blocking(move || load_messages(&cid))
+                    .await
+                    .unwrap_or_default();
+                if !disk_msgs.is_empty() {
+                    let mut s = state.lock().unwrap();
+                    let hist = s.history.entry(chat_id.clone()).or_default();
+                    let have: std::collections::HashSet<String> =
+                        hist.iter().map(|m| m.id.clone()).collect();
+                    let mut added = 0usize;
+                    for m in disk_msgs {
+                        if !have.contains(&m.id) {
+                            hist.push(m);
+                            added += 1;
+                        }
+                    }
+                    if added > 0 {
+                        hist.sort_by_key(|m| m.timestamp);
+                        log::info!(
+                            "LoadChat {chat_id}: reconciled {added} disk-only gmessages message(s) into history cache"
+                        );
+                    }
                 }
             }
 
