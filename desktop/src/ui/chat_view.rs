@@ -269,34 +269,56 @@ impl ChatViewPanel {
                     gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 10,
                 );
             }
-            let last_bucket: std::cell::Cell<i32> = std::cell::Cell::new(-1);
-            let scroll_tick = scroll.clone();
-            let messages_box_tick = messages_box.clone();
-            let provider_tick = provider.clone();
-            scroll.add_tick_callback(move |_, _| {
-                let pane_w = scroll_tick.width();
-                if pane_w <= 0 {
-                    return glib::ControlFlow::Continue;
-                }
-                // 65% of pane width, hard cap 1100px, soft floor 280px,
-                // bucketed to 32px so we don't rewrite CSS on every pixel.
-                let raw = (pane_w as f32 * 0.65) as i32;
-                let bucket = (raw / 32) * 32;
-                if bucket != last_bucket.get() {
-                    last_bucket.set(bucket);
-                    let max_w = bucket.clamp(280, 1100);
-                    let css = format!(
-                        "box.message-bubble-out, box.message-bubble-in \
-                         {{ max-width: {max_w}px; }}"
-                    );
-                    provider_tick.load_from_string(&css);
-                    // Force re-measurement so the new max-width takes
-                    // effect on the existing widget tree without waiting
-                    // for some unrelated event to invalidate layout.
-                    messages_box_tick.queue_resize();
-                }
-                glib::ControlFlow::Continue
-            });
+            // Recompute the bubble max-width only when the pane width
+            // actually changes. This used to be an `add_tick_callback`
+            // returning `ControlFlow::Continue`, which kept GTK's frame
+            // clock running ~60-144x/sec for the ENTIRE life of the app —
+            // even fully idle — just to read a width and compare a bucket.
+            // We now drive it from the horizontal adjustment's `changed`
+            // signal, which fires on viewport reconfigure (window resize OR
+            // sidebar-divider drag, since both re-allocate the pane) and
+            // never on vertical scroll or message append. The bucket guard
+            // makes any stray emission a cheap integer compare.
+            let recompute_width: std::rc::Rc<dyn Fn()> = {
+                let scroll_w = scroll.clone();
+                let messages_box_w = messages_box.clone();
+                let provider_w = provider.clone();
+                let last_bucket: std::cell::Cell<i32> = std::cell::Cell::new(-1);
+                std::rc::Rc::new(move || {
+                    let pane_w = scroll_w.width();
+                    if pane_w <= 0 {
+                        return;
+                    }
+                    // 65% of pane width, hard cap 1100px, soft floor 280px,
+                    // bucketed to 32px so we don't rewrite CSS on every pixel.
+                    let raw = (pane_w as f32 * 0.65) as i32;
+                    let bucket = (raw / 32) * 32;
+                    if bucket != last_bucket.get() {
+                        last_bucket.set(bucket);
+                        let max_w = bucket.clamp(280, 1100);
+                        let css = format!(
+                            "box.message-bubble-out, box.message-bubble-in \
+                             {{ max-width: {max_w}px; }}"
+                        );
+                        provider_w.load_from_string(&css);
+                        // Force re-measurement so the new max-width takes
+                        // effect on the existing widget tree without waiting
+                        // for some unrelated event to invalidate layout.
+                        messages_box_w.queue_resize();
+                    }
+                })
+            };
+            {
+                let rc = recompute_width.clone();
+                scroll.hadjustment().connect_changed(move |_| rc());
+            }
+            {
+                // Run once on first map in case the viewport was already
+                // configured before we connected, so the initial bucket is
+                // set without waiting for the first resize.
+                let rc = recompute_width.clone();
+                scroll.connect_map(move |_| rc());
+            }
         }
 
         // "Go to latest" floating button — visible when user scrolls up

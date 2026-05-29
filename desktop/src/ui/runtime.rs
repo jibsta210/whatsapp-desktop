@@ -1472,13 +1472,33 @@ async fn run_inner(
         .name("msg-disk-writer".into())
         .spawn(move || {
             while let Ok((chat_id, messages)) = msg_save_rx.recv() {
-                // The disk-writer serves the WhatsApp runtime. Save scoped
-                // so SMS history in a merged chat is never clobbered.
-                save_messages_scoped(
-                    &chat_id,
-                    crate::bridge::MessageSource::WhatsApp,
-                    &messages,
-                );
+                // Coalesce bursts before writing. Each queued item is the
+                // FULL current in-memory history for a chat, so for any one
+                // chat only the LAST snapshot matters — earlier ones are
+                // strict supersets-in-time of the same file. `queue_save`
+                // fires on every append (which also re-sorts), so a flurry
+                // of inbound messages can stack up many saves of the same
+                // chat. Since `save_messages_scoped` is a full-file
+                // read-modify-write (deserialize → clone → sort → serialize),
+                // collapsing N queued saves of one chat into 1 skips N-1
+                // whole-file rewrites. Different chats are each kept (keyed
+                // by id) and written once. Net on-disk state is identical to
+                // processing every save sequentially — last-writer-wins.
+                let mut latest: std::collections::HashMap<String, Vec<IncomingMessage>> =
+                    std::collections::HashMap::new();
+                latest.insert(chat_id, messages);
+                while let Ok((cid, msgs)) = msg_save_rx.try_recv() {
+                    latest.insert(cid, msgs);
+                }
+                for (cid, msgs) in latest {
+                    // The disk-writer serves the WhatsApp runtime. Save scoped
+                    // so SMS history in a merged chat is never clobbered.
+                    save_messages_scoped(
+                        &cid,
+                        crate::bridge::MessageSource::WhatsApp,
+                        &msgs,
+                    );
+                }
             }
         })
         .expect("Failed to spawn disk-writer thread");
