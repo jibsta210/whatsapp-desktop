@@ -421,13 +421,23 @@ impl Client {
         info: &MessageInfo,
         immediate: bool,
     ) {
-        // Don't send PDO for our own messages or status broadcasts
-        if info.source.is_from_me {
-            return;
-        }
+        // Don't send PDO for status broadcasts.
         if info.source.chat.server == wacore_binary::jid::BROADCAST_SERVER {
             return;
         }
+        // NOTE: we intentionally DO run PDO for `is_from_me` messages. On the
+        // decrypt-failure path these are the user's own messages authored on the
+        // PRIMARY PHONE (or another linked device) that the desktop is syncing —
+        // we never receive our OWN locally-sent messages back, so every
+        // is_from_me message that reaches here genuinely came from another of
+        // our devices. When the phone<->desktop LID Signal session desyncs
+        // (ratchet MAC failure), these self-messages fail to decrypt and the
+        // retry loop deadlocks: the phone believes its session is valid and
+        // never re-establishes, so they would NEVER appear. PDO recovers them
+        // by asking the phone (which already has the plaintext) to resend, over
+        // the PN peer session — which is independent of the broken LID session.
+        // Previously the `is_from_me` early-return left self-messages with no
+        // recovery path at all, which is the "self messages not coming" bug.
 
         let client_clone = Arc::clone(self);
         let info_clone = info.clone();
