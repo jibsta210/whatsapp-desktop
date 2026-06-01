@@ -1274,31 +1274,34 @@ pub fn start_ai_corrector() {
     let mut settings = crate::ui::settings::AppSettings::load();
     settings.prefill_ai_key();
 
-    let key = if !settings.ai_api_key.is_empty() {
-        settings.ai_api_key.clone()
-    } else {
-        log::info!(
-            "AI autocorrect disabled: no API key found. Set it in Settings → AI Autocorrect."
-        );
+    let provider = settings.ai_model.clone();
+    if provider == "none" {
+        log::info!("AI autocorrect disabled by user (provider set to 'none')");
         return;
-    };
-
-    if settings.ai_model == "none" {
-        log::info!("AI autocorrect disabled by user (model set to 'none')");
+    }
+    // Spawn the corrector if ANY provider key is configured. The loop reads the
+    // selected provider + its key LIVE from settings on every request, so the
+    // user can switch provider or paste a key in Settings → AI Autocorrect and
+    // it takes effect on the next message — no app restart needed.
+    if settings.ai_api_key.is_empty() && settings.deepseek_api_key.is_empty() {
+        log::info!(
+            "AI autocorrect idle: no API key configured. Add one in Settings → AI Autocorrect."
+        );
         return;
     }
 
     let (tx, rx) = std::sync::mpsc::channel::<AiCorrectionRequest>();
     let _ = AI_TX.set(tx);
 
-    log::info!("AI autocorrect enabled (key={}...)", &key[..8.min(key.len())]);
+    log::info!(
+        "AI autocorrect enabled (provider read live from settings; currently '{provider}')"
+    );
     std::thread::Builder::new()
         .name("ai-autocorrect".into())
         .spawn(move || {
-            ai_corrector_loop(&key, rx);
+            ai_corrector_loop(rx);
         })
         .ok();
-    log::info!("AI autocorrect enabled");
 }
 
 /// Clean any leaked reasoning, tags, or meta-commentary from AI response.
@@ -1351,92 +1354,133 @@ fn clean_ai_response(raw: &str) -> String {
     text
 }
 
-fn ai_corrector_loop(api_key: &str, rx: std::sync::mpsc::Receiver<AiCorrectionRequest>) {
+/// System prompt shared by every autocorrect provider.
+const AC_SYSTEM_PROMPT: &str = "Act as a savvy editor for a WhatsApp message input. Fix the user's bad typing and poor spelling so they look professional. Fix capitalization and punctuation. \
+\nDO NOT modify any nouns, hard numbers, URLs, acronyms, or slang when you are able to contextually identify them. \
+\nDo not expand contractions or short forms (e.g. leave 'don't' as 'don't', leave 'u' as 'u', leave 'rn' as 'rn'). \
+\nDo not correct internet slang (e.g. 'finna', 'no cap', 'slay', 'fr', 'tbh', 'lmk'). \
+\nOnly fix unintentional typos and missing essential punctuation. You may improve sentence structure, but DO NOT remove the original voice or vibe of the writer. \
+\nReturn ONLY the corrected text. No explanations, reasoning, change descriptions, markup, or surrounding quotes.";
+
+fn ai_corrector_loop(rx: std::sync::mpsc::Receiver<AiCorrectionRequest>) {
     log::info!("AI corrector thread started, waiting for requests...");
     let client = ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(5))
         .timeout_read(std::time::Duration::from_secs(8))
         .timeout_write(std::time::Duration::from_secs(5))
         .build();
-    // `gemini-flash-latest` is Google's maintained alias that always
-    // resolves to the newest Flash model — so autocorrect tracks the
-    // current generation without us hard-coding a version string that
-    // goes stale. (User asked to move to the "new flash" model.)
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
-    );
+    let deepseek_url = "https://api.deepseek.com/chat/completions";
 
     while let Ok(req) = rx.recv() {
+        // Read the selected provider + its key LIVE, so switching provider or
+        // pasting a key in Settings applies on the next message without an app
+        // restart. The settings file is tiny, so this per-request read is cheap.
+        let settings = crate::ui::settings::AppSettings::load();
+        let provider = settings.ai_model;
+        let api_key = if provider == "deepseek" {
+            settings.deepseek_api_key
+        } else {
+            settings.ai_api_key
+        };
+        let is_deepseek = provider == "deepseek";
+
         let text = &req.full_text;
-        if text.len() < 3 {
+        if provider == "none" || api_key.is_empty() || text.len() < 3 {
             if req.always_reply {
                 let _ = req.reply_tx.send(req.full_text.clone());
             }
             continue;
         }
 
-        log::info!("AI autocorrect: sending '{text}'");
+        // `gemini-flash-latest` is Google's maintained alias that always
+        // resolves to the newest Flash model. DeepSeek's `deepseek-chat` (V3)
+        // is its fast, cheap chat model and speaks the OpenAI chat-completions
+        // API. Both run at temperature 0 for deterministic edits.
+        let gemini_url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent?key={api_key}"
+        );
 
-        let body = serde_json::json!({
-            "systemInstruction": {
-                "parts": [{
-                    "text": "Act as a savvy editor for a WhatsApp message input. Fix the user's bad typing and poor spelling so they look professional. Fix capitalization and punctuation. \
-                    \nDO NOT modify any nouns, hard numbers, URLs, acronyms, or slang when you are able to contextually identify them. \
-                    \nDo not expand contractions or short forms (e.g. leave 'don't' as 'don't', leave 'u' as 'u', leave 'rn' as 'rn'). \
-                    \nDo not correct internet slang (e.g. 'finna', 'no cap', 'slay', 'fr', 'tbh', 'lmk'). \
-                    \nOnly fix unintentional typos and missing essential punctuation. You may improve sentence structure, but DO NOT remove the original voice or vibe of the writer. \
-                    \nReturn ONLY the corrected text. No explanations, reasoning, change descriptions, markup, or surrounding quotes."
-                }]
-            },
-            "contents": [{
-                "parts": [{
-                    "text": text
-                }]
-            }],
-            "generationConfig": {
+        log::info!("AI autocorrect: sending '{text}' (provider={provider})");
+
+        // Build the request per provider and extract the raw model text.
+        // `Ok(Some(raw))` = got text; `Ok(None)` = unexpected response shape;
+        // `Err(msg)` = transport/parse failure. Post-processing is shared.
+        let raw_result: Result<Option<String>, String> = if is_deepseek {
+            let body = serde_json::json!({
+                "model": "deepseek-chat",
+                "messages": [
+                    { "role": "system", "content": AC_SYSTEM_PROMPT },
+                    { "role": "user", "content": text }
+                ],
                 "temperature": 0.0,
-                "maxOutputTokens": 2048,
+                "max_tokens": 2048,
+                "stream": false,
+            });
+            match client
+                .post(deepseek_url)
+                .set("content-type", "application/json")
+                .set("authorization", &format!("Bearer {api_key}"))
+                .send_json(&body)
+            {
+                Ok(resp) => match resp.into_json::<serde_json::Value>() {
+                    Ok(json) => Ok(json["choices"][0]["message"]["content"]
+                        .as_str()
+                        .map(|s| s.to_string())),
+                    Err(e) => Err(format!("JSON parse error: {e}")),
+                },
+                Err(e) => Err(format!("request failed: {e}")),
             }
-        });
+        } else {
+            let body = serde_json::json!({
+                "systemInstruction": {
+                    "parts": [{ "text": AC_SYSTEM_PROMPT }]
+                },
+                "contents": [{
+                    "parts": [{ "text": text }]
+                }],
+                "generationConfig": {
+                    "temperature": 0.0,
+                    "maxOutputTokens": 2048,
+                }
+            });
+            match client
+                .post(&gemini_url)
+                .set("content-type", "application/json")
+                .send_json(&body)
+            {
+                Ok(resp) => match resp.into_json::<serde_json::Value>() {
+                    Ok(json) => Ok(json["candidates"][0]["content"]["parts"][0]["text"]
+                        .as_str()
+                        .map(|s| s.to_string())),
+                    Err(e) => Err(format!("JSON parse error: {e}")),
+                },
+                Err(e) => Err(format!("request failed: {e}")),
+            }
+        };
 
-        match client
-            .post(&url)
-            .set("content-type", "application/json")
-            .send_json(&body)
-        {
-            Ok(resp) => match resp.into_json::<serde_json::Value>() {
-                Ok(json) => {
-                    if let Some(raw) =
-                        json["candidates"][0]["content"]["parts"][0]["text"].as_str()
-                    {
-                        let corrected = clean_ai_response(raw);
-                        log::info!("AI autocorrect: got '{corrected}'");
-                        if corrected != req.full_text
-                            && !corrected.is_empty()
-                            && (corrected.len() as f64) < (req.full_text.len() as f64 * 1.5 + 20.0)
-                            && corrected.len() as f64 >= req.full_text.len() as f64 * 0.5
-                        {
-                            let _ = req.reply_tx.send(corrected);
-                        } else if req.always_reply {
-                            // Text unchanged or safety-guarded — return original
-                            let _ = req.reply_tx.send(req.full_text.clone());
-                        }
-                    } else {
-                        log::warn!("AI autocorrect: unexpected response: {json}");
-                        if req.always_reply {
-                            let _ = req.reply_tx.send(req.full_text.clone());
-                        }
-                    }
+        match raw_result {
+            Ok(Some(raw)) => {
+                let corrected = clean_ai_response(&raw);
+                log::info!("AI autocorrect: got '{corrected}'");
+                if corrected != req.full_text
+                    && !corrected.is_empty()
+                    && (corrected.len() as f64) < (req.full_text.len() as f64 * 1.5 + 20.0)
+                    && corrected.len() as f64 >= req.full_text.len() as f64 * 0.5
+                {
+                    let _ = req.reply_tx.send(corrected);
+                } else if req.always_reply {
+                    // Text unchanged or safety-guarded — return original
+                    let _ = req.reply_tx.send(req.full_text.clone());
                 }
-                Err(e) => {
-                    log::warn!("AI autocorrect: JSON parse error: {e}");
-                    if req.always_reply {
-                        let _ = req.reply_tx.send(req.full_text.clone());
-                    }
+            }
+            Ok(None) => {
+                log::warn!("AI autocorrect: unexpected {provider} response shape");
+                if req.always_reply {
+                    let _ = req.reply_tx.send(req.full_text.clone());
                 }
-            },
+            }
             Err(e) => {
-                log::warn!("AI autocorrect: request failed: {e}");
+                log::warn!("AI autocorrect ({provider}): {e}");
                 if req.always_reply {
                     let _ = req.reply_tx.send(req.full_text.clone());
                 }

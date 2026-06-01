@@ -31,10 +31,14 @@ pub struct AppSettings {
     #[serde(default)]
     pub do_not_disturb: bool,
     // ── AI Autocorrect ──
-    /// API key for the AI provider (Gemini, Claude, etc.)
+    /// Gemini API key (used when ai_model = "gemini").
     #[serde(default)]
     pub ai_api_key: String,
-    /// Which AI model to use: "gemini", "claude", or "none"
+    /// DeepSeek API key (used when ai_model = "deepseek"). DeepSeek is an
+    /// OpenAI-compatible provider that is far cheaper than Gemini.
+    #[serde(default)]
+    pub deepseek_api_key: String,
+    /// Which AI provider to use: "gemini", "deepseek", or "none".
     #[serde(default = "default_ai_model")]
     pub ai_model: String,
     // ── Appearance ──
@@ -75,6 +79,7 @@ impl Default for AppSettings {
             notify_when_focused: false,
             do_not_disturb: false,
             ai_api_key: String::new(),
+            deepseek_api_key: String::new(),
             ai_model: "gemini".to_string(),
             theme: "dark".to_string(),
             zoom_level: 0.0, // 0.0 = auto-detect
@@ -87,36 +92,47 @@ impl Default for AppSettings {
 impl AppSettings {
     /// Pre-fill the API key from environment/files if not already set.
     pub fn prefill_ai_key(&mut self) {
-        if !self.ai_api_key.is_empty() {
-            return;
-        }
-        // Try env vars and files in priority order
-        let key = std::env::var("GEMINI_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .or_else(|| {
-                std::env::var("GOOGLE_API_KEY")
-                    .ok()
-                    .filter(|k| !k.is_empty())
-            })
-            .or_else(|| {
-                std::fs::read_to_string("gemini_key.txt")
+        let mut changed = false;
+        // Gemini key from env vars / files in priority order.
+        if self.ai_api_key.is_empty() {
+            let key = std::env::var("GEMINI_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+                .or_else(|| {
+                    std::env::var("GOOGLE_API_KEY")
+                        .ok()
+                        .filter(|k| !k.is_empty())
+                })
+                .or_else(|| {
+                    std::fs::read_to_string("gemini_key.txt")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|k| !k.is_empty())
+                })
+                .or_else(|| {
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    std::fs::read_to_string(
+                        std::path::PathBuf::from(home)
+                            .join(".config/whatsapp-desktop/gemini_key"),
+                    )
                     .ok()
                     .map(|s| s.trim().to_string())
                     .filter(|k| !k.is_empty())
-            })
-            .or_else(|| {
-                let home = std::env::var("HOME").unwrap_or_default();
-                std::fs::read_to_string(
-                    std::path::PathBuf::from(home)
-                        .join(".config/whatsapp-desktop/gemini_key"),
-                )
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|k| !k.is_empty())
-            });
-        if let Some(k) = key {
-            self.ai_api_key = k;
+                });
+            if let Some(k) = key {
+                self.ai_api_key = k;
+                changed = true;
+            }
+        }
+        // DeepSeek key from env var.
+        if self.deepseek_api_key.is_empty()
+            && let Ok(k) = std::env::var("DEEPSEEK_API_KEY")
+            && !k.is_empty()
+        {
+            self.deepseek_api_key = k;
+            changed = true;
+        }
+        if changed {
             self.save();
         }
     }
@@ -279,14 +295,14 @@ pub fn show_settings_window(settings: &SettingsHandle, parent: Option<&gtk4::Win
 
     // Model selector dropdown
     let model_row = adw::ComboRow::new();
-    model_row.set_title("AI Model");
-    model_row.set_subtitle("Which AI provider to use for autocorrect");
-    let models = gtk4::StringList::new(&["Gemini", "Claude", "None"]);
+    model_row.set_title("AI Provider");
+    model_row.set_subtitle("Gemini, or DeepSeek (much cheaper)");
+    let models = gtk4::StringList::new(&["Gemini", "DeepSeek", "None"]);
     model_row.set_model(Some(&models));
     let current_model = settings.get().ai_model.clone();
     let active_idx = match current_model.as_str() {
         "gemini" => 0,
-        "claude" => 1,
+        "deepseek" => 1,
         _ => 2,
     };
     model_row.set_selected(active_idx);
@@ -294,16 +310,16 @@ pub fn show_settings_window(settings: &SettingsHandle, parent: Option<&gtk4::Win
     model_row.connect_selected_notify(move |row| {
         let model = match row.selected() {
             0 => "gemini",
-            1 => "claude",
+            1 => "deepseek",
             _ => "none",
         };
         sh.update(|s| s.ai_model = model.to_string());
     });
     ai_group.add(&model_row);
 
-    // API key entry — masked by default, eye icon to reveal
+    // Gemini API key — masked by default, eye icon to reveal.
     let key_row = adw::PasswordEntryRow::new();
-    key_row.set_title("API Key");
+    key_row.set_title("Gemini API Key");
     key_row.set_text(&settings.get().ai_api_key);
     let sh = settings.clone();
     key_row.connect_changed(move |row| {
@@ -311,6 +327,17 @@ pub fn show_settings_window(settings: &SettingsHandle, parent: Option<&gtk4::Win
         sh.update(|s| s.ai_api_key = key);
     });
     ai_group.add(&key_row);
+
+    // DeepSeek API key — OpenAI-compatible, far cheaper than Gemini.
+    let deepseek_key_row = adw::PasswordEntryRow::new();
+    deepseek_key_row.set_title("DeepSeek API Key");
+    deepseek_key_row.set_text(&settings.get().deepseek_api_key);
+    let sh = settings.clone();
+    deepseek_key_row.connect_changed(move |row| {
+        let key = row.text().to_string();
+        sh.update(|s| s.deepseek_api_key = key);
+    });
+    ai_group.add(&deepseek_key_row);
 
     ai_page.add(&ai_group);
     window.add(&ai_page);
