@@ -1355,11 +1355,12 @@ fn clean_ai_response(raw: &str) -> String {
 }
 
 /// System prompt shared by every autocorrect provider.
-const AC_SYSTEM_PROMPT: &str = "Act as a savvy editor for a WhatsApp message input. Fix the user's bad typing and poor spelling so they look professional. Fix capitalization and punctuation. \
+const AC_SYSTEM_PROMPT: &str = "Act as a savvy editor for a WhatsApp message input. Fix the user's bad typing and poor spelling so they look professional. \
+\nMANDATORY: always capitalize the first letter of every sentence and the pronoun 'I'. Do this even for short, casual, or entirely lowercase messages — correct capitalization is REQUIRED and takes priority over preserving a casual lowercase look. \
 \nDO NOT modify any nouns, hard numbers, URLs, acronyms, or slang when you are able to contextually identify them. \
 \nDo not expand contractions or short forms (e.g. leave 'don't' as 'don't', leave 'u' as 'u', leave 'rn' as 'rn'). \
 \nDo not correct internet slang (e.g. 'finna', 'no cap', 'slay', 'fr', 'tbh', 'lmk'). \
-\nOnly fix unintentional typos and missing essential punctuation. You may improve sentence structure, but DO NOT remove the original voice or vibe of the writer. \
+\nOnly fix unintentional typos and missing essential punctuation. You may improve sentence structure. Keep the writer's original voice and vibe — EXCEPT that capitalization and spelling must ALWAYS be corrected. \
 \nReturn ONLY the corrected text. No explanations, reasoning, change descriptions, markup, or surrounding quotes.";
 
 fn ai_corrector_loop(rx: std::sync::mpsc::Receiver<AiCorrectionRequest>) {
@@ -1383,6 +1384,25 @@ fn ai_corrector_loop(rx: std::sync::mpsc::Receiver<AiCorrectionRequest>) {
             settings.ai_api_key
         };
         let is_deepseek = provider == "deepseek";
+
+        // Surface a misconfiguration that would otherwise be silent: a real
+        // provider selected but its API key empty (corrections become a no-op).
+        // Warn once per episode (re-armed when a key reappears) so as-you-type
+        // traffic doesn't spam the log.
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static MISSING_KEY_WARNED: AtomicBool = AtomicBool::new(false);
+            if provider != "none" && api_key.is_empty() {
+                if !MISSING_KEY_WARNED.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "AI autocorrect: provider '{provider}' is selected but its API key is empty — corrections are a no-op. Paste the {} key in Settings → AI Autocorrect.",
+                        if provider == "deepseek" { "DeepSeek" } else { "Gemini" }
+                    );
+                }
+            } else {
+                MISSING_KEY_WARNED.store(false, Ordering::Relaxed);
+            }
+        }
 
         let text = &req.full_text;
         if provider == "none" || api_key.is_empty() || text.len() < 3 {
