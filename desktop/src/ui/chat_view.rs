@@ -1380,12 +1380,34 @@ impl ChatViewPanel {
                 {
                     return gtk4::glib::Propagation::Proceed;
                 }
+                // Leave Ctrl+V alone when a text Entry/Search field has focus —
+                // its focused inner widget is a GtkText, so those keep their
+                // normal text paste. The message input is a GtkTextView (not a
+                // GtkText), so it — and any non-editable focus target — still
+                // gets the image paste below.
+                let entry_focused = inner_c
+                    .root
+                    .root()
+                    .and_then(|r| r.downcast::<gtk4::Window>().ok())
+                    .and_then(|w| gtk4::prelude::GtkWindowExt::focus(&w))
+                    .map(|f| f.is::<gtk4::Text>())
+                    .unwrap_or(false);
+                if entry_focused {
+                    return gtk4::glib::Propagation::Proceed;
+                }
                 log::info!("Paste: Ctrl+V — reading clipboard via wl-paste");
                 paste_via_wl_clipboard(iv_paste.clone(), inner_c.clone());
                 // We handled it — never let the (broken) native paste run.
                 gtk4::glib::Propagation::Stop
             });
-            inner.input_view.add_controller(paste_ctrl);
+            // Attach to the chat-view ROOT (capture phase), not just the message
+            // input. KDE frequently doesn't keep the input focused when you
+            // switch to the app or copy from another app, so a handler bound to
+            // the input alone never saw Ctrl+V (paste silently did nothing).
+            // From the root, capture phase sees the keypress for any focused
+            // descendant of the chat view, so paste-into-message works wherever
+            // focus happens to be.
+            inner.root.add_controller(paste_ctrl);
         }
 
         // ── Buffer changed: trigger @ mention and / quick reply popovers ──
