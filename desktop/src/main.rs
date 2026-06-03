@@ -86,6 +86,19 @@ fn apply_prescale(data_dir: &std::path::Path) {
 }
 
 fn main() {
+    // Cap glibc's malloc arenas BEFORE any thread spawns. This app runs many
+    // threads (tokio workers, the gmessages runtime, disk writers, the AI
+    // corrector); glibc otherwise creates up to one 64MB arena PER thread
+    // (8×CPUs) and scatters allocations across dozens of arenas that never hand
+    // memory back to the OS — measured as 1GB+ RSS / 5GB virtual (RssAnon, not
+    // the message cache) that only ratchets up over a session. Two arenas keep
+    // enough allocator concurrency without the bloat; a periodic malloc_trim in
+    // the runtime loop returns freed pages on top.
+    // SAFETY: a plain libc call made before any threads exist.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+
     // Set the working directory to the XDG data dir so every relative
     // path in the app (whatsapp.db, wa_avatars/, wa_messages/, …)
     // lands in ~/.local/share/whatsapp-desktop/ instead of $HOME.

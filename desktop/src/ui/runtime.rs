@@ -1918,6 +1918,7 @@ async fn handle_wa_event(
                     let c = client_clone.clone();
                     let st = state_clone.clone();
                     tokio::spawn(async move {
+                        let mut trim_tick: u64 = 0;
                         loop {
                             tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
                             // Memory diagnostics
@@ -1934,6 +1935,17 @@ async fn handle_wa_event(
                                 log::info!(
                                     "MEM: RSS={rss}KB cache={cache_chats}chats/{cache_msgs}msgs contacts={contacts}"
                                 );
+                            }
+                            // Hand freed heap pages back to the OS. glibc keeps
+                            // freed memory parked in its arenas, so without this
+                            // RSS only ratchets up over a session — every
+                            // chat-switch allocates/frees ~50 bubble widgets and
+                            // decodes image textures. Every ~60s (every 6th 10s
+                            // tick) is plenty and cheap (trims arena tops).
+                            // SAFETY: malloc_trim is thread-safe.
+                            trim_tick = trim_tick.wrapping_add(1);
+                            if trim_tick % 6 == 0 {
+                                unsafe { libc::malloc_trim(0) };
                             }
                             use wacore::appstate::patch_decode::WAPatchName;
                             log::debug!("RegularLow poll tick");
