@@ -150,7 +150,7 @@ fn main() {
         unsafe {
             std::env::set_var(
                 "RUST_LOG",
-                "info,gmessages_rust=debug,whatsapp_desktop=info,whatsapp_rust=warn",
+                "info,gmessages_rust=debug,whatsapp_desktop=info,whatsapp_rust=warn,whatsapp_rust::pdo=info,whatsapp_rust::client::sessions=info",
             );
         }
     }

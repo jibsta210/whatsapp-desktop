@@ -69,8 +69,20 @@ impl Client {
             .clone()
             .ok_or_else(|| anyhow::Error::from(crate::client::ClientError::NotLoggedIn))?;
 
-        // Create JID for device 0 (primary phone)
-        let primary_phone_jid = own_pn.with_device(0);
+        // Target our PRIMARY PHONE (device 0). Prefer its LID address: modern
+        // WhatsApp routes self-device traffic over LID, so the session that
+        // desyncs — and that the phone actually listens on — is the LID session.
+        // Sending the PDO over LID both reaches the phone for content recovery
+        // AND, via ensure_e2e_sessions + the PreKeySignalMessage that
+        // send_peer_message emits on a freshly-established session, rebuilds the
+        // live LID session, healing the "self-message from phone won't decrypt"
+        // deadlock. The old PN target silently went nowhere (no PN session on
+        // the phone), so PDO never recovered these and never re-established.
+        let primary_phone_jid = device_snapshot
+            .lid
+            .clone()
+            .map(|lid| lid.with_device(0))
+            .unwrap_or_else(|| own_pn.with_device(0));
 
         // Resolve JIDs to LID for the MessageKey and cache key, matching WhatsApp Web's behavior.
         // This ensures the cache key matches the JID that the phone will respond with (usually LID).
