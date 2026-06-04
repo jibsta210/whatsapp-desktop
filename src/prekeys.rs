@@ -81,8 +81,19 @@ impl Client {
         // Determine the starting ID using both the persistent counter AND the store max.
         const MAX_PRE_KEY_ID: u32 = 16_777_215;
         let max_id = backend.get_max_prekey_id().await?;
+        // The persistent monotonic counter (next_pre_key_id, WA Web's NEXT_PK_ID)
+        // is AUTHORITATIVE. Do NOT clamp it up to the store's max.
+        // `get_max_prekey_id()` never decreases — old consumed/stale prekeys
+        // linger in the store forever — so `max(counter, store_max + 1)` pins
+        // start_id at the 24-bit ceiling permanently once the store has ever held
+        // a near-ceiling ID. That forced a wrap-to-1 on EVERY upload, which
+        // regenerated and OVERWROTE the live prekeys 1..=812 each launch — and
+        // silently broke every session a peer (including our own primary phone)
+        // had established with the previous batch (key mismatch → MAC failure →
+        // "session keeps dying after a day"). Trust the counter; only fall back
+        // to the store max to migrate an uninitialised counter.
         let mut start_id = if device_snapshot.next_pre_key_id > 0 {
-            std::cmp::max(device_snapshot.next_pre_key_id, max_id + 1)
+            device_snapshot.next_pre_key_id
         } else {
             log::info!(
                 "Migrating pre-key counter: MAX(key_id) in store = {}, starting from {}",
@@ -92,17 +103,16 @@ impl Client {
             max_id + 1
         };
 
-        // Wrap around when we run out of 24-bit ID space. Old pre-keys with
-        // IDs <= the consumed-server pointer have already been used; reusing
-        // those IDs is safe (the server will issue fresh ones from the
-        // upload, ignoring our local stale records). Without this reset,
-        // every startup after running out of IDs uploads ZERO keys and the
-        // session establishment from peers eventually fails.
+        // Wrap only when the AUTHORITATIVE counter genuinely lacks room for a
+        // full batch below the 24-bit ceiling. Because start_id now advances from
+        // the counter (no longer re-pegged to the stale store max), after a wrap
+        // it climbs from 1 normally — so this fires at most once per ~16.7M IDs
+        // instead of on every launch.
         if start_id > MAX_PRE_KEY_ID
             || start_id.saturating_add(WANTED_PRE_KEY_COUNT as u32) > MAX_PRE_KEY_ID
         {
             log::warn!(
-                "Pre-key ID counter at {}, wrapping back to 1 (was hitting 24-bit ceiling)",
+                "Pre-key ID counter at {}, wrapping back to 1 (24-bit ceiling)",
                 start_id
             );
             start_id = 1;
