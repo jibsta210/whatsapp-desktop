@@ -690,7 +690,18 @@ impl Client {
             let device_store = self.persistence_manager.get_device_arc().await;
             let device_guard = device_store.read().await;
 
-            let new_prekey_id = (rand::random::<u32>() % 16777215) + 1;
+            // Allocate this one-off prekey's ID SEQUENTIALLY from the persistent
+            // counter — never a random 24-bit value. A random ID scatters keys
+            // across the whole keyspace, which inflated MAX(prekey_id); combined
+            // with the legacy "start_id = max(counter, store_max+1)" clamp that
+            // drove the upload counter to the 24-bit ceiling, wrapping and
+            // overwriting prekeys 1..=812 every launch and silently breaking any
+            // session a peer (incl. our own phone) had built — the real cause of
+            // the "re-pair, breaks after a day" loop. A broken session sends a
+            // flood of retry receipts, so a random ID here poisons the keyspace
+            // fast. Sequential allocation keeps IDs dense and monotonic, matching
+            // upload_pre_keys, so the ceiling stays decades away.
+            let new_prekey_id = device_snapshot.next_pre_key_id.max(1);
             let new_prekey_keypair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
             let new_prekey_record = wacore::libsignal::store::record_helpers::new_pre_key_record(
                 new_prekey_id,
@@ -704,6 +715,13 @@ impl Client {
                 warn!("Failed to store new prekey for retry receipt: {e:?}");
             }
             drop(device_guard);
+            // Advance the shared counter so this ID is never reused by the next
+            // retry receipt or the next pre-key upload.
+            self.persistence_manager
+                .process_command(wacore::store::commands::DeviceCommand::SetNextPreKeyId(
+                    new_prekey_id.saturating_add(1),
+                ))
+                .await;
 
             let identity_key_bytes = device_snapshot
                 .identity_key
