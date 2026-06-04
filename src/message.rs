@@ -981,30 +981,37 @@ impl Client {
                         );
                         continue;
                     } else if matches!(e, SignalProtocolError::InvalidMessage(_, _)) {
-                        // InvalidMessage typically means MAC verification failed or session is out of sync.
-                        // This happens when the sender's session state diverged from ours (e.g., they reinstalled).
-                        // We need to:
-                        // 1. Delete the stale session so a new one can be established
-                        // 2. Send a retry receipt so the sender resends with a PreKeySignalMessage
+                        // InvalidMessage = MAC verification failed for THIS message: the
+                        // ratchet is out of sync for it (out-of-order delivery, a dropped
+                        // message, or the sender's session genuinely diverged). Decryption
+                        // has ALREADY tried the current state and every archived previous
+                        // state and none matched — so this one message is undecryptable.
+                        //
+                        // Match libsignal/Baileys: do NOT delete the session. Keep it and
+                        // send a retry receipt. The session can still decrypt FUTURE
+                        // messages, and if the sender truly reinstalled it will resend a
+                        // PreKeySignalMessage, which builds a new session and ARCHIVES this
+                        // one (SessionRecord::promote_state) — no manual delete needed.
+                        //
+                        // REGRESSION FIX (#171, 2026-03 added this delete): deleting here was
+                        // the root of the "re-pair, breaks after ~a day" loop. A single MAC
+                        // failure nuked the live session; the next message hit "No session";
+                        // we built a FRESH outgoing session at counter 0; the primary phone
+                        // (still on its advanced ratchet, and authoritative — a linked device
+                        // cannot force it to re-key) could not be decrypted by that fresh
+                        // session → MAC fail → delete → re-establish → forever. Keeping the
+                        // session breaks the cascade; the retry path handles real divergence.
+                        let _ = &signal_address;
                         log::warn!(
-                            "[msg:{}] Decryption failed for {} message from {} due to InvalidMessage (likely MAC failure). \
-                             Deleting stale session and sending retry receipt.",
+                            "[msg:{}] Decryption failed for {} message from {} due to InvalidMessage (MAC failure). \
+                             Keeping session (matches libsignal/Baileys); sending retry receipt.",
                             info.id,
                             enc_type,
                             info.source.sender
                         );
 
-                        // Delete the stale session from the signal cache.
-                        // IMPORTANT: Must go through the cache, not directly to the backend!
-                        // Going to the backend directly leaves the stale session in the cache,
-                        // which causes retry messages to also fail (they'd load the stale session).
-                        self.signal_cache.delete_session(&signal_address).await;
-                        log::info!(
-                            "Deleted stale session for {} from cache to allow re-establishment",
-                            signal_address
-                        );
-
-                        // Send retry receipt so the sender resends with a PreKeySignalMessage
+                        // Send retry receipt so the sender resends (re-establishing via a
+                        // pkmsg if its session genuinely diverged).
                         dispatched_undecryptable = self.handle_decrypt_failure(
                             info,
                             RetryReason::InvalidMessage,
