@@ -25,6 +25,79 @@ fn get_bytes_content(node: &Node) -> Option<&[u8]> {
     }
 }
 
+struct RecoveryPeerState {
+    window_start: std::time::Instant,
+    count: u32,
+    open_until: Option<std::time::Instant>,
+}
+
+static RECOVERY_BREAKER: std::sync::Mutex<
+    Option<std::collections::HashMap<String, RecoveryPeerState>>,
+> = std::sync::Mutex::new(None);
+
+/// Per-peer circuit breaker for decryption-recovery traffic (retry receipts +
+/// PDO requests). A genuinely broken session — e.g. a ratchet desync past the
+/// future-message limit — fails to decrypt EVERY message; naively retrying each
+/// failure asks the peer (here, the user's own phone) to re-send, which fails
+/// again: an unbounded feedback storm that hammers the peer and the server
+/// (observed in the field: 300k+ retries + 160k+ PDO requests in a single day,
+/// ~40/sec, which also throttled the phone's own sending). This caps recovery
+/// per peer: after `TRIP_THRESHOLD` recovery attempts inside `TRIP_WINDOW` we
+/// OPEN the circuit and suppress retry/PDO for that peer for `COOLDOWN`, then
+/// let a single probe through. Healthy peers never approach the threshold —
+/// legit transient retries are a handful, not dozens per 30s.
+///
+/// Returns `true` if recovery traffic is allowed for `peer` right now.
+pub(crate) fn allow_recovery(peer: &str) -> bool {
+    use std::time::{Duration, Instant};
+    const TRIP_THRESHOLD: u32 = 40;
+    const TRIP_WINDOW: Duration = Duration::from_secs(30);
+    const COOLDOWN: Duration = Duration::from_secs(300);
+
+    let now = Instant::now();
+    let mut guard = RECOVERY_BREAKER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    let st = map.entry(peer.to_string()).or_insert(RecoveryPeerState {
+        window_start: now,
+        count: 0,
+        open_until: None,
+    });
+
+    // Circuit currently open?
+    if let Some(until) = st.open_until {
+        if now < until {
+            return false;
+        }
+        // Cooldown elapsed — reset and let a single probe through.
+        st.open_until = None;
+        st.window_start = now;
+        st.count = 0;
+    }
+
+    // Slide the counting window.
+    if now.duration_since(st.window_start) > TRIP_WINDOW {
+        st.window_start = now;
+        st.count = 0;
+    }
+
+    st.count += 1;
+    if st.count > TRIP_THRESHOLD {
+        st.open_until = Some(now + COOLDOWN);
+        log::warn!(
+            "recovery circuit OPEN for {peer}: >{} decrypt-recovery attempts within {}s — \
+             suppressing retry receipts + PDO for that peer for {}s to stop a storm \
+             (session likely desynced past recovery; awaiting peer re-key).",
+            TRIP_THRESHOLD,
+            TRIP_WINDOW.as_secs(),
+            COOLDOWN.as_secs()
+        );
+        return false;
+    }
+    true
+}
+
 /// Helper to extract registration ID from a node (4 bytes big-endian).
 fn extract_registration_id_from_node(node: &Node) -> Option<u32> {
     let registration_node = node.get_optional_child("registration")?;

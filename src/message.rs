@@ -182,6 +182,16 @@ impl Client {
     /// * `info` - The message info for the failed message
     /// * `reason` - The retry reason code (matches WhatsApp Web's RetryReason enum)
     fn spawn_retry_receipt(self: &Arc<Self>, info: &MessageInfo, reason: RetryReason) {
+        // Circuit breaker: a desynced session fails to decrypt every message,
+        // and each retry asks the peer to re-send (re-encrypted at a higher
+        // counter) → an unbounded retry/PDO storm that hammers the peer (the
+        // user's own phone) and WhatsApp's servers. If this peer's recovery
+        // traffic has spiked into a storm, drop this attempt. The PDO requests
+        // spawned inside this task are gated here too (spawn_pdo_request is only
+        // ever invoked from within spawn_retry_receipt).
+        if !crate::retry::allow_recovery(&info.source.sender.to_string()) {
+            return;
+        }
         let client = Arc::clone(self);
         let info = info.clone();
 
