@@ -1358,9 +1358,13 @@ fn build_image_widget(
         pic.set_paintable(Some(tex));
     }
 
-    // Lazy reload: re-acquire the texture when the widget maps after having been
-    // unmapped (scrolled back into view), and release it on unmap to bound GPU
-    // memory. Weak refs avoid a widget → closure → widget reference cycle.
+    // Keep the texture resident once set — we deliberately do NOT clear it on
+    // unmap. The chat-view runs a hide/show paint cycle that unmaps every bubble,
+    // and GTK's `map` signal does not reliably fire on the remap, so clearing on
+    // unmap left valid, on-disk images permanently blank (the bug). The `map`
+    // handler below is now just a fallback that reloads if the paintable is
+    // somehow missing. Textures are released when the bubble is dropped on chat
+    // switch, bounding GPU memory to roughly the open chat's worth of images.
     let path_owned = path.to_string();
     let pic_weak = pic.downgrade();
     pic.connect_map(move |_| {
@@ -1370,12 +1374,6 @@ fn build_image_widget(
         }
         if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&path_owned) {
             p.set_paintable(Some(&tex));
-        }
-    });
-    let pic_weak2 = pic.downgrade();
-    pic.connect_unmap(move |_| {
-        if let Some(p) = pic_weak2.upgrade() {
-            p.set_paintable(None::<&gtk4::gdk::Paintable>);
         }
     });
 
