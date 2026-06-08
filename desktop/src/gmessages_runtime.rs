@@ -114,6 +114,44 @@ fn gm_media_dest(media_id: &str, mime: &str, data_dir: &Path) -> PathBuf {
     data_dir.join("gm_media").join(format!("{safe_id}.{safe_ext}"))
 }
 
+/// GTK/gdk-pixbuf has no HEIC/HEIF loader, so iPhone MMS/RCS photos download fine
+/// but can't be rendered — they show as a "📷 Photo" placeholder. Transcode a
+/// saved HEIC to a sibling JPEG via `heif-convert` and return that path. No-op
+/// (returns the original) for non-HEIC files or if the conversion fails; the
+/// produced .jpg is reused on subsequent calls. Blocking — run off the async
+/// runtime (decoding a multi-MB HEIC is heavy CPU).
+fn convert_heic_to_jpg(dest: &Path) -> PathBuf {
+    let is_heic = dest
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("heic") || e.eq_ignore_ascii_case("heif"))
+        .unwrap_or(false);
+    if !is_heic {
+        return dest.to_path_buf();
+    }
+    let jpg = dest.with_extension("jpg");
+    if jpg.exists() {
+        return jpg;
+    }
+    match std::process::Command::new("heif-convert")
+        .arg(dest)
+        .arg(&jpg)
+        .output()
+    {
+        Ok(o) if o.status.success() && jpg.exists() => {
+            log::info!("gmessages: transcoded HEIC → {}", jpg.display());
+            jpg
+        }
+        result => {
+            log::warn!(
+                "gmessages: HEIC→JPEG failed for {} ({result:?}); leaving original (won't render)",
+                dest.display()
+            );
+            dest.to_path_buf()
+        }
+    }
+}
+
 /// Best-effort MIME type from a file path's extension. Used when sending
 /// an outbound MMS — the relay needs a content type for the attachment.
 fn guess_mime(path: &str) -> String {
@@ -1087,11 +1125,18 @@ async fn run(
                                         "gmessages: media already downloaded at {}",
                                         dest.display()
                                     );
+                                    // HEIC can't render in GTK — transcode to JPEG off the runtime.
+                                    let dest_fallback = dest.clone();
+                                    let render_path = tokio::task::spawn_blocking(move || {
+                                        convert_heic_to_jpg(&dest)
+                                    })
+                                    .await
+                                    .unwrap_or(dest_fallback);
                                     let _ = event_tx
                                         .send(WaEvent::MediaReady {
                                             msg_id,
                                             chat_id,
-                                            path: dest.to_string_lossy().into_owned(),
+                                            path: render_path.to_string_lossy().into_owned(),
                                             media_type: kind,
                                         })
                                         .await;
@@ -1107,11 +1152,18 @@ async fn run(
                                             log::warn!("gmessages: write media file: {e}");
                                             return;
                                         }
+                                        // HEIC can't render in GTK — transcode to JPEG off the runtime.
+                                        let dest_fallback = dest.clone();
+                                        let render_path = tokio::task::spawn_blocking(move || {
+                                            convert_heic_to_jpg(&dest)
+                                        })
+                                        .await
+                                        .unwrap_or(dest_fallback);
                                         let _ = event_tx
                                             .send(WaEvent::MediaReady {
                                                 msg_id,
                                                 chat_id,
-                                                path: dest.to_string_lossy().into_owned(),
+                                                path: render_path.to_string_lossy().into_owned(),
                                                 media_type: kind,
                                             })
                                             .await;
