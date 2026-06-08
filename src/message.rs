@@ -324,8 +324,33 @@ impl Client {
                 }
                 sender.clone()
             } else if sender.server == pn_server {
-                // ... (PN to LID resolution logic)
-                if let Some(alt_jid) = alt
+                // CRITICAL self-sync fix. If this PN is our OWN phone number,
+                // ALWAYS resolve to our own LID session. The phone encrypts its
+                // self-sync to us over the LID session, so a PN-addressed copy
+                // must decrypt with that SAME session — never a separate
+                // PN-keyed one. We must NOT depend on lid_pn_cache here: the own
+                // mapping can be absent (a message racing the async cache
+                // warm-up right after pairing) or evicted (the cache is
+                // in-memory and get_current_lid does NOT fall back to the DB).
+                // When that happens the `else` arm below returns `sender.clone()`
+                // and we build a PHANTOM PN session that diverges from the live
+                // LID ratchet and never recovers — the exact root of "messages I
+                // send from my phone stop syncing to the desktop after a while"
+                // (and the storm that followed). The device always knows its own
+                // PN+LID, so key off that directly and bypass the cache entirely.
+                let own_self_lid = match (self.get_pn().await, self.get_lid().await) {
+                    (Some(own_pn), Some(own_lid)) if own_pn.user == sender.user => Some(own_lid),
+                    _ => None,
+                };
+                if let Some(own_lid) = own_self_lid {
+                    Jid {
+                        user: own_lid.user.clone(),
+                        server: wacore_binary::jid::cow_server_from_str(lid_server),
+                        device: sender.device,
+                        agent: sender.agent,
+                        integrator: sender.integrator,
+                    }
+                } else if let Some(alt_jid) = alt
                     && alt_jid.server == lid_server
                 {
                     if let Err(err) = self
