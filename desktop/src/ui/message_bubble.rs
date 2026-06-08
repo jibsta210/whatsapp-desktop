@@ -1323,9 +1323,11 @@ fn build_image_widget(
     let max_w: i32 = if is_sticker { 180 } else { 380 };
     let max_h: i32 = if is_sticker { 180 } else { 520 };
 
-    // Probe dimensions from file to compute display size without loading full texture.
-    // Falls back to max size if file can't be read.
-    let (display_w, display_h) = crate::ui::texture_cache::texture_from_filename(path)
+    // Probe the texture from file to compute display size. We keep the loaded
+    // texture (not just its dimensions) so we can show it immediately below.
+    let probe = crate::ui::texture_cache::texture_from_filename(path);
+    let (display_w, display_h) = probe
+        .as_ref()
         .map(|t| {
             let iw = t.width();
             let ih = t.height();
@@ -1346,8 +1348,19 @@ fn build_image_widget(
     pic.set_hexpand(false);
     pic.set_vexpand(false);
 
-    // Lazy load: only hold texture in GPU while widget is visible.
-    // Use weak refs to avoid prevent widget → closure → widget reference cycles.
+    // Show the texture eagerly. We already loaded it for the size probe, so this
+    // is free. Previously the paintable was ONLY set from `connect_map` (lazy),
+    // which on a bulk history-load — especially through the hide/show paint
+    // cycle — did not reliably fire, leaving valid, on-disk images blank until
+    // some unrelated event. Setting it here guarantees first paint; the map/
+    // unmap handlers below still manage GPU residency on scroll.
+    if let Some(tex) = &probe {
+        pic.set_paintable(Some(tex));
+    }
+
+    // Lazy reload: re-acquire the texture when the widget maps after having been
+    // unmapped (scrolled back into view), and release it on unmap to bound GPU
+    // memory. Weak refs avoid a widget → closure → widget reference cycle.
     let path_owned = path.to_string();
     let pic_weak = pic.downgrade();
     pic.connect_map(move |_| {

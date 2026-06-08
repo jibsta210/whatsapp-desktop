@@ -6215,7 +6215,8 @@ async fn handle_command(
                                 quoted_text: None,
                                 quoted_sender: None,
                                 reactions: vec![],
-                                media_local_path: Some(path),
+                                // Persist out of /tmp so the sent image survives a reboot.
+                                media_local_path: Some(persist_outgoing_media(&path)),
                                 media_filename: Some(filename),
                                 poll_question: None,
                                 poll_options: vec![],
@@ -7404,6 +7405,35 @@ fn generate_waveform(audio_data: &[u8], num_bins: usize) -> Vec<u8> {
 
 const MEDIA_DIR: &str = "wa_media";
 const AVATARS_DIR: &str = "wa_avatars";
+
+/// Copy an outgoing media file out of a volatile dir (`/tmp`, wiped on reboot)
+/// into the persistent `wa_media` dir, so the local echo of a sent image still
+/// has its file after a restart. Pasted/clipboard images are staged in
+/// `/tmp/wa_paste_*`; persisting them here is the difference between a sent
+/// image surviving a reboot and showing an empty placeholder. No-op for paths
+/// that are already persistent; returns the original path if the copy fails.
+fn persist_outgoing_media(path: &str) -> String {
+    if !path.starts_with("/tmp/") {
+        return path.to_string();
+    }
+    let src = std::path::Path::new(path);
+    let Some(fname) = src.file_name() else {
+        return path.to_string();
+    };
+    let dir = std::env::current_dir().unwrap_or_default().join(MEDIA_DIR);
+    let _ = std::fs::create_dir_all(&dir);
+    let dest = dir.join(fname);
+    match std::fs::copy(src, &dest) {
+        Ok(_) => dest.to_string_lossy().to_string(),
+        Err(e) => {
+            log::warn!(
+                "persist_outgoing_media: copy {path} -> {} failed: {e}",
+                dest.display()
+            );
+            path.to_string()
+        }
+    }
+}
 
 /// Cloned info from a proto sub-message needed to download + display media.
 enum PendingDownload {
