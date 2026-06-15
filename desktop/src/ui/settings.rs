@@ -30,6 +30,10 @@ pub struct AppSettings {
     /// Mute all notifications temporarily (do-not-disturb)
     #[serde(default)]
     pub do_not_disturb: bool,
+    /// Auto-copy verification codes from incoming SMS to the clipboard and show
+    /// a brief OSD. Off = no auto-copy and no 2FA notification at all.
+    #[serde(default = "default_true")]
+    pub twofa_autocopy: bool,
     // ── AI Autocorrect ──
     /// Gemini API key (used when ai_model = "gemini").
     #[serde(default)]
@@ -78,6 +82,7 @@ impl Default for AppSettings {
             notification_preview: true,
             notify_when_focused: false,
             do_not_disturb: false,
+            twofa_autocopy: true,
             ai_api_key: String::new(),
             deepseek_api_key: String::new(),
             ai_model: "gemini".to_string(),
@@ -200,6 +205,10 @@ impl SettingsHandle {
         s.notification_sound && s.notifications_enabled && !s.do_not_disturb
     }
 
+    pub fn twofa_autocopy_enabled(&self) -> bool {
+        self.inner.borrow().twofa_autocopy
+    }
+
     pub fn show_preview(&self) -> bool {
         self.inner.borrow().notification_preview
     }
@@ -280,6 +289,17 @@ pub fn show_settings_window(settings: &SettingsHandle, parent: Option<&gtk4::Win
         sh.update(|s| s.do_not_disturb = row.is_active());
     });
     group.add(&row_dnd);
+
+    // Auto-copy verification codes (2FA OSD)
+    let row_2fa = adw::SwitchRow::new();
+    row_2fa.set_title("Auto-copy verification codes");
+    row_2fa.set_subtitle("Copy 2FA codes from SMS to the clipboard and show a brief notification");
+    row_2fa.set_active(settings.get().twofa_autocopy);
+    let sh = settings.clone();
+    row_2fa.connect_active_notify(move |row| {
+        sh.update(|s| s.twofa_autocopy = row.is_active());
+    });
+    group.add(&row_2fa);
 
     page.add(&group);
     window.add(&page);

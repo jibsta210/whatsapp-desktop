@@ -897,11 +897,13 @@ impl MainWindow {
                     && let Some(text) = msg.text.as_deref()
                 {
                     if let Some(code) = detect_two_factor_code(text) {
-                        let sender = inner
-                            .chat_list
-                            .chat_name(&msg.chat_id)
-                            .unwrap_or_else(|| msg.sender_name.clone());
-                        copy_2fa_code_with_osd(&inner.gtk_app, &code, &sender);
+                        if inner.settings.twofa_autocopy_enabled() {
+                            let sender = inner
+                                .chat_list
+                                .chat_name(&msg.chat_id)
+                                .unwrap_or_else(|| msg.sender_name.clone());
+                            copy_2fa_code_with_osd(&inner.gtk_app, &code, &sender);
+                        }
                     } else {
                         log::debug!("2FA scan: no code detected in text");
                     }
@@ -1817,14 +1819,24 @@ pub use crate::bridge::detect_two_factor_code;
 /// renders as a transient OSD overlay.
 pub fn copy_2fa_code_with_osd(app: &adw::Application, code: &str, sender: &str) {
     set_clipboard_text(code);
-    // 2) Notification. Try GNotification first; in parallel fire a
-    //    notify-send so COSMIC OSD picks it up reliably even if the GTK
-    //    notification gets queued/grouped.
+    // Single GNotification under our real app-id (com.whatsapp.desktop), so it
+    // groups with the app's other notifications and the user's per-app mute
+    // actually applies to it.
+    //
+    // Priority is NORMAL, not Urgent. Urgent maps to freedesktop "critical"
+    // urgency, which is RESIDENT: the DE (KDE/Plasma especially) keeps it on
+    // screen until manually dismissed and IGNORES any timeout — that's what made
+    // this toast stick around for 16+ minutes. Normal auto-expires after the
+    // DE's default (a few seconds), which is plenty to read and Ctrl+V the code.
+    //
+    // We deliberately do NOT also fire `notify-send`: without `--app-name` it
+    // posts under the binary name `whatsapp-desktop` — a DIFFERENT app-id from
+    // ours — so it both duplicated this toast AND couldn't be muted along with
+    // the rest of the app's notifications.
     let notif = gtk4::gio::Notification::new("Verification code copied");
     notif.set_body(Some(&format!("{code} from {sender} — paste with Ctrl+V")));
-    notif.set_priority(gtk4::gio::NotificationPriority::Urgent);
-    // Each invocation needs a unique ID so it doesn't replace a previous
-    // 2FA toast (or get coalesced).
+    notif.set_priority(gtk4::gio::NotificationPriority::Normal);
+    // Unique ID so successive codes don't replace/coalesce each other.
     let notif_id = format!(
         "auth-code-{}",
         std::time::SystemTime::now()
@@ -1833,15 +1845,6 @@ pub fn copy_2fa_code_with_osd(app: &adw::Application, code: &str, sender: &str) 
             .unwrap_or(0)
     );
     app.send_notification(Some(&notif_id), &notif);
-    // Belt-and-braces: also fire `notify-send` with `-u critical -t 4000`
-    // for the OSD path. Spawned, non-blocking, ignores errors.
-    let _ = std::process::Command::new("notify-send")
-        .arg("-u").arg("critical")
-        .arg("-t").arg("4000")
-        .arg("-c").arg("im.received")
-        .arg("Verification code copied")
-        .arg(format!("{code} from {sender} — paste with Ctrl+V"))
-        .spawn();
     log::info!("2FA code {code} from {sender} copied to clipboard");
 }
 
