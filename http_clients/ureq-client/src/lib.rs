@@ -75,9 +75,17 @@ impl HttpClient for UreqHttpClient {
 
             let status_code = response.status().as_u16();
 
-            // Read the response body
+            // Read the response body. ureq 3.x's read_to_vec() defaults to a
+            // 10 MB cap ("response body is larger than request limit: 10485760"),
+            // which silently failed large WhatsApp media — e.g. architectural-
+            // drawing PDFs over 10 MB never downloaded and showed a dead-end
+            // placeholder. WhatsApp documents go well beyond that; lift the cap
+            // to 512 MB, still bounded so a malicious huge response can't OOM us.
             let mut body = response.into_body();
-            let body_bytes = body.read_to_vec()?;
+            let body_bytes = body
+                .with_config()
+                .limit(512 * 1024 * 1024)
+                .read_to_vec()?;
 
             Ok(HttpResponse {
                 status_code,
