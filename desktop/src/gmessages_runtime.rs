@@ -1404,6 +1404,7 @@ async fn handle_command(
                         .map(|d| d.as_secs() as i64)
                         .unwrap_or(0);
                     let echo = IncomingMessage {
+                        media_download: None,
                         id: tagged_real.clone(),
                         chat_id: chat_id.clone(),
                         sender_id: String::new(),
@@ -1707,6 +1708,7 @@ async fn handle_command(
                         MediaType::Document
                     };
                     let echo = IncomingMessage {
+                        media_download: None,
                         id: tagged,
                         chat_id: chat_id.clone(),
                         sender_id: String::new(),
@@ -2468,6 +2470,7 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
             .unwrap_or_else(|| m.participant_id.clone())
     };
     Some(IncomingMessage {
+        media_download: None,
         id: tagged_id,
         chat_id: format!("{CHAT_PREFIX}{}", m.conversation_id),
         sender_id: m.participant_id.clone(),

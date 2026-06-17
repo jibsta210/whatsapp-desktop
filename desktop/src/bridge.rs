@@ -389,6 +389,13 @@ pub enum WaCommand {
         caption: Option<String>,
         tmp_id: String,
     },
+    /// On-demand download of a received message's attachment — fired when the
+    /// user clicks an undownloaded media/document placeholder. Re-fetches using
+    /// the keys persisted on the message and emits `MediaReady` when done.
+    RequestMediaDownload {
+        chat_id: String,
+        msg_id: String,
+    },
     /// Search for GIFs via Tenor
     SearchGifs {
         query: String,
@@ -643,6 +650,29 @@ pub struct IncomingMessage {
     /// e.g. "You added ~Derek Bevilacqua", "John left"
     #[serde(default)]
     pub is_system_message: bool,
+    /// WhatsApp media-download keys, persisted so an attachment that never
+    /// downloaded (history-synced, or a failed/skipped auto-download) can be
+    /// re-fetched on demand when the user clicks it. `#[serde(default)]` keeps
+    /// old `wa_messages/*.bin` files readable (bincode tolerates a new field
+    /// only with a default).
+    #[serde(default)]
+    pub media_download: Option<MediaDownloadKeys>,
+}
+
+/// The minimal WhatsApp media-download key set needed to (re)fetch and decrypt a
+/// message's attachment at any time — even after a restart or a failed initial
+/// download. Stored on [`IncomingMessage::media_download`] and used to rebuild a
+/// download request from the persisted message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaDownloadKeys {
+    pub direct_path: String,
+    pub media_key: Vec<u8>,
+    pub enc_sha256: Vec<u8>,
+    pub sha256: Vec<u8>,
+    #[serde(default)]
+    pub file_length: u64,
+    #[serde(default)]
+    pub mimetype: Option<String>,
 }
 
 /// Origin protocol for an [`IncomingMessage`]. Derived at render time from
@@ -858,6 +888,7 @@ impl IncomingMessage {
             receipt_status: ReceiptStatus::Pending,
             is_edited: false,
             is_system_message: false,
+            media_download: None,
         }
     }
 }

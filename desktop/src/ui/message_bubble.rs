@@ -579,6 +579,10 @@ impl MessageBubble {
             let mb = Box::new(Orientation::Vertical, 4);
             if let Some(path) = &msg.media_local_path {
                 build_media_content(&mb, path, msg.media_type.as_ref().unwrap(), &on_image_click);
+            } else if msg.media_download.is_some() {
+                // No local file yet, but we hold the decryption keys — make the
+                // placeholder clickable to fetch the attachment on demand.
+                mb.append(&build_downloadable_placeholder(msg, bridge));
             } else {
                 mb.append(&media_placeholder_label(msg));
             }
@@ -1800,6 +1804,46 @@ fn media_placeholder_label(msg: &IncomingMessage) -> Label {
     lbl.set_lines(2);
     lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
     lbl
+}
+
+/// A clickable placeholder for media we have keys for but haven't downloaded
+/// yet. Clicking sends `RequestMediaDownload`; the runtime fetches + decrypts
+/// the file and emits `MediaReady`, which swaps in the real content.
+fn build_downloadable_placeholder(
+    msg: &IncomingMessage,
+    bridge: &Arc<crate::bridge::Bridge>,
+) -> Box {
+    let row = Box::new(Orientation::Horizontal, 6);
+    row.set_halign(Align::Start);
+
+    let label = media_placeholder_label(msg);
+    row.append(&label);
+
+    let hint = Label::new(Some("⬇ Tap to download"));
+    hint.add_css_class("dim-label");
+    hint.add_css_class("caption");
+    row.append(&hint);
+
+    row.set_cursor_from_name(Some("pointer"));
+
+    let clicked = Rc::new(std::cell::Cell::new(false));
+    let gesture = GestureClick::new();
+    let bridge_c = bridge.clone();
+    let chat_id = msg.chat_id.clone();
+    let msg_id = msg.id.clone();
+    let hint_c = hint.clone();
+    gesture.connect_pressed(move |_, _, _, _| {
+        if clicked.replace(true) {
+            return; // already requested — ignore repeat taps
+        }
+        bridge_c.send_command(crate::bridge::WaCommand::RequestMediaDownload {
+            chat_id: chat_id.clone(),
+            msg_id: msg_id.clone(),
+        });
+        hint_c.set_text("⏳ Downloading…");
+    });
+    row.add_controller(gesture);
+    row
 }
 
 /// Simple percent-decode (%XX → char) for display purposes.

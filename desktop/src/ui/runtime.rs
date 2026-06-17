@@ -1425,7 +1425,8 @@ fn command_chat_id(cmd: &WaCommand) -> Option<&str> {
         | WaCommand::SendGif { chat_id, .. }
         | WaCommand::SendSticker { chat_id, .. }
         | WaCommand::SendPoll { chat_id, .. }
-        | WaCommand::SendAudio { chat_id, .. } => Some(chat_id),
+        | WaCommand::SendAudio { chat_id, .. }
+        | WaCommand::RequestMediaDownload { chat_id, .. } => Some(chat_id),
         WaCommand::SendContact { to_chat_id, .. }
         | WaCommand::ForwardMessage { to_chat_id, .. } => Some(to_chat_id),
         _ => None,
@@ -3523,6 +3524,7 @@ async fn handle_wa_event(
 
             let now = update.timestamp.timestamp();
             let sys_msg = IncomingMessage {
+                media_download: None,
                 id: format!("sys_{now}_{}", wacore::time::now_millis()),
                 chat_id: chat_id.clone(),
                 sender_id: String::new(),
@@ -3862,6 +3864,42 @@ async fn handle_command(
     cmd: WaCommand,
 ) -> Result<()> {
     match cmd {
+        WaCommand::RequestMediaDownload { chat_id, msg_id } => {
+            // On-demand download: look up the stored message's download keys,
+            // media type, and filename, then run the same download path used by
+            // the auto-download trigger. Lets the user fetch attachments that were
+            // never auto-downloaded (history-synced, failed, or skipped media).
+            let found = {
+                let s = state.lock().unwrap();
+                s.history.get(&chat_id).and_then(|msgs| {
+                    msgs.iter().find(|m| m.id == msg_id).map(|m| {
+                        (
+                            m.media_download.clone(),
+                            m.media_type.clone(),
+                            m.media_filename.clone(),
+                        )
+                    })
+                })
+            };
+            let Some((keys, media_type, filename)) = found else {
+                log::warn!("RequestMediaDownload: msg {msg_id} not found in chat {chat_id}");
+                return Ok(());
+            };
+            let Some(keys) = keys else {
+                log::warn!(
+                    "RequestMediaDownload: msg {msg_id} has no download keys — re-send required"
+                );
+                return Ok(());
+            };
+            let Some(dl) = pending_from_keys(&keys, media_type.as_ref(), filename) else {
+                log::warn!(
+                    "RequestMediaDownload: msg {msg_id} has keys but no usable media_type"
+                );
+                return Ok(());
+            };
+            log::info!("On-demand media download requested: msg={msg_id} chat={chat_id}");
+            execute_media_download(client.clone(), tx.clone(), state, msg_id, chat_id, dl).await;
+        }
         WaCommand::SendText {
             chat_id,
             text,
@@ -4040,6 +4078,7 @@ async fn handle_command(
                         .unwrap_or_default()
                         .as_secs() as i64;
                     let sent_msg = IncomingMessage {
+                        media_download: None,
                         id: real_id.clone(),
                         chat_id: chat_id.clone(),
                         sender_id: String::new(),
@@ -4164,6 +4203,7 @@ async fn handle_command(
                         .unwrap_or_default()
                         .as_secs() as i64;
                     let sent_msg = IncomingMessage {
+                        media_download: None,
                         id: real_id.clone(),
                         chat_id: chat_id.clone(),
                         sender_id: String::new(),
@@ -5346,6 +5386,7 @@ async fn handle_command(
                                 .unwrap_or_default()
                                 .as_secs() as i64;
                             let local_msg = IncomingMessage {
+                                media_download: None,
                                 id: real_id,
                                 chat_id: to_chat_id.clone(),
                                 sender_id: String::new(),
@@ -5584,6 +5625,7 @@ async fn handle_command(
                         .unwrap_or_default()
                         .as_secs() as i64;
                     let poll_msg = IncomingMessage {
+                        media_download: None,
                         id: msg_id.clone(),
                         chat_id: chat_id.clone(),
                         sender_id: String::new(),
@@ -6201,6 +6243,7 @@ async fn handle_command(
                                 .unwrap_or_default()
                                 .as_secs() as i64;
                             let sent_msg = IncomingMessage {
+                                media_download: None,
                                 id: real_id.clone(),
                                 chat_id: chat_id.clone(),
                                 sender_id: String::new(),
@@ -6353,6 +6396,7 @@ async fn handle_command(
                                 .unwrap_or_default()
                                 .as_secs() as i64;
                             let sent = IncomingMessage {
+                                media_download: None,
                                 id: real_id.clone(),
                                 chat_id: chat_id.clone(),
                                 sender_id: String::new(),
@@ -6477,6 +6521,7 @@ async fn handle_command(
                         .unwrap_or_default()
                         .as_secs() as i64;
                     let sent = IncomingMessage {
+                        media_download: None,
                         id: real_id.clone(),
                         chat_id: to_chat_id.clone(),
                         sender_id: String::new(),
@@ -6655,6 +6700,7 @@ async fn handle_command(
                                 .unwrap_or_default()
                                 .as_secs() as i64;
                             let sent = IncomingMessage {
+                                media_download: None,
                                 id: real_id.clone(),
                                 chat_id: chat_id.clone(),
                                 sender_id: String::new(),
@@ -7488,6 +7534,120 @@ fn extract_pending_download(base: &wa::Message) -> Option<PendingDownload> {
     None
 }
 
+/// Pull the persistable media-download keys out of a base message if it carries
+/// a downloadable attachment. Mirrors `extract_pending_download` but keeps only
+/// the keys, so they ride on the persisted `IncomingMessage` and can drive an
+/// on-demand re-download later (history-synced, failed, or skipped media).
+fn extract_media_download_keys(base: &wa::Message) -> Option<crate::bridge::MediaDownloadKeys> {
+    use crate::bridge::MediaDownloadKeys;
+    macro_rules! keys_from {
+        ($m:expr) => {{
+            let m = $m;
+            if m.direct_path.is_some() && m.media_key.is_some() {
+                return Some(MediaDownloadKeys {
+                    direct_path: m.direct_path.clone().unwrap_or_default(),
+                    media_key: m.media_key.clone().unwrap_or_default(),
+                    enc_sha256: m.file_enc_sha256.clone().unwrap_or_default(),
+                    sha256: m.file_sha256.clone().unwrap_or_default(),
+                    file_length: m.file_length.unwrap_or(0),
+                    mimetype: m.mimetype.clone(),
+                });
+            }
+        }};
+    }
+    if let Some(m) = &base.image_message {
+        keys_from!(m);
+    }
+    if let Some(m) = &base.video_message {
+        keys_from!(m);
+    }
+    if let Some(m) = &base.document_message {
+        keys_from!(m);
+    }
+    if let Some(m) = &base.audio_message {
+        keys_from!(m);
+    }
+    if let Some(m) = &base.sticker_message {
+        keys_from!(m);
+    }
+    None
+}
+
+/// Rebuild a [`PendingDownload`] from persisted keys for an on-demand re-download.
+/// `media_type` selects the protobuf shape, which drives the HKDF key context.
+fn pending_from_keys(
+    keys: &crate::bridge::MediaDownloadKeys,
+    media_type: Option<&crate::bridge::MediaType>,
+    filename: Option<String>,
+) -> Option<PendingDownload> {
+    use crate::bridge::MediaType;
+    let dp = Some(keys.direct_path.clone());
+    let mk = Some(keys.media_key.clone());
+    let enc = Some(keys.enc_sha256.clone());
+    let sha = Some(keys.sha256.clone());
+    let len = Some(keys.file_length);
+    let mime = keys.mimetype.clone();
+    Some(match media_type? {
+        MediaType::Image => PendingDownload::Image {
+            msg: Box::new(wa::message::ImageMessage {
+                direct_path: dp,
+                media_key: mk,
+                file_enc_sha256: enc,
+                file_sha256: sha,
+                file_length: len,
+                mimetype: mime,
+                ..Default::default()
+            }),
+        },
+        MediaType::Video | MediaType::Gif => PendingDownload::Video {
+            msg: Box::new(wa::message::VideoMessage {
+                direct_path: dp,
+                media_key: mk,
+                file_enc_sha256: enc,
+                file_sha256: sha,
+                file_length: len,
+                mimetype: mime,
+                ..Default::default()
+            }),
+        },
+        MediaType::Audio => PendingDownload::Audio {
+            msg: Box::new(wa::message::AudioMessage {
+                direct_path: dp,
+                media_key: mk,
+                file_enc_sha256: enc,
+                file_sha256: sha,
+                file_length: len,
+                mimetype: mime,
+                ..Default::default()
+            }),
+        },
+        MediaType::Document => PendingDownload::Document {
+            msg: Box::new(wa::message::DocumentMessage {
+                direct_path: dp,
+                media_key: mk,
+                file_enc_sha256: enc,
+                file_sha256: sha,
+                file_length: len,
+                mimetype: mime,
+                file_name: filename.clone(),
+                ..Default::default()
+            }),
+            filename,
+        },
+        MediaType::Sticker => PendingDownload::Sticker {
+            msg: Box::new(wa::message::StickerMessage {
+                direct_path: dp,
+                media_key: mk,
+                file_enc_sha256: enc,
+                file_sha256: sha,
+                file_length: len,
+                mimetype: mime,
+                ..Default::default()
+            }),
+        },
+    })
+}
+
 fn ext_from_mime(mime: Option<&str>, default: &str) -> String {
     mime.and_then(|m| m.split('/').nth(1))
         .and_then(|s| s.split(';').next())
@@ -8278,6 +8438,10 @@ fn map_history_message(h: &wa::HistorySyncMsg, chat_id: &str) -> Option<Incoming
         quoted_media_path: None,
         is_edited: false,
         is_system_message: false,
+        media_download: web_msg
+            .message
+            .as_ref()
+            .and_then(|pm| extract_media_download_keys(pm.get_base_message())),
     })
 }
 
@@ -8519,6 +8683,7 @@ fn map_message(msg: wa::Message, info: MessageInfo) -> Option<IncomingMessage> {
         poll_votes: vec![],
         is_edited: false,
         is_system_message: false,
+        media_download: extract_media_download_keys(base),
     })
 }
 
@@ -8533,6 +8698,7 @@ fn make_outgoing_message(
         .unwrap_or_default()
         .as_secs() as i64;
     IncomingMessage {
+        media_download: None,
         id: msg_id,
         chat_id: chat_id.to_string(),
         sender_id: String::new(),

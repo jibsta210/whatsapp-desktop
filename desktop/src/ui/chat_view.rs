@@ -2123,6 +2123,7 @@ impl ChatViewPanel {
             receipt_status: crate::bridge::ReceiptStatus::Pending,
             is_edited: false,
             is_system_message: false,
+            media_download: None,
         };
         Self::append_bubble_to_inner(inner, optimistic);
 
