@@ -2065,18 +2065,68 @@ fn open_video_window(path: &str) {
 }
 
 fn open_with_xdg(path: &str) {
-    // Spawn xdg-open fully detached from the GTK process
     use std::process::{Command, Stdio};
-    let path = path.to_string();
+    let src = path.to_string();
     std::thread::spawn(move || {
+        // Copy into ~/Downloads and open THAT, for two reasons:
+        //  • wa_media lives under ~/.local/share, which sandboxed (Flatpak)
+        //    viewers/browsers — e.g. a Flatpak Vivaldi/Firefox — cannot read,
+        //    so xdg-open'ing the internal path silently opens a blank window.
+        //    ~/Downloads is reachable to them via the xdg-download portal.
+        //  • the user expects "download" to leave a real file where they can
+        //    find it.
+        // Falls back to the original path if the copy fails (no regression).
+        let target = save_to_downloads(std::path::Path::new(&src))
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| src.clone());
         let _ = Command::new("setsid")
             .arg("xdg-open")
-            .arg(&path)
+            .arg(&target)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
     });
+}
+
+/// Copy a downloaded media file into ~/Downloads under a clean, human-readable
+/// name (our `<8hex>_` download prefix stripped, percent-decoded). Returns the
+/// destination path. Idempotent: a same-name, same-size file is reused; a name
+/// collision with *different* content gets a " (n)" suffix.
+fn save_to_downloads(src: &std::path::Path) -> Option<std::path::PathBuf> {
+    let fname = src.file_name()?.to_str()?;
+    let base = fname
+        .splitn(2, '_')
+        .nth(1)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fname);
+    let clean = urldecode(base);
+    let dir = std::path::PathBuf::from(std::env::var("HOME").ok()?).join("Downloads");
+    std::fs::create_dir_all(&dir).ok()?;
+    let src_len = std::fs::metadata(src).ok()?.len();
+
+    let preferred = dir.join(&clean);
+    if preferred.exists()
+        && std::fs::metadata(&preferred).ok().map(|m| m.len()) == Some(src_len)
+    {
+        return Some(preferred); // already downloaded, identical — reuse
+    }
+    let dest = if preferred.exists() {
+        // Name collision with different content → "name (n).ext".
+        let (stem, ext) = match clean.rsplit_once('.') {
+            Some((s, e)) => (s.to_string(), format!(".{e}")),
+            None => (clean.clone(), String::new()),
+        };
+        (1..1000)
+            .map(|i| dir.join(format!("{stem} ({i}){ext}")))
+            .find(|p| !p.exists())
+            .unwrap_or(preferred)
+    } else {
+        preferred
+    };
+    std::fs::copy(src, &dest).ok()?;
+    log::info!("Saved attachment to {}", dest.display());
+    Some(dest)
 }
 
 fn format_time(ts: i64) -> String {
