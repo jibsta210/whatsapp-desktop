@@ -367,6 +367,44 @@ impl RecentMsgRing {
     }
 }
 
+/// Per-conversation read watermark for SMS/gm chats (raw conversation_id →
+/// timestamp of the latest message the user had seen when they read the chat).
+/// SMS read state has no other durable local representation — it is otherwise
+/// reconstructed from Google's `unread` flag on every connect — so without this
+/// a chat the user read keeps reverting to unread on every restart. Consulted
+/// when hydrating the cache and when reseeding from `list_conversations`.
+fn load_gm_watermarks(path: &std::path::Path) -> std::collections::HashMap<String, i64> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| bincode::deserialize::<std::collections::HashMap<String, i64>>(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_gm_watermarks(path: &std::path::Path, map: &std::collections::HashMap<String, i64>) {
+    if let Ok(bytes) = bincode::serialize(map) {
+        let _ = std::fs::write(path, &bytes);
+    }
+}
+
+/// Clamp a summary's unread badge to 0 if our read watermark already covers its
+/// latest activity (no new message since the user last read it). A genuinely
+/// newer message (timestamp past the watermark) is left untouched, so nothing
+/// is hidden.
+fn apply_gm_read_watermark(
+    summary: &mut ChatSummary,
+    watermarks: &std::collections::HashMap<String, i64>,
+) {
+    if summary.unread_count == 0 {
+        return;
+    }
+    let conv_id = strip_prefix(&summary.id);
+    if let Some(&wm) = watermarks.get(conv_id) {
+        if wm >= summary.timestamp {
+            summary.unread_count = 0;
+        }
+    }
+}
+
 async fn run(
     data_dir: PathBuf,
     event_tx: Sender<WaEvent>,
@@ -427,6 +465,13 @@ async fn run(
     // as we learn participant data.
     let merge_map: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Local SMS read watermarks (raw conversation_id → last-read timestamp),
+    // persisted so a chat the user read stays read across restart instead of
+    // being reseeded unread from Google's `unread` flag every launch.
+    let gm_read_wm_path = data_dir.join("gm_read_watermarks.bin");
+    let gm_read_watermarks: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(load_gm_watermarks(&gm_read_wm_path)));
 
     let client = Arc::new(Client::new(auth));
     let mut events = client
@@ -503,7 +548,9 @@ async fn run(
         && let Ok(cached) = bincode::deserialize::<Vec<ChatSummary>>(&bytes)
     {
         log::info!("gmessages: hydrating {} chats from cache", cached.len());
-        for summary in cached {
+        let wm_snap = gm_read_watermarks.lock().await.clone();
+        for mut summary in cached {
+            apply_gm_read_watermark(&mut summary, &wm_snap);
             let _ = event_tx.send(WaEvent::ChatAdded(summary)).await;
         }
     }
@@ -570,6 +617,7 @@ async fn run(
         let contact_cache = contact_cache.clone();
         let merge_map = merge_map.clone();
         let phone_to_wa_chat = phone_to_wa_chat.clone();
+        let gm_read_watermarks = gm_read_watermarks.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
@@ -687,10 +735,19 @@ async fn run(
             match client.list_conversations(1000).await {
                 Ok(resp) => {
                     log::info!("gmessages: got {} conversations", resp.conversations.len());
+                    // Clamp unread against our local read watermarks BEFORE
+                    // emitting or caching, so a chat the user already read isn't
+                    // reseeded unread from Google's stale `unread` flag. Flows to
+                    // both the ChatAdded events and the persisted gm_chats.bin.
+                    let wm_snap = gm_read_watermarks.lock().await.clone();
                     let summaries: Vec<ChatSummary> = resp
                         .conversations
                         .iter()
-                        .map(|c| conversation_to_summary(c, &contact_map))
+                        .map(|c| {
+                            let mut s = conversation_to_summary(c, &contact_map);
+                            apply_gm_read_watermark(&mut s, &wm_snap);
+                            s
+                        })
                         .collect();
                     // Persist the chat-list cache so the next startup shows
                     // gm chats instantly. Persistence happens AFTER the
@@ -1346,8 +1403,19 @@ async fn run(
                 let client = client.clone();
                 let event_tx = event_tx.clone();
                 let merge_map = merge_map.clone();
+                let gm_read_watermarks = gm_read_watermarks.clone();
+                let gm_read_wm_path = gm_read_wm_path.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_command(&client, &event_tx, &merge_map, cmd).await {
+                    if let Err(e) = handle_command(
+                        &client,
+                        &event_tx,
+                        &merge_map,
+                        &gm_read_watermarks,
+                        &gm_read_wm_path,
+                        cmd,
+                    )
+                    .await
+                    {
                         log::warn!("gmessages: command error: {e:#}");
                     }
                 });
@@ -1370,6 +1438,8 @@ async fn handle_command(
     client: &Arc<Client>,
     event_tx: &Sender<WaEvent>,
     merge_map: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
+    read_watermarks: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    wm_path: &std::path::Path,
     cmd: WaCommand,
 ) -> Result<()> {
     use crate::bridge::IncomingMessage;
@@ -1572,6 +1642,30 @@ async fn handle_command(
             // merged chats share one file). Find the most recent
             // message tagged with `gm:` — that's a gm message.
             let messages = crate::ui::runtime::load_messages(&chat_id);
+
+            // Stamp the LOCAL read watermark first — before any early return —
+            // so the badge stays cleared across restart even if we can't find a
+            // gm message_id to ACK to Google. The watermark is the latest
+            // message timestamp we've seen in this chat (same clock domain as
+            // conv.last_message_timestamp used when reseeding).
+            let watermark_ts = messages.iter().map(|m| m.timestamp).max().unwrap_or(0);
+            if watermark_ts > 0 {
+                let snapshot = {
+                    let mut wm = read_watermarks.lock().await;
+                    let mut changed = false;
+                    for conv in &convs {
+                        if wm.get(conv).copied().unwrap_or(0) < watermark_ts {
+                            wm.insert(conv.clone(), watermark_ts);
+                            changed = true;
+                        }
+                    }
+                    if changed { Some(wm.clone()) } else { None }
+                };
+                if let Some(snap) = snapshot {
+                    save_gm_watermarks(wm_path, &snap);
+                }
+            }
+
             let latest_gm_msg_id = messages
                 .iter()
                 .rev()
