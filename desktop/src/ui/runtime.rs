@@ -28,6 +28,13 @@ const CHATS_FILE: &str = "wa_chats.bin";
 const CONTACTS_FILE: &str = "wa_contacts.bin";
 const LID_PHONE_FILE: &str = "wa_lid_phone.bin";
 const MESSAGES_DIR: &str = "wa_messages";
+/// Per-chat read watermark: chat_id → timestamp of the latest message the user
+/// had seen when they last read the chat. Stored in its own file (a plain
+/// `HashMap<String,i64>`) so it survives reboot WITHOUT touching the
+/// `ChatSummary` bincode schema. Used by `upsert_chat` to stop a stale
+/// reconnect reseed (history sync / list_conversations) from resurrecting the
+/// unread badge of a chat the user already read. Missing file → empty map.
+const READ_WM_FILE: &str = "wa_read_watermarks.bin";
 
 // Magic header for versioned binary files: "WA01"
 // Bumped from '01' to '02' after adding is_edited + is_system_message to IncomingMessage.
@@ -164,6 +171,14 @@ pub fn load_chats() -> Vec<ChatSummary> {
 
 fn save_chats(chats: &[ChatSummary]) {
     write_bin(CHATS_FILE, &chats.to_vec());
+}
+
+fn load_read_watermarks() -> HashMap<String, i64> {
+    read_bin::<HashMap<String, i64>>(READ_WM_FILE).unwrap_or_default()
+}
+
+fn save_read_watermarks(map: &HashMap<String, i64>) {
+    write_bin(READ_WM_FILE, map);
 }
 
 pub fn load_contact_names() -> HashMap<String, String> {
@@ -970,6 +985,10 @@ struct RuntimeState {
     own_phone: String,
     own_lid: String,
     connect_count: u32,
+    /// Per-chat read watermark (chat_id → last-read message timestamp).
+    /// Persisted to [`READ_WM_FILE`]; consulted by [`RuntimeState::upsert_chat`]
+    /// to defend a locally-read chat against a stale reconnect reseed.
+    read_watermarks: HashMap<String, i64>,
 }
 
 impl RuntimeState {
@@ -978,6 +997,25 @@ impl RuntimeState {
         msg_save_tx: std::sync::mpsc::Sender<(String, Vec<IncomingMessage>)>,
     ) -> Self {
         let chats = load_chats();
+        // Read watermarks defend already-read chats from reconnect reseeds.
+        // First run after upgrade: the file won't exist, so seed it from every
+        // chat that is currently read (unread == 0) using its last-message
+        // timestamp. This makes the defense effective on the very first
+        // post-upgrade reconnect, before the user re-opens anything. A chat
+        // with genuinely newer server activity still has a higher reseed
+        // timestamp, so it correctly stays unread.
+        let mut read_watermarks = load_read_watermarks();
+        if read_watermarks.is_empty() {
+            for c in &chats {
+                if c.unread_count == 0 && c.timestamp > 0 {
+                    read_watermarks.insert(c.id.clone(), c.timestamp);
+                }
+            }
+            if !read_watermarks.is_empty() {
+                save_read_watermarks(&read_watermarks);
+                log::info!("Seeded {} read watermarks from existing chats", read_watermarks.len());
+            }
+        }
         let chat_names: HashMap<String, String> = chats
             .iter()
             .map(|c| (c.id.clone(), c.name.clone()))
@@ -1009,6 +1047,7 @@ impl RuntimeState {
             own_phone: String::new(),
             own_lid: String::new(),
             connect_count: 0,
+            read_watermarks,
         }
     }
 
@@ -1134,6 +1173,35 @@ impl RuntimeState {
 
     /// Insert or update a chat and queue an async disk flush.
     /// Never overwrites `last_message` or `timestamp` with older data.
+    /// Mark a chat read locally: zero its unread badge AND stamp a read
+    /// watermark at its latest-seen message timestamp. The watermark is what
+    /// lets [`RuntimeState::upsert_chat`] reject a later stale reconnect reseed
+    /// that would otherwise resurrect the badge. Works for WhatsApp, SMS/gm,
+    /// and merged chats — any chat present in `self.chats`. Persists both the
+    /// chat list and the watermark map only when something actually changed.
+    fn mark_chat_read_local(&mut self, chat_id: &str) {
+        let mut changed = false;
+        let mut watermark = 0i64;
+        if let Some(c) = self.chats.iter_mut().find(|c| c.id == chat_id) {
+            if c.unread_count != 0 {
+                c.unread_count = 0;
+                changed = true;
+            }
+            watermark = c.timestamp;
+        }
+        if watermark > 0 {
+            let prev = self.read_watermarks.get(chat_id).copied().unwrap_or(0);
+            if watermark > prev {
+                self.read_watermarks.insert(chat_id.to_string(), watermark);
+                save_read_watermarks(&self.read_watermarks);
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.save_tx.send(self.chats.clone());
+        }
+    }
+
     fn upsert_chat(&mut self, mut summary: ChatSummary) {
         // Never persist an empty or raw-JID name — resolve using all available sources
         let looks_raw = summary.name.is_empty()
@@ -1150,6 +1218,12 @@ impl RuntimeState {
         }
         self.chat_names
             .insert(summary.id.clone(), summary.name.clone());
+        // Snapshot the incoming activity + our read watermark BEFORE `summary`
+        // is moved, so the reseed-defense below can decide whether this update
+        // carries genuinely newer activity than what the user has already read.
+        let incoming_ts = summary.timestamp;
+        let incoming_unread = summary.unread_count;
+        let read_watermark = self.read_watermarks.get(&summary.id).copied();
         if let Some(existing) = self.chats.iter_mut().find(|c| c.id == summary.id) {
             // Preserve the newer last_message + timestamp
             let keep_old_preview =
@@ -1203,6 +1277,21 @@ impl RuntimeState {
             // Don't reset unread to 0 if the update doesn't carry unread info
             if existing.unread_count == 0 && old_unread > 0 {
                 existing.unread_count = old_unread;
+            }
+            // Reseed-defense: a history-sync / list_conversations summary carries
+            // the SERVER's unread count, which is stale for a chat the user read
+            // on THIS device (the local read may never have propagated to the
+            // server). If our read watermark already covers the incoming
+            // summary's latest activity, the count is stale — keep the chat read.
+            // A genuinely newer message (timestamp past the watermark) is still
+            // allowed to mark unread. This is what stops read chats from
+            // reverting to unread on every reboot/suspend reconnect.
+            if incoming_unread > 0 && existing.unread_count > 0 {
+                if let Some(wm) = read_watermark {
+                    if wm >= incoming_ts {
+                        existing.unread_count = 0;
+                    }
+                }
             }
         } else {
             self.chats.push(summary);
@@ -1356,23 +1445,30 @@ pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver
         let mut cmd_rx = cmd_rx;
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
+                // MarkRead must reach BOTH runtimes. The WhatsApp runtime owns
+                // the shared RuntimeState, where we stamp a local read watermark
+                // for EVERY chat (WhatsApp, SMS/gm, merged) so a reconnect reseed
+                // can't resurrect the badge; the gmessages runtime tells Google's
+                // server. Without the WA leg a pure `gm:N` read is never
+                // watermarked and reverts on the next list_conversations; without
+                // the gm leg a merged SMS is re-flagged unread on restart.
+                if let WaCommand::MarkRead { chat_id } = cmd {
+                    if let Some(tx) = &gm_cmd_tx {
+                        let _ = tx.send(WaCommand::MarkRead {
+                            chat_id: chat_id.clone(),
+                        });
+                    }
+                    if wa_cmd_tx.send(WaCommand::MarkRead { chat_id }).is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 // GmessagesRepair is gm-routed regardless of chat_id (it
                 // has none).
                 let goes_to_gm = matches!(cmd, WaCommand::GmessagesRepair)
                     || command_chat_id(&cmd)
                         .map(crate::gmessages_runtime::is_gm_chat)
                         .unwrap_or(false);
-                // MarkRead needs FAN-OUT: a merged gm conversation is
-                // rendered under its WA JID, so the UI fires MarkRead
-                // with that WA chat_id. Without also sending to gm, the
-                // gm relay never learns we read the SMS and re-marks
-                // it unread on every restart's list_conversations.
-                // WaCommand doesn't derive Clone, so fish out just the
-                // chat_id and rebuild a fresh MarkRead for the fan-out.
-                let fanout_chat_id: Option<String> = match &cmd {
-                    WaCommand::MarkRead { chat_id } => Some(chat_id.clone()),
-                    _ => None,
-                };
                 if goes_to_gm {
                     if let Some(tx) = &gm_cmd_tx {
                         let _ = tx.send(cmd);
@@ -1381,15 +1477,8 @@ pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver
                             "received gm-routed command but gmessages runtime is disabled — dropping"
                         );
                     }
-                } else {
-                    if let Some(chat_id) = fanout_chat_id
-                        && let Some(tx) = &gm_cmd_tx
-                    {
-                        let _ = tx.send(WaCommand::MarkRead { chat_id });
-                    }
-                    if wa_cmd_tx.send(cmd).is_err() {
-                        break;
-                    }
+                } else if wa_cmd_tx.send(cmd).is_err() {
+                    break;
                 }
             }
         });
@@ -2786,13 +2875,7 @@ async fn handle_wa_event(
                     log::info!("ReadSelf: clearing unread for chat={cid}");
                     {
                         let mut s = state.lock().unwrap();
-                        if let Some(c) = s.chats.iter_mut().find(|c| c.id == *cid) {
-                            if c.unread_count > 0 {
-                                log::info!("  Reset unread from {} → 0", c.unread_count);
-                                c.unread_count = 0;
-                                let _ = s.save_tx.send(s.chats.clone());
-                            }
-                        }
+                        s.mark_chat_read_local(cid);
                     }
                     let _ = tx
                         .send(WaEvent::ChatReadOnOtherDevice {
@@ -2861,10 +2944,7 @@ async fn handle_wa_event(
             if is_read {
                 {
                     let mut s = state.lock().unwrap();
-                    if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
-                        c.unread_count = 0;
-                        let _ = s.save_tx.send(s.chats.clone());
-                    }
+                    s.mark_chat_read_local(&chat_id);
                 }
                 let _ = tx.send(WaEvent::ChatReadOnOtherDevice { chat_id }).await;
             }
@@ -4716,10 +4796,29 @@ async fn handle_command(
         }
 
         WaCommand::MarkRead { chat_id } => {
-            // TWO mechanisms needed for cross-device read sync:
-            // 1. <receipt type="read"> — blue tick to sender
-            // 2. markChatAsRead app state mutation — syncs to our other devices
-            let jid: Jid = chat_id.parse()?;
+            // Persist the LOCAL read state for ANY chat (WhatsApp, SMS/gm, or
+            // merged) up front, before any early return. This zeros the badge
+            // and stamps a read watermark so a later reconnect reseed cannot
+            // resurrect it — the core of the "chats revert to unread after
+            // reboot/suspend" fix. gm chat_ids (`gm:N`) stop after this; their
+            // server-side read is handled by the gmessages runtime's MarkRead.
+            {
+                let mut s = state.lock().unwrap();
+                s.mark_chat_read_local(&chat_id);
+            }
+            let _ = tx
+                .send(WaEvent::ChatReadOnOtherDevice {
+                    chat_id: chat_id.clone(),
+                })
+                .await;
+
+            // The rest is WhatsApp-protocol read sync, valid only for real WA
+            // JIDs. TWO mechanisms needed for cross-device read sync:
+            //   1. <receipt type="read"> — blue tick to sender
+            //   2. markChatAsRead app state mutation — syncs to our other devices
+            let Ok(jid) = chat_id.parse::<Jid>() else {
+                return Ok(());
+            };
 
             // Mechanism 2: App state sync (durable, works across device restarts)
             if let Err(e) = client
@@ -4739,7 +4838,6 @@ async fn handle_command(
                 )
             };
             if let Some(msg_id) = last_id {
-                let jid: Jid = chat_id.parse()?;
                 // Groups require the sender JID (keep as LID if that's the original format)
                 let sender_jid = if chat_id.ends_with("@g.us") {
                     last_sender.clone().and_then(|s| s.parse::<Jid>().ok())
@@ -4780,17 +4878,6 @@ async fn handle_command(
                 } else {
                     log::info!("MarkRead succeeded for {chat_id}");
                 }
-                // Reset unread count locally AND notify UI
-                {
-                    let mut s = state.lock().unwrap();
-                    if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
-                        if c.unread_count > 0 {
-                            c.unread_count = 0;
-                            let _ = s.save_tx.send(s.chats.clone());
-                        }
-                    }
-                }
-                let _ = tx.send(WaEvent::ChatReadOnOtherDevice { chat_id }).await;
             }
         }
 
