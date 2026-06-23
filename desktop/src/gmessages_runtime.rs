@@ -1645,10 +1645,26 @@ async fn handle_command(
 
             // Stamp the LOCAL read watermark first — before any early return —
             // so the badge stays cleared across restart even if we can't find a
-            // gm message_id to ACK to Google. The watermark is the latest
-            // message timestamp we've seen in this chat (same clock domain as
-            // conv.last_message_timestamp used when reseeding).
-            let watermark_ts = messages.iter().map(|m| m.timestamp).max().unwrap_or(0);
+            // gm message_id to ACK to Google.
+            //
+            // Watermark = "read up to NOW", floored by the newest message we
+            // have. The earlier version used only max(persisted message ts),
+            // which broke two ways and left SMS stuck unread:
+            //   • verification-code / notification chats keep no persisted
+            //     messages (their SMS route to the synthetic Verification Codes
+            //     inbox), so max(..) was 0 and the `> 0` guard wrote NO watermark;
+            //   • a conversation's `last_message_timestamp` (used on reseed) can
+            //     sit AHEAD of the newest message we persisted, so the watermark
+            //     landed below summary.timestamp and the `wm >= ts` clamp missed.
+            // `now` is always > 0 and >= any past message, so opening a chat
+            // always records a usable watermark and the clamp fires; a genuinely
+            // newer message (ts past the read time) still shows unread.
+            let now_s = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let watermark_ts =
+                now_s.max(messages.iter().map(|m| m.timestamp).max().unwrap_or(0));
             if watermark_ts > 0 {
                 let snapshot = {
                     let mut wm = read_watermarks.lock().await;
