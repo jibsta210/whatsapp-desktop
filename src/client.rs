@@ -448,24 +448,48 @@ impl Client {
             .fetch_add(1, Ordering::SeqCst);
     }
 
-    /// Widen the CURRENT message-processing semaphore by `add` permits WITHOUT
-    /// swapping the Arc or bumping the generation.
-    ///
-    /// Used to open up concurrency at the end of offline sync. Swapping the Arc
-    /// (as `swap_message_semaphore` does) bumps the generation, which the
-    /// post-acquire guard in `handle_incoming_message` interprets as a stale
-    /// reconnect and SILENTLY DROPS the message — permanently losing offline
-    /// messages that were still draining when offline delivery completed (the
-    /// server already got the transport ack, so it won't resend). Growing the
-    /// same semaphore instead lets those in-flight workers keep a valid permit
-    /// and finish decoding. The generation guard still fires on a real reconnect
-    /// (which uses `swap_message_semaphore`).
-    pub(crate) fn widen_message_semaphore(&self, add: usize) {
+    /// Read the current (generation, semaphore Arc) pair atomically under the
+    /// semaphore mutex. Used by message workers to (re-)snapshot which semaphore
+    /// they must acquire a permit on. The pair is always consistent because the
+    /// generation counter is only ever bumped while this same mutex is held
+    /// (see `swap_message_semaphore`). The returned guard is dropped before the
+    /// caller `.await`s on the semaphore, so the mutex is never held across await.
+    pub(crate) fn snapshot_message_semaphore(&self) -> (u64, Arc<async_lock::Semaphore>) {
         let guard = match self.message_processing_semaphore.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        guard.add_permits(add);
+        let generation = self.message_semaphore_generation.load(Ordering::SeqCst);
+        (generation, guard.clone())
+    }
+
+    /// Atomically complete offline sync: CAS `offline_sync_completed` false→true
+    /// and, if it succeeded, widen the CURRENT semaphore by `add` permits — both
+    /// while holding the semaphore mutex.
+    ///
+    /// Holding the mutex across the CAS + `add_permits` closes the race where a
+    /// concurrent `swap_message_semaphore(1)` (from `cleanup_connection_state`)
+    /// interleaves between the CAS and the widen: without the lock, the extra
+    /// permits could land on the NEXT connection's fresh 1-permit semaphore,
+    /// making the next offline sync run at 64 permits (ordering broken → spurious
+    /// decrypt failures). `swap_message_semaphore` also takes this mutex, so the
+    /// two operations are now mutually exclusive.
+    ///
+    /// Returns `true` if this call won the CAS (and thus performed the widen).
+    /// The mutex is never held across an `.await` (this fn is synchronous).
+    pub(crate) fn try_complete_offline_sync_widen(&self, add: usize) -> bool {
+        let guard = match self.message_processing_semaphore.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let won = self
+            .offline_sync_completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if won {
+            guard.add_permits(add);
+        }
+        won
     }
 
     fn should_downgrade_sync_error(&self, err: &anyhow::Error) -> bool {
@@ -5547,6 +5571,147 @@ mod tests {
         assert!(
             result.is_ok(),
             "send_ack_for should return Ok during expected disconnect"
+        );
+    }
+
+    async fn create_bare_test_client() -> Arc<Client> {
+        let backend = crate::test_utils::create_test_backend().await;
+        let pm = Arc::new(
+            PersistenceManager::new(backend)
+                .await
+                .expect("persistence manager should initialize"),
+        );
+        let (client, _rx) = Client::new(
+            Arc::new(crate::runtime_impl::TokioRuntime),
+            pm,
+            Arc::new(crate::transport::mock::MockTransportFactory::new()),
+            Arc::new(MockHttpClient),
+            None,
+        )
+        .await;
+        client
+    }
+
+    /// S1 regression: a worker holding a permit on generation G must RE-ACQUIRE on
+    /// the new semaphore (gen G+1) after a disconnect swap, NOT drop the message.
+    ///
+    /// This drives the exact re-acquire loop from `handle_incoming_message` against
+    /// the real `snapshot_message_semaphore` helper. Deterministic — no sleeps.
+    #[tokio::test]
+    async fn test_message_worker_reacquires_on_generation_bump_instead_of_dropping() {
+        let client = create_bare_test_client().await;
+
+        // Worker snapshots + acquires a permit on generation G (offline sync: 1 permit).
+        let (mut generation, mut semaphore) = client.snapshot_message_semaphore();
+        let gen_at_start = generation;
+        let mut global_permit = semaphore.acquire_arc().await;
+
+        // A disconnect happens mid-flight: cleanup swaps the semaphore (bumps gen G -> G+1).
+        client.swap_message_semaphore(1);
+        assert_eq!(
+            client
+                .message_semaphore_generation
+                .load(Ordering::SeqCst),
+            gen_at_start + 1,
+            "swap must bump the generation exactly once"
+        );
+
+        // Replicate the handle_incoming_message re-acquire loop.
+        const MAX_SEMAPHORE_REACQUIRES: u32 = 3;
+        let mut reacquires = 0u32;
+        loop {
+            let current = client.message_semaphore_generation.load(Ordering::SeqCst);
+            if generation == current {
+                break;
+            }
+            assert!(
+                reacquires < MAX_SEMAPHORE_REACQUIRES,
+                "should re-acquire within the retry cap"
+            );
+            reacquires += 1;
+            drop(global_permit);
+            let (new_generation, new_semaphore) = client.snapshot_message_semaphore();
+            generation = new_generation;
+            semaphore = new_semaphore;
+            global_permit = semaphore.acquire_arc().await;
+        }
+        let _held = global_permit;
+
+        // The worker proceeded (loop exited) rather than returning/dropping, and it
+        // now holds a valid permit on the CURRENT generation's semaphore.
+        assert_eq!(
+            generation,
+            gen_at_start + 1,
+            "worker must have re-snapshotted onto the post-swap generation"
+        );
+        assert_eq!(
+            generation,
+            client.message_semaphore_generation.load(Ordering::SeqCst),
+            "worker's generation must match the live generation after re-acquire"
+        );
+        assert_eq!(reacquires, 1, "exactly one re-acquire was needed");
+    }
+
+    /// S2 regression: the CAS + widen must be atomic under the semaphore mutex so a
+    /// concurrent disconnect swap cannot land the 63 extra permits on the next
+    /// connection's fresh 1-permit semaphore.
+    #[tokio::test]
+    async fn test_complete_offline_sync_widen_is_atomic_under_mutex() {
+        let client = create_bare_test_client().await;
+
+        // Fresh client starts with 1 permit (offline-sync serialization) and the flag false.
+        assert!(!client.offline_sync_completed.load(Ordering::Relaxed));
+
+        // First completion wins the CAS and widens the CURRENT semaphore to 64.
+        assert!(
+            client.try_complete_offline_sync_widen(63),
+            "first call must win the CAS"
+        );
+        assert!(client.offline_sync_completed.load(Ordering::Relaxed));
+
+        let permits = {
+            let sem = match client.message_processing_semaphore.lock() {
+                Ok(g) => g.clone(),
+                Err(p) => p.into_inner().clone(),
+            };
+            let mut guards = Vec::new();
+            while let Some(g) = sem.try_acquire() {
+                guards.push(g);
+            }
+            guards.len()
+        };
+        assert_eq!(permits, 64, "widen must land on the current semaphore (1 + 63)");
+
+        // A second call (idempotency guard) must NOT win the CAS and must NOT widen again.
+        assert!(
+            !client.try_complete_offline_sync_widen(63),
+            "second call must lose the CAS (add_permits is not idempotent)"
+        );
+
+        // Simulate a disconnect: swap resets to a fresh 1-permit semaphore and the
+        // flag is cleared for the next connection.
+        client.swap_message_semaphore(1);
+        client
+            .offline_sync_completed
+            .store(false, Ordering::Relaxed);
+
+        // The next connection's first completion widens the NEW semaphore to 64 — the
+        // previous connection's widen did not leak onto it.
+        assert!(client.try_complete_offline_sync_widen(63));
+        let permits_next = {
+            let sem = match client.message_processing_semaphore.lock() {
+                Ok(g) => g.clone(),
+                Err(p) => p.into_inner().clone(),
+            };
+            let mut guards = Vec::new();
+            while let Some(g) = sem.try_acquire() {
+                guards.push(g);
+            }
+            guards.len()
+        };
+        assert_eq!(
+            permits_next, 64,
+            "next connection's semaphore must be exactly 64, not leaked to 64+63"
         );
     }
 }

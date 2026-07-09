@@ -581,32 +581,64 @@ impl Client {
         }
 
         // Acquire global processing permit (1 during offline sync, N after).
-        // Read generation + clone Arc under the same mutex so the pair is consistent.
-        let (generation, semaphore) = match self.message_processing_semaphore.lock() {
-            Ok(guard) => (
-                self.message_semaphore_generation
-                    .load(std::sync::atomic::Ordering::SeqCst),
-                guard.clone(),
-            ),
-            Err(poisoned) => {
-                let guard = poisoned.into_inner();
-                (
-                    self.message_semaphore_generation
-                        .load(std::sync::atomic::Ordering::SeqCst),
-                    guard.clone(),
-                )
-            }
-        };
-        let _global_permit = semaphore.acquire_arc().await;
-        // Post-acquire recheck: generation could have changed during the .await
-        if generation
-            != self
+        //
+        // The generation is bumped only when the semaphore Arc is SWAPPED
+        // (`swap_message_semaphore`, called on disconnect via
+        // `cleanup_connection_state`). If we acquired a permit on the old
+        // generation's semaphore and a reconnect swapped it out during our
+        // `.await`, we must NOT drop the message: the transport ACK for this
+        // stanza is sent by the dispatcher *before* this worker runs, so the
+        // server considers it delivered and will never resend. Dropping here
+        // permanently loses an offline-backlog message on a network flap.
+        //
+        // Instead, re-snapshot the current (generation, semaphore) and re-acquire
+        // a permit on the NEW semaphore, then proceed. The Signal/session store is
+        // durable across connections (only `signal_cache` is cleared on cleanup),
+        // so decrypting under the new connection's semaphore is safe. Cap retries
+        // to avoid a pathological spin if generations keep changing; if still
+        // mismatched after the cap, proceed on the latest permit anyway rather
+        // than silently dropping.
+        const MAX_SEMAPHORE_REACQUIRES: u32 = 3;
+        let (mut generation, mut semaphore) = self.snapshot_message_semaphore();
+        let mut global_permit = semaphore.acquire_arc().await;
+        let mut reacquires = 0u32;
+        loop {
+            let current = self
                 .message_semaphore_generation
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            log::debug!("Semaphore generation changed during acquire, dropping stale permit");
-            return;
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if generation == current {
+                break;
+            }
+            if reacquires >= MAX_SEMAPHORE_REACQUIRES {
+                log::error!(
+                    "[msg:{}] Semaphore generation still changing after {} re-acquires \
+                     (snapshot gen {}, current gen {}); processing on latest permit rather \
+                     than dropping to avoid permanent message loss",
+                    info.id,
+                    MAX_SEMAPHORE_REACQUIRES,
+                    generation,
+                    current,
+                );
+                break;
+            }
+            reacquires += 1;
+            log::debug!(
+                "[msg:{}] Semaphore generation changed during acquire (gen {} -> {}); \
+                 re-acquiring on the current semaphore (attempt {}) instead of dropping",
+                info.id,
+                generation,
+                current,
+                reacquires,
+            );
+            // Drop the stale permit before re-snapshotting/re-acquiring so we don't
+            // hold a permit on the old semaphore across the next await.
+            drop(global_permit);
+            let (new_generation, new_semaphore) = self.snapshot_message_semaphore();
+            generation = new_generation;
+            semaphore = new_semaphore;
+            global_permit = semaphore.acquire_arc().await;
         }
+        let _global_permit = global_permit;
 
         log::debug!(
             "Starting PASS 1: Processing {} session establishment messages (pkmsg/msg)",

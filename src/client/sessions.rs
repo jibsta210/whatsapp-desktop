@@ -25,25 +25,20 @@ impl Client {
 
         // Signal that offline sync is complete - post-login tasks are waiting for this.
         // This mimics WhatsApp Web's offlineDeliveryEnd event.
-        // Use compare_exchange to ensure we only run this once (add_permits is NOT idempotent).
-        // Install the wider semaphore BEFORE flipping the flag so that any thread
-        // observing offline_sync_completed=true already sees the 64-permit semaphore.
-        if self
-            .offline_sync_completed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            // Allow parallel message processing now that offline sync is done.
-            // During offline sync, permits=1 serialized all message processing.
-            // WIDEN the existing semaphore (1 → 64) rather than swapping the Arc:
-            // swapping bumps the generation, and any offline-message worker still
-            // draining the backlog would then see a generation mismatch and
-            // SILENTLY DROP its message before decryption — permanently losing
-            // offline messages (the server already got the transport ack, so it
-            // won't resend). Growing the same semaphore keeps those in-flight
-            // permits valid so the workers finish decoding.
-            self.widen_message_semaphore(63);
-
+        //
+        // The CAS (run-once guard; add_permits is NOT idempotent) and the widen
+        // (1 → 64 permits) are performed together under the semaphore mutex by
+        // `try_complete_offline_sync_widen`. Doing both under one lock closes the
+        // race where a concurrent `cleanup_connection_state` → `swap_message_semaphore(1)`
+        // interleaves between the CAS and the widen, which would otherwise leak the
+        // 63 extra permits onto the NEXT connection's fresh semaphore and break
+        // ordering for its offline sync.
+        //
+        // WIDEN the existing semaphore rather than swapping the Arc: swapping bumps
+        // the generation, and any offline-message worker still draining the backlog
+        // would then see a generation mismatch. Growing the same semaphore keeps those
+        // in-flight permits valid so the workers finish decoding without a re-acquire.
+        if self.try_complete_offline_sync_widen(63) {
             self.offline_sync_notifier.notify(usize::MAX);
 
             self.core
