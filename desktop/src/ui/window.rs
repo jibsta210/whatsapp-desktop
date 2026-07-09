@@ -55,6 +55,10 @@ struct MainWindowInner {
     cached_chats: RefCell<Vec<crate::bridge::ChatSummary>>,
     /// App-wide toast overlay for surfacing errors + confirmations.
     toast_overlay: adw::ToastOverlay,
+    /// Title of the last toast shown, to suppress consecutive duplicates
+    /// (a reconnect loop otherwise stacks an unbounded backlog of identical
+    /// "Reconnecting…" / error toasts).
+    last_toast_title: RefCell<String>,
 }
 
 #[derive(Clone)]
@@ -305,6 +309,7 @@ impl MainWindow {
             own_profile_data: RefCell::new(None),
             cached_chats: RefCell::new(Vec::new()),
             toast_overlay,
+            last_toast_title: RefCell::new(String::new()),
         });
 
         // Wire own avatar click → open profile window with cached data
@@ -434,11 +439,20 @@ impl MainWindow {
             let settings_c = inner.settings.clone();
             let gtk_app_c = inner.gtk_app.clone();
             let win_for_tray = inner.window.clone();
+            let inner_tray = inner.clone();
             // Track whether we've already spawned a tray icon
             let tray_spawned = std::cell::Cell::new(false);
             inner.window.connect_close_request(move |win| {
                 if settings_c.get().close_to_tray {
                     win.set_visible(false);
+                    // No chat is "actively viewed" while hidden in the tray.
+                    // Clearing the active chat stops the runtime from marking
+                    // incoming messages read (silent blue-ticks) and from
+                    // suppressing their unread badge bump while the window is
+                    // not on screen.
+                    inner_tray
+                        .bridge
+                        .send_command(crate::bridge::WaCommand::SetActiveChat { chat_id: None });
                     // Hold the application open even with no visible windows.
                     std::mem::forget(gtk_app_c.hold());
 
@@ -468,6 +482,28 @@ impl MainWindow {
                     gtk4::glib::Propagation::Stop
                 } else {
                     gtk4::glib::Propagation::Proceed
+                }
+            });
+        }
+
+        // ── Re-sync active chat on restore ──
+        // The close-to-tray path clears the runtime's active chat so
+        // hidden-window messages aren't silently blue-ticked. When the window
+        // becomes active again with a chat still open, tell the runtime that
+        // chat is active once more so its unread badge is cleared and read
+        // receipts resume normally. Covers every restore path uniformly
+        // (tray click, taskbar, alt-tab, show-window action).
+        {
+            let inner_active = inner.clone();
+            inner.window.connect_is_active_notify(move |win| {
+                if win.is_active()
+                    && let Some(chat_id) = inner_active.chat_view.current_chat_id()
+                {
+                    inner_active.bridge.send_command(
+                        crate::bridge::WaCommand::SetActiveChat {
+                            chat_id: Some(chat_id),
+                        },
+                    );
                 }
             });
         }
@@ -508,6 +544,11 @@ impl MainWindow {
                         chat_name,
                     });
                 }
+                // Make the sidebar selection follow: force the chat-list page
+                // and highlight the opened row so the sidebar isn't out of sync
+                // with the message panel after a notification click.
+                inner_c.sidebar_stack.set_visible_child_name("chats");
+                inner_c.chat_list.select_chat(&chat_id);
                 inner_c
                     .bridge
                     .send_command(crate::bridge::WaCommand::MarkRead {
@@ -948,8 +989,12 @@ impl MainWindow {
                     .chat_list
                     .update_last_message(&msg.chat_id, &msg, current_chat.as_deref());
                 // If viewing this chat OR chat has auto-mark-read enabled, mark as read.
+                // The is_current_chat arm is gated on window focus: a chat that is
+                // "current" but sitting in the tray (or behind another window) must
+                // NOT fire a read receipt for a message the user never saw. auto_mark
+                // is an explicit per-chat opt-in and stays unconditional.
                 let auto_mark = inner.chat_list.is_auto_mark_read(&msg.chat_id);
-                if (is_current_chat || auto_mark) && !msg.is_from_me {
+                if ((is_current_chat && inner.window.is_active()) || auto_mark) && !msg.is_from_me {
                     inner
                         .bridge
                         .send_command(crate::bridge::WaCommand::MarkRead {
@@ -1293,10 +1338,10 @@ impl MainWindow {
             }
             WaEvent::ErrorToast(msg) => {
                 log::warn!("Error toast: {msg}");
-                inner.toast_overlay.add_toast(adw::Toast::new(&msg));
+                show_toast_deduped(inner, &msg);
             }
             WaEvent::InfoToast(msg) => {
-                inner.toast_overlay.add_toast(adw::Toast::new(&msg));
+                show_toast_deduped(inner, &msg);
             }
             WaEvent::ForwardComplete { to_chat_id, count } => {
                 log::info!("Forwarded {count} messages to {to_chat_id}");
@@ -1435,6 +1480,18 @@ impl MainWindow {
             }
         }
     }
+}
+
+/// Add a toast, skipping it if its text is identical to the last toast shown
+/// consecutively. A reconnect loop emits the same "Reconnecting…"/error text
+/// repeatedly; without this guard those stack into an unbounded backlog that
+/// blocks the UI for minutes.
+fn show_toast_deduped(inner: &MainWindowInner, msg: &str) {
+    if inner.last_toast_title.borrow().as_str() == msg {
+        return;
+    }
+    *inner.last_toast_title.borrow_mut() = msg.to_string();
+    inner.toast_overlay.add_toast(adw::Toast::new(msg));
 }
 
 /// Extract just the phone number from a JID for dedup comparison.

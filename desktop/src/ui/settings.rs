@@ -572,28 +572,32 @@ pub fn show_settings_window(
     let account_group = adw::PreferencesGroup::new();
     account_group.set_title("Account");
     let logout_row = adw::ActionRow::new();
-    logout_row.set_title("Log out / Unlink device");
+    logout_row.set_title("Disconnect this session");
     logout_row.set_subtitle(
-        "Disconnects and unlinks this desktop from your phone. You'll need to \
-         re-scan the QR code to link again.",
+        "Disconnects this desktop from WhatsApp for now. The device stays linked \
+         to your phone and reconnects on next launch — it is not unlinked.",
     );
-    let logout_btn = gtk4::Button::with_label("Log out");
+    let logout_btn = gtk4::Button::with_label("Disconnect");
     logout_btn.set_valign(gtk4::Align::Center);
     logout_btn.add_css_class("destructive-action");
     {
         let bridge = bridge.clone();
         let window_c = window.clone();
         logout_btn.connect_clicked(move |_| {
-            // Confirm — unlinking loses the session and needs a fresh QR scan.
+            // Honest copy: this only disconnects the current session. The
+            // device remains linked on the phone and the app reconnects on
+            // next launch — a true unlink (remove-device IQ + local session
+            // wipe) is not yet implemented (see runtime.rs Logout handler).
             let dialog = adw::AlertDialog::new(
-                Some("Log out?"),
+                Some("Disconnect this session?"),
                 Some(
-                    "This unlinks the desktop from your phone. You'll re-scan the \
-                     QR code to link again.",
+                    "This disconnects the desktop from WhatsApp until you reopen \
+                     the app. The device stays linked to your phone — it is not \
+                     unlinked.",
                 ),
             );
             dialog.add_response("cancel", "Cancel");
-            dialog.add_response("logout", "Log out");
+            dialog.add_response("logout", "Disconnect");
             dialog.set_response_appearance("logout", adw::ResponseAppearance::Destructive);
             dialog.set_close_response("cancel");
             let bridge = bridge.clone();

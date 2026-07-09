@@ -623,7 +623,11 @@ impl ChatListPanel {
                 name,
                 last_message: preview,
                 timestamp: msg.timestamp,
-                unread_count: if msg.is_from_me { 0 } else { 1 },
+                unread_count: if msg.is_from_me || current_chat_id == Some(chat_id) {
+                    0
+                } else {
+                    1
+                },
                 is_group: chat_id.ends_with("@g.us"),
                 is_muted: false,
                 is_pinned: false,
@@ -747,11 +751,13 @@ impl ChatListPanel {
                 row.update_preview(&preview, msg.timestamp);
             }
             // Cache message for stealth peek (keep last 10)
+            let is_duplicate_id;
             {
                 let mut cache = self.inner.recent_messages.borrow_mut();
                 let entry = cache.entry(chat_id.to_string()).or_default();
                 // Dedup by message id
-                if !entry.iter().any(|m| m.id == msg.id) {
+                is_duplicate_id = entry.iter().any(|m| m.id == msg.id);
+                if !is_duplicate_id {
                     entry.push(msg.clone());
                     if entry.len() > 10 {
                         entry.remove(0);
@@ -759,10 +765,12 @@ impl ChatListPanel {
                 }
             }
             // Only increment unread if NOT from us, NOT the chat we're viewing,
-            // for a genuinely newer message, and not a row we just created with
-            // unread already seeded (else the first message double-counts to 2).
+            // for a genuinely newer message, not a row we just created with
+            // unread already seeded (else the first message double-counts to 2),
+            // and not a redelivery of a message id we've already counted (server
+            // re-pushes on reconnect would otherwise double-count the badge).
             let is_viewing = current_chat_id == Some(chat_id);
-            if !msg.is_from_me && !is_viewing && is_newer && !just_created {
+            if !msg.is_from_me && !is_viewing && is_newer && !just_created && !is_duplicate_id {
                 let new_count = row.unread_count.get() + 1;
                 row.set_unread(new_count);
             }
@@ -852,6 +860,16 @@ impl ChatListPanel {
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             row.set_unread(0);
+        }
+    }
+
+    /// Highlight the given chat's row as selected in the sidebar list, so the
+    /// sidebar selection follows chats opened from elsewhere (notification
+    /// click, profile-panel jump). No-op if the row doesn't exist.
+    pub fn select_chat(&self, chat_id: &str) {
+        let rows = self.inner.rows.borrow();
+        if let Some(row) = rows.get(chat_id) {
+            self.inner.list_box.select_row(Some(&row.gtk_row));
         }
     }
 
