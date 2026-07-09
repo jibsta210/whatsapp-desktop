@@ -211,7 +211,15 @@ impl ChatListPanel {
                 match ta.cmp(&tb) {
                     std::cmp::Ordering::Greater => gtk4::Ordering::Smaller,
                     std::cmp::Ordering::Less => gtk4::Ordering::Larger,
-                    std::cmp::Ordering::Equal => gtk4::Ordering::Equal,
+                    // Deterministic tiebreak on chat_id (widget name) so
+                    // equal-timestamp chats don't reshuffle between refreshes.
+                    std::cmp::Ordering::Equal => {
+                        match row_b.widget_name().cmp(&row_a.widget_name()) {
+                            std::cmp::Ordering::Greater => gtk4::Ordering::Larger,
+                            std::cmp::Ordering::Less => gtk4::Ordering::Smaller,
+                            std::cmp::Ordering::Equal => gtk4::Ordering::Equal,
+                        }
+                    }
                 }
             });
         }
@@ -550,8 +558,11 @@ impl ChatListPanel {
         msg: &IncomingMessage,
         current_chat_id: Option<&str>,
     ) {
-        // If this chat doesn't exist yet, create it on the fly
-        if !self.inner.rows.borrow().contains_key(chat_id) {
+        // If this chat doesn't exist yet, create it on the fly. `add_chat`
+        // already seeds unread_count=1 for an incoming message, so the live
+        // increment below must be skipped for a just-created row (was showing 2).
+        let just_created = !self.inner.rows.borrow().contains_key(chat_id);
+        if just_created {
             let preview = msg
                 .text
                 .as_deref()
@@ -728,9 +739,11 @@ impl ChatListPanel {
                     }
                 }
             }
-            // Only increment unread if NOT from us AND NOT the chat we're currently viewing
+            // Only increment unread if NOT from us, NOT the chat we're viewing,
+            // for a genuinely newer message, and not a row we just created with
+            // unread already seeded (else the first message double-counts to 2).
             let is_viewing = current_chat_id == Some(chat_id);
-            if !msg.is_from_me && !is_viewing {
+            if !msg.is_from_me && !is_viewing && is_newer && !just_created {
                 let new_count = row.unread_count.get() + 1;
                 row.set_unread(new_count);
             }

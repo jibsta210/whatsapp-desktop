@@ -1012,7 +1012,7 @@ impl MessageBubble {
         });
         root.add_controller(motion);
 
-        Self {
+        let bubble = Self {
             root,
             receipt_label,
             msg_id: msg.id.clone(),
@@ -1046,7 +1046,14 @@ impl MessageBubble {
             contact_msg_btn: None, // Wired by chat_view after creation
             text_label: stored_text_label,
             edited_label: stored_edited_label,
+        };
+        // Paint the receipt tick from the persisted status at construction, so
+        // read (blue ✓✓) history renders correctly on restart / history load —
+        // previously ticks stayed gray until a live receipt arrived this session.
+        if bubble.is_from_me {
+            bubble.update_receipt(&msg.receipt_status);
         }
+        bubble
     }
 
     /// Get the contact "Message" button if this bubble has a contact card

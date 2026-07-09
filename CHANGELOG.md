@@ -48,3 +48,30 @@ Failures no longer vanish silently. Findings: F1/F2/GW-02 (ErrorToast swallowed)
 - **Block contact** now emits `InfoToast("Contact blocked")` on success and `ErrorToast` on
   failure (was silent either way).
 - **Star** action now shows a "Message starred/unstarred" toast (handler was empty `=> {}`).
+
+## Batch 3 — Read/unread core (safe subset)
+
+The flagship complaint. The **safe, isolated** wins are applied here; the interlocking
+runtime-unread-store rework is **deferred** (see below) because it's the exact subsystem that has
+repeatedly broken and needs active-chat plumbing + a live repro to land safely.
+
+Applied:
+- **read-ticks-gray-on-restart** — `MessageBubble::new` now paints the receipt tick from the
+  persisted `receipt_status` at construction, so read (blue ✓✓) history renders correctly on
+  restart / history load (was gray until a live receipt arrived).
+- **read-receipt-uses-from-me-last-id / partial-read** — new `last_incoming_msg_id` map; the read
+  receipt now anchors on the last **incoming** message, not `last_msg_id` (which includes our own
+  sends and told the phone nothing → chat stayed unread on the phone). WhatsApp treats the receipt
+  as a read-up-to watermark, so this also covers the partial-read case.
+- **unread-badge-double-count** — the first message of a brand-new chat no longer counts to 2
+  (`add_chat` already seeds 1); the live increment is now gated on `is_newer && !just_created`.
+- **sort-tie-and-bump-time-stale** — equal-timestamp chats now tiebreak deterministically on
+  chat_id instead of reshuffling between refreshes.
+
+Deferred to a deliberate, repro-backed pass (all touch the fragile runtime unread store together):
+`wa-live-unread-not-persisted` / `live-wa-unread-not-persisted` (needs active-chat plumbing so the
+runtime, not the UI, owns the count — single source of truth), `wa-upsert-restores-stale-unread`
+(phone-read authoritative-0 needs an "authoritative unread" signal plumbed through `upsert_chat`),
+`seed-watermark-hides-unread-on-first-run` (depends on the persist-live-unread fix — seeding at
+`ts-1` in isolation would REVERT the SMS reseed clamp), `mark-unread-not-persisted`,
+`verification-inbox-markread-noop`. These are best done as one careful change with the app running.

@@ -1030,6 +1030,10 @@ struct RuntimeState {
     last_msg_id: HashMap<String, String>,
     /// Last message sender per chat (needed for group mark-as-read)
     last_msg_sender: HashMap<String, String>,
+    /// Last INCOMING (not-from-me) message id per chat — the correct anchor for
+    /// a read receipt. `last_msg_id` includes our own sends, so acking it tells
+    /// the phone nothing and the chat stays unread there.
+    last_incoming_msg_id: HashMap<String, String>,
     /// Chat display names (kept in sync with chats[].name)
     chat_names: HashMap<String, String>,
     /// LID JID → phone JID mapping for resolving LID-addressed group messages
@@ -1102,6 +1106,7 @@ impl RuntimeState {
             history_lru: Vec::new(),
             last_msg_id: HashMap::new(),
             last_msg_sender: HashMap::new(),
+            last_incoming_msg_id: HashMap::new(),
             chat_names,
             lid_to_phone,
             phone_to_lid,
@@ -2768,6 +2773,10 @@ async fn handle_wa_event(
                     {
                         let mut s = state.lock().unwrap();
                         s.last_msg_id.insert(m.chat_id.clone(), m.id.clone());
+                        if !m.is_from_me {
+                            s.last_incoming_msg_id
+                                .insert(m.chat_id.clone(), m.id.clone());
+                        }
                         if !m.sender_id.is_empty() && !m.is_from_me {
                             s.last_msg_sender
                                 .insert(m.chat_id.clone(), m.sender_id.clone());
@@ -4922,11 +4931,15 @@ async fn handle_command(
                 log::debug!("mark_chat_as_read (app state) failed: {e:#}");
             }
 
-            // Mechanism 1: Read receipt to sender
+            // Mechanism 1: Read receipt to sender. Anchor on the last INCOMING
+            // message — acking our own last send tells the phone nothing and the
+            // chat stays unread there. WhatsApp treats a read receipt as a
+            // read-up-to watermark, so the newest incoming id also clears older
+            // unread in the same chat.
             let (last_id, last_sender) = {
                 let s = state.lock().unwrap();
                 (
-                    s.last_msg_id.get(&chat_id).cloned(),
+                    s.last_incoming_msg_id.get(&chat_id).cloned(),
                     s.last_msg_sender.get(&chat_id).cloned(),
                 )
             };
