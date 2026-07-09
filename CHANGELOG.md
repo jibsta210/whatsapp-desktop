@@ -33,3 +33,18 @@ structs) are safe to land. Findings: `non-atomic-writes-corrupt-on-crash`,
 
 Deferred (bytes are preserved via `.corrupt`, so no data is lost — recovery is a safe follow-up):
 full legacy-decoder *recovery* of pre-`media_download` message files.
+
+## Batch 2 — Feedback / toast layer
+
+Failures no longer vanish silently. Findings: F1/F2/GW-02 (ErrorToast swallowed), F5/GW-03
+(detached multi-send toast), CL-03 (block no feedback), mb-03 (star no feedback).
+
+- **App-wide `adw::ToastOverlay`** now wraps the main stack (`window.rs`); `WaEvent::ErrorToast`
+  renders through it instead of a `log::warn!` + TODO. All ~13 runtime error emitters (calls,
+  group ops, member edits, leave-group, phone-not-responding) are now visible.
+- New **`WaEvent::InfoToast`** for neutral/positive confirmations, routed to the same overlay.
+- **Multi-send** completion toast now uses the real overlay (was created on a detached
+  `ToastOverlay::new()` that dropped immediately and never rendered).
+- **Block contact** now emits `InfoToast("Contact blocked")` on success and `ErrorToast` on
+  failure (was silent either way).
+- **Star** action now shows a "Message starred/unstarred" toast (handler was empty `=> {}`).

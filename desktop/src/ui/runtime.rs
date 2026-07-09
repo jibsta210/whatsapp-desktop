@@ -5103,8 +5103,16 @@ async fn handle_command(
 
         WaCommand::BlockContact { chat_id } => {
             let jid: Jid = chat_id.parse()?;
-            if let Err(e) = client.blocking().block(&jid).await {
-                log::warn!("Block {chat_id} failed: {e:#}");
+            match client.blocking().block(&jid).await {
+                Ok(_) => {
+                    let _ = tx.send(WaEvent::InfoToast("Contact blocked".into())).await;
+                }
+                Err(e) => {
+                    log::warn!("Block {chat_id} failed: {e:#}");
+                    let _ = tx
+                        .send(WaEvent::ErrorToast(format!("Failed to block contact: {e}")))
+                        .await;
+                }
             }
         }
 

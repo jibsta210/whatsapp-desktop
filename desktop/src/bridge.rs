@@ -83,6 +83,8 @@ pub enum WaEvent {
     },
     /// Error message to display as a toast notification
     ErrorToast(String),
+    /// Neutral/positive confirmation to display as a toast (e.g. "Contact blocked").
+    InfoToast(String),
     /// A chat's display name was resolved/updated (group name fetch or push name)
     ChatNameUpdated {
         chat_id: String,

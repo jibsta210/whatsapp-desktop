@@ -48,6 +48,8 @@ struct MainWindowInner {
     own_profile_data: RefCell<Option<OwnProfileData>>,
     /// Cached chat list for multi-send
     cached_chats: RefCell<Vec<crate::bridge::ChatSummary>>,
+    /// App-wide toast overlay for surfacing errors + confirmations.
+    toast_overlay: adw::ToastOverlay,
 }
 
 #[derive(Clone)]
@@ -252,9 +254,15 @@ impl MainWindow {
         app_title.add_css_class("title");
         top_header.set_title_widget(Some(&app_title));
 
+        // Single app-wide toast overlay. Without this, WaEvent::ErrorToast (and
+        // every "failed to …" the runtime emits) vanished into the log — the
+        // user never learned anything failed. Everything routes through here.
+        let toast_overlay = adw::ToastOverlay::new();
+        toast_overlay.set_child(Some(&stack));
+
         let toolbar_view = adw::ToolbarView::new();
         toolbar_view.add_top_bar(&top_header);
-        toolbar_view.set_content(Some(&stack));
+        toolbar_view.set_content(Some(&toast_overlay));
 
         window.set_content(Some(&toolbar_view));
 
@@ -282,6 +290,7 @@ impl MainWindow {
             settings,
             own_profile_data: RefCell::new(None),
             cached_chats: RefCell::new(Vec::new()),
+            toast_overlay,
         });
 
         // Wire own avatar click → open profile window with cached data
@@ -521,6 +530,7 @@ impl MainWindow {
             WaEvent::MessageDeletedLocal { msg_id, .. } => format!("DeleteLocal: {msg_id}"),
             WaEvent::MessageEdited { msg_id, .. } => format!("MessageEdited: {msg_id}"),
             WaEvent::ErrorToast(msg) => format!("ErrorToast: {msg}"),
+            WaEvent::InfoToast(msg) => format!("InfoToast: {msg}"),
             WaEvent::GroupInviteLink { link, .. } => format!("InviteLink: {link}"),
             WaEvent::ForwardComplete { count, .. } => format!("Forwarded: {count} msgs"),
             WaEvent::ChatListForPicker(c) => format!("ChatListForPicker: {} chats", c.len()),
@@ -1127,7 +1137,13 @@ impl MainWindow {
                     .chat_list
                     .update_preview_text(&chat_id, &format!("Reacted {emoji}"));
             }
-            WaEvent::MessageStarred { .. } => {}
+            WaEvent::MessageStarred { starred, .. } => {
+                inner.toast_overlay.add_toast(adw::Toast::new(if starred {
+                    "Message starred"
+                } else {
+                    "Message unstarred"
+                }));
+            }
             WaEvent::MessagePinned { chat_id, msg_id } => {
                 inner.chat_view.show_pinned_banner(&chat_id, &msg_id);
             }
@@ -1147,7 +1163,10 @@ impl MainWindow {
             }
             WaEvent::ErrorToast(msg) => {
                 log::warn!("Error toast: {msg}");
-                // TODO: Phase 2.1 — show as adw::Toast via ToastOverlay
+                inner.toast_overlay.add_toast(adw::Toast::new(&msg));
+            }
+            WaEvent::InfoToast(msg) => {
+                inner.toast_overlay.add_toast(adw::Toast::new(&msg));
             }
             WaEvent::ForwardComplete { to_chat_id, count } => {
                 log::info!("Forwarded {count} messages to {to_chat_id}");
@@ -1281,13 +1300,7 @@ impl MainWindow {
                 };
                 let toast = adw::Toast::new(&msg);
                 toast.set_timeout(3);
-                // Show via window's toast overlay if available
-                if let Some(child) = inner.window.content() {
-                    if let Some(tv) = child.downcast_ref::<adw::ToolbarView>() {
-                        let overlay = adw::ToastOverlay::new();
-                        overlay.add_toast(toast);
-                    }
-                }
+                inner.toast_overlay.add_toast(toast);
                 log::info!("MultiSend complete: sent={sent} failed={failed}");
             }
         }
