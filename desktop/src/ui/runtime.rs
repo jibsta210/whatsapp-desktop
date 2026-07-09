@@ -835,16 +835,21 @@ pub fn display_name_from_jid(jid: &str) -> String {
     jid.to_string()
 }
 
+/// Persist a live/local chat upsert. `from_reseed == false` — the read-watermark
+/// clobber in [`RuntimeState::upsert_chat`] does NOT apply, so a genuine unread
+/// bump is never zeroed by a same-second local mark-read watermark.
 fn persist_chat(state: &Arc<Mutex<RuntimeState>>, summary: ChatSummary) {
-    state.lock().unwrap().upsert_chat(summary, false);
+    state.lock().unwrap().upsert_chat(summary, false, false);
 }
 
-/// Like [`persist_chat`] but treats `summary.unread_count` as the SERVER's
-/// authoritative value (used when history sync provided `conv.unread_count`
+/// Persist a history-sync / server-reseed chat upsert whose `summary.unread_count`
+/// is the SERVER's authoritative value (history sync provided `conv.unread_count`
 /// explicitly). This lets a phone-side read (`unread_count == 0`) clear the
 /// desktop badge instead of being overridden by the stale-preserve heuristic.
+/// `from_reseed == true` so the read-watermark defense rejects a stale server
+/// unread the user already cleared locally.
 fn persist_chat_authoritative(state: &Arc<Mutex<RuntimeState>>, summary: ChatSummary) {
-    state.lock().unwrap().upsert_chat(summary, true);
+    state.lock().unwrap().upsert_chat(summary, true, true);
 }
 
 /// Create a system/notification message (centered gray text, no bubble).
@@ -1401,7 +1406,12 @@ impl RuntimeState {
         }
     }
 
-    fn upsert_chat(&mut self, mut summary: ChatSummary, authoritative_unread: bool) {
+    /// `from_reseed` marks history-sync / server-reseed / app-state paths, where
+    /// the incoming `unread_count` is the SERVER's (possibly stale) value. Only
+    /// those paths are subject to the read-watermark clobber below. The live
+    /// message path (`persist_new_message`) and local actions pass `false` so a
+    /// genuine unread bump is never zeroed by a same-second watermark.
+    fn upsert_chat(&mut self, mut summary: ChatSummary, authoritative_unread: bool, from_reseed: bool) {
         // Never persist an empty or raw-JID name — resolve using all available sources
         let looks_raw = summary.name.is_empty()
             || summary.name.contains("@lid")
@@ -1488,7 +1498,16 @@ impl RuntimeState {
             // A genuinely newer message (timestamp past the watermark) is still
             // allowed to mark unread. This is what stops read chats from
             // reverting to unread on every reboot/suspend reconnect.
-            if incoming_unread > 0 && existing.unread_count > 0 {
+            //
+            // Only applies to reseed paths. The live-message path passes
+            // `from_reseed == false` so a real unread bump that lands in the same
+            // second as a local mark-read (watermarks are second-resolution) or
+            // arrives from a slightly-behind sender clock is NOT zeroed. The
+            // comparison stays `>=` here because a chat read at exactly the
+            // last-message timestamp reseeds with that same second, and that
+            // stale server unread must still be clobbered — the `from_reseed`
+            // gate (not a stricter comparison) is what protects live bumps.
+            if from_reseed && incoming_unread > 0 && existing.unread_count > 0 {
                 if let Some(wm) = read_watermark {
                     if wm >= incoming_ts {
                         existing.unread_count = 0;
@@ -1668,7 +1687,19 @@ pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver
                 // MarkUnread persists in the shared RuntimeState (owned by the WA
                 // runtime); route it there for ANY chat (incl. gm:) so a gm chat's
                 // mark-unread also persists rather than being dropped by gm.
+                //
+                // For a gm/SMS chat ALSO forward it to the gmessages runtime so it
+                // can roll its own read watermark back. Without the gm leg the gm
+                // watermark still says "read" and re-clamps the chat to read on the
+                // next list_conversations reseed (mirror of the MarkRead fan-out).
                 if let WaCommand::MarkUnread { chat_id } = cmd {
+                    if crate::gmessages_runtime::is_gm_chat(&chat_id) {
+                        if let Some(tx) = &gm_cmd_tx {
+                            let _ = tx.send(WaCommand::MarkUnread {
+                                chat_id: chat_id.clone(),
+                            });
+                        }
+                    }
                     if wa_cmd_tx.send(WaCommand::MarkUnread { chat_id }).is_err() {
                         break;
                     }
@@ -1911,6 +1942,15 @@ async fn run_inner(
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => {
+                // SetActiveChat is a lock-only, no-await state mutation. Applying
+                // it inline (instead of tokio::spawn) preserves ordering: rapid
+                // chat switches used to race each other as independent tasks, so
+                // a stale `Some(A)` could land after `Some(B)` and mis-suppress
+                // B's unread bumps. Everything else is spawned as before.
+                if let WaCommand::SetActiveChat { chat_id } = cmd {
+                    state.lock().unwrap().active_chat = chat_id;
+                    continue;
+                }
                 let c = client.clone();
                 let tx = event_tx.clone();
                 let state = state.clone();
@@ -3443,6 +3483,29 @@ async fn handle_wa_event(
                     let _ = tx.send(WaEvent::MessageReceived(m.clone())).await;
                 }
 
+                // Seed the read-receipt anchor from history sync, mirroring the
+                // live handler (~2935). Without this, MarkRead has no
+                // last_incoming_msg_id to ack after a restart, so re-opening a
+                // synced chat can't send a read receipt / clear it on the phone.
+                // Use the newest incoming (non-from-me) message in this batch, but
+                // only fill an EMPTY slot — never clobber a fresher value already
+                // stored by a concurrent live MessageReceived for this chat.
+                if let Some(anchor) = sync_messages
+                    .iter()
+                    .filter(|m| !m.is_from_me)
+                    .max_by_key(|m| m.timestamp)
+                {
+                    let mut s = state.lock().unwrap();
+                    if !s.last_incoming_msg_id.contains_key(&chat_id) {
+                        s.last_incoming_msg_id
+                            .insert(chat_id.clone(), anchor.id.clone());
+                        if !anchor.sender_id.is_empty() {
+                            s.last_msg_sender
+                                .insert(chat_id.clone(), anchor.sender_id.clone());
+                        }
+                    }
+                }
+
                 // Respect the server's unread count when present.
                 // When absent (None), preserve the existing count if the chat
                 // is already known, otherwise count incoming non-from-me messages
@@ -3486,7 +3549,11 @@ async fn handle_wa_event(
                 if unread_authoritative {
                     persist_chat_authoritative(state, summary);
                 } else {
-                    persist_chat(state, summary);
+                    // History-sync reseed with no explicit server count: still a
+                    // reseed path, so the read-watermark defense must apply
+                    // (authoritative_unread == false keeps the stale-preserve
+                    // heuristic, from_reseed == true enables the clobber).
+                    state.lock().unwrap().upsert_chat(summary, false, true);
                 }
 
                 // Suppress @lid duplicates: if this is an @lid chat whose phone
@@ -4204,7 +4271,12 @@ fn persist_new_message(
                 ex.label.clone(),
             )
         } else {
-            (None, 0, false, false, false, false, None)
+            // Brand-new chat (not yet in self.chats). A first message from a new
+            // contact while the user is away must persist unread=1, or the chat
+            // shows as already-read after restart. Count it unless it's ours or
+            // the chat is the one actively being viewed.
+            let unread = (!m.is_from_me && active.as_deref() != Some(chat_id.as_str())) as u32;
+            (None, unread, false, false, false, false, None)
         }
     };
 
@@ -8462,7 +8534,7 @@ async fn merge_lid_chats(
             // Remove @lid entry, upsert @s.whatsapp.net — all within the same lock
             s.chats.retain(|c| c.id != lid_chat.id);
             s.chat_names.remove(&lid_chat.id);
-            s.upsert_chat(summary.clone(), false);
+            s.upsert_chat(summary.clone(), false, false);
             s.history.remove(&lid_chat.id);
             s.history.insert(phone_jid.clone(), merged.clone());
             summary
