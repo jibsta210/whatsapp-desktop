@@ -132,3 +132,27 @@ size gate (unbounded-auto-download), hidden-window sound, secondary-path notific
 Batches 7 (rendering/groups/names, 16 items) and 8 (polish/hardening, 30 items) are documented in
 `AUDIT.md` but were **not** auto-applied in this run — they are mostly P2/P3 and better done as a
 follow-up so this run stays reviewable and low-risk. See `AUDIT.md` Part B for the full list.
+
+## Batch 7a — Read/unread CORE rework (the flagship, single source of truth)
+
+The deferred core, now done deliberately. The runtime now OWNS the unread count.
+
+- **Live WA unread is persisted** — new `WaCommand::SetActiveChat` tells the runtime which chat is
+  open; `persist_new_message` bumps the persisted `unread_count` for a genuinely-new incoming message
+  unless that chat is being viewed or is auto-mark-read. The count now survives restart instead of
+  living only in the GTK badge Cell. (wa-live-unread-not-persisted / live-wa-unread-not-persisted)
+- **Phone-read clears the desktop badge** — `upsert_chat` gained an `authoritative_unread` flag;
+  history sync that carries an explicit `conv.unread_count` (a phone-side read arrives as Some(0)) is
+  now trusted over the local stale-preserve heuristic, via `persist_chat_authoritative`.
+  (wa-upsert-restores-stale-unread)
+- **Seed-hides-unread fixed for free** — because genuinely-unread chats now carry `unread_count > 0`,
+  the first-run watermark seeding (which only seeds `unread_count == 0` chats) no longer stamps them
+  read. (seed-watermark-hides-unread-on-first-run)
+- **Mark-as-unread persists** — the handler no longer bails on a `gm:` id; it sets `unread=1`, rolls
+  the read watermark back below the last message (so a reseed/restart doesn't re-clamp it read), and
+  persists. Routed to the WA runtime for any chat. (mark-unread-not-persisted)
+- **Verification-inbox flash gone** — auto-mark-read chats are excluded from the unread bump.
+  (verification-inbox-markread-noop)
+
+⚠️ This is the subsystem that's broken before — please test: read on phone → desktop clears; read on
+desktop → open chat, restart, stays read; unread chat → restart, stays unread; mark-unread → stays.

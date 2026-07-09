@@ -836,7 +836,15 @@ pub fn display_name_from_jid(jid: &str) -> String {
 }
 
 fn persist_chat(state: &Arc<Mutex<RuntimeState>>, summary: ChatSummary) {
-    state.lock().unwrap().upsert_chat(summary);
+    state.lock().unwrap().upsert_chat(summary, false);
+}
+
+/// Like [`persist_chat`] but treats `summary.unread_count` as the SERVER's
+/// authoritative value (used when history sync provided `conv.unread_count`
+/// explicitly). This lets a phone-side read (`unread_count == 0`) clear the
+/// desktop badge instead of being overridden by the stale-preserve heuristic.
+fn persist_chat_authoritative(state: &Arc<Mutex<RuntimeState>>, summary: ChatSummary) {
+    state.lock().unwrap().upsert_chat(summary, true);
 }
 
 /// Create a system/notification message (centered gray text, no bubble).
@@ -1057,6 +1065,11 @@ struct RuntimeState {
     /// Persisted to [`READ_WM_FILE`]; consulted by [`RuntimeState::upsert_chat`]
     /// to defend a locally-read chat against a stale reconnect reseed.
     read_watermarks: HashMap<String, i64>,
+    /// The chat currently open in the UI (via `WaCommand::SetActiveChat`).
+    /// An incoming message for this chat is not counted as unread (the user is
+    /// looking at it), so the persisted `unread_count` stays a true source of
+    /// truth that survives restart.
+    active_chat: Option<String>,
 }
 
 impl RuntimeState {
@@ -1117,6 +1130,7 @@ impl RuntimeState {
             own_lid: String::new(),
             connect_count: 0,
             read_watermarks,
+            active_chat: None,
         }
     }
 
@@ -1271,7 +1285,7 @@ impl RuntimeState {
         }
     }
 
-    fn upsert_chat(&mut self, mut summary: ChatSummary) {
+    fn upsert_chat(&mut self, mut summary: ChatSummary, authoritative_unread: bool) {
         // Never persist an empty or raw-JID name — resolve using all available sources
         let looks_raw = summary.name.is_empty()
             || summary.name.contains("@lid")
@@ -1343,8 +1357,11 @@ impl RuntimeState {
                 existing.last_message = old_msg;
                 existing.timestamp = old_ts;
             }
-            // Don't reset unread to 0 if the update doesn't carry unread info
-            if existing.unread_count == 0 && old_unread > 0 {
+            // Don't reset unread to 0 if the update doesn't carry unread info.
+            // BUT when the count is authoritative (history sync sent an explicit
+            // conv.unread_count), trust it — a phone-side read arrives as an
+            // authoritative 0 and must be allowed to clear the desktop badge.
+            if !authoritative_unread && existing.unread_count == 0 && old_unread > 0 {
                 existing.unread_count = old_unread;
             }
             // Reseed-defense: a history-sync / list_conversations summary carries
@@ -1528,6 +1545,15 @@ pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver
                         });
                     }
                     if wa_cmd_tx.send(WaCommand::MarkRead { chat_id }).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // MarkUnread persists in the shared RuntimeState (owned by the WA
+                // runtime); route it there for ANY chat (incl. gm:) so a gm chat's
+                // mark-unread also persists rather than being dropped by gm.
+                if let WaCommand::MarkUnread { chat_id } = cmd {
+                    if wa_cmd_tx.send(WaCommand::MarkUnread { chat_id }).is_err() {
                         break;
                     }
                     continue;
@@ -3324,6 +3350,10 @@ async fn handle_wa_event(
                 // When absent (None), preserve the existing count if the chat
                 // is already known, otherwise count incoming non-from-me messages
                 // so fresh syncs don't incorrectly mark everything as read.
+                // Whether the server explicitly told us the unread count. If so,
+                // it's authoritative (a phone-side read arrives as Some(0)) and
+                // upsert must trust it over the local stale-preserve heuristic.
+                let unread_authoritative = conv.unread_count.is_some();
                 let unread_count = match conv.unread_count {
                     Some(n) => n,
                     None => {
@@ -3356,7 +3386,11 @@ async fn handle_wa_event(
                 auto_mark_read: false,
                 };
 
-                persist_chat(state, summary);
+                if unread_authoritative {
+                    persist_chat_authoritative(state, summary);
+                } else {
+                    persist_chat(state, summary);
+                }
 
                 // Suppress @lid duplicates: if this is an @lid chat whose phone
                 // JID already exists, or vice versa, don't send both to the UI.
@@ -3901,7 +3935,8 @@ fn persist_new_message(
         s.evict_old_histories();
 
         let history = s.history.entry(chat_id.clone()).or_default();
-        if !history.iter().any(|x| x.id == m.id) {
+        let msg_is_new = !history.iter().any(|x| x.id == m.id);
+        if msg_is_new {
             history.push(m.clone());
             history.sort_by_key(|msg| msg.timestamp);
         }
@@ -3909,11 +3944,25 @@ fn persist_new_message(
         // Queue disk write on background thread — non-blocking
         s.queue_save_messages(&chat_id);
 
-        // Read chat info
+        // Read chat info AND compute the unread count to PERSIST. The runtime now
+        // owns the count so it survives restart (it used to be carried unchanged,
+        // leaving the persisted value stale while only the UI badge incremented).
+        // Bump for a genuinely-new incoming message unless the chat is the one
+        // being viewed or is auto-mark-read (both get cleared to 0 anyway).
+        let active = s.active_chat.clone();
         if let Some(ex) = s.chats.iter().find(|c| c.id == chat_id) {
+            let should_bump = msg_is_new
+                && !m.is_from_me
+                && active.as_deref() != Some(chat_id.as_str())
+                && !ex.auto_mark_read;
+            let unread = if should_bump {
+                ex.unread_count.saturating_add(1)
+            } else {
+                ex.unread_count
+            };
             (
                 Some(ex.name.clone()),
-                ex.unread_count,
+                unread,
                 ex.is_muted,
                 ex.is_pinned,
                 ex.is_archived,
@@ -4897,6 +4946,10 @@ async fn handle_command(
             }
         }
 
+        WaCommand::SetActiveChat { chat_id } => {
+            state.lock().unwrap().active_chat = chat_id;
+        }
+
         WaCommand::MarkRead { chat_id } => {
             // Persist the LOCAL read state for ANY chat (WhatsApp, SMS/gm, or
             // merged) up front, before any early return. This zeros the badge
@@ -5095,12 +5148,39 @@ async fn handle_command(
         }
 
         WaCommand::MarkUnread { chat_id } => {
-            let jid: Jid = chat_id.parse()?;
-            client
-                .chat_actions()
-                .mark_chat_as_read(&jid, false, None)
-                .await?;
-            let _ = tx.send(WaEvent::ChatMarkedUnread { chat_id }).await;
+            // Persist locally first (works for ANY chat incl gm/verification):
+            // set unread=1 and roll the read watermark back below the last
+            // message so a reseed / restart doesn't clamp it back to read.
+            {
+                let mut s = state.lock().unwrap();
+                let ts = if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
+                    if c.unread_count == 0 {
+                        c.unread_count = 1;
+                    }
+                    Some(c.timestamp)
+                } else {
+                    None
+                };
+                if let Some(ts) = ts {
+                    s.read_watermarks
+                        .insert(chat_id.clone(), ts.saturating_sub(1));
+                    save_read_watermarks(&s.read_watermarks);
+                    let chats = s.chats.clone();
+                    let _ = s.save_tx.send(chats);
+                }
+            }
+            let _ = tx
+                .send(WaEvent::ChatMarkedUnread {
+                    chat_id: chat_id.clone(),
+                })
+                .await;
+            // WhatsApp-server mark-unread only applies to real JIDs.
+            if let Ok(jid) = chat_id.parse::<Jid>() {
+                let _ = client
+                    .chat_actions()
+                    .mark_chat_as_read(&jid, false, None)
+                    .await;
+            }
         }
 
         WaCommand::FavoriteChat { chat_id, favorite } => {
@@ -8130,7 +8210,7 @@ async fn merge_lid_chats(
             // Remove @lid entry, upsert @s.whatsapp.net — all within the same lock
             s.chats.retain(|c| c.id != lid_chat.id);
             s.chat_names.remove(&lid_chat.id);
-            s.upsert_chat(summary.clone());
+            s.upsert_chat(summary.clone(), false);
             s.history.remove(&lid_chat.id);
             s.history.insert(phone_jid.clone(), merged.clone());
             summary

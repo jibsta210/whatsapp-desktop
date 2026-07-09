@@ -309,6 +309,12 @@ pub enum WaCommand {
     MarkRead {
         chat_id: String,
     },
+    /// The UI opened/closed a chat. Lets the runtime own unread counting: a
+    /// message for the actively-viewed chat isn't counted as unread. `None`
+    /// means no chat is open.
+    SetActiveChat {
+        chat_id: Option<String>,
+    },
     /// Toggle "auto-mark read on receive" for a chat (local-only flag,
     /// not synced to phone). When enabled, incoming messages trigger
     /// MarkRead automatically so the chat stays visually read.

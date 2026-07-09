@@ -111,6 +111,11 @@ impl MainWindow {
             bridge_for_list.send_command(crate::bridge::WaCommand::MarkRead {
                 chat_id: chat_id.clone(),
             });
+            // Tell the runtime this chat is now active so it doesn't count
+            // incoming messages for it as unread.
+            bridge_for_list.send_command(crate::bridge::WaCommand::SetActiveChat {
+                chat_id: Some(chat_id.clone()),
+            });
             // Dismiss any notifications for this chat
             withdraw_chat_notification(&app_for_list, &chat_id);
             // Close profile panel when switching chats
@@ -136,6 +141,9 @@ impl MainWindow {
                     chat_name: name,
                 });
             }
+            bridge_for_new.send_command(crate::bridge::WaCommand::SetActiveChat {
+                chat_id: Some(jid.clone()),
+            });
             bridge_for_new.send_command(crate::bridge::WaCommand::MarkRead { chat_id: jid });
         });
         sidebar_stack.add_named(new_chat_panel.widget(), Some("new-chat"));
@@ -474,6 +482,11 @@ impl MainWindow {
                     .bridge
                     .send_command(crate::bridge::WaCommand::MarkRead {
                         chat_id: chat_id.clone(),
+                    });
+                inner_c
+                    .bridge
+                    .send_command(crate::bridge::WaCommand::SetActiveChat {
+                        chat_id: Some(chat_id.clone()),
                     });
                 withdraw_chat_notification(&inner_c.gtk_app, &chat_id);
             });
