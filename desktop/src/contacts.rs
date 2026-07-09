@@ -81,6 +81,14 @@ pub struct ContactEntry {
     /// lowest tier and can be upgraded by any real source.
     #[serde(default)]
     pub name_priority: u8,
+    /// True if this row was keyed off a `@lid` JID (an opaque server id, not
+    /// a phone number). `insert()` skips the phone-suffix indices for these so
+    /// the LID digits can't fuzzy-match a real phone; `load()` reads this back
+    /// so the skip survives a restart (otherwise the indices get re-polluted on
+    /// every startup). Defaults to false for entries persisted before this
+    /// field existed.
+    #[serde(default)]
+    pub is_lid: bool,
 }
 
 impl ContactEntry {
@@ -146,10 +154,22 @@ impl ContactDirectory {
     /// Load the directory from `path`, creating an empty one if the file
     /// doesn't exist. Subsequent writes will save back to `path`.
     pub fn load(path: PathBuf) -> Self {
-        let by_digits: HashMap<String, ContactEntry> = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| bincode::deserialize(&bytes).ok())
-            .unwrap_or_default();
+        let by_digits: HashMap<String, ContactEntry> = match std::fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => decode_directory(&bytes).unwrap_or_else(|| {
+                // Present but undecodable by BOTH the current and legacy
+                // layouts — preserve the raw bytes so a future decoder can
+                // recover them instead of letting the next save() overwrite
+                // the file with an empty directory.
+                backup_corrupt_once(&path);
+                log::warn!(
+                    "contacts: {} is undecodable (schema drift?); preserved as .corrupt, treating as empty",
+                    path.display()
+                );
+                HashMap::new()
+            }),
+            // Missing or empty file → fresh empty directory (normal first run).
+            _ => HashMap::new(),
+        };
         let mut inner = DirectoryInner {
             by_digits: HashMap::new(),
             by_suffix_10: HashMap::new(),
@@ -158,9 +178,15 @@ impl ContactDirectory {
             persist_path: Some(path),
             dirty: false,
         };
-        // Rebuild secondary indices from the loaded data.
+        // Rebuild secondary indices from the loaded data. Skip the phone-suffix
+        // indices for LID-keyed rows — their opaque numeric part must never
+        // fuzzy-match a real phone. This mirrors insert()'s skip so the fix
+        // survives a restart (previously every row was re-added, re-polluting
+        // the indices after one restart).
         for (digits, entry) in by_digits {
-            inner.add_indices(&digits);
+            if !entry.is_lid {
+                inner.add_indices(&digits);
+            }
             for lid in &entry.lid_jids {
                 inner.by_lid.insert(lid.clone(), digits.clone());
             }
@@ -216,9 +242,14 @@ impl ContactDirectory {
         let entry = inner
             .by_digits
             .entry(digits.clone())
-            .or_insert_with(|| inner_default_entry(name, now, source));
+            .or_insert_with(|| inner_default_entry(name, now, source, is_lid_key));
         // Always record the source even if we don't change the name.
         entry.sources.insert(source.to_string());
+        // A later LID-keyed insert on an existing row must still mark it LID so
+        // load() keeps skipping the phone-suffix indices for it.
+        if is_lid_key {
+            entry.is_lid = true;
+        }
 
         let mut changed = false;
         if entry.name != name {
@@ -313,6 +344,9 @@ impl ContactDirectory {
                 // Placeholder name (a raw LID JID), lowest tier — any real
                 // source can upgrade it.
                 name_priority: 0,
+                // Keyed by resolved phone digits, so it's a real phone row and
+                // belongs in the suffix indices.
+                is_lid: false,
             }
         });
         if entry.lid_jids.insert(lid_jid.to_string()) {
@@ -361,6 +395,9 @@ impl ContactDirectory {
                 // Placeholder name (a raw chat_id), lowest tier — any real
                 // source can upgrade it.
                 name_priority: 0,
+                // The typing self-heal can pass a raw `@lid` as `phone_key`;
+                // mark such rows so load() keeps them out of the suffix indices.
+                is_lid: phone_key.ends_with("@lid"),
             }
         });
         entry.sources.insert(source.to_string());
@@ -499,7 +536,7 @@ impl ContactDirectory {
         // Drop the lock before doing IO.
         drop(inner);
         if let Ok(bytes) = bincode::serialize(&snapshot) {
-            if let Err(e) = std::fs::write(&path, bytes) {
+            if let Err(e) = atomic_write(&path, &bytes) {
                 log::warn!("contacts: failed to persist {}: {e}", path.display());
                 return;
             }
@@ -522,7 +559,103 @@ impl ContactDirectory {
     }
 }
 
-fn inner_default_entry(name: &str, now: u64, source: &str) -> ContactEntry {
+/// Pre-batch on-disk layout of `ContactEntry`, exactly as it was serialized
+/// before `name_priority` and `is_lid` were added. bincode is field-order- and
+/// field-count-sensitive and ignores `#[serde(default)]`, so a new-format
+/// decode of an old file fails outright; we retry into this struct and migrate.
+///
+/// IMPORTANT: keep these fields byte-identical (order + types) to the historical
+/// `ContactEntry`. Do NOT add the new fields here.
+///
+/// `Serialize` is derived only so tests can synthesize an old-format blob; the
+/// production code path uses this struct purely as a decode fallback.
+#[derive(Deserialize, Serialize)]
+struct LegacyContactEntry {
+    name: String,
+    updated_at: u64,
+    #[serde(default)]
+    sources: HashSet<String>,
+    #[serde(default)]
+    chat_ids: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    lid_jids: HashSet<String>,
+}
+
+impl From<LegacyContactEntry> for ContactEntry {
+    fn from(e: LegacyContactEntry) -> Self {
+        ContactEntry {
+            name: e.name,
+            updated_at: e.updated_at,
+            sources: e.sources,
+            chat_ids: e.chat_ids,
+            lid_jids: e.lid_jids,
+            // Fields that didn't exist in the old layout get their defaults;
+            // any real source can raise the tier on the next insert.
+            name_priority: 0,
+            is_lid: false,
+        }
+    }
+}
+
+/// Decode the persisted directory, tolerating the pre-`name_priority` layout.
+/// Tries the current format first; on failure retries the legacy layout and
+/// migrates. Returns `None` only if BOTH decodes fail (genuine corruption).
+fn decode_directory(bytes: &[u8]) -> Option<HashMap<String, ContactEntry>> {
+    if let Ok(map) = bincode::deserialize::<HashMap<String, ContactEntry>>(bytes) {
+        return Some(map);
+    }
+    // Retry the historical layout (no name_priority / is_lid fields).
+    let legacy: HashMap<String, LegacyContactEntry> = bincode::deserialize(bytes).ok()?;
+    Some(legacy.into_iter().map(|(k, v)| (k, v.into())).collect())
+}
+
+/// Preserve a present-but-undecodable file as `<path>.corrupt` before anything
+/// can overwrite it, so the raw bytes stay recoverable by a future decoder.
+/// Only copies once (won't clobber an existing `.corrupt`). Mirrors
+/// `ui::runtime::backup_corrupt_once`, kept local to avoid a cross-file edit.
+fn backup_corrupt_once(path: &std::path::Path) {
+    let bak = path.with_extension("corrupt");
+    if bak.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::copy(path, &bak) {
+        log::warn!("contacts backup_corrupt_once({}): {e}", path.display());
+    } else {
+        log::warn!(
+            "contacts: preserved undecodable {} → {} (needs a decoder to recover)",
+            path.display(),
+            bak.display()
+        );
+    }
+}
+
+/// Monotonic counter so concurrent atomic writes don't collide on the tmp name.
+static ATOMIC_WRITE_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Write `data` to `path` atomically: write to a unique temp file in the same
+/// directory, fsync it, then rename over the target. A crash/power-loss mid-write
+/// leaves either the intact old file or the complete new one — never a truncated
+/// aggregate (which previously meant a wiped contact directory). Rename within a
+/// directory is atomic on Linux. Kept local to avoid a cross-file edit.
+fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let n = ATOMIC_WRITE_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn inner_default_entry(name: &str, now: u64, source: &str, is_lid: bool) -> ContactEntry {
     let mut sources = HashSet::new();
     sources.insert(source.to_string());
     ContactEntry {
@@ -532,6 +665,7 @@ fn inner_default_entry(name: &str, now: u64, source: &str) -> ContactEntry {
         chat_ids: std::collections::HashMap::new(),
         lid_jids: HashSet::new(),
         name_priority: source_priority(source),
+        is_lid,
     }
 }
 
@@ -793,6 +927,99 @@ mod tests {
         dir.insert("14165559999", "Bob", "gmessages"); // confirm → tier 2
         dir.insert("14165559999", "Bob Longer Nickname", "typing"); // tier 0
         assert_eq!(dir.lookup("14165559999").as_deref(), Some("Bob"));
+    }
+
+    #[test]
+    fn legacy_blob_decodes_and_migrates_without_wiping() {
+        // Simulate a contacts_directory.bin written before name_priority /
+        // is_lid existed: serialize a HashMap<String, LegacyContactEntry> and
+        // prove decode_directory() reads it back (not wiped) with sane
+        // migrated defaults.
+        let mut legacy: HashMap<String, LegacyContactEntry> = HashMap::new();
+        legacy.insert(
+            "14164000790".to_string(),
+            LegacyContactEntry {
+                name: "Lorne".to_string(),
+                updated_at: 42,
+                sources: HashSet::from(["whatsapp".to_string()]),
+                chat_ids: std::collections::HashMap::from([(
+                    "whatsapp".to_string(),
+                    "14164000790@s.whatsapp.net".to_string(),
+                )]),
+                lid_jids: HashSet::from(["137340286709870@lid".to_string()]),
+            },
+        );
+        let bytes = bincode::serialize(&legacy).unwrap();
+
+        // A current-format decode of the OLD bytes must fail (this is the very
+        // bug C2 guards against); the fallback must succeed.
+        assert!(
+            bincode::deserialize::<HashMap<String, ContactEntry>>(&bytes).is_err(),
+            "old layout should not decode as the new struct (else the test proves nothing)"
+        );
+        let map = decode_directory(&bytes).expect("legacy fallback must decode old file");
+        let entry = map.get("14164000790").expect("row must survive migration");
+        assert_eq!(entry.name, "Lorne");
+        assert_eq!(entry.updated_at, 42);
+        assert_eq!(entry.name_priority, 0); // migrated default
+        assert!(!entry.is_lid); // migrated default
+        assert!(entry.lid_jids.contains("137340286709870@lid"));
+    }
+
+    #[test]
+    fn current_format_round_trips_through_decode() {
+        // A freshly serialized new-format directory decodes via the primary
+        // path (not the legacy fallback), preserving new fields.
+        let mut map: HashMap<String, ContactEntry> = HashMap::new();
+        map.insert(
+            "137340286709870".to_string(),
+            ContactEntry {
+                name: "Ghost".to_string(),
+                updated_at: 7,
+                sources: HashSet::new(),
+                chat_ids: std::collections::HashMap::new(),
+                lid_jids: HashSet::new(),
+                name_priority: 2,
+                is_lid: true,
+            },
+        );
+        let bytes = bincode::serialize(&map).unwrap();
+        let decoded = decode_directory(&bytes).expect("new format must decode");
+        let e = decoded.get("137340286709870").unwrap();
+        assert_eq!(e.name_priority, 2);
+        assert!(e.is_lid);
+    }
+
+    #[test]
+    fn is_lid_row_skips_suffix_index_on_load() {
+        // A LID-keyed row persisted with is_lid=true must NOT be re-added to the
+        // phone-suffix indices on load (the G1 restart regression). Round-trip
+        // through a temp file via load() and confirm no fuzzy match.
+        let dir_path = std::env::temp_dir().join(format!(
+            "contacts_islid_test_{}_{}.bin",
+            std::process::id(),
+            ATOMIC_WRITE_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut map: HashMap<String, ContactEntry> = HashMap::new();
+        map.insert(
+            "137340286709870".to_string(),
+            ContactEntry {
+                name: "Ghost".to_string(),
+                updated_at: 1,
+                sources: HashSet::new(),
+                chat_ids: std::collections::HashMap::new(),
+                lid_jids: HashSet::new(),
+                name_priority: 0,
+                is_lid: true,
+            },
+        );
+        std::fs::write(&dir_path, bincode::serialize(&map).unwrap()).unwrap();
+
+        let loaded = ContactDirectory::load(dir_path.clone());
+        // The LID digits' last-10 ("6286709870") must not fuzzy-match.
+        assert_eq!(loaded.lookup("15556286709870"), None);
+        assert_eq!(loaded.lookup("6286709870"), None);
+        let _ = std::fs::remove_file(&dir_path);
     }
 
     #[test]
