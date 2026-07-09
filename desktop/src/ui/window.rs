@@ -324,7 +324,11 @@ impl MainWindow {
             let inner_c = inner.clone();
             settings_btn.connect_clicked(move |_| {
                 let parent = inner_c.window.upcast_ref::<gtk4::Window>();
-                crate::ui::settings::show_settings_window(&inner_c.settings, Some(parent));
+                crate::ui::settings::show_settings_window(
+                    &inner_c.settings,
+                    Some(parent),
+                    &inner_c.bridge,
+                );
             });
         }
 

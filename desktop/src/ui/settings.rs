@@ -215,7 +215,11 @@ impl SettingsHandle {
 }
 
 /// Show the settings/preferences window.
-pub fn show_settings_window(settings: &SettingsHandle, parent: Option<&gtk4::Window>) {
+pub fn show_settings_window(
+    settings: &SettingsHandle,
+    parent: Option<&gtk4::Window>,
+    bridge: &std::sync::Arc<crate::bridge::Bridge>,
+) {
     let window = adw::PreferencesWindow::new();
     window.set_title(Some("Settings"));
     // 800×700 fits the QR widget (280px) + page chrome without resizing,
@@ -563,6 +567,50 @@ pub fn show_settings_window(settings: &SettingsHandle, parent: Option<&gtk4::Win
     });
     audio_group.add(&audio_row);
     behave_page.add(&audio_group);
+
+    // ── Account group: log out / unlink this device ──
+    let account_group = adw::PreferencesGroup::new();
+    account_group.set_title("Account");
+    let logout_row = adw::ActionRow::new();
+    logout_row.set_title("Log out / Unlink device");
+    logout_row.set_subtitle(
+        "Disconnects and unlinks this desktop from your phone. You'll need to \
+         re-scan the QR code to link again.",
+    );
+    let logout_btn = gtk4::Button::with_label("Log out");
+    logout_btn.set_valign(gtk4::Align::Center);
+    logout_btn.add_css_class("destructive-action");
+    {
+        let bridge = bridge.clone();
+        let window_c = window.clone();
+        logout_btn.connect_clicked(move |_| {
+            // Confirm — unlinking loses the session and needs a fresh QR scan.
+            let dialog = adw::AlertDialog::new(
+                Some("Log out?"),
+                Some(
+                    "This unlinks the desktop from your phone. You'll re-scan the \
+                     QR code to link again.",
+                ),
+            );
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("logout", "Log out");
+            dialog.set_response_appearance("logout", adw::ResponseAppearance::Destructive);
+            dialog.set_close_response("cancel");
+            let bridge = bridge.clone();
+            let window_c2 = window_c.clone();
+            dialog.connect_response(None, move |dlg, resp| {
+                if resp == "logout" {
+                    bridge.send_command(crate::bridge::WaCommand::Logout);
+                    window_c2.close();
+                }
+                dlg.close();
+            });
+            dialog.present(Some(&window_c));
+        });
+    }
+    logout_row.add_suffix(&logout_btn);
+    account_group.add(&logout_row);
+    behave_page.add(&account_group);
 
     window.add(&behave_page);
 

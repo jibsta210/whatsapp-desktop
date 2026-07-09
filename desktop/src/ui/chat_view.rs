@@ -68,6 +68,10 @@ struct ChatViewInner {
     pin_banner: Box,
     bridge: Arc<Bridge>,
     current_chat_id: RefCell<Option<String>>,
+    /// Outbound typing indicator throttle: last time we sent typing=true (ms).
+    typing_last_true_ms: std::cell::Cell<i64>,
+    /// Pending "typing stopped" timer, rearmed on each keystroke.
+    typing_stop_source: RefCell<Option<gtk4::glib::SourceId>>,
     /// The user's own JID (for avatar loading on sent messages)
     own_jid: RefCell<Option<String>>,
     own_name: RefCell<String>,
@@ -204,16 +208,19 @@ impl ChatViewPanel {
         search_button.set_tooltip_text(Some("Search messages"));
         header.pack_end(&search_button);
 
-        // Voice call button
+        // Voice call button — hidden until WebRTC calling is implemented (the
+        // buttons were a false affordance: click did nothing visible).
         let voice_call_btn = Button::from_icon_name("call-start-symbolic");
         voice_call_btn.add_css_class("flat");
         voice_call_btn.set_tooltip_text(Some("Voice call"));
+        voice_call_btn.set_visible(false);
         header.pack_end(&voice_call_btn);
 
-        // Video call button
+        // Video call button — hidden until WebRTC calling is implemented.
         let video_call_btn = Button::from_icon_name("camera-video-symbolic");
         video_call_btn.add_css_class("flat");
         video_call_btn.set_tooltip_text(Some("Video call"));
+        video_call_btn.set_visible(false);
         header.pack_end(&video_call_btn);
 
         // ── Search bar (hidden until search button clicked) ──
@@ -725,6 +732,8 @@ impl ChatViewPanel {
             scroll,
             input_view,
             send_button,
+            typing_last_true_ms: std::cell::Cell::new(0),
+            typing_stop_source: RefCell::new(None),
             typing_box,
             typing_name,
             header_name,
@@ -1420,6 +1429,45 @@ impl ChatViewPanel {
                 let cursor = buf.iter_at_mark(&buf.get_insert());
                 let text = buf.text(&buf.start_iter(), &cursor, false).to_string();
 
+                // ── Outbound "typing…" indicator (throttled true + idle false) ──
+                {
+                    let full = buf.text(&buf.start_iter(), &buf.end_iter(), false);
+                    if !full.trim().is_empty()
+                        && let Some(cid) = inner_c.current_chat_id.borrow().clone()
+                    {
+                        let routed = ChatViewPanel::resolve_send_target(&cid);
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0);
+                        // Send typing=true at most once every 3s.
+                        if now_ms - inner_c.typing_last_true_ms.get() > 3000 {
+                            inner_c.typing_last_true_ms.set(now_ms);
+                            inner_c.bridge.send_command(WaCommand::SetTyping {
+                                chat_id: routed.clone(),
+                                is_typing: true,
+                            });
+                        }
+                        // Rearm the idle-stop timer (typing=false after 4s quiet).
+                        if let Some(src) = inner_c.typing_stop_source.borrow_mut().take() {
+                            src.remove();
+                        }
+                        let inner_t = inner_c.clone();
+                        let src = gtk4::glib::timeout_add_local_once(
+                            std::time::Duration::from_secs(4),
+                            move || {
+                                inner_t.typing_last_true_ms.set(0);
+                                inner_t.bridge.send_command(WaCommand::SetTyping {
+                                    chat_id: routed.clone(),
+                                    is_typing: false,
+                                });
+                                *inner_t.typing_stop_source.borrow_mut() = None;
+                            },
+                        );
+                        *inner_c.typing_stop_source.borrow_mut() = Some(src);
+                    }
+                }
+
                 // --- @ Mention detection ---
                 if let Some(at_pos) = text.rfind('@') {
                     // Only trigger if @ is at start or preceded by whitespace
@@ -1737,6 +1785,8 @@ impl ChatViewPanel {
                         pop.popdown();
                         if label_str == "Poll" {
                             show_poll_creator(&inner_cc);
+                        } else if label_str == "Event" {
+                            show_event_creator(&inner_cc);
                         } else if label_str == "Photo & Video" || label_str == "Document" {
                             // Open file chooser
                             let dialog = gtk4::FileDialog::new();
@@ -4781,6 +4831,103 @@ fn show_message_menu(
 
     popover.set_child(Some(&vbox));
     popover.popup();
+}
+
+/// Simple event composer: collects name / date / time / location, formats a
+/// tidy event message, drops it into the compose box and sends it through the
+/// normal send path (optimistic bubble + channel routing).
+fn show_event_creator(inner: &Rc<ChatViewInner>) {
+    use gtk4::{Align, Entry, Label, Orientation};
+
+    if inner.current_chat_id.borrow().is_none() {
+        return;
+    }
+
+    let window = gtk4::Window::builder()
+        .title("Create Event")
+        .default_width(400)
+        .modal(true)
+        .build();
+    if let Some(root) = inner.root.root().and_then(|r| r.downcast::<gtk4::Window>().ok()) {
+        window.set_transient_for(Some(&root));
+    }
+
+    let content = Box::new(Orientation::Vertical, 12);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
+    content.set_margin_top(16);
+    content.set_margin_bottom(16);
+
+    let heading = Label::new(Some("New event"));
+    heading.add_css_class("title-3");
+    heading.set_halign(Align::Start);
+    content.append(&heading);
+
+    let name = Entry::builder().placeholder_text("Event name").build();
+    let date = Entry::builder()
+        .placeholder_text("Date (e.g. Sat 12 Jul)")
+        .build();
+    let time = Entry::builder().placeholder_text("Time (e.g. 7:00 PM)").build();
+    let location = Entry::builder()
+        .placeholder_text("Location (optional)")
+        .build();
+    content.append(&name);
+    content.append(&date);
+    content.append(&time);
+    content.append(&location);
+
+    let btn_row = Box::new(Orientation::Horizontal, 8);
+    btn_row.set_halign(Align::End);
+    let cancel = gtk4::Button::with_label("Cancel");
+    let create = gtk4::Button::with_label("Create");
+    create.add_css_class("suggested-action");
+    btn_row.append(&cancel);
+    btn_row.append(&create);
+    content.append(&btn_row);
+    window.set_child(Some(&content));
+
+    let win_cancel = window.clone();
+    cancel.connect_clicked(move |_| win_cancel.close());
+
+    // Escape closes.
+    let key = gtk4::EventControllerKey::new();
+    let win_key = window.clone();
+    key.connect_key_pressed(move |_, keyval, _, _| {
+        if keyval == gtk4::gdk::Key::Escape {
+            win_key.close();
+            gtk4::glib::Propagation::Stop
+        } else {
+            gtk4::glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key);
+
+    let inner_c = inner.clone();
+    let win_create = window.clone();
+    create.connect_clicked(move |_| {
+        let n = name.text().trim().to_string();
+        if n.is_empty() {
+            name.grab_focus();
+            return;
+        }
+        let d = date.text().trim().to_string();
+        let t = time.text().trim().to_string();
+        let l = location.text().trim().to_string();
+        let mut msg = format!("📅 Event: {n}");
+        let when = format!("{d} {t}");
+        let when = when.trim();
+        if !when.is_empty() {
+            msg.push_str(&format!("\n🗓 {when}"));
+        }
+        if !l.is_empty() {
+            msg.push_str(&format!("\n📍 {l}"));
+        }
+        inner_c.input_view.buffer().set_text(&msg);
+        ChatViewPanel::do_send(&inner_c);
+        win_create.close();
+    });
+
+    window.present();
 }
 
 fn show_poll_creator(inner: &Rc<ChatViewInner>) {

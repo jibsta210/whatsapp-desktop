@@ -156,3 +156,18 @@ The deferred core, now done deliberately. The runtime now OWNS the unread count.
 
 ⚠️ This is the subsystem that's broken before — please test: read on phone → desktop clears; read on
 desktop → open chat, restart, stays read; unread chat → restart, stays unread; mark-unread → stays.
+
+## Batch 7b — Approved decisions (from DECISIONS.md)
+
+Per your direction: destructive-action confirmations = NO change; the rest applied.
+
+- **Call buttons hidden** — the video/voice header buttons (a false affordance — click did nothing)
+  are now hidden until WebRTC calling is implemented.
+- **Log out / Unlink in settings** — new Account group under Behaviour with a destructive "Log out"
+  row that sends `WaCommand::Logout` behind a styled `adw::AlertDialog` confirm (unlinking needs a
+  fresh QR scan, so this one keeps a confirm).
+- **Outbound "typing…" indicator** — now broadcast: `SetTyping{true}` (throttled to once / 3s) on
+  keystrokes, auto `SetTyping{false}` after 4s idle, routed via the send-mode toggle.
+- **Event creator built** — the attach-menu "Event" row now opens a composer (name / date / time /
+  location), formats a tidy event message, and sends it through the normal send path (optimistic
+  bubble + channel routing). Escape/Cancel dismiss.
