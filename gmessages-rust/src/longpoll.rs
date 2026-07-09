@@ -230,7 +230,9 @@ async fn run_long_poll(client: Client, connected: Arc<AtomicBool>) -> Result<()>
         if !status.is_success() {
             let body = resp.bytes().await.unwrap_or_default();
             error_count += 1;
-            let secs = (error_count + 1) * 5;
+            // Cap the linear backoff (same as the POST-failure branch above) so a
+            // sustained 5xx outage doesn't push SMS recovery out unboundedly.
+            let secs = ((error_count + 1) * 5).min(60);
             // Log up to first 256 bytes of body for diagnostics.
             let body_preview = String::from_utf8_lossy(&body[..body.len().min(256)]);
             log::warn!(

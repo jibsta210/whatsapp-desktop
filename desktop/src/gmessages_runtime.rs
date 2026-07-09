@@ -424,7 +424,35 @@ fn load_gm_watermarks(path: &std::path::Path) -> std::collections::HashMap<Strin
 
 fn save_gm_watermarks(path: &std::path::Path, map: &std::collections::HashMap<String, i64>) {
     if let Ok(bytes) = bincode::serialize(map) {
-        let _ = std::fs::write(path, &bytes);
+        // Atomic tmp+rename (unique tmp name) so a crash mid-write can't leave a
+        // truncated watermark file that would decode empty and revert SMS chats
+        // to unread on the next restart.
+        if let Err(e) = crate::ui::runtime::atomic_write(path, &bytes) {
+            log::warn!("save_gm_watermarks({}): {e}", path.display());
+        }
+    }
+}
+
+/// Set of gm conversation_ids whose live SMS have been detected as 2FA /
+/// verification codes and rerouted into the synthetic "Verification Codes"
+/// inbox. Persisted so that on the next restart the reseed can SUPPRESS these
+/// standalone shortcode rows (which otherwise reappear with Google's `unread`
+/// flag every launch), and so MarkRead on the synthetic inbox knows which real
+/// convs to watermark + ACK. Without this, the "Verification Codes" chat could
+/// never be marked read and its shortcode rows kept re-flagging unread — a
+/// residual of the "SMS unread reappearing" bug.
+fn load_gm_verification_convs(path: &std::path::Path) -> std::collections::HashSet<String> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| bincode::deserialize::<std::collections::HashSet<String>>(&b).ok())
+        .unwrap_or_default()
+}
+
+fn save_gm_verification_convs(path: &std::path::Path, set: &std::collections::HashSet<String>) {
+    if let Ok(bytes) = bincode::serialize(set) {
+        if let Err(e) = crate::ui::runtime::atomic_write(path, &bytes) {
+            log::warn!("save_gm_verification_convs({}): {e}", path.display());
+        }
     }
 }
 
@@ -514,6 +542,14 @@ async fn run(
     let gm_read_wm_path = data_dir.join("gm_read_watermarks.bin");
     let gm_read_watermarks: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(load_gm_watermarks(&gm_read_wm_path)));
+
+    // Conversation_ids known to route into the synthetic "Verification Codes"
+    // inbox (learned from live 2FA detection, persisted). Consulted at reseed to
+    // suppress the standalone shortcode rows and at MarkRead to fan the read
+    // watermark + server ACK to the real underlying convs.
+    let gm_verif_path = data_dir.join("gm_verification_convs.bin");
+    let gm_verification_convs: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::Arc::new(tokio::sync::Mutex::new(load_gm_verification_convs(&gm_verif_path)));
 
     let client = Arc::new(Client::new(auth));
     let mut events = client
@@ -661,6 +697,7 @@ async fn run(
         let merge_map = merge_map.clone();
         let phone_to_wa_chat = phone_to_wa_chat.clone();
         let gm_read_watermarks = gm_read_watermarks.clone();
+        let gm_verification_convs = gm_verification_convs.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
@@ -783,6 +820,13 @@ async fn run(
                     // reseeded unread from Google's stale `unread` flag. Flows to
                     // both the ChatAdded events and the persisted gm_chats.bin.
                     let wm_snap = gm_read_watermarks.lock().await.clone();
+                    // Conversations we've previously seen route into the synthetic
+                    // "Verification Codes" inbox. Their standalone shortcode rows
+                    // must NOT be reseeded here — they carry Google's `unread` flag
+                    // and would re-appear unread every launch (and can never be
+                    // marked read as a standalone row). They live inside the
+                    // Verification Codes inbox instead.
+                    let verif_snap = gm_verification_convs.lock().await.clone();
                     let summaries: Vec<ChatSummary> = resp
                         .conversations
                         .iter()
@@ -857,15 +901,23 @@ async fn run(
                     let mut merged_cache: StdHashMap<String, ChatSummary> = StdHashMap::new();
                     // Seed with the OLD cache contents (if any).
                     for s in gm_load_chats_cache(&gm_chats_cache_path) {
-                        if !mm_snap.contains_key(strip_prefix(&s.id)) {
+                        let conv = strip_prefix(&s.id);
+                        if !mm_snap.contains_key(conv) && !verif_snap.contains(conv) {
                             merged_cache.insert(s.id.clone(), s);
                         }
                     }
                     // Overlay the fresh response (fresh wins).
                     for s in &summaries {
-                        if mm_snap.contains_key(strip_prefix(&s.id)) {
+                        let conv = strip_prefix(&s.id);
+                        if mm_snap.contains_key(conv) {
                             // Merged into a WA row — drop it from the
                             // gm cache so it doesn't get hydrated again.
+                            merged_cache.remove(&s.id);
+                            continue;
+                        }
+                        if verif_snap.contains(conv) {
+                            // 2FA shortcode — lives in the Verification Codes
+                            // inbox; never a standalone row in the cache.
                             merged_cache.remove(&s.id);
                             continue;
                         }
@@ -904,12 +956,31 @@ async fn run(
                             })
                             .await;
                     }
+                    // Evict any standalone shortcode row that was hydrated from
+                    // cache on startup: its SMS belong in the Verification Codes
+                    // inbox, not a per-shortcode row that keeps re-flagging unread.
+                    for conv_id in &verif_snap {
+                        let stale_id = format!("{CHAT_PREFIX}{conv_id}");
+                        log::info!(
+                            "gmessages: evicting stale 2FA shortcode row {stale_id} (→ {VERIFICATION_CODES_CHAT_ID})"
+                        );
+                        let _ = event_tx
+                            .send(WaEvent::ChatDeleted {
+                                chat_id: stale_id,
+                            })
+                            .await;
+                    }
                     for summary in &summaries {
                         let conv_id = strip_prefix(&summary.id);
                         if mm_snap.contains_key(conv_id) {
                             // Don't add a duplicate row — the existing
                             // WhatsApp row will absorb this conversation's
                             // messages via the merge_map redirect.
+                            continue;
+                        }
+                        if verif_snap.contains(conv_id) {
+                            // 2FA shortcode — routed into the Verification Codes
+                            // inbox; don't reseed a standalone (unread) row.
                             continue;
                         }
                         log::debug!(
@@ -1323,6 +1394,19 @@ async fn run(
                             im.sender_name,
                             VERIFICATION_CODES_CHAT_ID
                         );
+                        // Remember the REAL underlying conv id so reseed can
+                        // suppress its standalone shortcode row and MarkRead on
+                        // the synthetic inbox can watermark + ACK it. Persist on
+                        // first sighting of a new conv.
+                        let real_conv = strip_prefix(&im.chat_id).to_string();
+                        let newly_recorded = {
+                            let mut vc = gm_verification_convs.lock().await;
+                            vc.insert(real_conv)
+                        };
+                        if newly_recorded {
+                            let snap = gm_verification_convs.lock().await.clone();
+                            save_gm_verification_convs(&gm_verif_path, &snap);
+                        }
                         im.chat_id = VERIFICATION_CODES_CHAT_ID.into();
                     }
                     // STEP 1: rewrite chat_id for UI routing (gm:N → wa_jid)
@@ -1441,6 +1525,7 @@ async fn run(
                 let merge_map = merge_map.clone();
                 let gm_read_watermarks = gm_read_watermarks.clone();
                 let gm_read_wm_path = gm_read_wm_path.clone();
+                let gm_verification_convs = gm_verification_convs.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_command(
                         &client,
@@ -1448,6 +1533,7 @@ async fn run(
                         &merge_map,
                         &gm_read_watermarks,
                         &gm_read_wm_path,
+                        &gm_verification_convs,
                         cmd,
                     )
                     .await
@@ -1476,6 +1562,7 @@ async fn handle_command(
     merge_map: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
     read_watermarks: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>>,
     wm_path: &std::path::Path,
+    verification_convs: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     cmd: WaCommand,
 ) -> Result<()> {
     use crate::bridge::IncomingMessage;
@@ -1555,6 +1642,79 @@ async fn handle_command(
                     let _ = event_tx
                         .send(WaEvent::MessageFailed {
                             msg_id: tmp_id,
+                            chat_id,
+                        })
+                        .await;
+                }
+            }
+        }
+        // Resend of a previously-failed SMS bubble. Re-send via the same
+        // send_text path as SendText and re-key the existing failed bubble
+        // (msg_id) via MessageConfirmed on success, or re-emit MessageFailed
+        // on error so the red ✗ / Resend affordance stays.
+        WaCommand::ResendMessage { chat_id, msg_id, text } => {
+            let conv = strip_prefix(&chat_id);
+            log::info!("gmessages: ResendMessage to {conv}: {text:?}");
+            match client.send_text(conv, &text).await {
+                Ok(real_id) => {
+                    let tagged_real = if real_id.starts_with(CHAT_PREFIX) {
+                        real_id.clone()
+                    } else {
+                        format!("{CHAT_PREFIX}{real_id}")
+                    };
+                    let _ = event_tx
+                        .send(WaEvent::MessageConfirmed {
+                            tmp_id: msg_id.clone(),
+                            real_id: tagged_real.clone(),
+                            chat_id: chat_id.clone(),
+                        })
+                        .await;
+                    let now_s = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    let echo = IncomingMessage {
+                        media_download: None,
+                        id: tagged_real.clone(),
+                        chat_id: chat_id.clone(),
+                        sender_id: String::new(),
+                        sender_name: String::new(),
+                        text: Some(text),
+                        media_type: None,
+                        timestamp: now_s,
+                        is_from_me: true,
+                        quoted_msg_id: None,
+                        quoted_text: None,
+                        quoted_sender: None,
+                        is_forwarded: false,
+                        forwarding_score: 0,
+                        reactions: vec![],
+                        media_local_path: None,
+                        media_filename: None,
+                        media_caption: None,
+                        contact_name: None,
+                        contact_vcard: None,
+                        link_title: None,
+                        link_description: None,
+                        link_url: None,
+                        link_thumbnail_path: None,
+                        quoted_media_path: None,
+                        poll_question: None,
+                        poll_options: vec![],
+                        poll_selectable: 0,
+                        poll_secret: vec![],
+                        poll_votes: vec![],
+                        receipt_status: crate::bridge::ReceiptStatus::Sent,
+                        is_edited: false,
+                        is_system_message: false,
+                    };
+                    let _ = event_tx.send(WaEvent::MessageReceived(echo)).await;
+                }
+                Err(e) => {
+                    log::warn!("gmessages: ResendMessage send_text failed: {e}");
+                    let _ = event_tx
+                        .send(WaEvent::MessageFailed {
+                            msg_id,
                             chat_id,
                         })
                         .await;
@@ -1659,8 +1819,18 @@ async fn handle_command(
             // still flags `unread=true` on conversations the user
             // already read on the desktop, and they keep popping
             // back into the Unread filter.
+            // The synthetic "Verification Codes" inbox has no real
+            // conversation_id of its own ("verification-codes" is a bogus id
+            // that ACKs a nonexistent conv). Its messages come from many real
+            // shortcode convs recorded in `verification_convs` — fan the read
+            // watermark to ALL of them and SKIP the bogus server ACK. Without
+            // this the inbox could never be marked read and its shortcodes kept
+            // re-flagging unread on every reseed.
+            let is_verification_inbox = chat_id == VERIFICATION_CODES_CHAT_ID;
             let mut convs: Vec<String> = Vec::new();
-            if is_gm_chat(&chat_id) {
+            if is_verification_inbox {
+                convs.extend(verification_convs.lock().await.iter().cloned());
+            } else if is_gm_chat(&chat_id) {
                 convs.push(strip_prefix(&chat_id).to_string());
             } else {
                 let mm = merge_map.lock().await;
@@ -1722,6 +1892,14 @@ async fn handle_command(
                 }
             }
 
+            // For the synthetic Verification Codes inbox we've watermarked all
+            // real convs above; the inbox file mixes msg_ids from many convs, so
+            // we can't reliably pair a msg_id to its conv for a server ACK.
+            // Skip the ACK (the local watermark keeps them read across restart).
+            if is_verification_inbox {
+                return Ok(());
+            }
+
             let latest_gm_msg_id = messages
                 .iter()
                 .rev()
@@ -1737,6 +1915,48 @@ async fn handle_command(
                 if let Err(e) = client.mark_read(&conv, &msg_id).await {
                     log::warn!("gmessages: mark_read({conv}) failed: {e}");
                 }
+            }
+        }
+        // Mark-as-unread: the user deliberately flagged an SMS chat unread. The
+        // WA runtime handles the live UI/badge, but on reseed our local read
+        // watermark would re-clamp the chat back to read (unread=0). Roll the gm
+        // watermark BACK below the chat's latest activity so `apply_gm_read_
+        // watermark` no longer clamps and Google's `unread` flag survives the
+        // reseed. (Routing that makes MarkUnread reach the gm runtime is
+        // coordinator/runtime.rs work — reported in api_changes.)
+        WaCommand::MarkUnread { chat_id } => {
+            let mut convs: Vec<String> = Vec::new();
+            if chat_id == VERIFICATION_CODES_CHAT_ID {
+                convs.extend(verification_convs.lock().await.iter().cloned());
+            } else if is_gm_chat(&chat_id) {
+                convs.push(strip_prefix(&chat_id).to_string());
+            } else {
+                let mm = merge_map.lock().await;
+                for (conv, target) in mm.iter() {
+                    if target == &chat_id {
+                        convs.push(conv.clone());
+                    }
+                }
+            }
+            if convs.is_empty() {
+                // Not a gm-relevant chat (fanned out to every MarkUnread now).
+                return Ok(());
+            }
+            let snapshot = {
+                let mut wm = read_watermarks.lock().await;
+                let mut changed = false;
+                for conv in &convs {
+                    // Removing the watermark drops it below any real activity
+                    // timestamp, so the reseed clamp never fires for this chat.
+                    if wm.remove(conv).is_some() {
+                        changed = true;
+                    }
+                }
+                if changed { Some(wm.clone()) } else { None }
+            };
+            if let Some(snap) = snapshot {
+                log::info!("gmessages: MarkUnread cleared read watermark for {convs:?}");
+                save_gm_watermarks(wm_path, &snap);
             }
         }
         WaCommand::SetTyping { chat_id, is_typing } => {
@@ -1761,14 +1981,50 @@ async fn handle_command(
             );
             match client.send_reaction(&conv, &raw_msg_id, &emoji, action).await {
                 Ok(()) => {
+                    // Persist directly so the reaction survives a restart —
+                    // the long-poll echo path doesn't re-save existing
+                    // messages, so without this it would be lost. Do this FIRST
+                    // (and synchronously) so we can emit the FULL merged reaction
+                    // set: sending just our own `("", emoji)` would wipe every
+                    // other participant's reaction from the bubble until reload.
+                    let cid = chat_id.clone();
+                    let mid = msg_id.clone();
+                    let emo = emoji.clone();
+                    let merged = tokio::task::spawn_blocking(move || {
+                        let mut msgs = crate::ui::runtime::load_messages(&cid);
+                        if let Some(m) = msgs.iter_mut().find(|m| m.id == mid) {
+                            m.reactions.retain(|(who, _)| who != "me");
+                            if !emo.is_empty() {
+                                m.reactions.push(("me".to_string(), emo));
+                            }
+                            let merged = m.reactions.clone();
+                            crate::ui::runtime::save_messages_scoped(
+                                &cid,
+                                MessageSource::GoogleMessages,
+                                &msgs,
+                            );
+                            Some(merged)
+                        } else {
+                            None
+                        }
+                    })
+                    .await
+                    .unwrap_or(None);
                     // Optimistic UI update — show it immediately rather than
-                    // waiting for the phone's long-poll echo. Empty emoji = the
-                    // user cleared their reaction (empty vec). Empty sender
-                    // renders as "You".
-                    let reactions = if emoji.is_empty() {
-                        Vec::new()
-                    } else {
-                        vec![(String::new(), emoji.clone())]
+                    // waiting for the phone's long-poll echo. Prefer the merged
+                    // persisted set (others' reactions + our add/removal); fall
+                    // back to just our own change if the message wasn't cached.
+                    // The bubble renders an EMPTY sender as "You", so translate
+                    // the persisted self key ("me") back to "" for the event.
+                    let reactions = match merged {
+                        Some(r) => r
+                            .into_iter()
+                            .map(|(who, e)| {
+                                if who == "me" { (String::new(), e) } else { (who, e) }
+                            })
+                            .collect(),
+                        None if emoji.is_empty() => Vec::new(),
+                        None => vec![(String::new(), emoji.clone())],
                     };
                     let _ = event_tx
                         .send(WaEvent::ReactionUpdated {
@@ -1777,26 +2033,6 @@ async fn handle_command(
                             reactions,
                         })
                         .await;
-                    // Persist directly so the reaction survives a restart —
-                    // the long-poll echo path doesn't re-save existing
-                    // messages, so without this it would be lost.
-                    let cid = chat_id.clone();
-                    let mid = msg_id.clone();
-                    let emo = emoji.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let mut msgs = crate::ui::runtime::load_messages(&cid);
-                        if let Some(m) = msgs.iter_mut().find(|m| m.id == mid) {
-                            m.reactions.retain(|(who, _)| who != "me");
-                            if !emo.is_empty() {
-                                m.reactions.push(("me".to_string(), emo));
-                            }
-                            crate::ui::runtime::save_messages_scoped(
-                                &cid,
-                                MessageSource::GoogleMessages,
-                                &msgs,
-                            );
-                        }
-                    });
                 }
                 Err(e) => log::warn!("gmessages: send_reaction failed: {e}"),
             }
@@ -1925,6 +2161,21 @@ async fn handle_command(
                 .send(WaEvent::MessageFailed {
                     msg_id: tmp_id,
                     chat_id,
+                })
+                .await;
+        }
+        // Contact cards can't be sent over SMS/RCS via gmessages; the UI
+        // already showed an optimistic ⏳ bubble (tmp_id) and cleared the
+        // composer. Mark it FAILED (red ✗ + Resend) instead of leaving the
+        // bubble hanging on ⏳ forever.
+        WaCommand::SendContact { to_chat_id, tmp_id, .. } => {
+            log::warn!(
+                "gmessages: {to_chat_id} — contact card not supported over SMS; marking failed"
+            );
+            let _ = event_tx
+                .send(WaEvent::MessageFailed {
+                    msg_id: tmp_id,
+                    chat_id: to_chat_id,
                 })
                 .await;
         }
