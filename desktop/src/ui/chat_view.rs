@@ -1159,7 +1159,7 @@ impl ChatViewPanel {
                                             ChatViewPanel::force_scroll_to_bottom(&inner_c3, 3);
 
                                             bridge.send_command(WaCommand::SendAudio {
-                                                chat_id: cid,
+                                                chat_id: ChatViewPanel::resolve_send_target(&cid),
                                                 path,
                                                 duration_secs: dur,
                                                 is_voice_note: true,
@@ -1656,7 +1656,7 @@ impl ChatViewPanel {
                         for path_str in &paths {
                             let tmp_id = gen_tmp_id();
                             inner_c.bridge.send_command(WaCommand::SendImage {
-                                chat_id: chat_id.clone(),
+                                chat_id: ChatViewPanel::resolve_send_target(&chat_id),
                                 path: path_str.clone(),
                                 caption: None,
                                 tmp_id,
@@ -2020,7 +2020,7 @@ impl ChatViewPanel {
                         Some(corrected)
                     };
                     bridge.send_command(WaCommand::SendImage {
-                        chat_id,
+                        chat_id: ChatViewPanel::resolve_send_target(&chat_id),
                         path: image_path,
                         caption,
                         tmp_id,
@@ -2033,7 +2033,7 @@ impl ChatViewPanel {
                     Some(caption_text)
                 };
                 inner.bridge.send_command(WaCommand::SendImage {
-                    chat_id,
+                    chat_id: ChatViewPanel::resolve_send_target(&chat_id),
                     path: image_path,
                     caption,
                     tmp_id,
@@ -2048,7 +2048,7 @@ impl ChatViewPanel {
             inner.input_view.buffer().set_text("");
             let tmp_id = gen_tmp_id();
             inner.bridge.send_command(WaCommand::SendGif {
-                chat_id,
+                chat_id: ChatViewPanel::resolve_send_target(&chat_id),
                 mp4_url,
                 tmp_id,
             });
@@ -3529,7 +3529,7 @@ impl ChatViewPanel {
                             .subsec_nanos()
                     );
                     bridge.send_command(WaCommand::SendSticker {
-                        chat_id,
+                        chat_id: ChatViewPanel::resolve_send_target(&chat_id),
                         webp_url: webp_url.clone(),
                         tmp_id,
                     });

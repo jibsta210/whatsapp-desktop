@@ -1480,7 +1480,11 @@ async fn handle_command(
 ) -> Result<()> {
     use crate::bridge::IncomingMessage;
     match cmd {
-        WaCommand::SendText { chat_id, text, tmp_id, .. } => {
+        // SMS/RCS has no reply-quoting, so a SendReply to a gm chat is downgraded
+        // to a plain text SMS (the reply text still sends) rather than being
+        // silently dropped and leaving the optimistic bubble stuck forever.
+        WaCommand::SendText { chat_id, text, tmp_id, .. }
+        | WaCommand::SendReply { chat_id, text, tmp_id, .. } => {
             let conv = strip_prefix(&chat_id);
             log::info!("gmessages: SendText to {conv}: {text:?}");
             match client.send_text(conv, &text).await {
@@ -1900,6 +1904,22 @@ async fn handle_command(
                         .await;
                 }
             }
+        }
+        // Commands that carry an optimistic bubble (tmp_id) but that gmessages
+        // can't send (GIF / sticker / voice note over SMS/RCS). The UI already
+        // showed a bubble and cleared the input, so tell it the send FAILED
+        // (red ✗ + Resend) instead of leaving the bubble on ⏳ forever with the
+        // recipient getting nothing.
+        WaCommand::SendGif { chat_id, tmp_id, .. }
+        | WaCommand::SendAudio { chat_id, tmp_id, .. }
+        | WaCommand::SendSticker { chat_id, tmp_id, .. } => {
+            log::warn!("gmessages: {chat_id} — GIF/sticker/voice not supported over SMS; marking failed");
+            let _ = event_tx
+                .send(WaEvent::MessageFailed {
+                    msg_id: tmp_id,
+                    chat_id,
+                })
+                .await;
         }
         other => {
             log::debug!(
@@ -2530,8 +2550,17 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
                     && let Some(dir) = GM_DATA_DIR.get()
                 {
                     let p = gm_media_dest(blob_id, mime, dir);
-                    if p.exists() {
+                    // HEIC/HEIF are transcoded to a sibling .jpg on download (GTK
+                    // can't render HEIC). Prefer that .jpg so an iPhone photo
+                    // survives a restart instead of pointing at the unrenderable
+                    // .heic and going blank.
+                    let jpg = p.with_extension("jpg");
+                    if (mime == "image/heic" || mime == "image/heif") && jpg.exists() {
+                        media_local_path = Some(jpg.to_string_lossy().into_owned());
+                    } else if p.exists() {
                         media_local_path = Some(p.to_string_lossy().into_owned());
+                    } else if jpg.exists() {
+                        media_local_path = Some(jpg.to_string_lossy().into_owned());
                     }
                 }
             }

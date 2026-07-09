@@ -75,3 +75,27 @@ runtime, not the UI, owns the count — single source of truth), `wa-upsert-rest
 `seed-watermark-hides-unread-on-first-run` (depends on the persist-live-unread fix — seeding at
 `ts-1` in isolation would REVERT the SMS reseed clamp), `mark-unread-not-persisted`,
 `verification-inbox-markread-noop`. These are best done as one careful change with the app running.
+
+## Batch 4 — SMS / gm parity
+
+Findings: sms-reply-media-silent-drop, attachments-ignore-send-mode, gm-heic-blank-after-restart,
+CL-02 (gm delete broken), gm-longpoll-unbounded-backoff.
+
+- **SMS silent data-loss fixed** — a reply / voice note / GIF / sticker sent to an SMS chat no
+  longer vanishes. `SendReply` to a gm chat is **downgraded to a plain text SMS** (the text still
+  sends; SMS has no reply-quoting). GIF/sticker/voice (unsupported over SMS) now emit
+  `WaEvent::MessageFailed` → the optimistic bubble flips to red ✗ + Resend instead of a stuck ⏳.
+- **Attachments honor the send-mode toggle** — image/GIF/voice/sticker sends now route through
+  `resolve_send_target` (6 sites) like text did, so on a merged chat they go over the chosen
+  channel instead of always the raw open id (could have sent to the wrong person).
+- **iPhone HEIC survives restart** — `message_to_incoming` now prefers the transcoded sibling `.jpg`
+  for `image/heic`/`heif` instead of pointing at the unrenderable `.heic` (went blank on reload).
+- **gm Delete works** — the WhatsApp `DeleteChat` handler no longer bails on a `gm:` id via `?`;
+  local delete + `ChatDeleted` feedback now always run (WA-server delete only for a real JID).
+- **gm long-poll backoff capped** at 60s (was unbounded linear growth during an outage).
+
+Deferred (larger / riskier): gm media retry path, copy-outgoing-media-to-managed-dir,
+gm phone-not-responding idle-timeout reconnect (delicate long-poll stream change),
+SMS↔WA merge last-10 uniqueness (risky to the merge index), full gm-side delete persistence
+(a deleted SMS chat may re-appear on restart until the gm cache removal lands), duplicate
+runtime search cleanup.

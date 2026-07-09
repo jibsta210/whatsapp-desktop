@@ -194,7 +194,9 @@ async fn run_long_poll(client: Client, connected: Arc<AtomicBool>) -> Result<()>
             Ok(r) => r,
             Err(e) => {
                 error_count += 1;
-                let secs = (error_count + 1) * 5;
+                // Cap the linear backoff so a sustained outage doesn't push SMS
+                // recovery out to many minutes.
+                let secs = ((error_count + 1) * 5).min(60);
                 log::warn!("ReceiveMessages POST failed (#{error_count}): {e}; retrying in {secs}s");
                 tokio::select! {
                     _ = sleep(Duration::from_secs(secs as u64)) => {}

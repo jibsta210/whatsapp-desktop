@@ -5145,9 +5145,15 @@ async fn handle_command(
         }
 
         WaCommand::DeleteChat { chat_id } => {
-            let jid: Jid = chat_id.parse()?;
-            if let Err(e) = client.chat_actions().delete_chat(&jid, false, None).await {
-                log::warn!("Delete chat {chat_id} failed: {e:#}");
+            // WhatsApp-server delete only applies to real WA JIDs. A gm:/SMS
+            // chat_id fails to parse — previously the `?` bailed here so the row
+            // was never removed and the user got no feedback (they'd confirmed a
+            // dialog). Now the local delete + feedback always run; the WA server
+            // call is attempted only for a valid JID.
+            if let Ok(jid) = chat_id.parse::<Jid>() {
+                if let Err(e) = client.chat_actions().delete_chat(&jid, false, None).await {
+                    log::warn!("Delete chat {chat_id} failed: {e:#}");
+                }
             }
             {
                 let mut s = state.lock().unwrap();
