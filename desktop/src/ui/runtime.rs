@@ -986,45 +986,125 @@ fn names_from_messages(msgs: &[crate::bridge::IncomingMessage]) -> Option<String
     }
 }
 
-/// Replace @JID mentions in message text with @DisplayName.
-fn resolve_mentions(text: &str, s: &RuntimeState) -> String {
-    let mut result = text.to_string();
-    let words: Vec<&str> = text.split_whitespace().collect();
-    for word in words {
-        if !word.starts_with('@') || word.len() < 4 {
-            continue;
-        }
-        let jid_part = &word[1..]; // strip leading @
-        if !jid_part
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-        {
-            continue;
-        }
+/// Given a raw @mention token (leading '@' already stripped), produce the
+/// best display form for it. Returns `Some(display_without_leading_at)` when
+/// the token is a resolvable/formattable JID mention, `None` when it should be
+/// left exactly as-is (not a numeric JID mention).
+///
+/// Resolution order:
+///   1. A real contact/push name (passes `is_valid_contact_name`) → that name.
+///   2. Otherwise map @lid → canonical phone JID and format as "+phone".
+///   3. Otherwise strip the "@server" suffix and show the bare number as "+num".
+fn resolve_mention_token(jid_part: &str, s: &RuntimeState) -> Option<String> {
+    // Only numeric JID mentions (e.g. "12345@lid", "12345@s.whatsapp.net",
+    // or a bare "12345"). A leading non-digit means it's already a name.
+    if !jid_part
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
+        return None;
+    }
 
-        // Try all possible JID formats for this number
-        let candidates = if jid_part.contains('@') {
-            vec![jid_part.to_string()]
-        } else {
-            vec![
-                format!("{jid_part}@lid"), // LID format (most common in mentions)
-                format!("{jid_part}@s.whatsapp.net"), // Phone format
-            ]
-        };
-        for full_jid in &candidates {
-            let name = resolve_sender_name(s, full_jid);
-            if !name.contains('@') && name != *full_jid && name.len() > 1 {
-                result = result.replace(word, &format!("@{name}"));
+    // Candidate JID formats to try for a real name.
+    let candidates = if jid_part.contains('@') {
+        vec![jid_part.to_string()]
+    } else {
+        vec![
+            format!("{jid_part}@lid"), // LID format (most common in mentions)
+            format!("{jid_part}@s.whatsapp.net"), // Phone format
+        ]
+    };
+
+    // 1. Prefer a genuine resolved name (rejects '+digits'/pure-digit/'@' via
+    //    is_valid_contact_name, so a phone-format fallback never wins here).
+    for full_jid in &candidates {
+        let name = resolve_sender_name(s, full_jid);
+        if is_valid_contact_name(&name, full_jid) {
+            return Some(name);
+        }
+    }
+
+    // 2. No real name yet — never leak a raw "@12345@lid"/"@...@s.whatsapp.net"
+    //    with its server suffix. Map @lid → phone first, then format "+phone".
+    for full_jid in &candidates {
+        if let Some(phone_jid) = lid_to_canonical_phone_jid(full_jid) {
+            let formatted = display_name_from_jid(&phone_jid);
+            if !formatted.contains('@') {
+                return Some(formatted);
+            }
+        }
+    }
+
+    // 3. Last resort: format whatever number we have (strips "@server").
+    let formatted = display_name_from_jid(&candidates[0]);
+    if !formatted.contains('@') {
+        return Some(formatted);
+    }
+    // Even display_name couldn't format it — strip the server suffix manually
+    // so the user never sees the raw "@lid"/"@s.whatsapp.net" tail.
+    let bare = jid_part.split('@').next().unwrap_or(jid_part);
+    Some(format!("+{bare}"))
+}
+
+/// Replace @JID mentions in message text with @DisplayName.
+///
+/// Walks the text token-by-token (preserving original whitespace) instead of
+/// doing a global substring `replace`, so one mention token can never mangle
+/// another when one is a substring of the other.
+fn resolve_mentions(text: &str, s: &RuntimeState) -> String {
+    let mut result = String::with_capacity(text.len());
+    // Split on whitespace boundaries while keeping the separators intact.
+    let mut rest = text;
+    while !rest.is_empty() {
+        // Emit any leading whitespace verbatim.
+        let ws_end = rest
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(rest.len());
+        if ws_end > 0 {
+            result.push_str(&rest[..ws_end]);
+            rest = &rest[ws_end..];
+            if rest.is_empty() {
                 break;
             }
         }
+        // Grab the next whitespace-delimited token.
+        let tok_end = rest
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(rest.len());
+        let word = &rest[..tok_end];
+        rest = &rest[tok_end..];
+
+        if word.starts_with('@') && word.len() >= 4 {
+            let jid_part = &word[1..]; // strip leading @
+            if let Some(display) = resolve_mention_token(jid_part, s) {
+                result.push('@');
+                result.push_str(&display);
+                continue;
+            }
+        }
+        result.push_str(word);
     }
     result
 }
 
 // ── Shared runtime state ──────────────────────────────────────────────────────
+
+/// Provenance/priority of a stored contact name. A higher-priority source may
+/// overwrite a lower-priority one, but never the reverse — so a sender's
+/// self-chosen WhatsApp push_name can't clobber the user's phonebook name.
+///
+/// Ordering matters: `Phonebook` > `PushName` > `History`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NameSource {
+    /// Name inferred from history-sync/typing/other low-confidence paths.
+    History,
+    /// Sender's self-chosen WhatsApp display name (`push_name`).
+    PushName,
+    /// The user's own phonebook / app-state ContactUpdate name — always wins.
+    Phonebook,
+}
 
 struct RuntimeState {
     /// Authoritative in-memory chat list — ALL writes go through upsert_chat/rename_chat.
@@ -1051,6 +1131,12 @@ struct RuntimeState {
     /// Names from app-state ContactUpdate (phonebook sync) — highest-priority name source.
     /// Separate from chat_names so we never mistake a saved phone-number for a real name.
     contact_names: HashMap<String, String>,
+    /// Provenance of each `contact_names` entry, so a lower-priority source
+    /// (e.g. a sender's push_name) can never overwrite a higher-priority one
+    /// (e.g. the user's phonebook name). Entries loaded from disk have unknown
+    /// provenance and are treated as `History` (lowest) so any live update may
+    /// correct them. Not persisted — rebuilt from live events each session.
+    contact_name_sources: HashMap<String, NameSource>,
     /// Channel for async disk flusher — send a snapshot whenever chats change.
     /// Using watch so rapid updates coalesce: only the latest version hits disk.
     save_tx: std::sync::mpsc::Sender<Vec<ChatSummary>>,
@@ -1124,6 +1210,7 @@ impl RuntimeState {
             lid_to_phone,
             phone_to_lid,
             contact_names,
+            contact_name_sources: HashMap::new(),
             save_tx,
             msg_save_tx,
             own_phone: String::new(),
@@ -1217,22 +1304,44 @@ impl RuntimeState {
         }
     }
 
-    fn record_contact_name(&mut self, jid: &str, name: &str, also_jid: Option<&str>) -> bool {
+    fn record_contact_name(
+        &mut self,
+        jid: &str,
+        name: &str,
+        also_jid: Option<&str>,
+        source: NameSource,
+    ) -> bool {
         if !is_valid_contact_name(name, jid) {
             return false;
         }
+        // Refuse to overwrite an entry recorded from a strictly higher-priority
+        // source (e.g. a push_name must not clobber a phonebook name). Entries
+        // with no tracked provenance (loaded from disk) default to History
+        // (lowest) so any live source may correct them.
+        let may_write = |sources: &HashMap<String, NameSource>, key: &str| -> bool {
+            let existing = sources.get(key).copied().unwrap_or(NameSource::History);
+            source >= existing
+        };
         let mut changed = false;
-        if self.contact_names.get(jid).map(|n| n.as_str()) != Some(name) {
-            self.contact_names.insert(jid.to_string(), name.to_string());
-            changed = true;
+        if may_write(&self.contact_name_sources, jid) {
+            if self.contact_names.get(jid).map(|n| n.as_str()) != Some(name) {
+                self.contact_names.insert(jid.to_string(), name.to_string());
+                changed = true;
+            }
+            // Upgrade the tracked provenance even when the name text is
+            // unchanged, so a later lower-priority source can't overwrite it.
+            self.contact_name_sources.insert(jid.to_string(), source);
         }
         if let Some(alt) = also_jid {
             if !alt.is_empty()
                 && is_valid_contact_name(name, alt)
-                && self.contact_names.get(alt).map(|n| n.as_str()) != Some(name)
+                && may_write(&self.contact_name_sources, alt)
             {
-                self.contact_names.insert(alt.to_string(), name.to_string());
-                changed = true;
+                if self.contact_names.get(alt).map(|n| n.as_str()) != Some(name) {
+                    self.contact_names.insert(alt.to_string(), name.to_string());
+                    changed = true;
+                }
+                self.contact_name_sources.insert(alt.to_string(), source);
             }
             // Store LID→phone mapping whenever we have both JIDs
             if !alt.is_empty() {
@@ -1276,7 +1385,14 @@ impl RuntimeState {
             let prev = self.read_watermarks.get(chat_id).copied().unwrap_or(0);
             if watermark > prev {
                 self.read_watermarks.insert(chat_id.to_string(), watermark);
-                save_read_watermarks(&self.read_watermarks);
+                // Offload the bincode-serialize + std::fs::write to a background
+                // thread instead of doing it synchronously under the state lock
+                // (this runs on a tokio worker and, for auto-mark-read chats,
+                // fires on nearly every incoming message). The watermark map is
+                // small, so the snapshot clone is cheap — matching how
+                // save_lid_phone_map / save_contact_names are already offloaded.
+                let snapshot = self.read_watermarks.clone();
+                std::thread::spawn(move || save_read_watermarks(&snapshot));
                 changed = true;
             }
         }
@@ -1784,26 +1900,13 @@ async fn run_inner(
         });
     }
 
-    // Spawn suspend/resume detector — watches for wall-clock drift that indicates
-    // the system was sleeping. On wake, forces a disconnect+reconnect to re-sync.
-    let (wake_tx, mut wake_rx) = tokio::sync::mpsc::channel::<()>(1);
-    tokio::spawn(async move {
-        let check_interval = std::time::Duration::from_secs(5);
-        loop {
-            let before = std::time::Instant::now();
-            tokio::time::sleep(check_interval).await;
-            let elapsed = before.elapsed();
-            // If a 5s sleep took >15s, the system was likely suspended
-            if elapsed > std::time::Duration::from_secs(15) {
-                log::info!(
-                    "Suspend/resume detected: {}s sleep took {}s",
-                    check_interval.as_secs(),
-                    elapsed.as_secs()
-                );
-                let _ = wake_tx.send(()).await;
-            }
-        }
-    });
+    // NOTE: A wall-clock suspend/resume detector used to live here (a 5s sleep
+    // that fired a wake→force_reconnect when it overshot by >15s). It has been
+    // removed because the client keepalive loop already has an identical
+    // wall-clock suspend detector (src/keepalive.rs: `wall_elapsed_ms >
+    // expected_ms + 15_000` → reconnect_immediately()). Running both meant a
+    // single wake tore the connection down twice in quick succession — the
+    // keepalive path is now the single source of truth for suspend detection.
 
     loop {
         tokio::select! {
@@ -1816,14 +1919,6 @@ async fn run_inner(
                         log::warn!("Command error: {e:#}");
                     }
                 });
-            }
-            Some(_) = wake_rx.recv() => {
-                log::info!("System resumed from suspend — forcing reconnect");
-                // Spawn instead of awaiting — force_reconnect() sends a WebSocket
-                // close frame which can hang on a stale TCP socket after suspend.
-                // Spawning keeps this select loop responsive for commands.
-                let c = client.clone();
-                tokio::spawn(async move { c.force_reconnect().await; });
             }
             _ = &mut bot_handle => { break; }
         }
@@ -3415,6 +3510,34 @@ async fn handle_wa_event(
                     .iter()
                     .find(|c| c.id == chat_id)
                     .cloned();
+
+                // If a history-synced group ended up with a raw JID or a
+                // "Alice, Bob, …" participant-name placeholder (no subject in
+                // the proto), fetch the real subject now — mirroring the
+                // live-new-group path — so it doesn't stay on the placeholder
+                // until the chat is reopened. fetch_group_subject only renames
+                // when the server returns a non-empty subject, so this is a
+                // safe no-op for correctly-named groups.
+                if let Some(s) = &persisted {
+                    if s.id.ends_with("@g.us") {
+                        let n = &s.name;
+                        let looks_raw = n.contains('@')
+                            || (n.chars().all(|c| c.is_ascii_digit() || c == '+') && n.len() > 4);
+                        // group_name_from_history placeholders end with "…"
+                        // ("Karim Valji, Lorne, …"); treat those as unresolved.
+                        let looks_placeholder = n.ends_with('\u{2026}');
+                        if looks_raw || looks_placeholder {
+                            let c = client.clone();
+                            let st = state.clone();
+                            let t = tx.clone();
+                            let gid = s.id.clone();
+                            tokio::spawn(async move {
+                                fetch_group_subject(&c, &st, &t, &gid).await;
+                            });
+                        }
+                    }
+                }
+
                 match persisted {
                     Some(s) => WaEvent::ChatAdded(s),
                     None => return,
@@ -3496,14 +3619,22 @@ async fn handle_wa_event(
             let name = update.new_push_name.clone();
             if !name.is_empty() {
                 // Store in contact_names (persisted) so it survives restarts,
-                // and rename any already-loaded chat.
-                let names_snapshot = {
+                // and rename any already-loaded chat. push_name is a LOWER
+                // priority source than the user's phonebook name — record_contact_name
+                // refuses the write (returns false) when a phonebook entry already
+                // exists, and in that case we must NOT emit ChatNameUpdated (which
+                // routes through the authoritative path and would clobber the UI).
+                let (wrote, names_snapshot) = {
                     let mut s = state.lock().unwrap();
-                    s.record_contact_name(&chat_id, &name, None);
-                    s.contact_names.clone()
+                    let wrote = s.record_contact_name(&chat_id, &name, None, NameSource::PushName);
+                    (wrote, s.contact_names.clone())
                 };
-                tokio::task::spawn_blocking(move || save_contact_names(&names_snapshot));
-                WaEvent::ChatNameUpdated { chat_id, name }
+                if wrote {
+                    tokio::task::spawn_blocking(move || save_contact_names(&names_snapshot));
+                    WaEvent::ChatNameUpdated { chat_id, name }
+                } else {
+                    return;
+                }
             } else {
                 return;
             }
@@ -3538,12 +3669,14 @@ async fn handle_wa_event(
             // phonebook name from the user's contacts should always win.
             let (names_snapshot, resolved_phone) = {
                 let mut s = state.lock().unwrap();
+                // Phonebook is the highest-priority source (see NameSource) —
+                // it always wins over push_names captured from messages.
                 // 1. Primary LID
-                s.record_contact_name(&lid_jid, &name, None);
+                s.record_contact_name(&lid_jid, &name, None, NameSource::Phonebook);
                 // 2. Explicit phone JID from ContactAction
                 let mut phone = phone_jid.clone();
                 if !phone.is_empty() {
-                    s.record_contact_name(&phone, &name, None);
+                    s.record_contact_name(&phone, &name, None, NameSource::Phonebook);
                     if lid_jid.ends_with("@lid") {
                         s.insert_lid_phone(lid_jid.clone(), phone.clone());
                     }
@@ -3553,7 +3686,7 @@ async fn handle_wa_event(
                 //    LID, leaving phone-JID chats unresolved)
                 if phone.is_empty() && lid_jid.ends_with("@lid") {
                     if let Some(mapped) = s.lid_to_phone.get(&lid_jid).cloned() {
-                        s.record_contact_name(&mapped, &name, None);
+                        s.record_contact_name(&mapped, &name, None, NameSource::Phonebook);
                         phone = mapped;
                     }
                 }
@@ -3567,12 +3700,12 @@ async fn handle_wa_event(
                 };
                 let lid_base = strip_dev(&lid_jid);
                 if lid_base != lid_jid {
-                    s.record_contact_name(&lid_base, &name, None);
+                    s.record_contact_name(&lid_base, &name, None, NameSource::Phonebook);
                 }
                 if !phone.is_empty() {
                     let phone_base = strip_dev(&phone);
                     if phone_base != phone {
-                        s.record_contact_name(&phone_base, &name, None);
+                        s.record_contact_name(&phone_base, &name, None, NameSource::Phonebook);
                     }
                 }
                 (s.contact_names.clone(), phone)
@@ -3709,24 +3842,81 @@ async fn handle_wa_event(
                 resolve_sender_name(&s, &resolved)
             };
 
+            // Resolve the actor (admin/user who triggered the change) to a name.
+            // `participant` may be @lid — resolve() already runs it through
+            // lid_to_phone + resolve_sender_name and maps self→"You".
+            let actor_name: Option<String> = update.participant.as_ref().map(|p| resolve(p));
+            // Digits of the actor JID (both raw and phone-mapped) so we can tell
+            // a self-leave ("Bob left") from an admin-kick ("Alice removed Bob").
+            let actor_digits: Option<String> = update.participant.as_ref().map(|p| {
+                p.to_string().chars().filter(|c| c.is_ascii_digit()).collect()
+            });
+            let same_person = |info: &wacore::stanza::groups::GroupParticipantInfo| -> bool {
+                let Some(ad) = actor_digits.as_ref() else {
+                    return false;
+                };
+                if ad.is_empty() {
+                    return false;
+                }
+                let jd: String = info
+                    .jid
+                    .to_string()
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect();
+                let pd: String = info
+                    .phone_number
+                    .as_ref()
+                    .map(|p| p.to_string().chars().filter(|c| c.is_ascii_digit()).collect())
+                    .unwrap_or_default();
+                &jd == ad || (!pd.is_empty() && &pd == ad)
+            };
+
             let text = match &update.action {
                 GroupNotificationAction::Add { participants, .. } => {
                     let names: Vec<String> = participants.iter().map(|p| resolve(&p.jid)).collect();
-                    format!("Added {}", names.join(", "))
+                    match &actor_name {
+                        Some(actor) => format!("{actor} added {}", names.join(", ")),
+                        None => format!("Added {}", names.join(", ")),
+                    }
                 }
                 GroupNotificationAction::Remove { participants, .. } => {
                     let names: Vec<String> = participants.iter().map(|p| resolve(&p.jid)).collect();
-                    format!("{} left", names.join(", "))
+                    // A member removing *themselves* is a voluntary leave; anyone
+                    // else removing them is an admin kick ("Alice removed Bob").
+                    let self_leave = participants.len() == 1
+                        && participants.first().map(|p| same_person(p)).unwrap_or(false);
+                    if self_leave {
+                        format!("{} left", names.join(", "))
+                    } else if let Some(actor) = &actor_name {
+                        format!("{actor} removed {}", names.join(", "))
+                    } else {
+                        format!("{} was removed", names.join(", "))
+                    }
                 }
                 GroupNotificationAction::Promote { participants } => {
                     let names: Vec<String> = participants.iter().map(|p| resolve(&p.jid)).collect();
-                    format!("{} is now an admin", names.join(", "))
+                    match &actor_name {
+                        Some(actor) => format!("{actor} made {} an admin", names.join(", ")),
+                        None => format!("{} is now an admin", names.join(", ")),
+                    }
                 }
                 GroupNotificationAction::Demote { participants } => {
                     let names: Vec<String> = participants.iter().map(|p| resolve(&p.jid)).collect();
-                    format!("{} is no longer an admin", names.join(", "))
+                    match &actor_name {
+                        Some(actor) => format!("{actor} removed {} as admin", names.join(", ")),
+                        None => format!("{} is no longer an admin", names.join(", ")),
+                    }
                 }
-                GroupNotificationAction::Modify { .. } => "Group info was updated".to_string(),
+                GroupNotificationAction::Modify { participants } => {
+                    // wacore documents <modify> as "Member changed phone number".
+                    let names: Vec<String> = participants.iter().map(|p| resolve(&p.jid)).collect();
+                    if names.is_empty() {
+                        "A member changed their phone number".to_string()
+                    } else {
+                        format!("{} changed their phone number", names.join(", "))
+                    }
+                }
                 GroupNotificationAction::Subject { subject, .. } => {
                     // Falling through (not returning early) lets the member-refresh
                     // spawn below also rename the chat live via get_metadata.
@@ -3955,8 +4145,18 @@ fn persist_new_message(
         let history = s.history.entry(chat_id.clone()).or_default();
         let msg_is_new = !history.iter().any(|x| x.id == m.id);
         if msg_is_new {
-            history.push(m.clone());
-            history.sort_by_key(|msg| msg.timestamp);
+            // Insert in sorted position instead of push+full-resort. History is
+            // already sorted by timestamp; the common case (a message newer than
+            // everything present) is an O(1) push, and an out-of-order message
+            // (older, e.g. from history backfill) is a single binary-search
+            // insert — avoiding the O(n log n) re-sort of the whole Vec on
+            // every append in a large, active group.
+            if history.last().map(|last| m.timestamp >= last.timestamp).unwrap_or(true) {
+                history.push(m.clone());
+            } else {
+                let idx = history.partition_point(|x| x.timestamp <= m.timestamp);
+                history.insert(idx, m.clone());
+            }
         }
 
         // Queue disk write on background thread — non-blocking
@@ -4057,9 +4257,12 @@ fn persist_new_message(
     persist_chat(state, summary);
 
     if name_is_new && !is_group {
+        // resolved_name here is a sender push_name derived from the message —
+        // lower priority than the phonebook, so it must not clobber a saved
+        // ContactUpdate name.
         let names_snapshot = {
             let mut s = state.lock().unwrap();
-            s.record_contact_name(&chat_id, &resolved_name, None);
+            s.record_contact_name(&chat_id, &resolved_name, None, NameSource::PushName);
             s.contact_names.clone()
         };
         // Disk write on background — don't block the async runtime
@@ -8354,15 +8557,30 @@ async fn fetch_and_update_group_names(
                     .await;
             }
 
-            // Individually query unresolved groups — limit to 5 to avoid long delays
+            // Individually query groups whose name is STILL unresolved after the
+            // get_participating pass — i.e. a raw JID or a "Alice, Bob, …"
+            // participant-name placeholder. Narrowing to genuinely-unresolved
+            // groups (rather than a blanket first-N) means every group that
+            // needs a name eventually gets one; a small delay between queries
+            // rate-limits so we don't burst the server on large accounts.
             let unresolved: Vec<String> = {
                 let s = state.lock().unwrap();
                 s.chats
                     .iter()
                     .filter(|c| c.id.ends_with("@g.us"))
                     .filter(|c| !resolved_ids.contains(&c.id))
+                    .filter(|c| {
+                        let n = &c.name;
+                        let looks_raw = n.contains('@')
+                            || (n.chars().all(|ch| ch.is_ascii_digit() || ch == '+')
+                                && n.len() > 4);
+                        looks_raw || n.ends_with('\u{2026}')
+                    })
                     .map(|c| c.id.clone())
-                    .take(20)
+                    // Cap kept generous (was 20) but bounded so a huge account
+                    // can't spin for minutes on connect; remaining groups also
+                    // self-correct via the JoinedGroup fetch_group_subject path.
+                    .take(100)
                     .collect()
             };
             if !unresolved.is_empty() {
@@ -8387,6 +8605,8 @@ async fn fetch_and_update_group_names(
                             }
                             Err(e) => log::debug!("Failed to query group {gid}: {e:#}"),
                         }
+                        // Light rate-limit between individual metadata queries.
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                     }
                 }
             }

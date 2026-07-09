@@ -72,6 +72,15 @@ pub struct ContactEntry {
     /// to a phone.
     #[serde(default)]
     pub lid_jids: HashSet<String>,
+    /// Trust tier of the source that set the current `name` (see
+    /// `source_priority`). Higher = more authoritative (phonebook/contacts
+    /// beats push-name/history beats typing). A higher-tier name is never
+    /// overwritten by a lower-tier one regardless of length; length/word
+    /// heuristics only tiebreak WITHIN the same tier. Defaults to 0 so
+    /// entries persisted before this field existed are treated as the
+    /// lowest tier and can be upgraded by any real source.
+    #[serde(default)]
+    pub name_priority: u8,
 }
 
 impl ContactEntry {
@@ -186,6 +195,12 @@ impl ContactDirectory {
         if digits.is_empty() {
             return;
         }
+        // A LID JID's numeric part is an opaque server id, not a phone number.
+        // Store the entry keyed by its digits (so an explicit lid→phone
+        // mapping can still find it), but do NOT register it in the
+        // phone-suffix indices — that would let a real phone number fuzzy-match
+        // the LID number and resolve to the wrong contact.
+        let is_lid_key = key.ends_with("@lid");
         let mut inner = match self.inner.write() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -195,6 +210,7 @@ impl ContactDirectory {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let new_has_alpha = name.chars().any(|c| c.is_alphabetic());
+        let new_priority = source_priority(source);
 
         let was_new = !inner.by_digits.contains_key(&digits);
         let entry = inner
@@ -207,37 +223,61 @@ impl ContactDirectory {
         let mut changed = false;
         if entry.name != name {
             let existing_alpha = entry.has_alphabetic();
+            let existing_priority = entry.name_priority;
             let upgrade = match (existing_alpha, new_has_alpha) {
-                // Don't downgrade alpha → numeric.
+                // Don't downgrade alpha → numeric, even from a higher-trust
+                // source: a numeric string is never a real name.
                 (true, false) => false,
-                // Upgrade numeric → alpha.
+                // Upgrade numeric → alpha (a real name always beats a
+                // placeholder number).
                 (false, true) => true,
-                // Both alphabetic: prefer the LONGER name. Typing events
-                // often emit just a first name or initial (e.g. "S"),
-                // which would otherwise stomp the full saved-contact
-                // name. Length is a coarse proxy for "more complete".
+                // Both alphabetic. Source trust dominates: a phonebook name
+                // must never be shadowed by a longer typing/history/push name,
+                // and vice-versa a higher-trust name always replaces a
+                // lower-trust one regardless of length. Length/word-count is
+                // only a tiebreak WITHIN the same tier (typing events often
+                // emit just a first name or initial like "S", which would
+                // otherwise stomp the full saved-contact name).
                 (true, true) => {
-                    let existing_words = entry.name.split_whitespace().count();
-                    let new_words = name.split_whitespace().count();
-                    if new_words > existing_words {
+                    if new_priority > existing_priority {
                         true
-                    } else if new_words == existing_words {
-                        name.len() > entry.name.len()
-                    } else {
+                    } else if new_priority < existing_priority {
                         false
+                    } else {
+                        let existing_words = entry.name.split_whitespace().count();
+                        let new_words = name.split_whitespace().count();
+                        if new_words > existing_words {
+                            true
+                        } else if new_words == existing_words {
+                            name.len() > entry.name.len()
+                        } else {
+                            false
+                        }
                     }
                 }
-                // Both numeric: tiebreak by recency.
-                (false, false) => now >= entry.updated_at,
+                // Both numeric placeholders: higher tier wins, else recency.
+                (false, false) => {
+                    new_priority > existing_priority
+                        || (new_priority == existing_priority && now >= entry.updated_at)
+                }
             };
             if upgrade {
                 entry.name = name.to_string();
                 entry.updated_at = now;
+                entry.name_priority = new_priority;
                 changed = true;
             }
+        } else if new_priority > entry.name_priority {
+            // Same name arriving from a more authoritative source: raise the
+            // stored tier so a later longer-but-lower-trust name can't
+            // override this now-confirmed phonebook name.
+            entry.name_priority = new_priority;
+            changed = true;
         }
         if was_new {
-            inner.add_indices(&digits);
+            if !is_lid_key {
+                inner.add_indices(&digits);
+            }
             changed = true;
         }
         if changed {
@@ -270,6 +310,9 @@ impl ContactDirectory {
                 sources: HashSet::new(),
                 chat_ids: std::collections::HashMap::new(),
                 lid_jids: HashSet::new(),
+                // Placeholder name (a raw LID JID), lowest tier — any real
+                // source can upgrade it.
+                name_priority: 0,
             }
         });
         if entry.lid_jids.insert(lid_jid.to_string()) {
@@ -315,6 +358,9 @@ impl ContactDirectory {
                 sources: HashSet::new(),
                 chat_ids: std::collections::HashMap::new(),
                 lid_jids: HashSet::new(),
+                // Placeholder name (a raw chat_id), lowest tier — any real
+                // source can upgrade it.
+                name_priority: 0,
             }
         });
         entry.sources.insert(source.to_string());
@@ -326,8 +372,9 @@ impl ContactDirectory {
             }
         }
         // Make sure the secondary indices know about this digit string
-        // even if no name was inserted yet.
-        if digits.len() >= 10 {
+        // even if no name was inserted yet. Skip LID keys — their opaque
+        // numeric part must never pollute the phone-suffix indices.
+        if !phone_key.ends_with("@lid") && digits.len() >= 10 {
             let s10 = digits[digits.len() - 10..].to_string();
             if !inner.by_suffix_10.contains_key(&s10) {
                 inner.add_indices(&digits);
@@ -386,11 +433,18 @@ impl ContactDirectory {
             Err(e) => e.into_inner(),
         };
         // 0. LID JID lookup — `137340286709870@lid` → resolved phone digits.
-        if key.ends_with("@lid")
-            && let Some(canonical_digits) = inner.by_lid.get(key)
-            && let Some(entry) = inner.by_digits.get(canonical_digits)
-        {
-            return Some(entry.clone());
+        // A LID's numeric part is an opaque ~15-digit server id, NOT a phone
+        // number. If we have an explicit lid→phone mapping, use it; otherwise
+        // bail out. We must NOT fall through to digits/suffix matching, or the
+        // LID number gets fuzzy-matched (by last-10/last-7) against a real
+        // phone and attributes the message to a completely unrelated contact.
+        if key.ends_with("@lid") {
+            if let Some(canonical_digits) = inner.by_lid.get(key)
+                && let Some(entry) = inner.by_digits.get(canonical_digits)
+            {
+                return Some(entry.clone());
+            }
+            return None;
         }
         let digits = digits_only(key);
         if digits.is_empty() {
@@ -477,7 +531,45 @@ fn inner_default_entry(name: &str, now: u64, source: &str) -> ContactEntry {
         sources,
         chat_ids: std::collections::HashMap::new(),
         lid_jids: HashSet::new(),
+        name_priority: source_priority(source),
     }
+}
+
+/// Trust tier for a name source. Higher wins. A name from a higher tier is
+/// never overwritten by a lower tier (regardless of length), so a saved
+/// phonebook contact name can't be shadowed by a longer typing/history/
+/// push-name string.
+///
+///   2 — phonebook / saved contacts (authoritative): the WhatsApp contacts
+///       map, Google Messages ListContacts, lid→phone contact names, and any
+///       explicit user rename / ContactUpdate (tags containing "contact" or
+///       tagged "whatsapp"/"gmessages").
+///   1 — message-derived / push names (e.g. a sender's self-chosen display
+///       name learned from an incoming message).
+///   0 — ephemeral / low-trust (typing events) and unknown sources.
+pub fn source_priority(source: &str) -> u8 {
+    // Message/push sources first, so a "gmessages-msg" tag isn't caught by the
+    // broad "gmessages" phonebook check below.
+    if source.contains("msg")
+        || source.contains("push")
+        || source.contains("history")
+        || source.contains("sender")
+    {
+        return 1;
+    }
+    if source == "typing" {
+        return 0;
+    }
+    if source.contains("contact")
+        || source == "whatsapp"
+        || source == "gmessages"
+        || source == "whatsapp-lid-phone"
+    {
+        return 2;
+    }
+    // Unknown / unclassified source: treat as low trust so it can be upgraded
+    // but doesn't stomp a phonebook name.
+    0
 }
 
 /// Strip everything that isn't a digit. Strips leading `+`, parens,
@@ -630,5 +722,88 @@ mod tests {
             dir.lookup("137340286709870@lid").as_deref(),
             Some("Joe Mysak"),
         );
+    }
+
+    #[test]
+    fn unmapped_lid_never_fuzzy_matches_a_phone_contact() {
+        // A LID's numeric part is an opaque ~15-digit server id, not a phone.
+        // It must NOT resolve to an unrelated contact via last-10/last-7
+        // suffix fuzzy matching.
+        let dir = ContactDirectory::new();
+        dir.insert("14164000790", "Lorne", "whatsapp");
+        // Craft a LID whose last 10 digits collide with Lorne's number.
+        let lid = "999994164000790@lid"; // last 10 = 4164000790
+        assert_eq!(dir.lookup(lid), None);
+    }
+
+    #[test]
+    fn inserting_by_lid_key_does_not_pollute_phone_suffix_index() {
+        // The typing self-heal can call insert(&chat_id, ...) where chat_id
+        // is a raw @lid. That must not register the LID number in the
+        // phone-suffix indices, or a real phone lookup could fuzzy-match it.
+        let dir = ContactDirectory::new();
+        dir.insert("137340286709870@lid", "Ghost", "typing");
+        // A phone whose last-10 digits equal the LID number's last-10
+        // ("6286709870") must NOT fuzzy-match "Ghost".
+        assert_eq!(dir.lookup("15556286709870"), None);
+        assert_eq!(dir.lookup("6286709870"), None);
+        // Looking up the raw LID still works only via an explicit lid→phone
+        // mapping (which we never recorded here), so it stays None too.
+        assert_eq!(dir.lookup("137340286709870@lid"), None);
+    }
+
+    #[test]
+    fn phonebook_name_not_shadowed_by_longer_low_trust_name() {
+        // Core longer-name-heuristic bug: a longer string from a low-trust
+        // source (typing/history/push) must NOT lock out a shorter phonebook
+        // name, in either insertion order.
+        let dir = ContactDirectory::new();
+        // Low-trust longer name arrives first.
+        dir.insert("14165551234", "Craigy🔥 the Best", "gmessages-msg");
+        // Phonebook contact name (shorter) arrives later — should win.
+        dir.insert("14165551234", "Craig Thompson", "gmessages");
+        assert_eq!(dir.lookup("14165551234").as_deref(), Some("Craig Thompson"));
+    }
+
+    #[test]
+    fn low_trust_longer_name_cannot_override_phonebook() {
+        // Reverse order: phonebook name first, then a longer low-trust push
+        // name — the phonebook name must stick.
+        let dir = ContactDirectory::new();
+        dir.insert("14165551234", "Craig Thompson", "gmessages");
+        dir.insert("14165551234", "Craigy🔥 the Legend", "gmessages-msg");
+        assert_eq!(dir.lookup("14165551234").as_deref(), Some("Craig Thompson"));
+    }
+
+    #[test]
+    fn same_tier_still_prefers_longer_name() {
+        // Within the same trust tier the length/word heuristic still applies.
+        let dir = ContactDirectory::new();
+        dir.insert("14165550000", "Saad", "gmessages");
+        dir.insert("14165550000", "Saad Suleman", "whatsapp");
+        assert_eq!(dir.lookup("14165550000").as_deref(), Some("Saad Suleman"));
+    }
+
+    #[test]
+    fn confirmed_name_from_authoritative_source_blocks_later_low_trust() {
+        // Same name confirmed by a phonebook source raises its tier so a
+        // later longer low-trust name can't override it.
+        let dir = ContactDirectory::new();
+        dir.insert("14165559999", "Bob", "typing"); // tier 0
+        dir.insert("14165559999", "Bob", "gmessages"); // confirm → tier 2
+        dir.insert("14165559999", "Bob Longer Nickname", "typing"); // tier 0
+        assert_eq!(dir.lookup("14165559999").as_deref(), Some("Bob"));
+    }
+
+    #[test]
+    fn source_priority_tiers() {
+        assert_eq!(source_priority("gmessages"), 2);
+        assert_eq!(source_priority("whatsapp"), 2);
+        assert_eq!(source_priority("whatsapp-listcontacts"), 2);
+        assert_eq!(source_priority("whatsapp-lid-phone"), 2);
+        assert_eq!(source_priority("gmessages-msg"), 1);
+        assert_eq!(source_priority("push-name"), 1);
+        assert_eq!(source_priority("typing"), 0);
+        assert_eq!(source_priority("unknown-src"), 0);
     }
 }

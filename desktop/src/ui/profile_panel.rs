@@ -49,6 +49,9 @@ struct ProfileInner {
     bridge: Arc<Bridge>,
     share_btn: Button,
     current_chat_id: RefCell<Option<String>>,
+    /// Last group subject loaded into the entry, used to skip re-sending
+    /// SetGroupSubject on focus-out when the text is unchanged.
+    loaded_group_subject: RefCell<String>,
     /// Cached group profiles to avoid re-fetching on reopen
     cached_group_profiles: RefCell<
         std::collections::HashMap<String, (String, Option<String>, Vec<GroupMember>, bool)>,
@@ -369,6 +372,7 @@ impl ProfilePanel {
             bridge,
             share_btn,
             current_chat_id: RefCell::new(None),
+            loaded_group_subject: RefCell::new(String::new()),
             cached_group_profiles: RefCell::new(std::collections::HashMap::new()),
             on_chat_selected: RefCell::new(None),
         });
@@ -380,14 +384,23 @@ impl ProfilePanel {
                 let inner_c = inner.clone();
                 move || {
                     let new_name = inner_c.group_name_entry.text().to_string();
-                    if new_name.trim().is_empty() {
+                    let trimmed = new_name.trim();
+                    if trimmed.is_empty() {
+                        return;
+                    }
+                    // Only send if the subject actually changed vs what was loaded,
+                    // so merely focusing in/out of the field doesn't re-send it.
+                    if trimmed == inner_c.loaded_group_subject.borrow().trim() {
                         return;
                     }
                     if let Some(chat_id) = inner_c.current_chat_id.borrow().clone() {
                         inner_c.bridge.send_command(WaCommand::SetGroupSubject {
                             chat_id,
-                            subject: new_name.trim().to_string(),
+                            subject: trimmed.to_string(),
                         });
+                        // Treat the new value as loaded so a subsequent focus-out
+                        // without further edits doesn't send it again.
+                        *inner_c.loaded_group_subject.borrow_mut() = trimmed.to_string();
                     }
                 }
             };
@@ -633,6 +646,9 @@ impl ProfilePanel {
         if is_current {
             self.inner.name_label.set_text(name);
             self.inner.group_name_entry.set_text(name);
+            // Keep the dirty-check baseline in sync with the server-pushed name
+            // so a live rename isn't echoed back on the next focus-out.
+            *self.inner.loaded_group_subject.borrow_mut() = name.to_string();
         }
     }
 
@@ -669,6 +685,11 @@ impl ProfilePanel {
         inner.leave_group_btn.set_visible(false);
         inner.disappearing_section.set_visible(false);
 
+        // Share Contact only makes sense for an individual contact — not for the
+        // own profile or a group (their name/subtitle aren't a real phone number,
+        // which would produce a broken vCard). Shown again in the individual branch.
+        inner.share_btn.set_visible(false);
+
         if chat_id == "self" {
             // Own profile — editable
             inner.header_title.set_text("Your Profile");
@@ -685,6 +706,7 @@ impl ProfilePanel {
             inner.name_label.set_visible(false);
             inner.group_name_row.set_visible(true);
             inner.group_name_entry.set_text(chat_name);
+            *inner.loaded_group_subject.borrow_mut() = chat_name.to_string();
             inner.subtitle_label.set_text("Group");
             inner.members_section.set_visible(true);
             inner.groups_section.set_visible(false);
@@ -708,6 +730,7 @@ impl ProfilePanel {
             inner.header_title.set_text("Profile");
             inner.name_label.set_visible(true);
             inner.group_name_row.set_visible(false);
+            inner.share_btn.set_visible(true);
             inner.members_section.set_visible(false);
             inner.groups_section.set_visible(true);
             inner.about_section.set_visible(true);
@@ -949,6 +972,7 @@ impl ProfilePanel {
         }
         self.inner.name_label.set_text(subject);
         self.inner.group_name_entry.set_text(subject);
+        *self.inner.loaded_group_subject.borrow_mut() = subject.to_string();
         self.inner
             .subtitle_label
             .set_text(&format!("{} members", participants.len()));

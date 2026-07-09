@@ -33,6 +33,11 @@ pub struct MessageBubble {
     media_type: Option<MediaType>,
     media_loaded: RefCell<bool>,
     on_image_click: Rc<RefCell<Option<ClickHandler>>>,
+    /// Invoked when the user taps the quoted-reply context box — chat_view wires
+    /// this to jump/scroll to the original message (mb-01).
+    on_quoted_click: Rc<RefCell<Option<ClickHandler>>>,
+    /// The message id this bubble is quoting, if it's a reply.
+    pub quoted_msg_id: Option<String>,
     avatar: libadwaita::Avatar,
     pub sender_id: String,
     /// Quick action icons + dropdown chevron (shown on hover)
@@ -54,9 +59,12 @@ pub struct MessageBubble {
     /// Contact message button — needs to be wired by chat_view
     contact_msg_btn: Option<Button>,
     /// Reference to the text label for live editing
-    text_label: Option<Label>,
+    text_label: RefCell<Option<Label>>,
     /// "(edited)" indicator label
-    edited_label: Option<Label>,
+    edited_label: RefCell<Option<Label>>,
+    /// The inner content Box — kept so update_text can lazily append a caption
+    /// label to a media-only bubble that gains text via an edit.
+    content_box: Option<Box>,
 }
 
 impl MessageBubble {
@@ -99,6 +107,8 @@ impl MessageBubble {
                 media_type: None,
                 media_loaded: RefCell::new(false),
                 on_image_click: Rc::new(RefCell::new(None)),
+                on_quoted_click: Rc::new(RefCell::new(None)),
+                quoted_msg_id: None,
                 avatar: libadwaita::Avatar::new(0, None, false),
                 sender_id: String::new(),
                 hover_actions: Box::new(Orientation::Horizontal, 0),
@@ -112,10 +122,16 @@ impl MessageBubble {
                 poll_selectable: 0,
                 contact_jid: None,
                 contact_msg_btn: None,
-                text_label: None,
-                edited_label: None,
+                text_label: RefCell::new(None),
+                edited_label: RefCell::new(None),
+                content_box: None,
             };
         }
+
+        // Callback invoked when the quoted-reply box is tapped (wired by
+        // chat_view to jump to the original message — mb-01). Created early so
+        // the reply_box gesture below can capture it.
+        let on_quoted_click: Rc<RefCell<Option<ClickHandler>>> = Rc::new(RefCell::new(None));
 
         // Row: [avatar] [bubble] or [bubble] [avatar]
         let row = Box::new(Orientation::Horizontal, 6);
@@ -270,50 +286,30 @@ impl MessageBubble {
                     thumb_loaded = true;
                 }
             }
-            // Source 2: scan wa_media/ by quoted_msg_id prefix
+            // Source 2: deterministic wa_media/{qid}.<ext> lookup.
+            // Previously this fell back to a blocking std::fs::read_dir over the
+            // ENTIRE wa_media directory (which grows with every attachment) on
+            // the GTK main thread during bubble construction — a history load of
+            // N reply bubbles was N * dir-size of blocking work. Media is stored
+            // keyed by the full quoted_msg_id, so we probe only the handful of
+            // known extensions instead of scanning the whole dir.
             if !thumb_loaded {
                 if let Some(ref qid) = msg.quoted_msg_id {
                     let media_dir = std::path::PathBuf::from("wa_media");
                     if media_dir.exists() {
-                        // Try full ID first, then prefix
-                        let full = media_dir.join(format!("{qid}.jpeg"));
-                        if full.exists() {
-                            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&full) {
-                                let thumb = gtk4::Picture::new();
-                                thumb.set_paintable(Some(&tex));
-                                thumb.set_size_request(72, 72);
-                                thumb.set_can_shrink(true);
-                                thumb.set_content_fit(gtk4::ContentFit::Cover);
-                                thumb.set_halign(Align::End);
-                                reply_box.append(&thumb);
-                                thumb_loaded = true;
-                            }
-                        }
-                        if !thumb_loaded {
-                            let prefix = &qid[..8.min(qid.len())];
-                            for entry in std::fs::read_dir(&media_dir)
-                                .into_iter()
-                                .flatten()
-                                .flatten()
-                            {
-                                let fname = entry.file_name().to_string_lossy().to_string();
-                                if fname.starts_with(prefix)
-                                    && (fname.ends_with(".jpeg")
-                                        || fname.ends_with(".jpg")
-                                        || fname.ends_with(".png")
-                                        || fname.ends_with(".webp"))
+                        for ext in ["jpeg", "jpg", "png", "webp"] {
+                            let candidate = media_dir.join(format!("{qid}.{ext}"));
+                            if candidate.exists() {
+                                if let Some(tex) =
+                                    crate::ui::texture_cache::texture_from_filename(&candidate)
                                 {
-                                    if let Some(tex) =
-                                        crate::ui::texture_cache::texture_from_filename(entry.path())
-                                    {
-                                        let thumb = gtk4::Picture::new();
-                                        thumb.set_paintable(Some(&tex));
-                                        thumb.set_size_request(72, 72);
-                                        thumb.set_can_shrink(true);
-                                        thumb.set_content_fit(gtk4::ContentFit::Cover);
-                                        thumb.set_halign(Align::End);
-                                        reply_box.append(&thumb);
-                                    }
+                                    let thumb = gtk4::Picture::new();
+                                    thumb.set_paintable(Some(&tex));
+                                    thumb.set_size_request(72, 72);
+                                    thumb.set_can_shrink(true);
+                                    thumb.set_content_fit(gtk4::ContentFit::Cover);
+                                    thumb.set_halign(Align::End);
+                                    reply_box.append(&thumb);
                                     break;
                                 }
                             }
@@ -321,6 +317,21 @@ impl MessageBubble {
                     }
                 }
             }
+
+            // Make the quoted-reply box tap-to-jump: pointer cursor + a left
+            // click gesture that fires the (chat_view-supplied) callback. Inert
+            // until wired, so on its own this only adds the cursor affordance.
+            reply_box.set_cursor_from_name(Some("pointer"));
+            let reply_gesture = GestureClick::new();
+            reply_gesture.set_button(1);
+            let quoted_cb = on_quoted_click.clone();
+            reply_gesture.connect_released(move |_, _, _, _| {
+                let borrow = quoted_cb.borrow();
+                if let Some(f) = borrow.as_ref() {
+                    f();
+                }
+            });
+            reply_box.add_controller(reply_gesture);
 
             content.append(&reply_box);
         }
@@ -402,6 +413,15 @@ impl MessageBubble {
                 // Shared refs to per-option widgets for the click handler
                 let click_widgets: Rc<RefCell<Vec<PollOptionWidgets>>> =
                     Rc::new(RefCell::new(Vec::new()));
+                // Shared, full poll-vote state (every voter, not just us) so an
+                // optimistic click MERGES our vote into everyone else's instead
+                // of wiping them (poll-vote-wipes-other-voters). Seeded from the
+                // persisted votes; the server echo later replaces it wholesale.
+                let live_votes: Rc<RefCell<Vec<(String, Vec<String>)>>> =
+                    Rc::new(RefCell::new(msg.poll_votes.clone()));
+                // Key we use for our own voter row in the local merge. Must not
+                // collide with a real voter's display name.
+                let own_vote_key = own_display_name.to_string();
 
                 for (idx, opt) in msg.poll_options.iter().enumerate() {
                     let opt_row = Box::new(Orientation::Vertical, 2);
@@ -470,6 +490,7 @@ impl MessageBubble {
                     // Click handler — update UI immediately AND send vote to WhatsApp
                     let sel = selected.clone();
                     let wdg = click_widgets.clone();
+                    let votes_state = live_votes.clone();
                     let is_single_c = is_single;
                     let bridge_c = bridge.clone();
                     let chat_id_c = msg.chat_id.clone();
@@ -482,7 +503,7 @@ impl MessageBubble {
                     let poll_secret_c = msg.poll_secret.clone();
                     let all_options = msg.poll_options.clone();
                     let total_lbl_c = total_label_rc.clone();
-                    let own_name_c = own_display_name.to_string();
+                    let own_key_c = own_vote_key.clone();
                     opt_btn.connect_clicked(move |_| {
                         let mut s = sel.borrow_mut();
                         if is_single_c {
@@ -493,61 +514,47 @@ impl MessageBubble {
                             s[idx] = !s[idx];
                         }
 
-                        let total_votes: usize = s.iter().filter(|v| **v).count();
-                        let w = wdg.borrow();
-                        for (i, pw) in w.iter().enumerate() {
-                            if s[i] {
-                                pw.radio.set_markup(
-                                    "<span size='x-large' foreground='#25D366'>●</span>",
-                                );
-                                pw.count_label.set_text("1");
-                            } else {
-                                pw.radio.set_markup(
-                                    "<span size='x-large' foreground='#8696a0'>◯</span>",
-                                );
-                                pw.count_label.set_text("");
-                            }
-                            pw.bar_track.set_visible(true);
-                            if s[i] {
-                                pw.bar_fill.set_size_request(250, 6);
-                            } else {
-                                pw.bar_fill.set_size_request(0, 6);
-                            }
-                            // Show own avatar on selected options, clear on deselected
-                            while let Some(child) = pw.voters_box.first_child() {
-                                pw.voters_box.remove(&child);
-                            }
-                            if s[i] {
-                                let av = libadwaita::Avatar::new(20, Some(&own_name_c), true);
-                                av.set_size_request(20, 20);
-                                pw.voters_box.append(&av);
+                        // Options we (locally) now have selected.
+                        let own_selected: Vec<String> = s
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| **v)
+                            .map(|(i, _)| all_options[i].clone())
+                            .collect();
+
+                        // Merge our vote into the FULL vote set: drop our old row,
+                        // re-add it with the current selection (if any). Other
+                        // voters' rows are left untouched so their counts/avatars
+                        // and proportional bars stay visible.
+                        {
+                            let mut v = votes_state.borrow_mut();
+                            v.retain(|(voter, _)| voter != &own_key_c);
+                            if !own_selected.is_empty() {
+                                v.push((own_key_c.clone(), own_selected.clone()));
                             }
                         }
 
-                        // Update total label
-                        if total_votes > 0 {
-                            total_lbl_c.set_text(&format!(
-                                "{total_votes} vote{}",
-                                if total_votes != 1 { "s" } else { "" }
-                            ));
-                        } else {
-                            total_lbl_c.set_text("0 votes");
-                        }
+                        // Re-render every option widget from the merged truth using
+                        // the shared proportional renderer (real fills, real avatars).
+                        let w = wdg.borrow();
+                        let merged = votes_state.borrow();
+                        Self::apply_votes_to_widgets(
+                            w.as_slice(),
+                            &all_options,
+                            merged.as_slice(),
+                            Some(&*total_lbl_c),
+                        );
+                        drop(merged);
+                        drop(w);
 
                         // Send vote to WhatsApp
                         if !poll_secret_c.is_empty() {
-                            let selected_names: Vec<String> = s
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, v)| **v)
-                                .map(|(i, _)| all_options[i].clone())
-                                .collect();
                             bridge_c.send_command(crate::bridge::WaCommand::VotePoll {
                                 chat_id: chat_id_c.clone(),
                                 poll_msg_id: msg_id_c.clone(),
                                 poll_creator: sender_id_c.clone(),
                                 poll_secret: poll_secret_c.clone(),
-                                selected_options: selected_names,
+                                selected_options: own_selected,
                             });
                         }
                     });
@@ -639,7 +646,9 @@ impl MessageBubble {
 
             let text_label = Label::new(None);
             let markup = format_whatsapp_markup(text);
-            text_label.set_markup(&markup);
+            // Guard against malformed markup blanking the bubble — fall back to
+            // the raw text so the message is never lost.
+            set_markup_safe(&text_label, &markup, text);
             text_label.set_use_markup(true);
 
             if is_single_emoji {
@@ -812,14 +821,16 @@ impl MessageBubble {
             url_lbl.set_max_width_chars(50);
             preview_box.append(&url_lbl);
 
-            // Click to open URL
+            // Click to open URL — route through the same hardened launcher used
+            // for files (setsid + null stdio + detached) so the preview card no
+            // longer spawns a bare, unhardened xdg-open (mb-12). save_to_downloads
+            // inside open_with_xdg no-ops for a non-file URL and falls back to
+            // opening the URL directly.
             let url_owned = url.clone();
             let gesture = GestureClick::new();
             gesture.set_button(1);
             gesture.connect_released(move |_, _, _, _| {
-                let _ = std::process::Command::new("xdg-open")
-                    .arg(&url_owned)
-                    .spawn();
+                open_with_xdg(&url_owned);
             });
             preview_box.add_controller(gesture);
             preview_box.set_cursor_from_name(Some("pointer"));
@@ -864,6 +875,8 @@ impl MessageBubble {
         chevron_btn.set_margin_end(2);
         chevron_btn.set_margin_top(2);
         chevron_btn.set_opacity(0.5);
+        // Pointer cursor so the chevron reads as a clickable control (mb-09).
+        chevron_btn.set_cursor_from_name(Some("pointer"));
 
         // Overlay the chevron on top of the bubble
         let bubble_overlay = gtk4::Overlay::new();
@@ -1001,6 +1014,9 @@ impl MessageBubble {
         // ── Hover show/hide for quick actions — disabled in forward mode ──
         let motion = gtk4::EventControllerMotion::new();
         let actions_ref = hover_actions.clone();
+        // Raise the (normally faint) chevron to full opacity on hover for
+        // discoverability; restored to 0.5 on leave (mb-09).
+        let chevron_hover = chevron_btn.clone();
         // Get widget from controller at callback time — never capture widget in its
         // own controller's closure (creates ref cycle → memory leak).
         motion.connect_enter(move |ctrl, _, _| {
@@ -1012,10 +1028,13 @@ impl MessageBubble {
                 }
             }
             actions_ref.set_visible(true);
+            chevron_hover.set_opacity(1.0);
         });
         let actions_ref2 = hover_actions.clone();
+        let chevron_leave = chevron_btn.clone();
         motion.connect_leave(move |_| {
             actions_ref2.set_visible(false);
+            chevron_leave.set_opacity(0.5);
         });
         root.add_controller(motion);
 
@@ -1028,6 +1047,8 @@ impl MessageBubble {
             media_type: msg.media_type.clone(),
             media_loaded: RefCell::new(msg.media_local_path.is_some()),
             on_image_click,
+            on_quoted_click,
+            quoted_msg_id: msg.quoted_msg_id.clone(),
             avatar,
             sender_id: if msg.is_from_me {
                 String::new()
@@ -1051,8 +1072,9 @@ impl MessageBubble {
                     .map(|waid| format!("{waid}@s.whatsapp.net"))
             }),
             contact_msg_btn: None, // Wired by chat_view after creation
-            text_label: stored_text_label,
-            edited_label: stored_edited_label,
+            text_label: RefCell::new(stored_text_label),
+            edited_label: RefCell::new(stored_edited_label),
+            content_box: Some(content),
         };
         // Paint the receipt tick from the persisted status at construction, so
         // read (blue ✓✓) history renders correctly on restart / history load —
@@ -1070,19 +1092,39 @@ impl MessageBubble {
 
     /// Update the text of this bubble (for message edits) and show "(edited)" badge.
     pub fn update_text(&self, new_text: &str, show_edited: bool) {
-        if let Some(label) = &self.text_label {
-            let markup = format_whatsapp_markup(new_text);
-            label.set_markup(&markup);
+        let markup = format_whatsapp_markup(new_text);
+        // If the bubble had no text label (a media-only / no-caption message
+        // that just gained a caption via edit), lazily create one and append it
+        // to the content box so the new text — and the "(edited)" badge below —
+        // actually appear instead of silently no-oping (edited-badge fix).
+        if self.text_label.borrow().is_none() {
+            if let Some(content) = &self.content_box {
+                let label = Label::new(None);
+                set_markup_safe(&label, &markup, new_text);
+                label.set_use_markup(true);
+                label.set_wrap(true);
+                label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                label.set_max_width_chars(48);
+                label.set_hexpand(true);
+                label.set_halign(Align::Start);
+                label.set_selectable(true);
+                label.set_xalign(0.0);
+                content.append(&label);
+                *self.text_label.borrow_mut() = Some(label);
+            }
+        } else if let Some(label) = self.text_label.borrow().as_ref() {
+            set_markup_safe(label, &markup, new_text);
         }
-        if show_edited && self.edited_label.is_none() {
+        if show_edited && self.edited_label.borrow().is_none() {
             // Add "(edited)" label next to the text
-            if let Some(text_label) = &self.text_label {
+            if let Some(text_label) = self.text_label.borrow().as_ref() {
                 if let Some(parent) = text_label.parent().and_then(|p| p.downcast::<Box>().ok()) {
                     let edited = Label::new(Some("edited"));
                     edited.add_css_class("caption");
                     edited.add_css_class("dim-label");
                     edited.set_halign(gtk4::Align::End);
                     parent.append(&edited);
+                    *self.edited_label.borrow_mut() = Some(edited);
                 }
             }
         }
@@ -1232,6 +1274,12 @@ impl MessageBubble {
     /// Called by chat_view after creation so it can pass a closure over the media list.
     pub fn set_image_click_handler(&self, f: impl Fn() + 'static) {
         *self.on_image_click.borrow_mut() = Some(std::boxed::Box::new(f));
+    }
+
+    /// Set the callback invoked when the user taps this bubble's quoted-reply
+    /// context box. chat_view wires this to scroll to `quoted_msg_id` (mb-01).
+    pub fn set_quoted_click_handler(&self, f: impl Fn() + 'static) {
+        *self.on_quoted_click.borrow_mut() = Some(std::boxed::Box::new(f));
     }
 
     pub fn update_receipt(&self, status: &ReceiptStatus) {
@@ -1678,7 +1726,10 @@ fn build_audio_widget(container: &Box, path: &str) {
     let hbox = Box::new(Orientation::Horizontal, 8);
 
     let path_owned = path.to_string();
-    let play_btn = Button::from_icon_name("media-playback-start-symbolic");
+    // Behaviour is "open in external player" (open_with_xdg), so use an
+    // open-external glyph rather than a play-triangle that implies inline
+    // playback the widget does not do (mb-10).
+    let play_btn = Button::from_icon_name("document-open-symbolic");
     play_btn.add_css_class("flat");
     play_btn.set_tooltip_text(Some("Open audio player"));
     play_btn.connect_clicked(move |_| open_with_xdg(&path_owned));
@@ -1975,6 +2026,23 @@ fn highlight_mentions(text: &str) -> String {
     result
 }
 
+/// Set Pango markup on a label, falling back to plain text if the markup is
+/// malformed. Our WhatsApp→Pango conversion can, in rare cases (e.g. a `_`/`*`/`~`
+/// delimiter opened before a URL whose href then swallows the emitted close tag),
+/// produce invalid markup. GtkLabel::set_markup on invalid input logs a g_critical
+/// and leaves the label BLANK, silently losing the whole message. Pre-validate
+/// with pango::parse_markup and, on failure, render the raw text so the message
+/// is never lost.
+fn set_markup_safe(label: &Label, markup: &str, plain: &str) {
+    // accel marker '\u{0}' disables accelerator parsing (we never use accels).
+    if gtk4::pango::parse_markup(markup, '\u{0}').is_ok() {
+        label.set_markup(markup);
+    } else {
+        log::warn!("invalid Pango markup, falling back to plain text");
+        label.set_text(plain);
+    }
+}
+
 /// Convert WhatsApp-style formatting to Pango markup.
 /// Handles: *bold*, _italic_, ~strikethrough~, @mentions (green+bold),
 /// URLs (clickable links), and preserves newlines.
@@ -2025,6 +2093,31 @@ fn apply_inline_format(text: &str, delim: char, tag: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
     while i < chars.len() {
+        // Skip over already-emitted `<a ...>...</a>` link spans verbatim. Without
+        // this, a delimiter opened earlier in the message whose matching char
+        // appears inside the href/link text would inject a close tag inside the
+        // <a> attribute, producing invalid Pango markup that blanks the bubble.
+        if chars[i] == '<' && chars[i + 1..].starts_with(&['a', ' ']) {
+            // Find the end of the closing </a>
+            let close: Vec<char> = "</a>".chars().collect();
+            let mut j = i;
+            let mut end = None;
+            while j + close.len() <= chars.len() {
+                if chars[j..j + close.len()] == close[..] {
+                    end = Some(j + close.len());
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(e) = end {
+                for &c in &chars[i..e] {
+                    result.push(c);
+                }
+                i = e;
+                last_was_open = false;
+                continue;
+            }
+        }
         if chars[i] == delim {
             // Don't match inside URLs or Pango tags
             if inside {

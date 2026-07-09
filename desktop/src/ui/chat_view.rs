@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -149,6 +149,11 @@ struct ChatViewInner {
     drafts: RefCell<HashMap<String, String>>,
     /// When Some, current "chat" is a send group — do_send fires MultiSend instead of SendText
     send_group_ids: RefCell<Option<Vec<String>>>,
+    /// Message ids the user has starred this session. Lets the context menu
+    /// offer Star ↔ Unstar as a real toggle (the backend supports both, but
+    /// IncomingMessage carries no starred flag from history, so this is a
+    /// best-effort per-session view seeded on each Star/Unstar action).
+    starred_msgs: RefCell<HashSet<String>>,
 }
 
 impl ChatViewPanel {
@@ -458,6 +463,30 @@ impl ChatViewPanel {
         input_scroll.set_propagate_natural_height(true);
         input_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
 
+        // GtkTextView has no native placeholder — overlay a dim "Type a message"
+        // label over the scroll that hides as soon as the buffer has content.
+        // The overlay wraps the ScrolledWindow (not the TextView) so the view
+        // keeps its native scrolling; the label is click-through.
+        let input_placeholder = Label::new(Some("Type a message"));
+        input_placeholder.add_css_class("dim-label");
+        input_placeholder.set_halign(Align::Start);
+        input_placeholder.set_valign(Align::Start);
+        input_placeholder.set_margin_top(17);
+        input_placeholder.set_margin_start(8);
+        input_placeholder.set_can_target(false);
+
+        let input_overlay = gtk4::Overlay::new();
+        input_overlay.set_child(Some(&input_scroll));
+        input_overlay.add_overlay(&input_placeholder);
+        input_overlay.set_hexpand(true);
+
+        {
+            let ph = input_placeholder.clone();
+            input_view.buffer().connect_changed(move |buf| {
+                ph.set_visible(buf.char_count() == 0);
+            });
+        }
+
         // Send button — same visual size as emoji/attach
         let send_button = Button::from_icon_name("go-up-symbolic");
         send_button.add_css_class("suggested-action");
@@ -466,6 +495,9 @@ impl ChatViewPanel {
         send_button.set_valign(Align::Center);
         send_button.set_margin_end(4);
         send_button.set_tooltip_text(Some("Send"));
+        // Nothing to send on an empty compose field — start disabled. Toggled
+        // on by update_send_button_state as text/attachments come and go.
+        send_button.set_sensitive(false);
 
         // AI autocorrect spinner (hidden by default, shown during correction)
         let ai_spinner = gtk4::Spinner::new();
@@ -502,7 +534,7 @@ impl ChatViewPanel {
         // All inside the single rounded frame
         input_frame.append(&emoji_btn);
         input_frame.append(&attach_btn);
-        input_frame.append(&input_scroll);
+        input_frame.append(&input_overlay);
         input_frame.append(&ai_spinner);
         input_frame.append(&ac_toggle);
         input_frame.append(&mic_btn);
@@ -786,6 +818,7 @@ impl ChatViewPanel {
             ac_delay_send,
             drafts: RefCell::new(HashMap::new()),
             send_group_ids: RefCell::new(None),
+            starred_msgs: RefCell::new(HashSet::new()),
         });
 
         // Poll AI autocorrect in-flight status to toggle the spinner.
@@ -1095,10 +1128,36 @@ impl ChatViewPanel {
                         play_btn.add_css_class("flat");
                         play_btn.set_tooltip_text(Some("Preview"));
                         let path_play = path.clone();
-                        play_btn.connect_clicked(move |_| {
-                            let _ = std::process::Command::new("xdg-open")
-                                .arg(&path_play)
-                                .spawn();
+                        // Preview inline via gtk4::MediaFile (same audio backend
+                        // the video bubbles use) instead of shelling out to
+                        // xdg-open, which stole focus to an external player and
+                        // failed silently. Play/pause toggles on repeat clicks.
+                        let media_slot: Rc<RefCell<Option<gtk4::MediaFile>>> =
+                            Rc::new(RefCell::new(None));
+                        play_btn.connect_clicked(move |btn| {
+                            let mut slot = media_slot.borrow_mut();
+                            if let Some(mf) = slot.as_ref() {
+                                // Toggle pause/resume on an already-loaded clip.
+                                if mf.is_playing() {
+                                    mf.pause();
+                                    btn.set_icon_name("media-playback-start-symbolic");
+                                } else {
+                                    mf.play();
+                                    btn.set_icon_name("media-playback-pause-symbolic");
+                                }
+                                return;
+                            }
+                            let mf = gtk4::MediaFile::for_filename(&path_play);
+                            // Reset the icon when playback finishes.
+                            let btn_end = btn.clone();
+                            mf.connect_ended_notify(move |m| {
+                                if m.is_ended() {
+                                    btn_end.set_icon_name("media-playback-start-symbolic");
+                                }
+                            });
+                            mf.play();
+                            btn.set_icon_name("media-playback-pause-symbolic");
+                            *slot = Some(mf);
                         });
 
                         let send_btn = Button::from_icon_name("go-up-symbolic");
@@ -1314,12 +1373,10 @@ impl ChatViewPanel {
                             return gtk4::glib::Propagation::Stop;
                         }
                         gtk4::gdk::Key::Escape => {
+                            // Dismiss only the popover — no longer also cancels a
+                            // staged attachment (that was an overloaded Escape).
                             inner_clone.mention_popover.popdown();
                             inner_clone.slash_popover.popdown();
-                            // Also cancel image/gif preview
-                            *inner_clone.pending_image_path.borrow_mut() = None;
-                            *inner_clone.pending_gif_url.borrow_mut() = None;
-                            inner_clone.image_preview_bar.set_visible(false);
                             return gtk4::glib::Propagation::Stop;
                         }
                         gtk4::gdk::Key::Down => {
@@ -1340,6 +1397,27 @@ impl ChatViewPanel {
                             return gtk4::glib::Propagation::Stop;
                         }
                         _ => {}
+                    }
+                }
+
+                // Escape when no mention/slash popover is up: first close the
+                // emoji/GIF/sticker popover if it's open (GTK's default only
+                // closes it when the popover itself holds focus, not while focus
+                // stays in the input); otherwise cancel a staged attachment
+                // preview. These are now separate so one Escape never does both.
+                if key == gtk4::gdk::Key::Escape {
+                    if inner_clone.emoji_popover.is_visible() {
+                        inner_clone.emoji_popover.popdown();
+                        return gtk4::glib::Propagation::Stop;
+                    }
+                    if inner_clone.pending_image_path.borrow().is_some()
+                        || inner_clone.pending_gif_url.borrow().is_some()
+                    {
+                        *inner_clone.pending_image_path.borrow_mut() = None;
+                        *inner_clone.pending_gif_url.borrow_mut() = None;
+                        inner_clone.image_preview_bar.set_visible(false);
+                        update_send_button_state(&inner_clone);
+                        return gtk4::glib::Propagation::Stop;
                     }
                 }
 
@@ -1428,6 +1506,10 @@ impl ChatViewPanel {
             inner.input_view.buffer().connect_changed(move |buf| {
                 let cursor = buf.iter_at_mark(&buf.get_insert());
                 let text = buf.text(&buf.start_iter(), &cursor, false).to_string();
+
+                // Toggle the send button: active only when there's something to
+                // send (non-empty text or a staged image/GIF attachment).
+                update_send_button_state(&inner_c);
 
                 // ── Outbound "typing…" indicator (throttled true + idle false) ──
                 {
@@ -1727,6 +1809,7 @@ impl ChatViewPanel {
                 *inner_clone.pending_image_path.borrow_mut() = None;
                 *inner_clone.pending_gif_url.borrow_mut() = None;
                 inner_clone.image_preview_bar.set_visible(false);
+                update_send_button_state(&inner_clone);
                 // Clear stale state so the next attachment starts fresh.
                 inner_clone
                     .image_preview_pic
@@ -1757,6 +1840,7 @@ impl ChatViewPanel {
 
                 let items = [
                     ("📷", "Photo & Video"),
+                    ("🎵", "Audio"),
                     ("📄", "Document"),
                     ("📊", "Poll"),
                     ("📅", "Event"),
@@ -1787,6 +1871,44 @@ impl ChatViewPanel {
                             show_poll_creator(&inner_cc);
                         } else if label_str == "Event" {
                             show_event_creator(&inner_cc);
+                        } else if label_str == "Audio" {
+                            // Pick an existing audio file → SendAudio (not a
+                            // voice note). Distinct from the hold-to-record mic,
+                            // which was the only audio path before.
+                            let dialog = gtk4::FileDialog::new();
+                            let filter = gtk4::FileFilter::new();
+                            filter.add_mime_type("audio/*");
+                            filter.set_name(Some("Audio"));
+                            let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
+                            filters.append(&filter);
+                            dialog.set_filters(Some(&filters));
+                            let inner_ccc = inner_cc.clone();
+                            let win = inner_cc
+                                .root
+                                .root()
+                                .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                            dialog.open(
+                                win.as_ref(),
+                                None::<&gtk4::gio::Cancellable>,
+                                move |result| {
+                                    if let (Ok(file), Some(chat_id)) = (
+                                        result,
+                                        inner_ccc.current_chat_id.borrow().clone(),
+                                    ) {
+                                        if let Some(path) = file.path() {
+                                            inner_ccc.bridge.send_command(WaCommand::SendAudio {
+                                                chat_id: ChatViewPanel::resolve_send_target(
+                                                    &chat_id,
+                                                ),
+                                                path: path.to_string_lossy().to_string(),
+                                                duration_secs: 0,
+                                                is_voice_note: false,
+                                                tmp_id: gen_tmp_id(),
+                                            });
+                                        }
+                                    }
+                                },
+                            );
                         } else if label_str == "Photo & Video" || label_str == "Document" {
                             // Open file chooser
                             let dialog = gtk4::FileDialog::new();
@@ -1798,6 +1920,23 @@ impl ChatViewPanel {
                                 let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
                                 filters.append(&filter);
                                 dialog.set_filters(Some(&filters));
+                            } else {
+                                // Document: broad non-image/video filter so the
+                                // chooser doesn't silently accept an image as a
+                                // "document" (which would then ride the image
+                                // send path). "All files" plus common doc types.
+                                let doc_filter = gtk4::FileFilter::new();
+                                doc_filter.add_mime_type("application/*");
+                                doc_filter.add_mime_type("text/*");
+                                doc_filter.set_name(Some("Documents"));
+                                let all_filter = gtk4::FileFilter::new();
+                                all_filter.add_pattern("*");
+                                all_filter.set_name(Some("All files"));
+                                let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>();
+                                filters.append(&doc_filter);
+                                filters.append(&all_filter);
+                                dialog.set_filters(Some(&filters));
+                                dialog.set_default_filter(Some(&doc_filter));
                             }
                             let inner_ccc = inner_cc.clone();
                             let win = inner_cc
@@ -2180,19 +2319,32 @@ impl ChatViewPanel {
         };
         Self::append_bubble_to_inner(inner, optimistic);
 
-        // Collect @mention data (jid\tname pairs → jid list + name→number mapping)
+        // Collect @mention data (jid\tname pairs → jid list + name→number mapping).
+        // Reconcile against the final message text: only keep a mention whose
+        // literal "@Name" is still present, so deleting an @mention before send
+        // no longer pings that person. Replacements are applied longest-name-
+        // first with word-boundary matching to avoid substring corruption when
+        // one name is a prefix of another (or the literal appears elsewhere).
         let raw_mentions: Vec<String> = inner.pending_mentions.borrow_mut().drain(..).collect();
         let mut mentioned_jids: Vec<String> = Vec::new();
         let mut mention_replacements: Vec<(String, String)> = Vec::new(); // (@Name, @Number)
         for entry in &raw_mentions {
             if let Some((jid, name)) = entry.split_once('\t') {
+                let name_pat = format!("@{name}");
+                // Drop the mention if the user deleted its "@Name" from the text.
+                if !text.contains(name_pat.as_str()) {
+                    continue;
+                }
                 mentioned_jids.push(jid.to_string());
                 let jid_number = jid.split('@').next().unwrap_or(jid);
-                mention_replacements.push((format!("@{name}"), format!("@{jid_number}")));
+                mention_replacements.push((name_pat, format!("@{jid_number}")));
             } else {
                 mentioned_jids.push(entry.clone());
             }
         }
+        // Longest literal first so a shorter name that is a prefix of a longer
+        // one doesn't consume the longer one's "@Name" mid-string.
+        mention_replacements.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
         // Dismiss popovers
         inner.mention_popover.popdown();
@@ -2224,10 +2376,13 @@ impl ChatViewPanel {
         let bounce_stop = bounce_active.clone();
         let msgs_box_for_send = inner.messages_box.clone();
         let send_network = move |final_text: String| {
-            // Apply @Name → @Number replacement for the WA protocol
+            // Apply @Name → @Number replacement for the WA protocol.
+            // Word-boundary-aware (only replaces "@Name" when the char after the
+            // literal is not part of a longer name) and applied longest-first, so
+            // substring names can't corrupt one another.
             let mut send_text = final_text.clone();
             for (name_pat, number_pat) in &mention_replacements {
-                send_text = send_text.replace(name_pat.as_str(), number_pat.as_str());
+                send_text = replace_mention_literal(&send_text, name_pat, number_pat);
             }
 
             // Stop bounce and settle into place
@@ -2572,6 +2727,10 @@ impl ChatViewPanel {
             // identical to how the user originally staged it.
             set_pending_attachment(&self.inner, &saved);
         }
+        // Normalise the send button for the freshly-restored draft/attachment
+        // state (the connect_changed from set_text above may have observed a
+        // stale pending value from the previous chat).
+        update_send_button_state(&self.inner);
 
         // Clear message area and search/media state
         remove_all_children(&self.inner.messages_box);
@@ -2912,6 +3071,20 @@ impl ChatViewPanel {
             }
         });
         bubble.widget().add_controller(gesture);
+
+        // Long-press (touch / single-tap) → same context menu, so touchscreen
+        // users aren't limited to the faint chevron. Anchored at the press
+        // point. As above, fetch the widget from the gesture to avoid a ref
+        // cycle through the closure.
+        let long_press = gtk4::GestureLongPress::new();
+        let inner_lp = inner.clone();
+        let msg_lp = msg.clone();
+        long_press.connect_pressed(move |g, x, y| {
+            if let Some(w) = g.widget() {
+                show_message_menu(&inner_lp, &msg_lp, w.upcast_ref(), x, y);
+            }
+        });
+        bubble.widget().add_controller(long_press);
 
         // Left-click in forward mode toggles message selection.
         // Uses CAPTURE phase so it intercepts before text selection handlers.
@@ -3503,17 +3676,29 @@ impl ChatViewPanel {
                 // and store the MP4 URL for sending on Enter
                 *inner_c.pending_gif_url.borrow_mut() = Some(mp4_url.clone());
                 *inner_c.pending_image_path.borrow_mut() = None;
+                // Clear any stale preview and show a loading hint until the
+                // thumbnail arrives, so a slow network doesn't leave the bar
+                // blank (which made users click again).
+                inner_c
+                    .image_preview_pic
+                    .set_paintable(None::<&gtk4::gdk::Paintable>);
+                inner_c
+                    .preview_label
+                    .set_text("Loading GIF… (Enter to send, Escape to cancel)");
                 inner_c.image_preview_bar.set_visible(true);
+                update_send_button_state(&inner_c);
                 inner_c.emoji_popover.popdown();
                 // Load preview into the preview bar
                 let url = preview_url_c.clone();
                 let pic = inner_c.image_preview_pic.clone();
+                let label_reset = inner_c.preview_label.clone();
                 let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
                 glib::MainContext::default().spawn_local(async move {
                     if let Ok(bytes) = rx.recv().await {
                         let gb = glib::Bytes::from(&bytes);
                         if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&gb) {
                             pic.set_paintable(Some(&tex));
+                            label_reset.set_text("Press Enter to send, Escape to cancel");
                         }
                     }
                 });
@@ -3842,13 +4027,66 @@ impl ChatViewPanel {
     }
 }
 
+/// Enable the send button only when there's actually something to send:
+/// non-whitespace text in the compose buffer, or a staged image/GIF
+/// attachment. Called from buffer changes and whenever the pending
+/// attachment is set/cleared.
+fn update_send_button_state(inner: &Rc<ChatViewInner>) {
+    let buf = inner.input_view.buffer();
+    let has_text = !buf
+        .text(&buf.start_iter(), &buf.end_iter(), false)
+        .trim()
+        .is_empty();
+    let has_attachment = inner.pending_image_path.borrow().is_some()
+        || inner.pending_gif_url.borrow().is_some();
+    inner.send_button.set_sensitive(has_text || has_attachment);
+}
+
+/// Replace every occurrence of a mention literal (`@Name`) with `@Number`,
+/// but only when the literal is not immediately followed by another name
+/// character (letter/digit/underscore). This stops a shorter name from
+/// matching inside a longer one and keeps the substitution word-boundary safe.
+fn replace_mention_literal(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    let mut out = String::with_capacity(haystack.len());
+    let mut rest = haystack;
+    while let Some(pos) = rest.find(needle) {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + needle.len()..];
+        // Only treat this as a whole mention if the next char isn't a name char.
+        let next_is_name_char = after
+            .chars()
+            .next()
+            .map(|c| c.is_alphanumeric() || c == '_')
+            .unwrap_or(false);
+        if next_is_name_char {
+            // Not a boundary — emit the matched literal verbatim and continue.
+            out.push_str(&rest[pos..pos + needle.len()]);
+        } else {
+            out.push_str(replacement);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
 fn gen_tmp_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+    // Monotonic per-session counter appended to the full-nanosecond timestamp so
+    // two calls in the same nanosecond (e.g. a synchronous multi-file drop loop)
+    // never collide. A bare subsec_nanos value could repeat, dropping a bubble
+    // and mis-keying its receipt.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .subsec_nanos();
-    format!("tmp-{:08x}", nanos)
+        .as_nanos();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("tmp-{nanos:x}-{seq:x}")
 }
 
 /// Max retries for a flaky clipboard read on COSMIC. Each retry waits
@@ -4330,6 +4568,8 @@ fn set_pending_attachment(inner: &Rc<ChatViewInner>, path_str: &str) {
     *inner.pending_image_path.borrow_mut() = Some(path_str.to_string());
     *inner.pending_gif_url.borrow_mut() = None;
     inner.image_preview_bar.set_visible(true);
+    // A staged attachment is sendable even with empty text.
+    update_send_button_state(inner);
     inner.input_view.grab_focus();
     // Mirror to the per-chat record so the attachment survives chat
     // switches (back-and-forth restores the same file in preview).
@@ -4564,8 +4804,9 @@ fn show_message_menu(
             vbox.append(&btn);
         }
 
-        // Copy
-        if let Some(text) = &msg.text {
+        // Copy — fall back to the media caption so captioned image/video
+        // messages (whose text lives in media_caption) still get a Copy item.
+        if let Some(text) = msg.text.as_ref().or(msg.media_caption.as_ref()) {
             let btn = menu_btn!("Copy");
             let text_c = text.clone();
             let pop = popover.clone();
@@ -4684,17 +4925,26 @@ fn show_message_menu(
         }
         vbox.append(&pin_box);
 
-        // Star
-        let btn = menu_btn!("Star");
+        // Star / Unstar — toggle based on this session's known star state.
+        let currently_starred = inner.starred_msgs.borrow().contains(&msg.id);
+        let btn = menu_btn!(if currently_starred { "Unstar" } else { "Star" });
         let inner_c = inner.clone();
         let msg_c = msg.clone();
         let pop = popover.clone();
         btn.connect_clicked(move |_| {
             if let Some(cid) = inner_c.current_chat_id.borrow().clone() {
+                // Flip the desired state and record it so a re-open of the
+                // menu offers the opposite action.
+                let new_starred = !inner_c.starred_msgs.borrow().contains(&msg_c.id);
+                if new_starred {
+                    inner_c.starred_msgs.borrow_mut().insert(msg_c.id.clone());
+                } else {
+                    inner_c.starred_msgs.borrow_mut().remove(&msg_c.id);
+                }
                 inner_c.bridge.send_command(WaCommand::StarMessage {
                     chat_id: cid,
                     msg_id: msg_c.id.clone(),
-                    starred: true,
+                    starred: new_starred,
                     sender_jid: msg_c.sender_id.clone(),
                     is_from_me: msg_c.is_from_me,
                 });
@@ -4703,8 +4953,16 @@ fn show_message_menu(
         });
         vbox.append(&btn);
 
-        // Edit (own text messages only)
-        if msg.is_from_me && msg.text.is_some() && msg.media_type.is_none() {
+        // Edit (own text messages only, and only within WhatsApp's ~15-minute
+        // edit window — offering Edit on older messages just leads users into
+        // a server-side rejection).
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        const EDIT_WINDOW_SECS: i64 = 15 * 60;
+        let within_edit_window = now_secs - msg.timestamp <= EDIT_WINDOW_SECS;
+        if msg.is_from_me && msg.text.is_some() && msg.media_type.is_none() && within_edit_window {
             let btn = menu_btn!("Edit");
             let inner_c = inner.clone();
             let msg_c = msg.clone();
@@ -4732,45 +4990,49 @@ fn show_message_menu(
             let text_c = text.clone();
             let bridge = inner.bridge.clone();
             let pop = popover.clone();
+            let inner_c = inner.clone();
             btn.connect_clicked(move |_| {
                 pop.popdown();
-                // Show a small dialog for the shortcut name
-                let dialog = gtk4::Window::builder()
-                    .title("Save Quick Reply")
-                    .default_width(300)
-                    .default_height(120)
-                    .modal(true)
+                // Styled adw::AlertDialog (Cancel + Save, Escape closes, Enter
+                // in the entry submits) — matches the app's dialog convention
+                // instead of the previous bare, non-transient gtk4::Window.
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Save quick reply")
+                    .body("Choose a shortcut for this message (used as /shortcut).")
                     .build();
-                let vbox = Box::new(Orientation::Vertical, 8);
-                vbox.set_margin_top(12);
-                vbox.set_margin_bottom(12);
-                vbox.set_margin_start(12);
-                vbox.set_margin_end(12);
-                let label = Label::new(Some("Shortcut name (without /):"));
-                label.set_halign(Align::Start);
-                vbox.append(&label);
+                dialog.add_response("cancel", "Cancel");
+                dialog.add_response("save", "Save");
+                dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+                dialog.set_default_response(Some("save"));
+                dialog.set_close_response("cancel");
+
                 let entry = gtk4::Entry::new();
                 entry.set_placeholder_text(Some("e.g. greeting"));
-                vbox.append(&entry);
-                let save_btn = Button::with_label("Save");
-                save_btn.add_css_class("suggested-action");
+                entry.set_margin_top(8);
+                entry.set_activates_default(true);
+                dialog.set_extra_child(Some(&entry));
+
+                let parent_window = inner_c
+                    .root
+                    .root()
+                    .and_then(|r| r.downcast::<gtk4::Window>().ok());
+                dialog.present(parent_window.as_ref());
+
                 let b = bridge.clone();
                 let t = text_c.clone();
-                let d = dialog.clone();
-                let e = entry.clone();
-                save_btn.connect_clicked(move |_| {
-                    let shortcut = e.text().to_string().trim().to_string();
-                    if !shortcut.is_empty() {
-                        b.send_command(WaCommand::SaveQuickReply {
-                            shortcut,
-                            message: t.clone(),
-                        });
+                dialog.connect_response(None, move |_, response| {
+                    if response != "save" {
+                        return;
                     }
-                    d.close();
+                    let shortcut = entry.text().to_string().trim().to_string();
+                    if shortcut.is_empty() {
+                        return;
+                    }
+                    b.send_command(WaCommand::SaveQuickReply {
+                        shortcut,
+                        message: t.clone(),
+                    });
                 });
-                vbox.append(&save_btn);
-                dialog.set_child(Some(&vbox));
-                dialog.present();
             });
             vbox.append(&btn);
         }
@@ -5413,20 +5675,45 @@ fn show_react_picker(inner: &Rc<ChatViewInner>, msg: &IncomingMessage, _anchor: 
     hbox.set_margin_top(4);
     hbox.set_margin_bottom(4);
 
+    // The user's own current reaction (if any) so we can highlight it and let
+    // a second tap clear it. Own reactions are stored with the user's own JID
+    // as the sender (runtime persists own_lid/own_phone); match on that.
+    let own_reaction: Option<String> = {
+        let own = inner.own_jid.borrow();
+        own.as_deref().and_then(|own_jid| {
+            msg.reactions
+                .iter()
+                .find(|(sender, _)| sender.as_str() == own_jid)
+                .map(|(_, emoji)| emoji.clone())
+        })
+    };
+
     let quick_emojis = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
     for emoji in &quick_emojis {
         let btn = Button::with_label(emoji);
         btn.add_css_class("flat");
+        // Visually mark the emoji the user has already reacted with.
+        let is_current = own_reaction.as_deref() == Some(*emoji);
+        if is_current {
+            btn.add_css_class("suggested-action");
+        }
         let inner_c = inner.clone();
         let msg_c = msg.clone();
         let emoji_c = emoji.to_string();
         let pop = popover.clone();
         btn.connect_clicked(move |_| {
             if let Some(cid) = inner_c.current_chat_id.borrow().clone() {
+                // Tapping the already-selected reaction clears it (empty emoji),
+                // otherwise set/replace with the tapped one.
+                let emoji_to_send = if is_current {
+                    String::new()
+                } else {
+                    emoji_c.clone()
+                };
                 inner_c.bridge.send_command(WaCommand::SendReaction {
                     chat_id: cid,
                     msg_id: msg_c.id.clone(),
-                    emoji: emoji_c.clone(),
+                    emoji: emoji_to_send,
                     sender_jid: msg_c.sender_id.clone(),
                     is_from_me: msg_c.is_from_me,
                 });

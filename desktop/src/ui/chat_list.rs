@@ -74,7 +74,18 @@ impl ChatListPanel {
         search.set_size_request(-1, 42); // 50% taller
         search.add_css_class("search-rounded");
 
-        let new_chat_btn = gtk4::Button::from_icon_name("chat-message-new-symbolic");
+        // Use a themed-icon fallback chain: "chat-message-new-symbolic" only
+        // exists in GNOME/Adwaita, so on KDE/Breeze the button rendered as a
+        // broken-image placeholder. Fall back to Breeze-available names.
+        let new_chat_btn = gtk4::Button::new();
+        new_chat_btn.set_child(Some(&gtk4::Image::from_gicon(
+            &gtk4::gio::ThemedIcon::from_names(&[
+                "chat-message-new-symbolic",
+                "document-edit-symbolic",
+                "mail-message-new-symbolic",
+                "list-add-symbolic",
+            ]),
+        )));
         new_chat_btn.add_css_class("flat");
         new_chat_btn.add_css_class("circular");
         new_chat_btn.set_tooltip_text(Some("New chat"));
@@ -1205,7 +1216,30 @@ fn attach_stealth_hover(row: &ChatRow, chat_id: String, recent_cache: Rc<RefCell
                 *timer_clear.borrow_mut() = None;
                 let popover = build_stealth_popover(&rw2, &cid2, &cache);
                 popover.popup();
-                *pop2.borrow_mut() = Some(popover);
+                *pop2.borrow_mut() = Some(popover.clone());
+
+                // Safety fallback dismissal (CL-07): autohide is disabled and
+                // dismissal relies solely on the row's leave event. If that
+                // never fires (popover grabbed the pointer, the row was
+                // scrolled/removed while hovered, or focus shifted away), the
+                // peek could linger forever. Pop it down after 8s regardless.
+                // Only act if THIS popover is still the one in the shared ref —
+                // a normal leave (or a re-hover replacing it) will have taken
+                // it already, so we must not dismiss a newer popover.
+                let pop_safety = pop2.clone();
+                let this_pop = popover.clone();
+                gtk4::glib::timeout_add_local_once(
+                    std::time::Duration::from_secs(8),
+                    move || {
+                        let mut slot = pop_safety.borrow_mut();
+                        if slot.as_ref() == Some(&this_pop) {
+                            *slot = None;
+                            drop(slot);
+                            this_pop.popdown();
+                            this_pop.unparent();
+                        }
+                    },
+                );
             });
         *timer_clone.borrow_mut() = Some(id);
     });
@@ -1358,7 +1392,12 @@ fn attach_context_menu(row: &ChatRow, inner: &Rc<ChatListInner>, chat_id: String
     let is_favorite = row.is_favorite.clone();
     let auto_mark_read = row.auto_mark_read.clone();
     let auto_mr_indicator = row.auto_mr_indicator.clone();
+    // Indicator widgets + the list box are threaded through so the menu can
+    // apply pin/mute/archive/favorite changes optimistically (CL-06).
+    let pin_indicator = row.pin_indicator.clone();
+    let mute_indicator = row.mute_indicator.clone();
     let row_widget = row.gtk_row.clone();
+    let list_box = inner.list_box.clone();
     let bridge = inner.bridge.clone();
 
     gesture.connect_pressed(move |_, _, x, y| {
@@ -1372,6 +1411,9 @@ fn attach_context_menu(row: &ChatRow, inner: &Rc<ChatListInner>, chat_id: String
             is_favorite.clone(),
             auto_mark_read.clone(),
             auto_mr_indicator.clone(),
+            pin_indicator.clone(),
+            mute_indicator.clone(),
+            list_box.clone(),
             x,
             y,
         );
@@ -1390,6 +1432,9 @@ fn show_context_menu(
     is_favorite: Rc<Cell<bool>>,
     auto_mark_read: Rc<Cell<bool>>,
     auto_mr_indicator: Label,
+    pin_indicator: Label,
+    mute_indicator: Label,
+    list_box: ListBox,
     x: f64,
     y: f64,
 ) {
@@ -1434,9 +1479,15 @@ fn show_context_menu(
         let bridge = bridge.clone();
         let chat_id = chat_id.clone();
         let is_archived = is_archived.clone();
+        let list_box = list_box.clone();
         let popover = popover.clone();
         btn_archive.connect_clicked(move |_| {
             let new_val = !is_archived.get();
+            // Optimistic: update local state + reflow immediately so the row
+            // moves in/out of the archived view without waiting for the server
+            // echo (which reconciles via set_chat_archived). CL-06.
+            is_archived.set(new_val);
+            list_box.invalidate_filter();
             bridge.send_command(WaCommand::ArchiveChat {
                 chat_id: chat_id.clone(),
                 archived: new_val,
@@ -1456,9 +1507,14 @@ fn show_context_menu(
         let bridge = bridge.clone();
         let chat_id = chat_id.clone();
         let is_muted = is_muted.clone();
+        let mute_indicator = mute_indicator.clone();
         let popover = popover.clone();
         btn_mute.connect_clicked(move |_| {
             let new_val = !is_muted.get();
+            // Optimistic: flip local state + 🔕 indicator immediately (server
+            // echo reconciles via set_chat_muted). CL-06.
+            is_muted.set(new_val);
+            mute_indicator.set_visible(new_val);
             bridge.send_command(WaCommand::MuteChat {
                 chat_id: chat_id.clone(),
                 muted: new_val,
@@ -1478,9 +1534,17 @@ fn show_context_menu(
         let bridge = bridge.clone();
         let chat_id = chat_id.clone();
         let is_pinned = is_pinned.clone();
+        let pin_indicator = pin_indicator.clone();
+        let list_box = list_box.clone();
         let popover = popover.clone();
         btn_pin.connect_clicked(move |_| {
             let new_val = !is_pinned.get();
+            // Optimistic: flip local state + 📌 indicator and re-sort so the
+            // row jumps to/from the top immediately (server echo reconciles via
+            // set_chat_pinned). CL-06.
+            is_pinned.set(new_val);
+            pin_indicator.set_visible(new_val);
+            list_box.invalidate_sort();
             bridge.send_command(WaCommand::PinChat {
                 chat_id: chat_id.clone(),
                 pinned: new_val,
@@ -1561,9 +1625,14 @@ fn show_context_menu(
         let bridge = bridge.clone();
         let chat_id = chat_id.clone();
         let is_favorite = is_favorite.clone();
+        let list_box = list_box.clone();
         let popover = popover.clone();
         btn_fav.connect_clicked(move |_| {
             let new_val = !is_favorite.get();
+            // Optimistic: flip local state + reflow the Favourites filter now
+            // (server echo reconciles via set_chat_favorite). CL-06.
+            is_favorite.set(new_val);
+            list_box.invalidate_filter();
             bridge.send_command(WaCommand::FavoriteChat {
                 chat_id: chat_id.clone(),
                 favorite: new_val,

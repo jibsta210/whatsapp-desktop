@@ -214,3 +214,32 @@ To confirm from logs after an offline→reopen repro: previously each lost messa
 `"Semaphore generation changed during acquire, dropping stale permit"` (message.rs); that line should
 now be absent for offline messages, and each `DIAG msg arrival ... offline` should be followed by a
 `MSG routed` on the desktop.
+
+## Batch 8 — remaining polish (40 of 44, via 7 parallel file-owner agents)
+
+Implemented by a workflow with one agent per file (disjoint files → no clobbering); verified to compile
+together (0 errors after one glue fix). Highlights:
+- **New-chat button icon fixed on KDE** — was `chat-message-new-symbolic` (GNOME-only) rendering as a
+  broken-image placeholder on Breeze; now a themed-icon fallback chain.
+- Markup no longer corrupts bubbles (URLs with `_`/`*`/`~`) + `set_markup` plain-text fallback;
+  poll voting merges instead of wiping other voters; quoted-reply thumb no longer scans all of
+  wa_media; edited badge works on media-only messages.
+- Quoted-reply tap-to-jump (mb-01); long-press message menu (mb-08); chevron hover/cursor (mb-09);
+  inline audio playback (mb-10); unified hardened URL launcher (mb-12).
+- Compose: send-button disabled when empty (cv-05); "Type a message" placeholder (cv-06); Audio attach
+  + document filter (cv-02); inline voice-note preview (cv-08); Escape de-overloaded (cv-12); GIF
+  loading feedback (cv-10); Save-Quick-Reply is now a styled adw::AlertDialog (mb-07/cv-09/F10).
+- Star toggle (mb-04); reaction picker highlight+remove (mb-05); copy for captions (mb-06);
+  phantom-mention-on-delete + word-safe @-substitution; gen_tmp_id collision fix.
+- Names/groups: unresolved @mentions/@lid resolve instead of raw JID; group membership actor +
+  kick-vs-left labels; history-sync groups fetch their subject; push_name won't overwrite phonebook;
+  directory "longer name wins" + unmapped-@lid fuzzy-match tightened (data-integrity).
+- Perf: per-message history no longer deep-cloned + resorted under the lock; MarkRead watermark write
+  off the lock. Reliability: dual suspend detectors deduped; sync-spinner race fixed.
+- Escape-to-close on secondary windows/profile panel (GW-07/GW-08); Share-Contact hidden on
+  group/self (F8); group subject not re-sent unchanged (F12); gm context-menu optimistic feedback
+  (CL-06); stealth-peek popover orphan guard (CL-07).
+
+Skipped (4) — each genuinely needs a NEW WaEvent variant + cross-file wiring the parallel agents were
+barred from adding; small follow-up: `live-reaction-duplicate-row-no-dedup`, `edit-failure-loses-text`
+(the 15-min edit-window gate half WAS done), `group-participant-name-never-live-refreshes`, `F5`.

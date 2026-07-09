@@ -37,6 +37,11 @@ struct MainWindowInner {
     sidebar_stack: Stack,
     sync_revealer: Revealer,
     sync_progress: gtk4::ProgressBar,
+    /// In-flight sync counter. SyncProgress(bool) producers are uncoordinated
+    /// (reconnect resync, offline-sync preview/complete), so a plain boolean
+    /// let one producer's `false` hide the bar while another sync was still
+    /// running. We reference-count instead: reveal while > 0.
+    sync_count: std::cell::Cell<u32>,
     bridge: Arc<Bridge>,
     debug_buf: gtk4::TextBuffer,
     debug_revealer: Revealer,
@@ -289,6 +294,7 @@ impl MainWindow {
             sidebar_stack,
             sync_revealer,
             sync_progress,
+            sync_count: std::cell::Cell::new(0),
             bridge,
             debug_buf,
             debug_revealer,
@@ -314,7 +320,8 @@ impl MainWindow {
                     .unwrap_or_default();
                 let data = inner_c.own_profile_data.borrow().clone();
                 let jid = inner_c.own_jid.borrow().clone();
-                open_own_profile_window(&inner_c.bridge, &name, data.as_ref(), &jid);
+                let parent = inner_c.window.upcast_ref::<gtk4::Window>();
+                open_own_profile_window(Some(parent), &inner_c.bridge, &name, data.as_ref(), &jid);
             });
             inner.own_avatar.add_controller(avatar_click);
         }
@@ -384,6 +391,25 @@ impl MainWindow {
                 profile_rev.set_reveal_child(true);
             }
         });
+
+        // Escape dismisses the profile side panel. Previously the only close
+        // paths were re-clicking the chat header or switching chats — a keyboard
+        // user couldn't dismiss it at all. Capture phase so it fires even when a
+        // child widget (e.g. the group-name entry) holds focus.
+        {
+            let key = gtk4::EventControllerKey::new();
+            key.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            let profile_rev = inner.profile_revealer.clone();
+            key.connect_key_pressed(move |_, keyval, _, _| {
+                if keyval == gtk4::gdk::Key::Escape && profile_rev.reveals_child() {
+                    profile_rev.set_reveal_child(false);
+                    gtk4::glib::Propagation::Stop
+                } else {
+                    gtk4::glib::Propagation::Proceed
+                }
+            });
+            inner.profile_panel.widget().add_controller(key);
+        }
 
         // Clicking a group in profile panel jumps to that chat
         inner.profile_panel.connect_chat_selected({
@@ -1093,8 +1119,19 @@ impl MainWindow {
                 withdraw_chat_notification(&inner.gtk_app, &chat_id);
             }
             WaEvent::SyncProgress(syncing) => {
-                inner.sync_revealer.set_reveal_child(syncing);
-                if syncing {
+                // Reference-count concurrent syncs so one producer's `false`
+                // can't hide the bar while another sync is still running.
+                let prev = inner.sync_count.get();
+                let count = if syncing {
+                    prev.saturating_add(1)
+                } else {
+                    prev.saturating_sub(1)
+                };
+                inner.sync_count.set(count);
+                inner.sync_revealer.set_reveal_child(count > 0);
+                // Only kick off the pulse loop + safety timeout on the leading
+                // edge (0 -> 1), not on every nested SyncProgress(true).
+                if syncing && prev == 0 {
                     // Start pulsing the progress bar every 150ms.
                     // GTK ProgressBar::pulse() is lightweight and doesn't freeze
                     // like a Spinner during heavy widget work.
@@ -1109,9 +1146,13 @@ impl MainWindow {
                             glib::ControlFlow::Break
                         }
                     });
-                    // Safety timeout: hide after 60s even if OfflineSyncCompleted never fires
+                    // Safety timeout: force-hide after 60s even if a matching
+                    // SyncProgress(false) never arrives. Reset the counter too so
+                    // a stale count can't wedge the bar open on the next sync.
                     let rev2 = inner.sync_revealer.clone();
+                    let inner2 = inner.clone();
                     glib::timeout_add_local_once(std::time::Duration::from_secs(60), move || {
+                        inner2.sync_count.set(0);
                         rev2.set_reveal_child(false);
                     });
                 }
@@ -1561,6 +1602,7 @@ fn populate_rail_favourites(
 
 /// Open a full-window overlay for editing the user's own business profile.
 fn open_own_profile_window(
+    parent: Option<&gtk4::Window>,
     bridge: &Arc<crate::bridge::Bridge>,
     display_name: &str,
     data: Option<&OwnProfileData>,
@@ -1574,6 +1616,22 @@ fn open_own_profile_window(
         .default_height(750)
         .modal(true)
         .build();
+    // A modal with no transient parent is a Wayland/GTK pitfall (mis-parenting,
+    // weak modality, poor placement) — anchor it to the main window.
+    window.set_transient_for(parent);
+
+    // Escape closes, matching the app's other dialogs (chat_view.rs).
+    let key = gtk4::EventControllerKey::new();
+    let win_key = window.clone();
+    key.connect_key_pressed(move |_, keyval, _, _| {
+        if keyval == gtk4::gdk::Key::Escape {
+            win_key.close();
+            gtk4::glib::Propagation::Stop
+        } else {
+            gtk4::glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key);
 
     let scroll = ScrolledWindow::new();
     scroll.set_vexpand(true);
@@ -2078,6 +2136,20 @@ fn show_global_search_results(
     }
 
     dialog.set_child(Some(&vbox));
+
+    // Escape closes, matching the app's other dialogs.
+    let key = gtk4::EventControllerKey::new();
+    let dlg_key = dialog.clone();
+    key.connect_key_pressed(move |_, keyval, _, _| {
+        if keyval == gtk4::gdk::Key::Escape {
+            dlg_key.close();
+            gtk4::glib::Propagation::Stop
+        } else {
+            gtk4::glib::Propagation::Proceed
+        }
+    });
+    dialog.add_controller(key);
+
     dialog.present();
 }
 
