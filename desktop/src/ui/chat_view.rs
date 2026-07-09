@@ -2627,6 +2627,31 @@ impl ChatViewPanel {
 
     /// Open a chat immediately (sets current_chat_id, clears messages, shows loading).
     /// Returns false if the chat is already open (no reload needed).
+    /// Restore a failed edit: put the edited text back in the composer and
+    /// re-open edit mode so the user doesn't lose what they typed. Only applies
+    /// if the failed edit's chat is still open.
+    pub fn restore_failed_edit(&self, chat_id: &str, msg_id: &str, new_text: &str) {
+        if self.inner.current_chat_id.borrow().as_deref() != Some(chat_id) {
+            return;
+        }
+        self.inner.input_view.buffer().set_text(new_text);
+        *self.inner.editing_msg.borrow_mut() = Some((chat_id.to_string(), msg_id.to_string()));
+        self.inner.edit_banner.set_reveal_child(true);
+        self.inner.input_view.grab_focus();
+    }
+
+    /// Update the group-sender name label on any open bubbles from this sender
+    /// (late name resolution — a participant that showed a raw number now shows
+    /// their real name without needing to reopen the chat).
+    pub fn refresh_sender_name(&self, chat_id: &str, sender_id: &str, name: &str) {
+        if self.inner.current_chat_id.borrow().as_deref() != Some(chat_id) {
+            return;
+        }
+        for bubble in self.inner.bubbles.borrow().values() {
+            bubble.update_sender_name(sender_id, name);
+        }
+    }
+
     pub fn open_chat(&self, chat_id: String, chat_name: &str) -> bool {
         // A chat is now selected — enable the compose bar (disabled at startup so
         // typing/Send/attach don't silently no-op on the "Select a chat" pane).
@@ -3574,7 +3599,7 @@ impl ChatViewPanel {
         crate::ui::quick_replies::save(&qr);
     }
 
-    pub fn show_reaction(&self, chat_id: &str, msg_id: &str, emoji: &str) {
+    pub fn show_reaction(&self, chat_id: &str, msg_id: &str, reactions: &[(String, String)]) {
         let is_current = self
             .inner
             .current_chat_id
@@ -3585,37 +3610,10 @@ impl ChatViewPanel {
         if !is_current {
             return;
         }
-        let bubbles = self.inner.bubbles.borrow();
-        if let Some(bubble) = bubbles.get(msg_id) {
-            // Check if there's already a reaction row after this bubble
-            let root = bubble.widget();
-            // The root is a vertical Box — check if last child is a reaction row
-            let existing = root
-                .last_child()
-                .filter(|c| c.widget_name() == "reaction-row");
-
-            if let Some(row) = existing {
-                // Append to existing row
-                let pill = Label::new(Some(emoji));
-                pill.add_css_class("caption");
-                row.downcast_ref::<Box>().map(|b| b.append(&pill));
-            } else {
-                // Create new reaction row
-                let reaction_row = Box::new(Orientation::Horizontal, 4);
-                reaction_row.set_widget_name("reaction-row");
-                reaction_row.set_margin_top(-6);
-                reaction_row.set_margin_start(if bubble.is_from_me { 60 } else { 44 });
-                reaction_row.set_halign(if bubble.is_from_me {
-                    Align::End
-                } else {
-                    Align::Start
-                });
-
-                let pill = Label::new(Some(emoji));
-                pill.add_css_class("caption");
-                reaction_row.append(&pill);
-                root.append(&reaction_row);
-            }
+        // Rebuild the whole reaction row from the full deduped set — groups by
+        // emoji, no duplicate rows, and an empty set clears it (removal).
+        if let Some(bubble) = self.inner.bubbles.borrow().get(msg_id) {
+            bubble.rebuild_reactions(reactions);
         }
     }
 

@@ -243,3 +243,23 @@ together (0 errors after one glue fix). Highlights:
 Skipped (4) — each genuinely needs a NEW WaEvent variant + cross-file wiring the parallel agents were
 barred from adding; small follow-up: `live-reaction-duplicate-row-no-dedup`, `edit-failure-loses-text`
 (the 15-min edit-window gate half WAS done), `group-participant-name-never-live-refreshes`, `F5`.
+
+## Batch 8 completion — the last 4 skipped items
+
+The 4 cross-file items (needed new WaEvent variants) are now done:
+- **F5** — already fixed in Batch 2 (multi-send toast routed to the shared overlay); the agent had
+  mis-scoped it. Verified.
+- **live-reaction-duplicate-row-no-dedup** — factored the reaction row into a shared
+  `build_reaction_row` (tagged `reaction-row`); `ReactionUpdated` now carries the message's FULL
+  deduped reactions vec (both emit sites capture `m.reactions` and emit ALWAYS, incl. removals);
+  new `MessageBubble::rebuild_reactions` removes the old row and rebuilds grouped pills. No more
+  duplicate rows; reactions dedup/group/count and removals clear.
+- **edit-failure-loses-text** — new `WaEvent::EditFailed{chat_id,msg_id,new_text}`, emitted from the
+  runtime edit-failure path; `ChatViewPanel::restore_failed_edit` puts the text back in the composer
+  and re-opens edit mode (the 15-min edit-window gate was already done).
+- **group-participant-name-never-live-refreshes** — new `WaEvent::SenderNameResolved`, emitted from
+  the usync member-resolution block; `MessageBubble` stores its group-sender label +
+  `update_sender_name`; `ChatViewPanel::refresh_sender_name` updates open bubbles so a raw number
+  becomes the real name without reopening the chat.
+
+All 44 batch-7/8 items now complete.

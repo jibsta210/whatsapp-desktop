@@ -40,6 +40,9 @@ pub struct MessageBubble {
     pub quoted_msg_id: Option<String>,
     avatar: libadwaita::Avatar,
     pub sender_id: String,
+    /// The group-sender name label (received group messages only) — kept so a
+    /// late name resolution can refresh it live via `update_sender_name`.
+    sender_label: Option<Label>,
     /// Quick action icons + dropdown chevron (shown on hover)
     hover_actions: Box,
     chevron_btn: Button,
@@ -111,6 +114,7 @@ impl MessageBubble {
                 quoted_msg_id: None,
                 avatar: libadwaita::Avatar::new(0, None, false),
                 sender_id: String::new(),
+                sender_label: None,
                 hover_actions: Box::new(Orientation::Horizontal, 0),
                 chevron_btn: Button::new(),
                 is_from_me: false,
@@ -196,6 +200,7 @@ impl MessageBubble {
 
         let mut stored_text_label: Option<Label> = None;
         let mut stored_edited_label: Option<Label> = None;
+        let mut stored_sender_label: Option<Label> = None;
 
         content_wrapper.append(&content);
 
@@ -250,6 +255,7 @@ impl MessageBubble {
             sender_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
             sender_label.set_max_width_chars(50);
             text_col.append(&sender_label);
+            stored_sender_label = Some(sender_label);
 
             // Show quoted text or media type indicator
             let display_text = msg.quoted_text.as_deref().unwrap_or("");
@@ -933,81 +939,7 @@ impl MessageBubble {
         root.append(&row);
 
         // ── Reaction pills (shown below the bubble) ──
-        if !msg.reactions.is_empty() {
-            // Group reactions by emoji, collect senders for each
-            let mut grouped: std::collections::HashMap<String, Vec<String>> =
-                std::collections::HashMap::new();
-            for (sender, emoji) in &msg.reactions {
-                grouped
-                    .entry(emoji.clone())
-                    .or_default()
-                    .push(sender.clone());
-            }
-
-            let reaction_row = Box::new(Orientation::Horizontal, 4);
-            reaction_row.set_margin_top(-6); // slight overlap with bubble
-            reaction_row.set_margin_start(if msg.is_from_me { 60 } else { 44 });
-            reaction_row.set_halign(if msg.is_from_me {
-                Align::End
-            } else {
-                Align::Start
-            });
-
-            for (emoji, senders) in &grouped {
-                let count = senders.len();
-                let pill_text = if count > 1 {
-                    format!("{emoji} {count}")
-                } else {
-                    emoji.clone()
-                };
-
-                let pill_btn = Button::with_label(&pill_text);
-                pill_btn.add_css_class("flat");
-                pill_btn.add_css_class("caption");
-                pill_btn.set_cursor_from_name(Some("pointer"));
-
-                // Build reactor names
-                let names: Vec<String> = senders
-                    .iter()
-                    .map(|s| {
-                        if s.is_empty() {
-                            "You".to_string()
-                        } else {
-                            crate::ui::runtime::display_name_from_jid(s)
-                        }
-                    })
-                    .collect();
-                // Tooltip for hover
-                pill_btn.set_tooltip_text(Some(&names.join(", ")));
-                // Click shows popover with reactor list
-                let emoji_c = emoji.clone();
-                pill_btn.connect_clicked(move |btn| {
-                    let popover = gtk4::Popover::new();
-                    popover.set_parent(btn);
-                    popover.set_has_arrow(true);
-
-                    let vbox = Box::new(Orientation::Vertical, 4);
-                    vbox.set_margin_start(8);
-                    vbox.set_margin_end(8);
-                    vbox.set_margin_top(6);
-                    vbox.set_margin_bottom(6);
-
-                    for name in &names {
-                        let row = Box::new(Orientation::Horizontal, 8);
-                        let emoji_lbl = Label::new(Some(&emoji_c));
-                        let name_lbl = Label::new(Some(name));
-                        name_lbl.add_css_class("body");
-                        row.append(&emoji_lbl);
-                        row.append(&name_lbl);
-                        vbox.append(&row);
-                    }
-
-                    popover.set_child(Some(&vbox));
-                    popover.popup();
-                });
-
-                reaction_row.append(&pill_btn);
-            }
+        if let Some(reaction_row) = build_reaction_row(&msg.reactions, msg.is_from_me) {
             root.append(&reaction_row);
         }
 
@@ -1055,6 +987,7 @@ impl MessageBubble {
             } else {
                 msg.sender_id.clone()
             },
+            sender_label: stored_sender_label,
             hover_actions,
             chevron_btn,
             is_from_me: msg.is_from_me,
@@ -1310,6 +1243,34 @@ impl MessageBubble {
     /// True if this bubble is in a failed-send state (shows red ✗).
     pub fn is_failed(&self) -> bool {
         self.receipt_label.has_css_class("error")
+    }
+
+    /// Refresh the group-sender name label if this bubble is from `sender_id`
+    /// (late name resolution — a raw number becomes the real name in place).
+    pub fn update_sender_name(&self, sender_id: &str, name: &str) {
+        if self.sender_id == sender_id
+            && let Some(label) = &self.sender_label
+        {
+            label.set_text(name);
+        }
+    }
+
+    /// Replace this bubble's reaction row from the message's FULL deduped
+    /// reactions vec. Fixes live reactions that previously appended a second
+    /// row and never deduped/removed: the old row is removed and rebuilt (or
+    /// dropped entirely when `reactions` is empty).
+    pub fn rebuild_reactions(&self, reactions: &[(String, String)]) {
+        let mut child = self.root.first_child();
+        while let Some(c) = child {
+            let next = c.next_sibling();
+            if c.widget_name() == "reaction-row" {
+                self.root.remove(&c);
+            }
+            child = next;
+        }
+        if let Some(row) = build_reaction_row(reactions, self.is_from_me) {
+            self.root.append(&row);
+        }
     }
 
     /// Replace the media placeholder with the actual downloaded file.
@@ -1843,6 +1804,76 @@ fn build_document_widget(container: &Box, path: &str) {
 }
 
 /// Placeholder shown while media is still downloading.
+/// Build the grouped reaction pill row for a set of reactions, or None if empty.
+/// Shared by the initial bubble render and live `rebuild_reactions` so both
+/// group-by-emoji + count + reactor popover identically. Tagged with the widget
+/// name "reaction-row" so the live path can find and replace it.
+fn build_reaction_row(reactions: &[(String, String)], is_from_me: bool) -> Option<Box> {
+    if reactions.is_empty() {
+        return None;
+    }
+    let mut grouped: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for (sender, emoji) in reactions {
+        grouped.entry(emoji.clone()).or_default().push(sender.clone());
+    }
+
+    let reaction_row = Box::new(Orientation::Horizontal, 4);
+    reaction_row.set_widget_name("reaction-row");
+    reaction_row.set_margin_top(-6); // slight overlap with bubble
+    reaction_row.set_margin_start(if is_from_me { 60 } else { 44 });
+    reaction_row.set_halign(if is_from_me { Align::End } else { Align::Start });
+
+    for (emoji, senders) in &grouped {
+        let count = senders.len();
+        let pill_text = if count > 1 {
+            format!("{emoji} {count}")
+        } else {
+            emoji.clone()
+        };
+        let pill_btn = Button::with_label(&pill_text);
+        pill_btn.add_css_class("flat");
+        pill_btn.add_css_class("caption");
+        pill_btn.set_cursor_from_name(Some("pointer"));
+
+        let names: Vec<String> = senders
+            .iter()
+            .map(|s| {
+                if s.is_empty() {
+                    "You".to_string()
+                } else {
+                    crate::ui::runtime::display_name_from_jid(s)
+                }
+            })
+            .collect();
+        pill_btn.set_tooltip_text(Some(&names.join(", ")));
+
+        let emoji_c = emoji.clone();
+        pill_btn.connect_clicked(move |btn| {
+            let popover = gtk4::Popover::new();
+            popover.set_parent(btn);
+            popover.set_has_arrow(true);
+            let vbox = Box::new(Orientation::Vertical, 4);
+            vbox.set_margin_start(8);
+            vbox.set_margin_end(8);
+            vbox.set_margin_top(6);
+            vbox.set_margin_bottom(6);
+            for name in &names {
+                let row = Box::new(Orientation::Horizontal, 8);
+                row.append(&Label::new(Some(&emoji_c)));
+                let name_lbl = Label::new(Some(name));
+                name_lbl.add_css_class("body");
+                row.append(&name_lbl);
+                vbox.append(&row);
+            }
+            popover.set_child(Some(&vbox));
+            popover.popup();
+        });
+        reaction_row.append(&pill_btn);
+    }
+    Some(reaction_row)
+}
+
 fn media_placeholder_label(msg: &IncomingMessage) -> Label {
     // For old messages without downloaded media, show "unavailable" not "downloading"
     let text = match &msg.media_type {

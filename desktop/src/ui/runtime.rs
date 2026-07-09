@@ -2478,29 +2478,31 @@ async fn handle_wa_event(
                     let emoji = rm.text.clone().unwrap_or_default();
                     let sender = info.source.sender.to_string();
                     if !target_id.is_empty() {
-                        // Persist reaction to message cache
-                        {
+                        // Persist reaction to message cache + capture the full
+                        // updated reactions so the UI can rebuild (dedup/remove).
+                        let updated: Option<Vec<(String, String)>> = {
                             let mut s = state.lock().unwrap();
+                            let mut out = None;
                             if let Some(msgs) = s.history.get_mut(&chat_id) {
                                 if let Some(m) = msgs.iter_mut().find(|m| m.id == target_id) {
-                                    if emoji.is_empty() {
-                                        // Empty emoji = reaction removed
-                                        m.reactions.retain(|(s, _)| *s != sender);
-                                    } else {
-                                        // Replace existing reaction from this sender or add new
-                                        m.reactions.retain(|(s, _)| *s != sender);
+                                    // Replace-or-remove this sender's reaction.
+                                    m.reactions.retain(|(s, _)| *s != sender);
+                                    if !emoji.is_empty() {
                                         m.reactions.push((sender, emoji.clone()));
                                     }
-                                    s.queue_save_messages(&chat_id);
+                                    out = Some(m.reactions.clone());
                                 }
+                                s.queue_save_messages(&chat_id);
                             }
-                        }
-                        if !emoji.is_empty() {
+                            out
+                        };
+                        // Emit ALWAYS (including removals — empty vec clears the row).
+                        if let Some(reactions) = updated {
                             let _ = tx
                                 .send(WaEvent::ReactionUpdated {
                                     chat_id: chat_id.clone(),
                                     msg_id: target_id,
-                                    emoji,
+                                    reactions,
                                 })
                                 .await;
                         }
@@ -4068,6 +4070,20 @@ async fn handle_wa_event(
                                         m.name = resolve_sender_name(&st, &m.jid);
                                     }
                                 }
+                                // Live-refresh any open bubbles from these senders
+                                // so a participant that showed a raw number now
+                                // shows their real name without reopening the chat.
+                                for m in &members {
+                                    if !m.name.contains('@') {
+                                        let _ = t
+                                            .send(WaEvent::SenderNameResolved {
+                                                chat_id: cid.clone(),
+                                                sender_id: m.jid.clone(),
+                                                name: m.name.clone(),
+                                            })
+                                            .await;
+                                    }
+                                }
                                 log::info!(
                                     "GroupMembers {cid}: resolved {newly_resolved}/{} via usync",
                                     unresolved.len()
@@ -5511,6 +5527,7 @@ async fn handle_command(
             if let Err(e) = client.send_message(jid, reaction).await {
                 log::warn!("SendReaction failed: {e:#}");
             } else {
+                let mut updated_reactions: Option<Vec<(String, String)>> = None;
                 // Persist reaction to cache
                 {
                     let own_jid = {
@@ -5525,18 +5542,24 @@ async fn handle_command(
                     if let Some(msgs) = s.history.get_mut(&chat_id) {
                         if let Some(m) = msgs.iter_mut().find(|m| m.id == msg_id) {
                             m.reactions.retain(|(s, _)| *s != own_jid);
-                            m.reactions.push((own_jid, emoji.clone()));
+                            // Empty emoji = clear our own reaction (toggle off).
+                            if !emoji.is_empty() {
+                                m.reactions.push((own_jid, emoji.clone()));
+                            }
+                            updated_reactions = Some(m.reactions.clone());
                             s.queue_save_messages(&chat_id);
                         }
                     }
                 }
-                let _ = tx
-                    .send(WaEvent::ReactionUpdated {
-                        chat_id,
-                        msg_id,
-                        emoji,
-                    })
-                    .await;
+                if let Some(reactions) = updated_reactions {
+                    let _ = tx
+                        .send(WaEvent::ReactionUpdated {
+                            chat_id,
+                            msg_id,
+                            reactions,
+                        })
+                        .await;
+                }
             }
         }
 
@@ -7310,6 +7333,14 @@ async fn handle_command(
                     log::warn!("EditMessage failed: {e:#}");
                     let _ = tx
                         .send(WaEvent::ErrorToast(format!("Failed to edit message: {e}")))
+                        .await;
+                    // Give the edited text back to the composer so it isn't lost.
+                    let _ = tx
+                        .send(WaEvent::EditFailed {
+                            chat_id,
+                            msg_id,
+                            new_text,
+                        })
                         .await;
                 }
             }

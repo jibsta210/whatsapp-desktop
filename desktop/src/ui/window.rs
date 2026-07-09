@@ -600,13 +600,21 @@ impl MainWindow {
                 msg_id, chat_id, ..
             } => format!("MediaReady: {msg_id} in {chat_id}"),
             WaEvent::AvatarReady { chat_id, .. } => format!("AvatarReady: {chat_id}"),
-            WaEvent::ReactionUpdated { msg_id, emoji, .. } => format!("Reaction: {msg_id} {emoji}"),
+            WaEvent::ReactionUpdated {
+                msg_id, reactions, ..
+            } => {
+                format!("Reaction: {msg_id} ({} total)", reactions.len())
+            }
             WaEvent::MessageStarred {
                 msg_id, starred, ..
             } => format!("Star: {msg_id} {starred}"),
             WaEvent::MessagePinned { msg_id, .. } => format!("Pin: {msg_id}"),
             WaEvent::MessageDeletedLocal { msg_id, .. } => format!("DeleteLocal: {msg_id}"),
             WaEvent::MessageEdited { msg_id, .. } => format!("MessageEdited: {msg_id}"),
+            WaEvent::EditFailed { msg_id, .. } => format!("EditFailed: {msg_id}"),
+            WaEvent::SenderNameResolved { sender_id, .. } => {
+                format!("SenderNameResolved: {sender_id}")
+            }
             WaEvent::ErrorToast(msg) => format!("ErrorToast: {msg}"),
             WaEvent::InfoToast(msg) => format!("InfoToast: {msg}"),
             WaEvent::GroupInviteLink { link, .. } => format!("InviteLink: {link}"),
@@ -1230,16 +1238,16 @@ impl MainWindow {
             WaEvent::ReactionUpdated {
                 chat_id,
                 msg_id,
-                emoji,
+                reactions,
             } => {
-                // Show reaction on the message bubble
-                inner.chat_view.show_reaction(&chat_id, &msg_id, &emoji);
-                // Update chat list preview
-                let rows = inner.chat_list.widget();
-                // Show reaction as latest action in chat list
-                inner
-                    .chat_list
-                    .update_preview_text(&chat_id, &format!("Reacted {emoji}"));
+                // Rebuild the reaction row on the bubble from the full set.
+                inner.chat_view.show_reaction(&chat_id, &msg_id, &reactions);
+                // Show the newest reaction as the latest action in the chat list.
+                if let Some((_, emoji)) = reactions.last() {
+                    inner
+                        .chat_list
+                        .update_preview_text(&chat_id, &format!("Reacted {emoji}"));
+                }
             }
             WaEvent::MessageStarred { starred, .. } => {
                 inner.toast_overlay.add_toast(adw::Toast::new(if starred {
@@ -1264,6 +1272,24 @@ impl MainWindow {
                 inner
                     .chat_view
                     .update_message_text(&chat_id, &msg_id, &new_text, true);
+            }
+            WaEvent::EditFailed {
+                chat_id,
+                msg_id,
+                new_text,
+            } => {
+                inner
+                    .chat_view
+                    .restore_failed_edit(&chat_id, &msg_id, &new_text);
+            }
+            WaEvent::SenderNameResolved {
+                chat_id,
+                sender_id,
+                name,
+            } => {
+                inner
+                    .chat_view
+                    .refresh_sender_name(&chat_id, &sender_id, &name);
             }
             WaEvent::ErrorToast(msg) => {
                 log::warn!("Error toast: {msg}");

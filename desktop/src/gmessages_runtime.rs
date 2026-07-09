@@ -1762,12 +1762,19 @@ async fn handle_command(
             match client.send_reaction(&conv, &raw_msg_id, &emoji, action).await {
                 Ok(()) => {
                     // Optimistic UI update — show it immediately rather than
-                    // waiting for the phone's long-poll echo.
+                    // waiting for the phone's long-poll echo. Empty emoji = the
+                    // user cleared their reaction (empty vec). Empty sender
+                    // renders as "You".
+                    let reactions = if emoji.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![(String::new(), emoji.clone())]
+                    };
                     let _ = event_tx
                         .send(WaEvent::ReactionUpdated {
                             chat_id: chat_id.clone(),
                             msg_id: msg_id.clone(),
-                            emoji: emoji.clone(),
+                            reactions,
                         })
                         .await;
                     // Persist directly so the reaction survives a restart —

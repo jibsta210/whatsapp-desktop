@@ -81,6 +81,18 @@ pub enum WaEvent {
         msg_id: String,
         new_text: String,
     },
+    /// An outgoing edit failed — restore the edited text so it isn't lost.
+    EditFailed {
+        chat_id: String,
+        msg_id: String,
+        new_text: String,
+    },
+    /// A group participant's real name resolved — refresh open bubbles.
+    SenderNameResolved {
+        chat_id: String,
+        sender_id: String,
+        name: String,
+    },
     /// Error message to display as a toast notification
     ErrorToast(String),
     /// Neutral/positive confirmation to display as a toast (e.g. "Contact blocked").
@@ -136,7 +148,10 @@ pub enum WaEvent {
     ReactionUpdated {
         chat_id: String,
         msg_id: String,
-        emoji: String,
+        /// The message's FULL deduped reactions (sender_jid, emoji) — the UI
+        /// rebuilds the whole row from this so it groups/dedups and handles
+        /// removals (empty vec clears the row).
+        reactions: Vec<(String, String)>,
     },
     MessageStarred {
         chat_id: String,
