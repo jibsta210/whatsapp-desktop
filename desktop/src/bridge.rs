@@ -924,3 +924,45 @@ impl Bridge {
         let _ = self.cmd_tx.send(cmd);
     }
 }
+
+#[cfg(test)]
+mod persistence_regression {
+    //! Tripwire tests for the on-disk bincode formats. If you ADD a field to
+    //! `ChatSummary` or `IncomingMessage`, bincode 1.x will NOT read old files
+    //! (`#[serde(default)]` does not apply mid-`Vec`), so you MUST bump
+    //! `BIN_HEADER` and add a legacy-decoder fallback (see `load_chats` /
+    //! `load_messages` / `gm_load_chats_cache`). These tests just guard that the
+    //! current structs remain bincode-round-trippable.
+    use super::*;
+
+    #[test]
+    fn chat_summary_bincode_roundtrips() {
+        let c = ChatSummary {
+            id: "123@g.us".into(),
+            name: "Group".into(),
+            last_message: "hi".into(),
+            timestamp: 42,
+            unread_count: 3,
+            is_group: true,
+            is_muted: false,
+            is_pinned: true,
+            is_archived: false,
+            is_favorite: true,
+            label: Some("Work".into()),
+            pinned_msg_id: None,
+            auto_mark_read: false,
+        };
+        let bytes = bincode::serialize(&c).expect("serialize");
+        let back: ChatSummary = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!((c.id, c.unread_count, c.is_favorite, c.auto_mark_read),
+                   (back.id, back.unread_count, back.is_favorite, back.auto_mark_read));
+    }
+
+    #[test]
+    fn incoming_message_bincode_roundtrips() {
+        let m = IncomingMessage::outgoing("m1".into(), "chat@s.whatsapp.net".into(), Some("hey".into()), 7);
+        let bytes = bincode::serialize(&m).expect("serialize");
+        let back: IncomingMessage = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!((m.id, m.text, m.timestamp), (back.id, back.text, back.timestamp));
+    }
+}

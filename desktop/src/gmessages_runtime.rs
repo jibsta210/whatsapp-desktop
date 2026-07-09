@@ -191,6 +191,53 @@ fn guess_mime(path: &str) -> String {
 /// next restart. This keeps the cache current message-by-message:
 /// load → upsert the one entry → write back. The file is small (tens of
 /// KB) and SMS volume is low, so a full rewrite per message is fine.
+/// Load the gm chat-list cache, tolerating corruption / schema drift. A present
+/// but undecodable file is preserved as `.corrupt` (never silently wiped) and
+/// treated as empty so the server reseed can rebuild it.
+fn gm_load_chats_cache(path: &Path) -> Vec<ChatSummary> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(v) = bincode::deserialize::<Vec<ChatSummary>>(&bytes) {
+        return v;
+    }
+    crate::ui::runtime::backup_corrupt_once(path);
+    log::warn!(
+        "gm_load_chats_cache: {} is undecodable (schema drift?); preserved as .corrupt, treating as empty",
+        path.display()
+    );
+    Vec::new()
+}
+
+/// Save the gm chat-list cache atomically, and NEVER overwrite a non-empty
+/// on-disk cache with an empty vector — that turned a one-restart schema blip
+/// (a `ChatSummary` field added without a fallback) into permanent loss of every
+/// SMS-only chat.
+fn gm_save_chats_cache(path: &Path, chats: &[ChatSummary]) {
+    if chats.is_empty() {
+        if let Ok(bytes) = std::fs::read(path) {
+            if !bytes.is_empty() {
+                log::warn!(
+                    "gm_save_chats_cache: refusing to overwrite non-empty {} with an empty cache",
+                    path.display()
+                );
+                return;
+            }
+        }
+    }
+    match bincode::serialize(&chats.to_vec()) {
+        Ok(payload) => {
+            if let Err(e) = crate::ui::runtime::atomic_write(path, &payload) {
+                log::warn!("gm_save_chats_cache({}): {e}", path.display());
+            }
+        }
+        Err(e) => log::warn!("gm_save_chats_cache serialize failed: {e}"),
+    }
+}
+
 fn upsert_gm_chat_cache(
     path: &Path,
     chat_id: &str,
@@ -199,10 +246,7 @@ fn upsert_gm_chat_cache(
     is_from_me: bool,
     sender_name: &str,
 ) {
-    let mut cache: Vec<ChatSummary> = std::fs::read(path)
-        .ok()
-        .and_then(|b| bincode::deserialize(&b).ok())
-        .unwrap_or_default();
+    let mut cache: Vec<ChatSummary> = gm_load_chats_cache(path);
 
     if let Some(existing) = cache.iter_mut().find(|c| c.id == chat_id) {
         // Move forward only — an out-of-order older message in a batch
@@ -245,9 +289,7 @@ fn upsert_gm_chat_cache(
         });
     }
 
-    if let Ok(bytes) = bincode::serialize(&cache) {
-        let _ = std::fs::write(path, bytes);
-    }
+    gm_save_chats_cache(path, &cache);
 }
 
 /// Build phone-digits → wa_chat_id (JID) index from the persisted WhatsApp
@@ -544,14 +586,15 @@ async fn run(
     // Hydrate the chat list from local cache BEFORE we connect, so gm chats
     // show up instantly on restart instead of after the ~3s server fetch.
     let gm_chats_cache_path = data_dir.join("gm_chats.bin");
-    if let Ok(bytes) = std::fs::read(&gm_chats_cache_path)
-        && let Ok(cached) = bincode::deserialize::<Vec<ChatSummary>>(&bytes)
     {
-        log::info!("gmessages: hydrating {} chats from cache", cached.len());
-        let wm_snap = gm_read_watermarks.lock().await.clone();
-        for mut summary in cached {
-            apply_gm_read_watermark(&mut summary, &wm_snap);
-            let _ = event_tx.send(WaEvent::ChatAdded(summary)).await;
+        let cached = gm_load_chats_cache(&gm_chats_cache_path);
+        if !cached.is_empty() {
+            log::info!("gmessages: hydrating {} chats from cache", cached.len());
+            let wm_snap = gm_read_watermarks.lock().await.clone();
+            for mut summary in cached {
+                apply_gm_read_watermark(&mut summary, &wm_snap);
+                let _ = event_tx.send(WaEvent::ChatAdded(summary)).await;
+            }
         }
     }
 
@@ -813,14 +856,9 @@ async fn run(
                     use std::collections::HashMap as StdHashMap;
                     let mut merged_cache: StdHashMap<String, ChatSummary> = StdHashMap::new();
                     // Seed with the OLD cache contents (if any).
-                    if let Ok(old_bytes) = std::fs::read(&gm_chats_cache_path)
-                        && let Ok(old_cached) =
-                            bincode::deserialize::<Vec<ChatSummary>>(&old_bytes)
-                    {
-                        for s in old_cached {
-                            if !mm_snap.contains_key(strip_prefix(&s.id)) {
-                                merged_cache.insert(s.id.clone(), s);
-                            }
+                    for s in gm_load_chats_cache(&gm_chats_cache_path) {
+                        if !mm_snap.contains_key(strip_prefix(&s.id)) {
+                            merged_cache.insert(s.id.clone(), s);
                         }
                     }
                     // Overlay the fresh response (fresh wins).
@@ -845,9 +883,7 @@ async fn run(
                         summaries.len(),
                         mm_snap.len(),
                     );
-                    if let Ok(bytes) = bincode::serialize(&to_persist) {
-                        let _ = std::fs::write(&gm_chats_cache_path, &bytes);
-                    }
+                    gm_save_chats_cache(&gm_chats_cache_path, &to_persist);
 
                     // First, evict stale gm rows that may have been hydrated
                     // from gm_chats.bin cache on startup but should now be

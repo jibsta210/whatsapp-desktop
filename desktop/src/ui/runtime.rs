@@ -69,6 +69,51 @@ fn messages_file(chat_id: &str) -> PathBuf {
     messages_dir().join(format!("{safe}.bin"))
 }
 
+static ATOMIC_WRITE_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Atomically write `data` to `path`: write a sibling temp file, fsync it, then
+/// rename over the target. A crash/power-loss mid-write leaves either the intact
+/// old file or the complete new one — never a truncated/corrupt aggregate file
+/// (which previously meant an empty sidebar, lost history, or read chats
+/// reverting to unread). Rename within the same directory is atomic on Linux.
+pub(crate) fn atomic_write(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let n = ATOMIC_WRITE_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{n}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Preserve a present-but-undecodable bincode file (schema drift / corruption)
+/// as `<path>.corrupt` before anything can overwrite it, so the raw bytes stay
+/// recoverable by a future decoder. Only copies once (won't clobber an existing
+/// `.corrupt`), so repeated failed loads don't churn.
+pub(crate) fn backup_corrupt_once(path: &std::path::Path) {
+    let bak = path.with_extension("corrupt");
+    if bak.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::copy(path, &bak) {
+        log::warn!("backup_corrupt_once({}): {e}", path.display());
+    } else {
+        log::warn!(
+            "Preserved undecodable {} → {} (history not lost; needs a decoder to recover)",
+            path.display(),
+            bak.display()
+        );
+    }
+}
+
 /// Read a bincode file with version header. Returns None on any failure.
 fn read_bin<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
     let data = std::fs::read(path).ok()?;
@@ -78,13 +123,15 @@ fn read_bin<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
     bincode::deserialize(&data[4..]).ok()
 }
 
-/// Write a bincode file with version header.
+/// Write a bincode file with version header (atomically).
 fn write_bin<T: serde::Serialize>(path: &str, value: &T) {
     if let Ok(payload) = bincode::serialize(value) {
         let mut data = Vec::with_capacity(4 + payload.len());
         data.extend_from_slice(&BIN_HEADER);
         data.extend_from_slice(&payload);
-        let _ = std::fs::write(path, data);
+        if let Err(e) = atomic_write(std::path::Path::new(path), &data) {
+            log::warn!("write_bin({path}) failed: {e}");
+        }
     }
 }
 
@@ -102,7 +149,9 @@ fn write_bin_path<T: serde::Serialize>(path: &PathBuf, value: &T) {
         let mut data = Vec::with_capacity(4 + payload.len());
         data.extend_from_slice(&BIN_HEADER);
         data.extend_from_slice(&payload);
-        let _ = std::fs::write(path, data);
+        if let Err(e) = atomic_write(path, &data) {
+            log::warn!("write_bin_path({}) failed: {e}", path.display());
+        }
     }
 }
 
@@ -388,6 +437,21 @@ pub fn load_messages(chat_id: &str) -> Vec<IncomingMessage> {
     // Try current version first
     if let Some(msgs) = read_bin_path::<Vec<IncomingMessage>>(&bin_path) {
         return msgs;
+    }
+
+    // Present with the CURRENT header but undecodable by the current struct =
+    // schema drift (a field added without a legacy decoder). Preserve the raw
+    // bytes as `.corrupt` before returning empty, otherwise the very next
+    // incoming message would load []→append→save and permanently overwrite the
+    // old history. The `.corrupt` copy keeps it recoverable.
+    if let Ok(data) = std::fs::read(&bin_path) {
+        if data.len() >= 4 && data[..4] == BIN_HEADER {
+            backup_corrupt_once(&bin_path);
+            log::warn!(
+                "load_messages({chat_id}): current-format decode failed; preserved as .corrupt, showing empty"
+            );
+            return vec![];
+        }
     }
 
     // Fallback: try old bincode format (v1) — the new fields have #[serde(default)]
