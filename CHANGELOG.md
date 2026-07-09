@@ -10,6 +10,85 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## Review-pass cleanup — fixes from `REVIEW-REPORT.md`
+
+Independent second-pass review of the whole `pre-audit-fixes..HEAD` diff (6 parallel
+reviewers) surfaced bugs the batches introduced or left. Fixed here as 7 file-partitioned
+work packets executed in parallel, then compile-checked (root crate **and** the `whatsapp-desktop`
+bin — the latter is *not* in `default-members`, so `cargo build --release` alone does not build it)
+and regression-tested.
+
+**Reversibility:** baseline for this pass is tag **`pre-cleanup`** (commit `57bc157`).
+Undo the whole cleanup: `git reset --hard pre-cleanup`. Each packet is committed separately
+below so a single packet can be `git revert`ed in isolation.
+
+**Verification:** release build of both crates clean (no new warnings beyond the pre-existing
+`send_remove_mutation`); new regression tests all green — `test_message_worker_reacquires_on_generation_bump_instead_of_dropping`,
+`test_complete_offline_sync_widen_is_atomic_under_mutex` (S1/S2), and
+`legacy_blob_decodes_and_migrates_without_wiping` + `current_format_round_trips_through_decode` +
+`is_lid_row_skips_suffix_index_on_load` (C2/G1).
+
+### Critical
+- **C1 — Tray window no longer silently blue-ticks unseen messages.** `SetActiveChat{None}` is
+  now sent on close-to-tray and re-sent with `Some(current)` on window refocus; the current-chat
+  auto-mark-read is gated on window focus. Previously a chat left "active" while the window sat in
+  the tray sent real read receipts (and mis-persisted unread counts) for messages never seen.
+- **C2 — `contacts_directory.bin` no longer silently wiped on upgrade.** The new `name_priority`
+  field broke bincode decode of old files; a legacy-layout fallback decoder now migrates existing
+  directories, and an undecodable file is preserved as `.corrupt` instead of being overwritten empty.
+- **C3 / C4 — Typing indicator no longer misfires.** Opening a chat with a saved draft (or restoring
+  a failed edit / opening the event creator) no longer broadcasts a phantom "typing…"; switching
+  chats or sending now flushes `SetTyping{false}` to the correct chat via a shared `cancel_typing()`
+  helper, so a contact no longer stays stuck on "typing…" indefinitely.
+
+### Major
+- **S1 — Offline messages no longer lost on a mid-drain disconnect.** A worker whose semaphore
+  generation was bumped by a reconnect during backlog drain now re-acquires on the new semaphore and
+  processes the (already-acked, durable-session) message instead of silently dropping it.
+- **S2 — Offline-sync completion CAS + permit widen are now atomic** under the semaphore mutex,
+  closing the race that could leak 63 permits onto the next connection's semaphore and break ordering.
+- **R1 — Live unread bumps no longer swallowed** by the reseed-defense watermark guard (now gated on
+  a `from_reseed` flag), so a message arriving in the same second as a local mark-read is counted.
+- **R2 — First message of a brand-new chat persists `unread=1`** when it arrives while away (was
+  hardcoded 0), so a new contact's chat no longer shows already-read after restart.
+- **W1 — "Log out / Unlink device" relabeled to "Disconnect this session"** with honest copy — it
+  disconnects but does not unlink (a true remove-device is not yet implemented; see report for the
+  runtime.rs work it needs).
+- **B1 — `update_sender_name` renames the group sender label**, not the quoted-reply sender; refresh
+  keeps its hashed colour + bold styling.
+- **B2 — Re-downloading a deleted media file** no longer sticks on the download placeholder forever
+  (`media_loaded` seeded from the exists-filtered path).
+- **G2 — Failed-SMS Resend button actually re-sends** now (was a silent no-op).
+- **G3 — Sending a contact card to an SMS chat** marks the bubble failed instead of hanging forever.
+- **G4 — Longpoll HTTP non-success backoff capped at 60s** (matching the POST-failure branch).
+- **G5 — Mark-as-unread on an SMS chat survives reseed** — runtime now fans `MarkUnread` to the gm
+  runtime, which rolls its read watermark back.
+- **G6 — The synthetic "Verification Codes" inbox can be marked read** — the watermark is fanned to
+  the real underlying shortcode convs (bogus server ACK skipped) and those rows are suppressed on
+  reseed so they stop reappearing unread.
+- **V1 — No malformed `SetTyping` with a virtual `sendgroup::` id** while typing in a send group.
+- **V2 — Event creator no longer hijacks composer state** (staged image, in-progress edit, or draft);
+  event text is sent directly, bypassing the composer.
+- **V3 — A failed message edit no longer clobbers text typed while the edit was in flight** — it only
+  reclaims the composer when empty, otherwise surfaces the failed text via a toast.
+
+### Minor (selected)
+- Optimistic SMS reaction updates merge with the persisted set instead of wiping other participants'
+  reactions; gm read-watermark and contacts directory now written atomically; `set_use_markup(true)`
+  no longer defeats the plain-text markup fallback; sender-controlled URLs are http/https-allowlisted
+  before `xdg-open`; typing throttle uses `glib::monotonic_time()`; `@Ann`/`@Anna` mention
+  boundary fix; notification-open selects the sidebar row; brand-new chat row doesn't seed unread=1
+  when you're viewing it; consecutive duplicate toasts suppressed; `SetActiveChat` applied inline
+  (ordering); history-sync seeds the read-receipt anchor; event-creator dialog leak fixed;
+  voice-note preview can replay; quick-reply Save disabled until non-empty.
+- Removed the now-dead `widen_message_semaphore` (superseded by `try_complete_offline_sync_widen`).
+
+**Deferred (in report, not applied):** a true device-unlink for W1 (needs a remove-device IQ +
+session wipe + QR re-route); watermark single-writer channel; best-effort reactions for uncached
+chats. See `REVIEW-REPORT.md` for the rationale on each.
+
+---
+
 ## Batch 1 — Persistence hardening
 
 Closes the silent data-loss / corruption holes so the later batches (which change persisted
