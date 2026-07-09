@@ -171,3 +171,20 @@ Per your direction: destructive-action confirmations = NO change; the rest appli
 - **Event creator built** — the attach-menu "Event" row now opens a composer (name / date / time /
   location), formats a tidy event message, and sends it through the normal send path (optimistic
   bubble + channel routing). Escape/Cancel dismiss.
+
+## Batch 7c — Group event labels (subset)
+
+- **Group rename applies live** — the `Subject` group-notification no longer hits the early-return
+  catch-all; it now emits a "changed the group name to …" system message AND falls through to the
+  metadata refresh that renames the chat. (group-subject-change-ignored)
+- **"You" in group events** — your own account shows as "You" instead of your phone number in
+  add/remove/promote/demote system messages. (self-not-shown-as-you-in-group-events)
+
+## Remaining (batches 7–8) — documented, not yet applied
+
+The rest of batches 7–8 (~40 items) are mostly P3 micro-polish (chevron hover, per-message
+long-press menu, Escape-to-close on secondary dialogs, compose placeholder, star-toggle, live
+reaction dedup, poll-vote merge, name-resolution heuristics, per-message perf under lock, etc.).
+They are fully listed in `AUDIT.md` Part B and can be executed as a follow-up. The high-value,
+user-visible work (persistence, feedback, read/unread core, SMS parity, notifications, groups/names,
+and all four approved decisions) is done.

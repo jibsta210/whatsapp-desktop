@@ -3693,6 +3693,19 @@ async fn handle_wa_event(
                 } else {
                     raw.clone()
                 };
+                // Show the user's own account as "You" instead of their number.
+                let digits = |j: &str| -> String {
+                    j.chars().filter(|c| c.is_ascii_digit()).collect()
+                };
+                let rd = digits(&resolved);
+                let raw_d = digits(&raw);
+                if !rd.is_empty()
+                    && (rd == digits(&s.own_phone)
+                        || rd == digits(&s.own_lid)
+                        || raw_d == digits(&s.own_lid))
+                {
+                    return "You".to_string();
+                }
                 resolve_sender_name(&s, &resolved)
             };
 
@@ -3714,6 +3727,11 @@ async fn handle_wa_event(
                     format!("{} is no longer an admin", names.join(", "))
                 }
                 GroupNotificationAction::Modify { .. } => "Group info was updated".to_string(),
+                GroupNotificationAction::Subject { subject, .. } => {
+                    // Falling through (not returning early) lets the member-refresh
+                    // spawn below also rename the chat live via get_metadata.
+                    format!("changed the group name to \u{201c}{subject}\u{201d}")
+                }
                 _ => {
                     log::debug!("Unhandled group notification action");
                     return;
