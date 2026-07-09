@@ -35,9 +35,14 @@ impl Client {
         {
             // Allow parallel message processing now that offline sync is done.
             // During offline sync, permits=1 serialized all message processing.
-            // Replace with a new semaphore with 64 permits for concurrent processing.
-            // Old workers holding the previous semaphore Arc will finish normally.
-            self.swap_message_semaphore(64);
+            // WIDEN the existing semaphore (1 → 64) rather than swapping the Arc:
+            // swapping bumps the generation, and any offline-message worker still
+            // draining the backlog would then see a generation mismatch and
+            // SILENTLY DROP its message before decryption — permanently losing
+            // offline messages (the server already got the transport ack, so it
+            // won't resend). Growing the same semaphore keeps those in-flight
+            // permits valid so the workers finish decoding.
+            self.widen_message_semaphore(63);
 
             self.offline_sync_notifier.notify(usize::MAX);
 

@@ -448,6 +448,26 @@ impl Client {
             .fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Widen the CURRENT message-processing semaphore by `add` permits WITHOUT
+    /// swapping the Arc or bumping the generation.
+    ///
+    /// Used to open up concurrency at the end of offline sync. Swapping the Arc
+    /// (as `swap_message_semaphore` does) bumps the generation, which the
+    /// post-acquire guard in `handle_incoming_message` interprets as a stale
+    /// reconnect and SILENTLY DROPS the message — permanently losing offline
+    /// messages that were still draining when offline delivery completed (the
+    /// server already got the transport ack, so it won't resend). Growing the
+    /// same semaphore instead lets those in-flight workers keep a valid permit
+    /// and finish decoding. The generation guard still fires on a real reconnect
+    /// (which uses `swap_message_semaphore`).
+    pub(crate) fn widen_message_semaphore(&self, add: usize) {
+        let guard = match self.message_processing_semaphore.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.add_permits(add);
+    }
+
     fn should_downgrade_sync_error(&self, err: &anyhow::Error) -> bool {
         if self.is_shutting_down() {
             return true;

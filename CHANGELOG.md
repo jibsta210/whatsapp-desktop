@@ -188,3 +188,29 @@ reaction dedup, poll-vote merge, name-resolution heuristics, per-message perf un
 They are fully listed in `AUDIT.md` Part B and can be executed as a follow-up. The high-value,
 user-visible work (persistence, feedback, read/unread core, SMS parity, notifications, groups/names,
 and all four approved decisions) is done.
+
+## Offline message loss — messages that arrived while the app was closed
+
+Long-standing bug: messages a contact sent while the desktop was closed never appeared after
+reopening (permanently missing, not just un-notified). Root cause (source-verified, corroborated by
+two independent traces): a semaphore **generation-guard race** in the core message pipeline.
+
+During offline sync the message-processing semaphore is set to permits=1 (serialized). Offline
+`<message>` stanzas queue in per-chat workers, each capturing `generation = G` then blocking on the
+permit. When the server's "offline complete" marker arrives, `complete_offline_sync` **swapped** the
+semaphore Arc and bumped the generation to G+1 — *while the backlog was still draining*. Each
+still-queued worker then saw `generation(G) != G+1` and `return`ed at `message.rs:608`, dropping its
+message **before decryption** — no decrypt, no retry receipt, no event. Since the transport `<ack>`
+was already sent, the server considered it delivered and dropped it from the offline queue →
+permanent loss. (Reproduces only for the offline window; live + history-sync never hit a mid-flight
+generation flip.)
+
+Fix: `complete_offline_sync` now **widens** the existing semaphore (`add_permits`, 1→64) instead of
+swapping the Arc + bumping the generation (new `Client::widen_message_semaphore`). In-flight offline
+workers keep a valid permit and finish decoding. The generation guard still fires on a genuine
+reconnect (which still uses `swap_message_semaphore`). Files: `src/client.rs`, `src/client/sessions.rs`.
+
+To confirm from logs after an offline→reopen repro: previously each lost message logged
+`"Semaphore generation changed during acquire, dropping stale permit"` (message.rs); that line should
+now be absent for offline messages, and each `DIAG msg arrival ... offline` should be followed by a
+`MSG routed` on the desktop.
