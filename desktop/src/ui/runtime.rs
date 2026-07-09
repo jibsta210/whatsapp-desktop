@@ -2712,7 +2712,20 @@ async fn handle_wa_event(
                     // Persist message and update chat summary
                     let (name_update, new_chat) = persist_new_message(&m, state);
                     if let Some(s) = new_chat {
+                        // A brand-new group starts with a placeholder name (the
+                        // creator/sender, since we have no subject yet). Fetch the
+                        // real subject now so the header corrects within a second
+                        // instead of showing the creator's name until restart.
+                        let new_group_id = s.id.ends_with("@g.us").then(|| s.id.clone());
                         let _ = tx.send(WaEvent::ChatAdded(s)).await;
+                        if let Some(gid) = new_group_id {
+                            let c = client.clone();
+                            let st = state.clone();
+                            let t = tx.clone();
+                            tokio::spawn(async move {
+                                fetch_group_subject(&c, &st, &t, &gid).await;
+                            });
+                        }
                     }
 
                     // Spawn media download if needed
@@ -3660,6 +3673,22 @@ async fn handle_wa_event(
                     Err(_) => return,
                 };
                 if let Ok(meta) = c.groups().get_metadata(&jid).await {
+                    // Update the group NAME from the fresh subject. A newly
+                    // created group (or one we were just added to) initially
+                    // shows a placeholder derived from the creator/sender —
+                    // group_name_from_history picks the only person who has
+                    // spoken. Previously that stuck until the next restart's
+                    // group-name refresh; set it now that we have the real
+                    // subject in hand.
+                    if !meta.subject.is_empty() {
+                        s.lock().unwrap().rename_chat(&cid, &meta.subject);
+                        let _ = t
+                            .send(WaEvent::ChatNameUpdated {
+                                chat_id: cid.clone(),
+                                name: meta.subject.clone(),
+                            })
+                            .await;
+                    }
                     // First pass: resolve what we can from cache
                     let mut members: Vec<crate::bridge::GroupMember> = meta
                         .participants
@@ -8035,6 +8064,35 @@ async fn merge_lid_chats(
 }
 
 // ── Group name refresh ────────────────────────────────────────────────────────
+
+/// Fetch a single group's subject from the server and apply it as the chat
+/// name. Used when a brand-new group first appears via a live message (before
+/// any GroupUpdate notification), so the header shows the real group name
+/// instead of the creator/sender placeholder within a second — not on restart.
+async fn fetch_group_subject(
+    client: &Arc<Client>,
+    state: &Arc<Mutex<RuntimeState>>,
+    tx: &Sender<WaEvent>,
+    chat_id: &str,
+) {
+    let Ok(jid) = chat_id.parse::<Jid>() else {
+        return;
+    };
+    match client.groups().get_metadata(&jid).await {
+        Ok(meta) if !meta.subject.is_empty() => {
+            log::info!("Resolved new group {chat_id} → {:?}", meta.subject);
+            state.lock().unwrap().rename_chat(chat_id, &meta.subject);
+            let _ = tx
+                .send(WaEvent::ChatNameUpdated {
+                    chat_id: chat_id.to_string(),
+                    name: meta.subject,
+                })
+                .await;
+        }
+        Ok(_) => {}
+        Err(e) => log::debug!("fetch_group_subject({chat_id}) failed: {e:#}"),
+    }
+}
 
 async fn fetch_and_update_group_names(
     client: &Arc<Client>,
