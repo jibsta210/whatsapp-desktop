@@ -72,6 +72,14 @@ struct ChatViewInner {
     typing_last_true_ms: std::cell::Cell<i64>,
     /// Pending "typing stopped" timer, rearmed on each keystroke.
     typing_stop_source: RefCell<Option<gtk4::glib::SourceId>>,
+    /// The routed chat target we last sent SetTyping{true} for. Stored so
+    /// cancel_typing can flush a SetTyping{false} to the RIGHT chat even after
+    /// current_chat_id has moved on (chat switch, send).
+    typing_target: RefCell<Option<String>>,
+    /// When true, the next buffer `connect_changed` is a programmatic set_text
+    /// (draft restore, edit restore, event creator) — NOT a user keystroke — so
+    /// the typing-indicator block early-returns and doesn't broadcast "typing…".
+    suppress_typing: Cell<bool>,
     /// The user's own JID (for avatar loading on sent messages)
     own_jid: RefCell<Option<String>>,
     own_name: RefCell<String>,
@@ -766,6 +774,8 @@ impl ChatViewPanel {
             send_button,
             typing_last_true_ms: std::cell::Cell::new(0),
             typing_stop_source: RefCell::new(None),
+            typing_target: RefCell::new(None),
+            suppress_typing: Cell::new(false),
             typing_box,
             typing_name,
             header_name,
@@ -1142,6 +1152,12 @@ impl ChatViewPanel {
                                     mf.pause();
                                     btn.set_icon_name("media-playback-start-symbolic");
                                 } else {
+                                    // If playback already ran to the end, rewind
+                                    // first — a MediaFile parked at EOS won't
+                                    // replay on play() without seeking to 0.
+                                    if mf.is_ended() {
+                                        mf.seek(0);
+                                    }
                                     mf.play();
                                     btn.set_icon_name("media-playback-pause-symbolic");
                                 }
@@ -1514,17 +1530,26 @@ impl ChatViewPanel {
                 // ── Outbound "typing…" indicator (throttled true + idle false) ──
                 {
                     let full = buf.text(&buf.start_iter(), &buf.end_iter(), false);
-                    if !full.trim().is_empty()
+                    // Skip programmatic set_text (draft/edit restore, event creator):
+                    // those aren't real keystrokes and must not broadcast "typing…".
+                    if inner_c.suppress_typing.get() {
+                        // fall through to popover detection below
+                    } else if !full.trim().is_empty()
                         && let Some(cid) = inner_c.current_chat_id.borrow().clone()
+                        // Send groups have no real recipient JID — dispatching
+                        // SetTyping with the virtual "sendgroup::Name" id sends a
+                        // malformed JID to the bridge every 3s. Skip typing there.
+                        && inner_c.send_group_ids.borrow().is_none()
+                        && !cid.starts_with("sendgroup::")
                     {
                         let routed = ChatViewPanel::resolve_send_target(&cid);
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0);
+                        // Monotonic clock: immune to suspend / NTP wall-clock jumps
+                        // that could otherwise wedge the throttle. Microseconds → ms.
+                        let now_ms = gtk4::glib::monotonic_time() / 1000;
                         // Send typing=true at most once every 3s.
                         if now_ms - inner_c.typing_last_true_ms.get() > 3000 {
                             inner_c.typing_last_true_ms.set(now_ms);
+                            *inner_c.typing_target.borrow_mut() = Some(routed.clone());
                             inner_c.bridge.send_command(WaCommand::SetTyping {
                                 chat_id: routed.clone(),
                                 is_typing: true,
@@ -1544,6 +1569,7 @@ impl ChatViewPanel {
                                     is_typing: false,
                                 });
                                 *inner_t.typing_stop_source.borrow_mut() = None;
+                                *inner_t.typing_target.borrow_mut() = None;
                             },
                         );
                         *inner_c.typing_stop_source.borrow_mut() = Some(src);
@@ -2180,6 +2206,84 @@ impl ChatViewPanel {
         self.inner.header_name.set_cursor_from_name(Some("pointer"));
     }
 
+    /// Send a plain text message to the current chat WITHOUT touching the
+    /// composer buffer, editing state, pending attachment, reply context or
+    /// mentions. Builds its own optimistic bubble and routes through the same
+    /// SendText / MultiSend paths do_send uses for a plain message. Used by the
+    /// event creator so composing an event can't hijack an in-progress edit,
+    /// caption a staged image, or destroy the user's draft.
+    fn send_plain_text(inner: &Rc<ChatViewInner>, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let chat_id = match inner.current_chat_id.borrow().clone() {
+            Some(id) => id,
+            None => return,
+        };
+        let tmp_id = gen_tmp_id();
+        let now_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        let optimistic = IncomingMessage {
+            id: tmp_id.clone(),
+            chat_id: chat_id.clone(),
+            sender_id: String::new(),
+            sender_name: String::new(),
+            text: Some(text.clone()),
+            media_type: None,
+            timestamp: now_ts,
+            is_from_me: true,
+            quoted_msg_id: None,
+            quoted_text: None,
+            quoted_sender: None,
+            quoted_media_path: None,
+            poll_question: None,
+            poll_options: vec![],
+            poll_selectable: 0,
+            poll_secret: vec![],
+            poll_votes: vec![],
+            is_forwarded: false,
+            forwarding_score: 0,
+            reactions: vec![],
+            media_local_path: None,
+            media_filename: None,
+            media_caption: None,
+            contact_name: None,
+            contact_vcard: None,
+            link_title: None,
+            link_description: None,
+            link_url: None,
+            link_thumbnail_path: None,
+            receipt_status: crate::bridge::ReceiptStatus::Pending,
+            is_edited: false,
+            is_system_message: false,
+            media_download: None,
+        };
+        Self::append_bubble_to_inner(inner, optimistic);
+        Self::force_scroll_to_bottom(inner, 5);
+
+        if let Some(group_ids) = inner.send_group_ids.borrow().clone() {
+            let group_name = chat_id
+                .strip_prefix("sendgroup::")
+                .unwrap_or(&chat_id)
+                .to_string();
+            save_send_group_message(&group_name, &text);
+            inner.bridge.send_command(WaCommand::MultiSend {
+                chat_ids: group_ids,
+                text,
+            });
+        } else {
+            inner.bridge.send_command(WaCommand::SendText {
+                chat_id: ChatViewPanel::resolve_send_target(&chat_id),
+                text,
+                tmp_id,
+                mentioned_jids: vec![],
+            });
+        }
+    }
+
     fn do_send(inner: &Rc<ChatViewInner>) {
         let chat_id = match inner.current_chat_id.borrow().clone() {
             Some(id) => id,
@@ -2190,6 +2294,9 @@ impl ChatViewPanel {
 
         let pending_image = inner.pending_image_path.borrow_mut().take();
         if let Some(image_path) = pending_image {
+            // Sending ends the typing session — flush SetTyping{false} to the
+            // routed target so the recipient doesn't linger on "typing…".
+            Self::cancel_typing(inner, true);
             inner.image_preview_bar.set_visible(false);
             // Drop the per-chat saved record too — once sent, the chat
             // shouldn't retain it for next-time-opened.
@@ -2236,6 +2343,7 @@ impl ChatViewPanel {
 
         let pending_gif = inner.pending_gif_url.borrow_mut().take();
         if let Some(mp4_url) = pending_gif {
+            Self::cancel_typing(inner, true);
             inner.image_preview_bar.set_visible(false);
             inner.input_view.buffer().set_text("");
             let tmp_id = gen_tmp_id();
@@ -2256,6 +2364,9 @@ impl ChatViewPanel {
         if text.trim().is_empty() {
             return;
         }
+
+        // We are committing to a send — flush any outbound "typing…" now.
+        Self::cancel_typing(inner, true);
 
         // Edit an existing message — send immediately, no AC delay
         let editing = inner.editing_msg.borrow_mut().take();
@@ -2332,7 +2443,9 @@ impl ChatViewPanel {
             if let Some((jid, name)) = entry.split_once('\t') {
                 let name_pat = format!("@{name}");
                 // Drop the mention if the user deleted its "@Name" from the text.
-                if !text.contains(name_pat.as_str()) {
+                // Word-boundary aware (same rule as replace_mention_literal) so a
+                // deleted "@Ann" doesn't linger just because "@Anna" remains.
+                if !mention_literal_present(&text, &name_pat) {
                     continue;
                 }
                 mentioned_jids.push(jid.to_string());
@@ -2606,6 +2719,47 @@ impl ChatViewPanel {
         }
     }
 
+    /// Tear down the outbound typing-indicator state. Removes any armed
+    /// idle-stop timer, resets the throttle, and (when `flush`) sends a final
+    /// SetTyping{false} to the chat we last announced typing for — using the
+    /// stored routed target, NOT current_chat_id, so a chat switch / send
+    /// flushes the OLD chat correctly instead of stranding it on "typing…".
+    fn cancel_typing(inner: &Rc<ChatViewInner>, flush: bool) {
+        if let Some(src) = inner.typing_stop_source.borrow_mut().take() {
+            src.remove();
+        }
+        inner.typing_last_true_ms.set(0);
+        let target = inner.typing_target.borrow_mut().take();
+        if flush && let Some(routed) = target {
+            inner.bridge.send_command(WaCommand::SetTyping {
+                chat_id: routed,
+                is_typing: false,
+            });
+        }
+    }
+
+    /// Programmatically set the composer text WITHOUT tripping the outbound
+    /// typing indicator (draft/edit restore, event-creator prefill are not
+    /// real keystrokes). Guards `suppress_typing` around the set_text.
+    fn set_composer_text_silent(inner: &Rc<ChatViewInner>, text: &str) {
+        inner.suppress_typing.set(true);
+        inner.input_view.buffer().set_text(text);
+        inner.suppress_typing.set(false);
+    }
+
+    /// Find the app-wide `adw::ToastOverlay` by walking up the widget tree from
+    /// the chat root. Lets chat-view surface a toast without a bridge round-trip.
+    fn toast_overlay(inner: &ChatViewInner) -> Option<adw::ToastOverlay> {
+        let mut w = inner.root.parent();
+        while let Some(cur) = w {
+            if let Ok(overlay) = cur.clone().downcast::<adw::ToastOverlay>() {
+                return Some(overlay);
+            }
+            w = cur.parent();
+        }
+        None
+    }
+
     /// Force scroll-to-bottom (for chat switch, send, history load).
     /// Fires on the next N vadjustment `changed` signals.
     fn force_scroll_to_bottom(inner: &ChatViewInner, pulses: u32) {
@@ -2634,7 +2788,24 @@ impl ChatViewPanel {
         if self.inner.current_chat_id.borrow().as_deref() != Some(chat_id) {
             return;
         }
-        self.inner.input_view.buffer().set_text(new_text);
+        // Only reclaim the composer if it's empty — otherwise we'd clobber a
+        // fresh draft the user typed while the edit was in flight. In that case
+        // surface the failed text via a toast so it isn't silently lost, and do
+        // NOT re-arm editing_msg (the next Enter would fire an unintended edit).
+        let buf = self.inner.input_view.buffer();
+        let current = buf
+            .text(&buf.start_iter(), &buf.end_iter(), false)
+            .to_string();
+        if !current.trim().is_empty() {
+            if let Some(overlay) = Self::toast_overlay(&self.inner) {
+                overlay.add_toast(adw::Toast::new(&format!(
+                    "Edit failed — your text: {new_text}"
+                )));
+            }
+            return;
+        }
+        // suppress_typing: this is a programmatic restore, not a keystroke.
+        Self::set_composer_text_silent(&self.inner, new_text);
         *self.inner.editing_msg.borrow_mut() = Some((chat_id.to_string(), msg_id.to_string()));
         self.inner.edit_banner.set_reveal_child(true);
         self.inner.input_view.grab_focus();
@@ -2663,6 +2834,12 @@ impl ChatViewPanel {
             self.inner.input_view.grab_focus();
             return false;
         }
+
+        // ── Flush the outgoing chat's typing indicator ──
+        // Before we swap current_chat_id, tell the OLD chat we've stopped
+        // typing (using the stored routed target) and tear down its idle timer,
+        // so the recipient doesn't get stuck on "typing…" after we leave.
+        Self::cancel_typing(&self.inner, true);
 
         // ── Save draft for outgoing chat ──
         if let Some(old_chat_id) = self.inner.current_chat_id.borrow().clone() {
@@ -2724,7 +2901,9 @@ impl ChatViewPanel {
             .get(&chat_id)
             .cloned()
             .unwrap_or_default();
-        self.inner.input_view.buffer().set_text(&draft);
+        // Programmatic restore — suppress the outbound typing indicator so
+        // merely clicking a chat with a saved draft doesn't broadcast "typing…".
+        Self::set_composer_text_silent(&self.inner, &draft);
 
         // ── Restore pending attachment for incoming chat ──
         // Always reset the active pending state first so a stale
@@ -4044,6 +4223,30 @@ fn update_send_button_state(inner: &Rc<ChatViewInner>) {
 /// but only when the literal is not immediately followed by another name
 /// character (letter/digit/underscore). This stops a shorter name from
 /// matching inside a longer one and keeps the substitution word-boundary safe.
+/// True if `needle` (an "@Name" literal) appears in `haystack` as a WHOLE
+/// mention — i.e. the char immediately after it is not a name char. Mirrors the
+/// word-boundary rule in `replace_mention_literal` so the keep-decision for a
+/// mention doesn't spuriously match "@Ann" inside "@Anna".
+fn mention_literal_present(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut rest = haystack;
+    while let Some(pos) = rest.find(needle) {
+        let after = &rest[pos + needle.len()..];
+        let next_is_name_char = after
+            .chars()
+            .next()
+            .map(|c| c.is_alphanumeric() || c == '_')
+            .unwrap_or(false);
+        if !next_is_name_char {
+            return true;
+        }
+        rest = after;
+    }
+    false
+}
+
 fn replace_mention_literal(haystack: &str, needle: &str, replacement: &str) -> String {
     if needle.is_empty() {
         return haystack.to_string();
@@ -4969,8 +5172,9 @@ fn show_message_menu(
                 pop.popdown();
                 // Pre-fill input with current text and set edit mode
                 if let Some(text) = &msg_c.text {
-                    let buf = inner_c.input_view.buffer();
-                    buf.set_text(text);
+                    // Programmatic prefill — suppress the outbound typing
+                    // indicator so opening "Edit" doesn't broadcast "typing…".
+                    ChatViewPanel::set_composer_text_silent(&inner_c, text);
                     // Store edit state: (chat_id, msg_id)
                     *inner_c.editing_msg.borrow_mut() =
                         Some((msg_c.chat_id.clone(), msg_c.id.clone()));
@@ -5009,6 +5213,20 @@ fn show_message_menu(
                 entry.set_margin_top(8);
                 entry.set_activates_default(true);
                 dialog.set_extra_child(Some(&entry));
+
+                // Save is meaningless with an empty shortcut — keep it disabled
+                // until the entry has content so a stray Save doesn't silently
+                // eat the dialog with nothing saved.
+                dialog.set_response_enabled("save", false);
+                {
+                    let dialog_e = dialog.clone();
+                    entry.connect_changed(move |e| {
+                        dialog_e.set_response_enabled(
+                            "save",
+                            !e.text().trim().is_empty(),
+                        );
+                    });
+                }
 
                 let parent_window = inner_c
                     .root
@@ -5146,15 +5364,24 @@ fn show_event_creator(inner: &Rc<ChatViewInner>) {
     content.append(&btn_row);
     window.set_child(Some(&content));
 
-    let win_cancel = window.clone();
-    cancel.connect_clicked(move |_| win_cancel.close());
+    // Weak window refs in the closures: a strong clone captured by a signal
+    // handler ON the window forms a reference cycle that leaks the whole event
+    // dialog on every open. Downgrade + upgrade-on-use breaks it.
+    let win_cancel = window.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(w) = win_cancel.upgrade() {
+            w.close();
+        }
+    });
 
     // Escape closes.
     let key = gtk4::EventControllerKey::new();
-    let win_key = window.clone();
+    let win_key = window.downgrade();
     key.connect_key_pressed(move |_, keyval, _, _| {
         if keyval == gtk4::gdk::Key::Escape {
-            win_key.close();
+            if let Some(w) = win_key.upgrade() {
+                w.close();
+            }
             gtk4::glib::Propagation::Stop
         } else {
             gtk4::glib::Propagation::Proceed
@@ -5163,7 +5390,7 @@ fn show_event_creator(inner: &Rc<ChatViewInner>) {
     window.add_controller(key);
 
     let inner_c = inner.clone();
-    let win_create = window.clone();
+    let win_create = window.downgrade();
     create.connect_clicked(move |_| {
         let n = name.text().trim().to_string();
         if n.is_empty() {
@@ -5182,9 +5409,14 @@ fn show_event_creator(inner: &Rc<ChatViewInner>) {
         if !l.is_empty() {
             msg.push_str(&format!("\n📍 {l}"));
         }
-        inner_c.input_view.buffer().set_text(&msg);
-        ChatViewPanel::do_send(&inner_c);
-        win_create.close();
+        // Send the event text directly through normal text routing WITHOUT
+        // touching the composer buffer, editing_msg, pending attachment or
+        // draft — so composing an event never captions a staged image, turns an
+        // active edit into an edit-of-old-message, or destroys the user's draft.
+        ChatViewPanel::send_plain_text(&inner_c, msg);
+        if let Some(w) = win_create.upgrade() {
+            w.close();
+        }
     });
 
     window.present();
