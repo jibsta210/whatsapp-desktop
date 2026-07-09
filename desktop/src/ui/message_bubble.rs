@@ -255,7 +255,6 @@ impl MessageBubble {
             sender_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
             sender_label.set_max_width_chars(50);
             text_col.append(&sender_label);
-            stored_sender_label = Some(sender_label);
 
             // Show quoted text or media type indicator
             let display_text = msg.quoted_text.as_deref().unwrap_or("");
@@ -364,6 +363,7 @@ impl MessageBubble {
                 glib::markup_escape_text(&display_name)
             ));
             content.append(&sender);
+            stored_sender_label = Some(sender);
         }
 
         // Poll widget
@@ -587,16 +587,23 @@ impl MessageBubble {
 
         let on_image_click: Rc<RefCell<Option<ClickHandler>>> = Rc::new(RefCell::new(None));
 
+        // Whether the stored media file ACTUALLY exists on disk right now. The
+        // stale `media_local_path` can point at a cleared/missing file, so we
+        // derive this exists-filtered value once and reuse it both for the
+        // placeholder decision below AND the `media_loaded` seed — otherwise a
+        // deleted file seeds media_loaded=true and re-download is a dead end (B2).
+        let existing_path = msg
+            .media_local_path
+            .as_deref()
+            .filter(|p| std::path::Path::new(p).exists());
+        let media_exists_on_disk = existing_path.is_some();
+
         // Media widget
         let media_box = if msg.media_type.is_some() {
             let mb = Box::new(Orientation::Vertical, 4);
             // Only treat the media as present if the file ACTUALLY exists on
             // disk — a cleared/missing file used to render as a permanent blank
             // box. When it's gone we fall through to the re-download placeholder.
-            let existing_path = msg
-                .media_local_path
-                .as_deref()
-                .filter(|p| std::path::Path::new(p).exists());
             if let Some(path) = existing_path {
                 build_media_content(&mb, path, msg.media_type.as_ref().unwrap(), &on_image_click);
             } else if msg.media_download.is_some() {
@@ -655,7 +662,6 @@ impl MessageBubble {
             // Guard against malformed markup blanking the bubble — fall back to
             // the raw text so the message is never lost.
             set_markup_safe(&text_label, &markup, text);
-            text_label.set_use_markup(true);
             // Open link clicks through our hardened launcher (setsid + detached)
             // instead of GTK's default gtk_show_uri, for consistent behaviour
             // with the rest of the app (mb-12).
@@ -835,15 +841,14 @@ impl MessageBubble {
             preview_box.append(&url_lbl);
 
             // Click to open URL — route through the same hardened launcher used
-            // for files (setsid + null stdio + detached) so the preview card no
-            // longer spawns a bare, unhardened xdg-open (mb-12). save_to_downloads
-            // inside open_with_xdg no-ops for a non-file URL and falls back to
-            // opening the URL directly.
+            // for the text-label link path (setsid + null stdio + detached). The
+            // URL is sender-controlled, so `open_url` allowlists http/https only
+            // and rejects any other scheme before spawning xdg-open (mb-12).
             let url_owned = url.clone();
             let gesture = GestureClick::new();
             gesture.set_button(1);
             gesture.connect_released(move |_, _, _, _| {
-                open_with_xdg(&url_owned);
+                open_url(&url_owned);
             });
             preview_box.add_controller(gesture);
             preview_box.set_cursor_from_name(Some("pointer"));
@@ -854,6 +859,8 @@ impl MessageBubble {
         // Bottom row: time + receipt
         let meta_row = Box::new(Orientation::Horizontal, 4);
         meta_row.set_halign(Align::End);
+        // Named so a lazily-added edit caption can be inserted ABOVE it (below).
+        meta_row.set_widget_name("meta-row");
 
         let time_label = Label::new(Some(&format_time(msg.timestamp)));
         time_label.add_css_class("caption");
@@ -984,7 +991,7 @@ impl MessageBubble {
             text: msg.text.clone().or_else(|| msg.media_caption.clone()),
             media_box,
             media_type: msg.media_type.clone(),
-            media_loaded: RefCell::new(msg.media_local_path.is_some()),
+            media_loaded: RefCell::new(media_exists_on_disk),
             on_image_click,
             on_quoted_click,
             quoted_msg_id: msg.quoted_msg_id.clone(),
@@ -1041,7 +1048,6 @@ impl MessageBubble {
             if let Some(content) = &self.content_box {
                 let label = Label::new(None);
                 set_markup_safe(&label, &markup, new_text);
-                label.set_use_markup(true);
                 label.set_wrap(true);
                 label.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
                 label.set_max_width_chars(48);
@@ -1049,7 +1055,25 @@ impl MessageBubble {
                 label.set_halign(Align::Start);
                 label.set_selectable(true);
                 label.set_xalign(0.0);
-                content.append(&label);
+                // Insert above the time/ticks meta row instead of appending
+                // after it, so the new caption renders in the right place.
+                let meta_row = {
+                    let mut found = None;
+                    let mut child = content.first_child();
+                    while let Some(c) = child {
+                        if c.widget_name() == "meta-row" {
+                            found = Some(c);
+                            break;
+                        }
+                        child = c.next_sibling();
+                    }
+                    found
+                };
+                if let Some(meta_row) = meta_row {
+                    label.insert_before(content, Some(&meta_row));
+                } else {
+                    content.append(&label);
+                }
                 *self.text_label.borrow_mut() = Some(label);
             }
         } else if let Some(label) = self.text_label.borrow().as_ref() {
@@ -1258,7 +1282,11 @@ impl MessageBubble {
         if self.sender_id == sender_id
             && let Some(label) = &self.sender_label
         {
-            label.set_text(name);
+            let colour = name_to_colour(&self.sender_id);
+            label.set_markup(&format!(
+                "<span foreground='{colour}'><b>{}</b></span>",
+                glib::markup_escape_text(name)
+            ));
         }
     }
 
@@ -2288,17 +2316,41 @@ fn open_video_window(path: &str) {
 
 /// Open an http(s) URL in the browser, hardened like `open_with_xdg`
 /// (setsid + detached + null stdio) so it survives the app and never blocks.
+///
+/// The URL is sender-controlled, so only `http://` and `https://` are allowed
+/// through — any other scheme (`file://`, `javascript:`, a bare local path,
+/// etc.) is rejected without ever reaching xdg-open.
 fn open_url(url: &str) {
     use std::process::{Command, Stdio};
+    let lower = url.trim_start().to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        eprintln!("open_url: refusing non-http(s) URL: {url}");
+        return;
+    }
     let url = url.to_string();
     std::thread::spawn(move || {
-        let _ = Command::new("setsid")
+        // Prefer setsid so the browser survives the app; fall back to a bare
+        // xdg-open if setsid isn't available. Log failures instead of silently
+        // discarding them.
+        let spawn_setsid = Command::new("setsid")
             .arg("xdg-open")
             .arg(&url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
+        if let Err(e) = spawn_setsid {
+            eprintln!("open_url: setsid spawn failed ({e}); falling back to xdg-open");
+            if let Err(e2) = Command::new("xdg-open")
+                .arg(&url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                eprintln!("open_url: xdg-open spawn failed: {e2}");
+            }
+        }
     });
 }
 
