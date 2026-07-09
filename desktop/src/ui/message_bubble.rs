@@ -577,7 +577,14 @@ impl MessageBubble {
         // Media widget
         let media_box = if msg.media_type.is_some() {
             let mb = Box::new(Orientation::Vertical, 4);
-            if let Some(path) = &msg.media_local_path {
+            // Only treat the media as present if the file ACTUALLY exists on
+            // disk — a cleared/missing file used to render as a permanent blank
+            // box. When it's gone we fall through to the re-download placeholder.
+            let existing_path = msg
+                .media_local_path
+                .as_deref()
+                .filter(|p| std::path::Path::new(p).exists());
+            if let Some(path) = existing_path {
                 build_media_content(&mb, path, msg.media_type.as_ref().unwrap(), &on_image_click);
             } else if msg.media_download.is_some() {
                 // No local file yet, but we hold the decryption keys — make the

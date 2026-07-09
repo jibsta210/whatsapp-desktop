@@ -713,6 +713,9 @@ impl ChatViewPanel {
         root.append(&reply_bar);
         root.append(&edit_banner);
         root.append(&image_preview_bar);
+        // Disabled until a chat is opened — no chat means Send/typing/attach
+        // would silently do nothing (open_chat re-enables it).
+        input_bar.set_sensitive(false);
         root.append(&input_bar);
         root.append(&forward_bar);
 
@@ -2420,6 +2423,9 @@ impl ChatViewPanel {
     /// Open a chat immediately (sets current_chat_id, clears messages, shows loading).
     /// Returns false if the chat is already open (no reload needed).
     pub fn open_chat(&self, chat_id: String, chat_name: &str) -> bool {
+        // A chat is now selected — enable the compose bar (disabled at startup so
+        // typing/Send/attach don't silently no-op on the "Select a chat" pane).
+        self.inner.input_bar.set_sensitive(true);
         // If this chat is already displayed, just update the header and skip reload
         let already_open = self.inner.current_chat_id.borrow().as_deref() == Some(&chat_id);
         if already_open {

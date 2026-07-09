@@ -99,3 +99,36 @@ gm phone-not-responding idle-timeout reconnect (delicate long-poll stream change
 SMS↔WA merge last-10 uniqueness (risky to the merge index), full gm-side delete persistence
 (a deleted SMS chat may re-appear on restart until the gm cache removal lands), duplicate
 runtime search cleanup.
+
+## Batches 5 & 6 — per-chat state, states, notifications, media (high-value subset)
+
+Applied:
+- **Mute now suppresses notifications AND sound** (new `ChatListPanel::is_chat_muted`; gated in
+  `window.rs`) — muting was purely cosmetic before. (mute-does-not-suppress-notifications /
+  per-chat-mute-ignored)
+- **2FA auto-copy gated to SMS** (`&& is_gm`) — a WhatsApp message containing "code"/"pin" no longer
+  silently overwrites your clipboard. (2fa-autocopy-clobbers-clipboard)
+- **No duplicate OTP notification** — an SMS OTP that fired the copy-OSD no longer also fires a
+  normal banner + sound (`handled_as_2fa` gate). (duplicate-notification-for-otp-sms)
+- **Notification click opens the chat** — new `app.open-chat` action; the banner now raises the
+  window and opens the originating chat (was a dead click). (notification-click / GW-01)
+- **Missing media file no longer a permanent blank** — the bubble checks the file actually exists on
+  disk and falls through to the re-download placeholder instead of a blank box.
+  (wa-missing-file-permanent-blank)
+- **Filter-chip un-toggle veto** — clicking the active filter chip no longer leaves the list filtered
+  with no chip highlighted. (CL-04)
+- **Compose bar disabled with no chat selected** — typing/Send/attach no longer silently no-op on the
+  "Select a chat" pane. (cv-03)
+
+Deferred (medium/large or state-sync-sensitive — good follow-ups): star/label header buttons reflect
+persisted state (F3/F4), disappearing-messages dropdown reflects setting (F6), transient-disconnect
+offline banner instead of QR bounce (GW-04), empty-state placeholders (GW-05), startup connect
+timeout + Retry (GW-06), drafts persistence, @lid duplicate-row dedup, media-download-failure
+retry/MediaFailed + video error surfacing (download-failure-silent-stuck / mb-11), auto-download
+size gate (unbounded-auto-download), hidden-window sound, secondary-path notification withdraw.
+
+## Remaining work (batches 7–8, ~46 items) — NOT yet executed
+
+Batches 7 (rendering/groups/names, 16 items) and 8 (polish/hardening, 30 items) are documented in
+`AUDIT.md` but were **not** auto-applied in this run — they are mostly P2/P3 and better done as a
+follow-up so this run stays reviewable and low-risk. See `AUDIT.md` Part B for the full list.

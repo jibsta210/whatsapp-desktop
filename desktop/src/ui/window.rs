@@ -445,6 +445,41 @@ impl MainWindow {
             inner.gtk_app.add_action(&action);
         }
 
+        // Register "open-chat" action: clicking a message notification raises the
+        // window AND opens the originating chat (previously the click did nothing).
+        {
+            let inner_c = inner.clone();
+            let action = gtk4::gio::SimpleAction::new(
+                "open-chat",
+                Some(gtk4::glib::VariantTy::STRING),
+            );
+            action.connect_activate(move |_, param| {
+                let Some(chat_id) = param.and_then(|p| p.get::<String>()) else {
+                    return;
+                };
+                inner_c.window.set_visible(true);
+                inner_c.window.present();
+                let chat_name = inner_c
+                    .chat_list
+                    .chat_name(&chat_id)
+                    .unwrap_or_else(|| chat_id.clone());
+                let needs_load = inner_c.chat_view.open_chat(chat_id.clone(), &chat_name);
+                if needs_load {
+                    inner_c.bridge.send_command(crate::bridge::WaCommand::LoadChat {
+                        chat_id: chat_id.clone(),
+                        chat_name,
+                    });
+                }
+                inner_c
+                    .bridge
+                    .send_command(crate::bridge::WaCommand::MarkRead {
+                        chat_id: chat_id.clone(),
+                    });
+                withdraw_chat_notification(&inner_c.gtk_app, &chat_id);
+            });
+            inner.gtk_app.add_action(&action);
+        }
+
         MainWindow { inner }
     }
 
@@ -901,9 +936,13 @@ impl MainWindow {
                     msg.text.as_deref().map(|t| t.chars().take(40).collect::<String>()),
                 );
                 // Auto-detect 2FA codes in incoming SMS/RCS messages and pop
-                // them into the clipboard with an OSD-style notification.
+                // them into the clipboard with an OSD-style notification. Gated on
+                // `is_gm` — a WhatsApp message containing a "code"/"pin" keyword
+                // must NOT silently overwrite the clipboard.
+                let mut handled_as_2fa = false;
                 if !msg.is_from_me
                     && is_recent
+                    && is_gm
                     && let Some(text) = msg.text.as_deref()
                 {
                     if let Some(code) = detect_two_factor_code(text) {
@@ -913,12 +952,16 @@ impl MainWindow {
                                 .chat_name(&msg.chat_id)
                                 .unwrap_or_else(|| msg.sender_name.clone());
                             copy_2fa_code_with_osd(&inner.gtk_app, &code, &sender);
+                            handled_as_2fa = true;
                         }
                     } else {
                         log::debug!("2FA scan: no code detected in text");
                     }
                 }
-                if !msg.is_from_me && is_recent {
+                let muted = inner.chat_list.is_chat_muted(&msg.chat_id);
+                // A 2FA OSD already surfaced this OTP; don't also fire a normal
+                // banner + sound for it. Muted chats suppress both entirely.
+                if !msg.is_from_me && is_recent && !handled_as_2fa && !muted {
                     let is_active = inner.window.is_active();
                     if inner.settings.should_notify(is_active, is_current_chat) {
                         let chat_name = inner
@@ -1818,6 +1861,11 @@ fn set_clipboard_text(text: &str) {
 fn send_desktop_notification(app: &adw::Application, chat_id: &str, title: &str, body: &str) {
     let notif = gtk4::gio::Notification::new(title);
     notif.set_body(Some(body));
+    // Clicking the banner raises the window and opens this chat.
+    notif.set_default_action_and_target_value(
+        "app.open-chat",
+        Some(&gtk4::glib::Variant::from(chat_id)),
+    );
     let notif_id = format!("chat-{}", chat_id.replace('@', "-").replace('.', "-"));
     app.send_notification(Some(&notif_id), &notif);
 }

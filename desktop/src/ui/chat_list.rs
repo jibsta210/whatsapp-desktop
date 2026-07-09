@@ -114,6 +114,14 @@ impl ChatListPanel {
                             other.set_active(false);
                         }
                     }
+                } else {
+                    // Radio semantics: clicking the ACTIVE chip would toggle it
+                    // off, leaving no chip highlighted while the list stays
+                    // filtered (looks stuck). Veto the un-toggle when nothing
+                    // else is active.
+                    if !btns.iter().any(|o| o.is_active()) {
+                        b.set_active(true);
+                    }
                 }
             });
         }
@@ -1013,6 +1021,17 @@ impl ChatListPanel {
             .borrow()
             .get(chat_id)
             .map(|r| r.auto_mark_read.get())
+            .unwrap_or(false)
+    }
+
+    /// Whether a chat is muted — used to suppress its desktop notifications and
+    /// sound (muting was previously cosmetic; only the mute icon changed).
+    pub fn is_chat_muted(&self, chat_id: &str) -> bool {
+        self.inner
+            .rows
+            .borrow()
+            .get(chat_id)
+            .map(|r| r.is_muted.get())
             .unwrap_or(false)
     }
 
