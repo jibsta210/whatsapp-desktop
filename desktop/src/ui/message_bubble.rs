@@ -656,6 +656,13 @@ impl MessageBubble {
             // the raw text so the message is never lost.
             set_markup_safe(&text_label, &markup, text);
             text_label.set_use_markup(true);
+            // Open link clicks through our hardened launcher (setsid + detached)
+            // instead of GTK's default gtk_show_uri, for consistent behaviour
+            // with the rest of the app (mb-12).
+            text_label.connect_activate_link(|_, uri| {
+                open_url(uri);
+                gtk4::glib::Propagation::Stop
+            });
 
             if is_single_emoji {
                 text_label.add_css_class("title-1");
@@ -2066,12 +2073,45 @@ fn highlight_mentions(text: &str) -> String {
 /// is never lost.
 fn set_markup_safe(label: &Label, markup: &str, plain: &str) {
     // accel marker '\u{0}' disables accelerator parsing (we never use accels).
-    if gtk4::pango::parse_markup(markup, '\u{0}').is_ok() {
+    //
+    // GtkLabel::set_markup supports the `<a href>` LINK extension, but the raw
+    // `pango::parse_markup` validator does NOT recognise `<a>` and rejects it —
+    // so validating the full markup marked EVERY message containing a URL as
+    // invalid and fell back to plain text, killing link rendering + clicks.
+    // Validate with the link tags stripped: that still catches real markup
+    // corruption (bad escaping / broken *_~ spans) while letting a valid link
+    // through, and GtkLabel renders the `<a>` fine.
+    let valid = gtk4::pango::parse_markup(markup, '\u{0}').is_ok()
+        || gtk4::pango::parse_markup(&strip_link_tags(markup), '\u{0}').is_ok();
+    if valid {
         label.set_markup(markup);
     } else {
         log::warn!("invalid Pango markup, falling back to plain text");
         label.set_text(plain);
     }
+}
+
+/// Remove `<a ...>` / `</a>` tags (keeping their inner text) so the markup can
+/// be validated by the raw Pango parser, which doesn't support GtkLabel's link
+/// extension. User text is already Pango-escaped, so the only `<a` / `</a>` in
+/// the string are our own generated link tags.
+fn strip_link_tags(markup: &str) -> String {
+    let mut out = String::with_capacity(markup.len());
+    let mut rest = markup;
+    while let Some(pos) = rest.find("<a") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        if (after.starts_with("<a ") || after.starts_with("<a>"))
+            && let Some(gt) = after.find('>')
+        {
+            rest = &after[gt + 1..];
+        } else {
+            out.push_str("<a");
+            rest = &after[2..];
+        }
+    }
+    out.push_str(rest);
+    out.replace("</a>", "")
 }
 
 /// Convert WhatsApp-style formatting to Pango markup.
@@ -2244,6 +2284,22 @@ fn open_video_window(path: &str) {
     window.set_child(Some(&overlay));
     window.fullscreen();
     window.present();
+}
+
+/// Open an http(s) URL in the browser, hardened like `open_with_xdg`
+/// (setsid + detached + null stdio) so it survives the app and never blocks.
+fn open_url(url: &str) {
+    use std::process::{Command, Stdio};
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        let _ = Command::new("setsid")
+            .arg("xdg-open")
+            .arg(&url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    });
 }
 
 fn open_with_xdg(path: &str) {

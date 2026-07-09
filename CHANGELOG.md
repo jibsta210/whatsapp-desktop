@@ -263,3 +263,16 @@ The 4 cross-file items (needed new WaEvent variants) are now done:
   becomes the real name without reopening the chat.
 
 All 44 batch-7/8 items now complete.
+
+## Fix — URLs stopped rendering as clickable links (Batch 8 regression)
+
+Batch 8's `set_markup_safe` (added to stop malformed markup blanking a bubble) validated the markup
+with `pango::parse_markup` before applying it. But `<a href>` is a **GtkLabel** link extension that
+the raw Pango parser rejects (verified: `parse_markup("<a href…>")` → false, `<b>` → true). So every
+message containing a URL failed validation and fell back to plain `set_text` — links rendered as
+plain, unclickable text.
+
+Fix: `set_markup_safe` now also accepts the markup if it validates with the `<a>`/`</a>` tags stripped
+(new `strip_link_tags`) — real corruption is still caught, but valid links pass and `GtkLabel` renders
+them. Also wired `connect_activate_link` on the message text label to open URLs through the app's
+hardened launcher (`open_url`: setsid + detached) for consistent behaviour (mb-12).
