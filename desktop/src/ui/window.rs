@@ -993,8 +993,11 @@ impl MainWindow {
 
                         send_desktop_notification(&inner.gtk_app, &msg.chat_id, &title, &body);
                     }
-                    // Play notification sound
-                    if inner.settings.should_play_sound() && !is_current_chat {
+                    // Play notification sound. Suppress only when the user is
+                    // actively looking at this chat (window focused AND current
+                    // chat); a message for the open chat while the app is in the
+                    // tray should still chime.
+                    if inner.settings.should_play_sound() && !(is_current_chat && is_active) {
                         play_notification_sound();
                     }
                 }
