@@ -3226,12 +3226,19 @@ impl ChatViewPanel {
     pub fn confirm_bubble(&self, tmp_id: &str, real_id: &str) {
         let mut bubbles = self.inner.bubbles.borrow_mut();
         if let Some(bubble) = bubbles.remove(tmp_id) {
-            bubble.update_receipt(&ReceiptStatus::Sent);
-            bubbles.insert(real_id.to_string(), bubble);
+            if bubbles.contains_key(real_id) {
+                // Residual race: the server echo already rendered a bubble under
+                // real_id (it won the race against this confirm). Drop the
+                // optimistic widget instead of stacking a second one.
+                self.inner.messages_box.remove(bubble.widget());
+            } else {
+                bubble.update_receipt(&ReceiptStatus::Sent);
+                bubbles.insert(real_id.to_string(), bubble);
+            }
         }
         let mut texts = self.inner.search_texts.borrow_mut();
         if let Some(text) = texts.remove(tmp_id) {
-            texts.insert(real_id.to_string(), text);
+            texts.entry(real_id.to_string()).or_insert(text);
         }
     }
 

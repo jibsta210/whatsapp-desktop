@@ -33,6 +33,20 @@ the list.
   also stops group-event system messages from bumping the badge.
 - Revert: `git revert <O commit>`.
 
+### Packet D — SMS double-bubble on desktop send (display-only)
+Outbound SMS sent from desktop sometimes rendered twice (first single-tick optimistic,
+second double-tick echo). The tmp→real reconcile in the longpoll path was dead code: it
+emitted RAW un-prefixed ids while the bubble was keyed `gm:<tmp>` and the echo id was
+`gm:<real>`, so both lookups missed and the echo appended a second bubble.
+- **desktop/src/gmessages_runtime.rs** (translate_event): the `MessageConfirmed` fired
+  from the longpoll echo now tags BOTH `tmp_id` and `real_id` with the `gm:` prefix
+  (guarded by `starts_with`), so it re-keys the optimistic bubble to `gm:<real>` right
+  before the echo arrives and the exact-id dedup hits.
+- **desktop/src/ui/chat_view.rs** (confirm_bubble): hardening for the residual race — if
+  the echo already rendered a bubble under `real_id`, drop the optimistic widget instead
+  of stacking a second one.
+- Display-only bug (disk always held one copy); revert: `git revert <D commit>`.
+
 ## Review-pass cleanup — fixes from `REVIEW-REPORT.md`
 
 Independent second-pass review of the whole `pre-audit-fixes..HEAD` diff (6 parallel

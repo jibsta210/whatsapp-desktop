@@ -2620,10 +2620,24 @@ fn translate_event(event: Event) -> Vec<WaEvent> {
                 // the server is confirming an outgoing send we made — fire
                 // a MessageConfirmed so the optimistic bubble re-keys to
                 // the server-assigned `message_id`.
+                //
+                // BOTH ids MUST carry the `gm:` prefix. The optimistic bubble
+                // was already re-keyed to `gm:<tmp>` by the send-RPC confirm
+                // path, and the echo MessageReceived (message_to_incoming) tags
+                // its id `gm:<message_id>`. Emitting the raw un-prefixed ids
+                // here made this confirm a no-op (lookup miss) and left the echo
+                // to append a duplicate bubble.
                 if !m.tmp_id.is_empty() {
+                    let tag = |id: &str| -> String {
+                        if id.starts_with(CHAT_PREFIX) {
+                            id.to_string()
+                        } else {
+                            format!("{CHAT_PREFIX}{id}")
+                        }
+                    };
                     out.push(WaEvent::MessageConfirmed {
-                        tmp_id: m.tmp_id.clone(),
-                        real_id: m.message_id.clone(),
+                        tmp_id: tag(&m.tmp_id),
+                        real_id: tag(&m.message_id),
                         chat_id: format!("{CHAT_PREFIX}{}", m.conversation_id),
                     });
                 }
