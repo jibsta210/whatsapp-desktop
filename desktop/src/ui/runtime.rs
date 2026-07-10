@@ -1156,6 +1156,13 @@ struct RuntimeState {
     /// Persisted to [`READ_WM_FILE`]; consulted by [`RuntimeState::upsert_chat`]
     /// to defend a locally-read chat against a stale reconnect reseed.
     read_watermarks: HashMap<String, i64>,
+    /// Watermarks derived ONLY from self-read receipts (a chat read on another
+    /// device). Kept SEPARATE from `read_watermarks` so gating the live unread
+    /// bump on them does not reintroduce the same-second suppression that local
+    /// reads / auto-mark-read would cause. In-memory only — its job is to win the
+    /// offline-flush race where a self-read receipt arrives before the messages it
+    /// covers, so those messages are not bumped to unread when they finally decode.
+    receipt_watermarks: HashMap<String, i64>,
     /// The chat currently open in the UI (via `WaCommand::SetActiveChat`).
     /// An incoming message for this chat is not counted as unread (the user is
     /// looking at it), so the persisted `unread_count` stays a true source of
@@ -1222,6 +1229,7 @@ impl RuntimeState {
             own_lid: String::new(),
             connect_count: 0,
             read_watermarks,
+            receipt_watermarks: HashMap::new(),
             active_chat: None,
         }
     }
@@ -1901,6 +1909,36 @@ async fn run_inner(
         .await?;
 
     let client = bot.client();
+
+    // Seed own phone/lid identity BEFORE the event loop starts. A group self-read
+    // receipt can be processed during the offline flush (the is_own_read check
+    // consults own_lid/own_phone) before the Connected handler — which normally
+    // sets these — has run. Seeding here removes that race; Connected still
+    // refreshes them.
+    {
+        let device = client.persistence_manager().get_device_snapshot().await;
+        let strip = |raw: String| -> String {
+            if let (Some(c), Some(a)) = (raw.find(':'), raw.find('@')) {
+                if c < a {
+                    return format!("{}{}", &raw[..c], &raw[a..]);
+                }
+            }
+            raw
+        };
+        let mut s = state.lock().unwrap();
+        if let Some(pn) = device.pn.as_ref() {
+            s.own_phone = strip(pn.to_string());
+        }
+        if let Some(lid) = device.lid.as_ref() {
+            s.own_lid = strip(lid.to_string());
+        }
+        log::info!(
+            "Seeded own identity pre-run: phone={} lid={}",
+            s.own_phone,
+            s.own_lid
+        );
+    }
+
     let mut bot_handle = bot.run().await?;
 
     // Spawn the background LID resolver task
@@ -3120,11 +3158,24 @@ async fn handle_wa_event(
                 if actual_chats.is_empty() {
                     actual_chats.push(chat_id.clone());
                 }
+                // Stamp the read watermark at the RECEIPT's timestamp (when the
+                // phone actually read), not the chat's stale last-message time.
+                // During the offline flush a self-read receipt can arrive before
+                // the messages it covers; stamping a receipt-time watermark lets
+                // persist_new_message suppress those messages' unread bump when
+                // they finally decode, regardless of arrival order.
+                let receipt_ts = r.timestamp.timestamp();
                 for cid in &actual_chats {
-                    log::info!("ReadSelf: clearing unread for chat={cid}");
+                    log::info!("ReadSelf: clearing unread for chat={cid} (t={receipt_ts})");
                     {
                         let mut s = state.lock().unwrap();
                         s.mark_chat_read_local(cid);
+                        if receipt_ts > 0 {
+                            let prev = s.receipt_watermarks.get(cid).copied().unwrap_or(0);
+                            if receipt_ts > prev {
+                                s.receipt_watermarks.insert(cid.clone(), receipt_ts);
+                            }
+                        }
                     }
                     let _ = tx
                         .send(WaEvent::ChatReadOnOtherDevice {
@@ -4252,12 +4303,17 @@ fn persist_new_message(
         // Bump for a genuinely-new incoming message unless the chat is the one
         // being viewed or is auto-mark-read (both get cleared to 0 anyway).
         let active = s.active_chat.clone();
+        // A self-read receipt (read on the phone) may have already arrived for this
+        // chat, ahead of this message in the offline backlog. If so, this message
+        // is at-or-before the read point and must NOT bump unread.
+        let receipt_wm = s.receipt_watermarks.get(&chat_id).copied().unwrap_or(0);
         if let Some(ex) = s.chats.iter().find(|c| c.id == chat_id) {
             let should_bump = msg_is_new
                 && !m.is_from_me
                 && active.as_deref() != Some(chat_id.as_str())
                 && !ex.auto_mark_read
-                && !m.is_system_message;
+                && !m.is_system_message
+                && m.timestamp > receipt_wm;
             let unread = if should_bump {
                 ex.unread_count.saturating_add(1)
             } else {
@@ -4278,7 +4334,9 @@ fn persist_new_message(
             // contact while the user is away must persist unread=1, or the chat
             // shows as already-read after restart. Count it unless it's ours or
             // the chat is the one actively being viewed.
-            let unread = (!m.is_from_me && active.as_deref() != Some(chat_id.as_str())) as u32;
+            let unread = (!m.is_from_me
+                && active.as_deref() != Some(chat_id.as_str())
+                && m.timestamp > receipt_wm) as u32;
             (None, unread, false, false, false, false, None, msg_is_new)
         }
     };
@@ -5280,10 +5338,15 @@ async fn handle_command(
             // resurrect it — the core of the "chats revert to unread after
             // reboot/suspend" fix. gm chat_ids (`gm:N`) stop after this; their
             // server-side read is handled by the gmessages runtime's MarkRead.
-            {
+            // Capture the previous watermark BEFORE mark_chat_read_local bumps it,
+            // so the read-receipt collection below knows which incoming messages
+            // were still unread (everything newer-or-equal to it).
+            let prev_wm = {
                 let mut s = state.lock().unwrap();
+                let prev = s.read_watermarks.get(&chat_id).copied().unwrap_or(0);
                 s.mark_chat_read_local(&chat_id);
-            }
+                prev
+            };
             let _ = tx
                 .send(WaEvent::ChatReadOnOtherDevice {
                     chat_id: chat_id.clone(),
@@ -5307,40 +5370,88 @@ async fn handle_command(
                 log::debug!("mark_chat_as_read (app state) failed: {e:#}");
             }
 
-            // Mechanism 1: Read receipt to sender. Anchor on the last INCOMING
-            // message — acking our own last send tells the phone nothing and the
-            // chat stays unread there. WhatsApp treats a read receipt as a
-            // read-up-to watermark, so the newest incoming id also clears older
-            // unread in the same chat.
-            let (last_id, last_sender) = {
+            // Mechanism 1: Read receipts to the sender(s). Ack EVERY unread
+            // incoming message id since the previous watermark — not just the
+            // newest. The phone dismisses its system notification per message id,
+            // so a single-id receipt left the other notified messages stuck in the
+            // Android notification tray. Official clients ack all unread ids in one
+            // <receipt ...><list><item id=.../></list></receipt>.
+            //
+            // `>=` prev_wm (not `>`) is intentional: the watermark is
+            // second-granularity and re-acking an already-read id is idempotent.
+            let mut unread: Vec<(String, String)> = {
                 let s = state.lock().unwrap();
-                (
-                    s.last_incoming_msg_id.get(&chat_id).cloned(),
-                    s.last_msg_sender.get(&chat_id).cloned(),
-                )
+                s.history
+                    .get(&chat_id)
+                    .map(|msgs| {
+                        msgs.iter()
+                            .filter(|m| !m.is_from_me && m.timestamp >= prev_wm)
+                            .map(|m| (m.sender_id.clone(), m.id.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
             };
-            if let Some(msg_id) = last_id {
-                // Groups require the sender JID (keep as LID if that's the original format)
-                let sender_jid = if chat_id.ends_with("@g.us") {
-                    last_sender.clone().and_then(|s| s.parse::<Jid>().ok())
-                } else {
-                    None
+            // History LRU may have evicted this chat — fall back to disk (outside
+            // the state lock).
+            if unread.is_empty() {
+                unread = load_messages(&chat_id)
+                    .iter()
+                    .filter(|m| !m.is_from_me && m.timestamp >= prev_wm)
+                    .map(|m| (m.sender_id.clone(), m.id.clone()))
+                    .collect();
+            }
+            // Ultimate fallback: the single last-incoming anchor.
+            if unread.is_empty() {
+                let (last_id, last_sender) = {
+                    let s = state.lock().unwrap();
+                    (
+                        s.last_incoming_msg_id.get(&chat_id).cloned(),
+                        s.last_msg_sender.get(&chat_id).cloned(),
+                    )
                 };
-                log::info!("MarkRead: chat={chat_id} msg={msg_id} sender={sender_jid:?}");
-                // Try multiple approaches — LID groups need specific format
-                let result = client
-                    .mark_as_read(&jid, sender_jid.as_ref(), vec![msg_id.clone()])
-                    .await;
-                if let Err(e) = &result {
-                    log::warn!("MarkRead attempt 1 failed: {e:#}");
-                    // Retry without sender
-                    let _ = client
-                        .mark_as_read(&jid, None, vec![msg_id.clone()])
-                        .await
-                        .map_err(|e2| log::warn!("MarkRead attempt 2 (no sender): {e2:#}"));
-                    // Retry with phone JID if sender was LID
-                    if let Some(ref sender) = sender_jid {
-                        let sender_str = sender.to_string();
+                if let Some(msg_id) = last_id {
+                    unread.push((last_sender.unwrap_or_default(), msg_id));
+                }
+            }
+            if unread.is_empty() {
+                return Ok(());
+            }
+            // Dedup by id (preserving chronological order) and cap to bound the
+            // stanza size — a chat unread for weeks could otherwise ack thousands.
+            {
+                let mut seen = std::collections::HashSet::new();
+                unread.retain(|(_, id)| seen.insert(id.clone()));
+                const MAX_RECEIPT_IDS: usize = 100;
+                if unread.len() > MAX_RECEIPT_IDS {
+                    // Keep the NEWEST ids (history is chronological ascending).
+                    let drop_to = unread.len() - MAX_RECEIPT_IDS;
+                    unread.drain(0..drop_to);
+                }
+            }
+
+            if chat_id.ends_with("@g.us") {
+                // Groups: one receipt per sender, with that sender as the
+                // `participant` (whatsmeow semantics — a receipt's participant
+                // covers only that sender's ids). Keep the LID→phone retry ladder.
+                let mut by_sender: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for (sender, id) in unread {
+                    by_sender.entry(sender).or_default().push(id);
+                }
+                for (sender_str, ids) in by_sender {
+                    let sender_jid = sender_str.parse::<Jid>().ok();
+                    log::info!(
+                        "MarkRead: chat={chat_id} sender={sender_str} ids={}",
+                        ids.len()
+                    );
+                    let result = client
+                        .mark_as_read(&jid, sender_jid.as_ref(), ids.clone())
+                        .await;
+                    if let Err(e) = &result {
+                        log::warn!("MarkRead group attempt 1 failed: {e:#}");
+                        let _ = client.mark_as_read(&jid, None, ids.clone()).await.map_err(
+                            |e2| log::warn!("MarkRead group attempt 2 (no sender): {e2:#}"),
+                        );
                         if sender_str.ends_with("@lid") {
                             let phone_jid_opt = state
                                 .lock()
@@ -5351,12 +5462,23 @@ async fn handle_command(
                                 .and_then(|p| p.parse::<Jid>().ok());
                             if let Some(phone_jid) = phone_jid_opt {
                                 let _ = client
-                                    .mark_as_read(&jid, Some(&phone_jid), vec![msg_id])
+                                    .mark_as_read(&jid, Some(&phone_jid), ids)
                                     .await
-                                    .map_err(|e3| log::warn!("MarkRead attempt 3 (phone): {e3:#}"));
+                                    .map_err(|e3| {
+                                        log::warn!("MarkRead group attempt 3 (phone): {e3:#}")
+                                    });
                             }
                         }
+                    } else {
+                        log::info!("MarkRead succeeded for {chat_id} (sender {sender_str})");
                     }
+                }
+            } else {
+                // DM: one receipt, no participant.
+                let ids: Vec<String> = unread.into_iter().map(|(_, id)| id).collect();
+                log::info!("MarkRead: chat={chat_id} ids={}", ids.len());
+                if let Err(e) = client.mark_as_read(&jid, None, ids).await {
+                    log::warn!("MarkRead failed: {e:#}");
                 } else {
                     log::info!("MarkRead succeeded for {chat_id}");
                 }

@@ -39,14 +39,40 @@ impl Client {
         let receipt_type_cow = attrs.optional_string("type");
         let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
         let participant = attrs.optional_jid("participant");
+        let recipient = attrs.optional_jid("recipient");
+        // `t` is the read/delivery time in unix seconds. Use it — NOT local
+        // arrival time — so a self-read receipt that arrives in the reconnect
+        // backlog stamps its watermark at the moment the phone actually read,
+        // rather than at connect time (which would over-suppress messages that
+        // are genuinely unread on the phone).
+        let receipt_ts = attrs
+            .optional_u64("t")
+            .filter(|&t| t > 0)
+            .and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0))
+            .unwrap_or_else(wacore::time::now_utc);
 
         let receipt_type = ReceiptType::from(receipt_type_str.to_string());
 
         debug!("Received receipt type '{receipt_type:?}' for message {id} from {from}");
 
+        // Collect EVERY acked message id: the primary `id` attr plus any in the
+        // <list><item id="..."/></list> extension. Official clients ack all unread
+        // ids in one receipt; without this only the first id updated tick state.
+        let mut message_ids = vec![id.clone()];
+        if let Some(list) = node.get_optional_child("list") {
+            for item in list.get_children_by_tag("item") {
+                if let Some(item_id) = item.attrs().optional_string("id") {
+                    let item_id = item_id.to_string();
+                    if item_id != id {
+                        message_ids.push(item_id);
+                    }
+                }
+            }
+        }
+
         let from_clone = from.clone();
         let sender = if from.is_group() {
-            if let Some(participant) = participant {
+            if let Some(participant) = participant.clone() {
                 participant
             } else {
                 from_clone
@@ -55,14 +81,35 @@ impl Client {
             from.clone()
         };
 
+        // Resolve whether this receipt reports OUR OWN read fanned back to this
+        // companion by the server. For a DM self-read the stanza carries
+        // from=<own jid> and the real chat in the `recipient` attr; without
+        // resolving it the chat wrongly becomes our own JID (whatsmeow
+        // parseMessageSource parity).
+        let snapshot = self.persistence_manager.get_device_snapshot().await;
+        let from_is_self = match (&snapshot.pn, &snapshot.lid) {
+            (Some(pn), lid) => from.matches_user_or_lid(pn, lid.as_ref()),
+            (None, Some(lid)) => from.is_same_user_as(lid),
+            (None, None) => false,
+        };
+        let (chat, is_from_me) = if from_is_self && !from.is_group() {
+            match recipient {
+                Some(r) => (r.to_non_ad(), true),
+                None => (from.to_non_ad(), true),
+            }
+        } else {
+            (from.clone(), false)
+        };
+
         let receipt = Receipt {
-            message_ids: vec![id.clone()],
+            message_ids: message_ids.clone(),
             source: crate::types::message::MessageSource {
-                chat: from.clone(),
+                chat,
                 sender: sender.clone(),
+                is_from_me,
                 ..Default::default()
             },
-            timestamp: wacore::time::now_utc(),
+            timestamp: receipt_ts,
             r#type: receipt_type.clone(),
             message_sender: sender.clone(),
         };
@@ -649,5 +696,51 @@ mod tests {
             participant_attr
         );
         assert_eq!(participant_attr.to_jid().unwrap(), sender_jid);
+    }
+
+    /// A read receipt with a <list><item id=.../> extension must surface EVERY
+    /// message id (primary `id` + all items) in the dispatched Receipt event, and
+    /// must parse the `t` attribute into the receipt timestamp (not local time).
+    #[tokio::test]
+    async fn test_read_receipt_collects_list_item_ids_and_t() {
+        let (client, collector) = setup_client_with_collector().await;
+
+        let node = Arc::new(
+            NodeBuilder::new("receipt")
+                .attr("from", "5511999999999@s.whatsapp.net")
+                .attr("id", "MSG-1")
+                .attr("type", "read")
+                .attr("t", "1700000000")
+                .children([NodeBuilder::new("list")
+                    .children([
+                        NodeBuilder::new("item").attr("id", "MSG-2").build(),
+                        NodeBuilder::new("item").attr("id", "MSG-3").build(),
+                        // Duplicate of the primary id must not be added twice.
+                        NodeBuilder::new("item").attr("id", "MSG-1").build(),
+                    ])
+                    .build()])
+                .build(),
+        );
+
+        client.handle_receipt(node).await;
+
+        let events = collector.events();
+        let receipt = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Receipt(r) => Some(r),
+                _ => None,
+            })
+            .expect("must dispatch a Receipt event");
+        assert_eq!(
+            receipt.message_ids,
+            vec!["MSG-1", "MSG-2", "MSG-3"],
+            "receipt must ack the primary id plus all <list><item> ids, deduped"
+        );
+        assert_eq!(
+            receipt.timestamp.timestamp(),
+            1_700_000_000,
+            "the `t` attribute must be parsed into the receipt timestamp"
+        );
     }
 }

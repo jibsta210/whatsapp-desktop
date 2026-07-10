@@ -47,6 +47,36 @@ emitted RAW un-prefixed ids while the bubble was keyed `gm:<tmp>` and the echo i
   of stacking a second one.
 - Display-only bug (disk always held one copy); revert: `git revert <D commit>`.
 
+### Packet R + S — Full read receipts + order-independent self-read handling
+**R (phone notification persistence):** reading a chat on desktop dismissed the phone's
+chat-list unread but left the Android system notification stuck, because we sent a read
+receipt for only ONE message id (the newest anchor). The phone clears notifications per
+message id.
+- **desktop/src/ui/runtime.rs** (MarkRead arm): now collects EVERY unread incoming id
+  since the previous read watermark (history → disk fallback → last-incoming anchor),
+  dedupes, caps at 100 newest, and sends them all in one receipt. Groups batch by sender
+  (one receipt per participant, whatsmeow semantics) keeping the LID→phone retry ladder.
+- **src/receipt.rs** (handle_receipt): inbound receipts now parse the `<list><item id/>`
+  extension so a multi-id receipt from the phone updates tick state for every id, not
+  just the first.
+
+**S (offline self-read receipts race the message backlog):** during the offline flush a
+self-read receipt (chat read on the phone) arrives before the messages it covers, so the
+badge was re-created and never cleared. DM self-reads also resolved their chat to our own
+JID.
+- **src/receipt.rs**: parse the `recipient` attr and detect self-reads (from matches own
+  pn/lid) → resolve the chat to `recipient` and set `is_from_me`; parse the `t` attr into
+  the receipt timestamp (was local arrival time — mandatory so boot-time receipts don't
+  over-suppress genuinely-unread messages).
+- **desktop/src/ui/runtime.rs**: new in-memory `receipt_watermarks` map (SEPARATE from the
+  durable read_watermarks to avoid same-second suppression of local reads); the ReadSelf
+  arm stamps it at the receipt time; persist_new_message suppresses a live unread bump when
+  the message is at-or-before the receipt watermark. Own phone/lid identity is now seeded
+  before the event loop starts so a group self-read during the flush doesn't race an empty
+  identity.
+- Tests: `test_read_receipt_collects_list_item_ids_and_t` (multi-id + `t` parse).
+- Revert: `git revert <R+S commit>`.
+
 ## Review-pass cleanup — fixes from `REVIEW-REPORT.md`
 
 Independent second-pass review of the whole `pre-audit-fixes..HEAD` diff (6 parallel
