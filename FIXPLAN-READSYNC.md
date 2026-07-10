@@ -2,6 +2,53 @@
 
 **Status: PLAN ONLY — nothing here is implemented. Execution by Opus agents after review.**
 
+## EXECUTION INSTRUCTIONS (read first, Opus)
+
+Every mechanism below was verified against HEAD by independent investigators AND
+adversarially re-verified (file:line evidence throughout). Do not re-derive the
+diagnosis; do read the cited code before editing.
+
+**Standing rules (user-mandated, non-negotiable):**
+- Tag the baseline before starting: `git tag pre-readsync-fixes`.
+- One packet = one commit, each independently revertable. Append a CHANGELOG.md entry
+  per packet with a revert line (follow the existing "Review-pass cleanup" format).
+- Push to `github main` ONLY (`git push github main`). NEVER push to `origin`.
+- Build check MUST use `cargo build --release -p whatsapp-desktop` — the desktop crate
+  is NOT in default-members; a plain `cargo build --release` compiles only the root
+  crate and will happily report success while the desktop code is broken.
+- After the final build: `pkill -x whatsapp-deskto`, then
+  `cp /home/jakes/.cache/cargo-target/release/whatsapp-desktop ~/.local/bin/whatsapp-desktop`
+  — pre-authorized, do NOT ask.
+- Tests: root-crate tests via `cargo test -p whatsapp-rust --lib`; desktop-crate tests
+  via `cargo test -p whatsapp-desktop --bins` (it is a bin crate — `--lib` fails).
+- No native dialogs ever (alert/confirm/prompt equivalents); adw::AlertDialog if needed.
+
+**Execution order: O → D → K → R+S → G** (rationale in Sequencing section).
+
+**Parallelization constraints (if using workflows/agents):** one owner per file.
+O and K are disjoint. D owns gmessages_runtime.rs + chat_view.rs. R and S MUST be one
+agent (both edit src/receipt.rs handle_receipt). O and R+S both touch
+desktop/src/ui/runtime.rs (persist_new_message vs MarkRead/ReadSelf arms) — run them
+sequentially, not concurrently.
+
+**Traps already caught by adversarial review — do not re-introduce them:**
+1. Packet O: `unread = 0` in the summary is SILENTLY REVERTED by upsert_chat's
+   stale-preserve heuristic (runtime.rs:1490). Use `mark_chat_read_local` AFTER
+   persist_chat, exactly as specified.
+2. Packet K: do NOT hoist `get_missing_key_ids` onto the client-side parse — external
+   snapshots/mutations hide key ids until decode attaches the blobs. Detect inside the
+   processor (typed `AppStateSyncError::KeyNotFound(ids)`), as specified.
+3. Packet S: parsing the `t` attr is MANDATORY before stamping receipt watermarks —
+   Receipt.timestamp is currently local arrival time; skipping this over-suppresses
+   genuinely-unread messages at boot.
+4. Packet D: prefix BOTH ids (`tmp_id` and `real_id`) with `CHAT_PREFIX`, and guard
+   with `starts_with` for retransmits.
+
+**Live-phone acceptance:** packets O, D, R are verifiable by the user immediately;
+K and S need the user's phone (test script at the end of this document). Report
+build + unit-test results per packet; flag K explicitly as "needs live phone test"
+in the final summary — do not claim it verified without one.
+
 Two user reports drive this plan:
 
 1. **Offline-unread flood** — boot desktop after it was closed; offline messages sync in
