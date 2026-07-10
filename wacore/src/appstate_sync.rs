@@ -209,9 +209,36 @@ impl AppStateProcessor {
 
     pub async fn process_patch_list(
         &self,
-        pl: PatchList,
+        mut pl: PatchList,
         validate_macs: bool,
     ) -> Result<(Vec<Mutation>, HashState, PatchList)> {
+        // Missing app-state sync key: decoding here would HARD-FAIL the whole
+        // collection (the `get_keys` closures below return
+        // `AppStateError::KeyNotFound`), which aborts the caller with `?` BEFORE
+        // it can reach its `get_missing_key_ids` + `request_app_state_keys` block.
+        // That is why a rotated key on the phone left the desktop unable to ever
+        // decode the phone's read state.
+        //
+        // Externals are already attached at this point (decode_patch_list /
+        // decode_multi_patch_list attach them before calling us), so detect the
+        // miss now and return an EMPTY result instead of failing: the caller's
+        // request block then fires, and the collection is re-synced once the
+        // primary shares the key (see handle_app_state_sync_key_share). Force
+        // `has_more_patches = false` so the caller does not spin refetching an
+        // undecryptable collection in the meantime.
+        let missing = self.get_missing_key_ids(&pl).await?;
+        if !missing.is_empty() {
+            log::warn!(
+                target: "AppState",
+                "Collection {:?}: {} app-state key(s) missing — deferring decode until key share arrives",
+                pl.name,
+                missing.len()
+            );
+            let state = self.backend.get_version(pl.name.as_str()).await?;
+            pl.has_more_patches = false;
+            return Ok((Vec::new(), state, pl));
+        }
+
         // Pre-fetch all keys we'll need
         self.prefetch_keys(&pl).await?;
 
@@ -251,7 +278,7 @@ impl AppStateProcessor {
                 Ok::<_, crate::appstate::AppStateError>((result, snapshot_state))
             })
             .await
-            .map_err(|e| anyhow!("{}", e))?;
+            .map_err(anyhow::Error::new)?;
 
             let (snapshot_result, snapshot_state) = result;
             state = snapshot_state;
@@ -340,7 +367,7 @@ impl AppStateProcessor {
                 )
             })
             .await
-            .map_err(|e| anyhow!("{}", e))?;
+            .map_err(anyhow::Error::new)?;
 
             // Update local state with the result from the blocking task
             state = result.state;

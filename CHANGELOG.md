@@ -84,6 +84,35 @@ JID.
   clamp to hide an already-read badge.
 - Revert: `git revert <G commit>`.
 
+### Packet K — Make app-state key recovery reachable (root cause / phone→desktop read sync) — CRITICAL
+The desktop held one stale app-state sync key while the phone had rotated to a newer one,
+so every `regular_low` patch (which carries `markChatAsRead`) failed to decode. The
+key-request machinery existed but was unreachable: `decode_patch_list` /
+`decode_multi_patch_list` hard-failed (via the `get_keys` closures) with `?` BEFORE the
+callers' `get_missing_key_ids` + `request_app_state_keys` block could run, so a key was
+never requested and phone-side reads could never reach the desktop.
+- **wacore/src/appstate_sync.rs** (process_patch_list): detect missing keys AFTER external
+  blobs are attached (this is the choke point both decode paths funnel through) and return
+  an EMPTY result with `has_more_patches=false` instead of hard-failing. The callers'
+  existing request blocks (client.rs:2413, :2620) now fire. Also preserve the typed
+  `AppStateError` at the two blocking-decode sites (`anyhow::Error::new`) for diagnostics.
+- **src/message.rs** (handle_app_state_sync_key_share): now `self: &Arc<Self>`; notifies
+  waiters on EVERY share (not just the first) and spawns a re-sync of the app-state
+  collections when keys arrive, so the deferred reads apply promptly instead of waiting for
+  the next server_sync notification.
+- **src/client.rs** (request_app_state_keys): log the request at info level (app-state
+  debug was invisible under the default `whatsapp_rust=warn` filter).
+- **Needs a live-phone test** (protocol-level): boot log should show `missing app-state
+  key(s)` → `Requesting … key(s)` → `key share: … stored` → resync; and
+  `sqlite3 whatsapp.db "SELECT COUNT(*) FROM app_state_keys"` should grow past 1.
+- Revert: `git revert <K commit>`.
+
+**Pre-existing test note:** the whatsapp-rust lib suite has 4 failing tests unrelated to
+this work — `bot::tests::test_bot_builder_with_{version,os,platform}_*` (assert a default
+device-props version; `src/bot.rs` has zero diff from the `pre-readsync-fixes` baseline)
+and `client::tests::test_fibonacci_backoff_max_900s` (a ±10% jitter timing assertion in
+untouched code). These fail at baseline and should be triaged separately.
+
 ## Review-pass cleanup — fixes from `REVIEW-REPORT.md`
 
 Independent second-pass review of the whole `pre-audit-fixes..HEAD` diff (6 parallel

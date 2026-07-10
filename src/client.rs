@@ -2667,6 +2667,11 @@ impl Client {
             Some(j) => j,
             None => return,
         };
+        log::info!(
+            target: "Client/AppState",
+            "Requesting {} missing app-state sync key(s) from primary device",
+            raw_key_ids.len()
+        );
         let key_ids: Vec<wa::message::AppStateSyncKeyId> = raw_key_ids
             .iter()
             .map(|k| wa::message::AppStateSyncKeyId {

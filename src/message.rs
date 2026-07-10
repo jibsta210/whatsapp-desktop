@@ -1358,7 +1358,7 @@ impl Client {
     }
 
     pub(crate) async fn handle_app_state_sync_key_share(
-        &self,
+        self: &Arc<Self>,
         keys: &wa::message::AppStateSyncKeyShare,
     ) {
         struct KeyComponents<'a> {
@@ -1418,14 +1418,41 @@ impl Client {
             );
         }
 
-        // Notify any waiters (initial full sync) that at least one key share was processed.
-        if stored_count > 0
-            && !self
-                .initial_app_state_keys_received
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            // First time setting; notify any waiters
+        if stored_count > 0 {
+            self.initial_app_state_keys_received
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Notify UNCONDITIONALLY (not only the first-ever share). A later key
+            // share is exactly what unblocks a collection whose decode we deferred,
+            // so any waiter must be woken every time new keys land.
             self.initial_keys_synced_notifier.notify(usize::MAX);
+
+            // Re-sync the app-state collections now that we have new keys. The
+            // phone's reads (markChatAsRead, carried by regular_low) were deferred
+            // pending these keys; without an explicit resync they would not apply
+            // until the next server_sync notification or reconnect. Spawn detached
+            // so the message handler returns promptly. sync_collections_batched has
+            // its own in-flight dedup, so this cannot double-run a collection.
+            use wacore::appstate::patch_decode::WAPatchName;
+            let client = self.clone();
+            self.runtime
+                .spawn(Box::pin(async move {
+                    if let Err(e) = client
+                        .sync_collections_batched(vec![
+                            WAPatchName::CriticalBlock,
+                            WAPatchName::CriticalUnblockLow,
+                            WAPatchName::RegularLow,
+                            WAPatchName::RegularHigh,
+                            WAPatchName::Regular,
+                        ])
+                        .await
+                    {
+                        log::warn!(
+                            target: "Client/AppState",
+                            "App-state resync after key share failed: {e:#}"
+                        );
+                    }
+                }))
+                .detach();
         }
     }
 
