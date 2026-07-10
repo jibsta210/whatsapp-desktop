@@ -770,9 +770,21 @@ impl ChatListPanel {
             // and not a redelivery of a message id we've already counted (server
             // re-pushes on reconnect would otherwise double-count the badge).
             let is_viewing = current_chat_id == Some(chat_id);
-            if !msg.is_from_me && !is_viewing && is_newer && !just_created && !is_duplicate_id {
+            if !msg.is_from_me
+                && !msg.is_system_message
+                && !is_viewing
+                && is_newer
+                && !just_created
+                && !is_duplicate_id
+            {
                 let new_count = row.unread_count.get() + 1;
                 row.set_unread(new_count);
+            } else if msg.is_from_me && is_newer && !msg.is_system_message {
+                // Our own message (including the echo of a message sent from the
+                // phone) marks the chat read — clear the badge immediately so the
+                // UI matches the persisted state (persist_new_message runs
+                // mark_chat_read_local for the same case).
+                row.set_unread(0);
             }
         }
         drop(rows);

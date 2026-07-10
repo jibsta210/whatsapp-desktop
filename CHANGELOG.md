@@ -10,6 +10,29 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## Read-sync fixes — execution of `FIXPLAN-READSYNC.md`
+
+Fixes the offline-unread flood, phone-notification persistence, and SMS double-bubble,
+diagnosed by a verified multi-agent investigation (see FIXPLAN-READSYNC.md for the full
+evidence chain). Baseline for this pass: tag **`pre-readsync-fixes`** (commit `060cf9d`).
+Undo whole pass: `git reset --hard pre-readsync-fixes`. Each packet is a separate commit.
+
+### Packet O — Own outbound message marks the chat read (biggest visible win)
+Chats where the user's only offline-window activity was their own phone-sent reply (or
+that they read + replied to on the phone) stayed unread on desktop forever, because an
+own-outbound echo carried the stale unread count forward and floated it to the top of
+the list.
+- **desktop/src/ui/runtime.rs** (persist_new_message): after persisting the chat, an own
+  new non-system message now calls `mark_chat_read_local` — zeroing the count POST-upsert
+  (so the upsert stale-preserve heuristic can't restore it) and stamping the read
+  watermark at the message timestamp so a later reseed can't resurrect the badge. Added
+  `!is_system_message` to the unread-bump guard.
+- **desktop/src/ui/chat_list.rs** (update_last_message): the badge increment is now gated
+  on `!is_system_message`, and an own newer message clears the badge to 0 immediately so
+  the UI matches the persisted state (previously only fixed at the next full reload). This
+  also stops group-event system messages from bumping the badge.
+- Revert: `git revert <O commit>`.
+
 ## Review-pass cleanup — fixes from `REVIEW-REPORT.md`
 
 Independent second-pass review of the whole `pre-audit-fixes..HEAD` diff (6 parallel

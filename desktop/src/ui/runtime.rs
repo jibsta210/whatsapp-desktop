@@ -4212,6 +4212,7 @@ fn persist_new_message(
         existing_is_archived,
         existing_is_favorite,
         existing_label,
+        msg_is_new,
     ) = {
         let mut s = state.lock().unwrap();
 
@@ -4255,7 +4256,8 @@ fn persist_new_message(
             let should_bump = msg_is_new
                 && !m.is_from_me
                 && active.as_deref() != Some(chat_id.as_str())
-                && !ex.auto_mark_read;
+                && !ex.auto_mark_read
+                && !m.is_system_message;
             let unread = if should_bump {
                 ex.unread_count.saturating_add(1)
             } else {
@@ -4269,6 +4271,7 @@ fn persist_new_message(
                 ex.is_archived,
                 ex.is_favorite,
                 ex.label.clone(),
+                msg_is_new,
             )
         } else {
             // Brand-new chat (not yet in self.chats). A first message from a new
@@ -4276,7 +4279,7 @@ fn persist_new_message(
             // shows as already-read after restart. Count it unless it's ours or
             // the chat is the one actively being viewed.
             let unread = (!m.is_from_me && active.as_deref() != Some(chat_id.as_str())) as u32;
-            (None, unread, false, false, false, false, None)
+            (None, unread, false, false, false, false, None, msg_is_new)
         }
     };
 
@@ -4343,6 +4346,17 @@ fn persist_new_message(
                 auto_mark_read: false,
     };
     persist_chat(state, summary);
+
+    // WhatsApp semantics: a message the user sent (including the echo of a message
+    // sent from their phone during an offline window) marks that chat read. Do this
+    // AFTER persist_chat so mark_chat_read_local runs POST-upsert — otherwise the
+    // upsert stale-preserve heuristic (see upsert_chat) would restore the old
+    // nonzero unread. mark_chat_read_local also stamps the read watermark at the
+    // now-updated chat timestamp, so a later stale reseed carrying this message's
+    // timestamp cannot resurrect the badge. System messages are excluded.
+    if m.is_from_me && msg_is_new && !m.is_system_message {
+        state.lock().unwrap().mark_chat_read_local(&chat_id);
+    }
 
     if name_is_new && !is_group {
         // resolved_name here is a sender push_name derived from the message —
