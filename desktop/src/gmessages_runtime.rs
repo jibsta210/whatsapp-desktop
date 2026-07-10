@@ -1892,6 +1892,26 @@ async fn handle_command(
                 }
             }
 
+            // Also clear unread_count in gm_chats.bin for the marked conv(s), so a
+            // boot that fails to reseed (e.g. the observed `list_conversations`
+            // rpc timeout) doesn't depend solely on the watermark clamp to hide an
+            // already-read badge. gm_chats.bin lives beside the watermark file.
+            if let Some(parent) = wm_path.parent() {
+                let cache_path = parent.join("gm_chats.bin");
+                let mut cache = gm_load_chats_cache(&cache_path);
+                let mut changed = false;
+                for c in cache.iter_mut() {
+                    let cid = strip_prefix(&c.id);
+                    if c.unread_count != 0 && convs.iter().any(|conv| conv == cid) {
+                        c.unread_count = 0;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    gm_save_chats_cache(&cache_path, &cache);
+                }
+            }
+
             // For the synthetic Verification Codes inbox we've watermarked all
             // real convs above; the inbox file mixes msg_ids from many convs, so
             // we can't reliably pair a msg_id to its conv for a server ACK.

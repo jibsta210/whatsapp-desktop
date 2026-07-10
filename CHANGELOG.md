@@ -77,6 +77,13 @@ JID.
 - Tests: `test_read_receipt_collects_list_item_ids_and_t` (multi-id + `t` parse).
 - Revert: `git revert <R+S commit>`.
 
+### Packet G — gm staleness hardening (optional)
+- **desktop/src/gmessages_runtime.rs** (MarkRead arm): marking an SMS chat read now also
+  clears `unread_count=0` in gm_chats.bin for the marked conv(s), so a boot that fails to
+  reseed (e.g. a `list_conversations` rpc timeout) doesn't depend solely on the watermark
+  clamp to hide an already-read badge.
+- Revert: `git revert <G commit>`.
+
 ## Review-pass cleanup — fixes from `REVIEW-REPORT.md`
 
 Independent second-pass review of the whole `pre-audit-fixes..HEAD` diff (6 parallel
