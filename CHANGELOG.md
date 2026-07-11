@@ -10,6 +10,23 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## Message-edit fixes — execution of `FIXPLAN-EDIT.md`
+
+Editing a sent WhatsApp message did nothing (no bubble update, no error, nothing on the
+phone). Three independent bugs, each verified against HEAD. Baseline: tag
+**`pre-edit-fixes`** (commit `15af073`). Undo whole pass: `git reset --hard pre-edit-fixes`.
+
+### Packet EB-B — inbound edit resolver (peer edits + own echoes)
+Inbound edits arrive wrapped a level deeper than the top-level `protocol_message`
+(`Message.edited_message` → `.message.protocol_message`), so the handler read empty text
+with a missing target for every peer edit, and dropped from_me edit echoes entirely.
+- **desktop/src/ui/runtime.rs** (Event::Message edit branch): resolve the ProtocolMessage
+  from BOTH nesting levels (`edit_pm`); detection, target id (original message id), and
+  new_text now use it. `new_text` reads the wrapped `edited_message` (covers both
+  `conversation` and `extendedTextMessage.text`). Added an empty-text guard so a failed
+  extraction can never blank a bubble.
+- Revert: `git revert <EB-B commit>`.
+
 ## Read-sync fixes — execution of `FIXPLAN-READSYNC.md`
 
 Fixes the offline-unread flood, phone-notification persistence, and SMS double-bubble,

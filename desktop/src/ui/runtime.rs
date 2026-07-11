@@ -2488,42 +2488,53 @@ async fn handle_wa_event(
             // Detect edits either via the edit attribute OR by checking
             // for protocol_message.edited_message (self-edits from phone
             // sometimes arrive without the edit attribute set).
-            let has_edited_msg = msg
-                .protocol_message
-                .as_ref()
-                .and_then(|pm| pm.edited_message.as_ref())
-                .is_some();
+            // Inbound edits arrive wrapped one level deeper than the top-level
+            // protocol_message: Message.edited_message (FutureProofMessage) →
+            // .message.protocol_message{type=MESSAGE_EDIT, key.id=ORIGINAL id,
+            // edited_message=replacement}. Resolve the ProtocolMessage from BOTH
+            // possible levels — reading only the top level made every peer edit
+            // parse as empty text with a missing target and dropped from_me echoes.
+            let edit_pm = msg.protocol_message.as_deref().or_else(|| {
+                msg.edited_message
+                    .as_ref()
+                    .and_then(|fp| fp.message.as_deref())
+                    .and_then(|m| m.protocol_message.as_deref())
+            });
+            let has_edited_msg = edit_pm.is_some_and(|pm| pm.edited_message.is_some());
             if matches!(info.edit, EditAttribute::MessageEdit) || has_edited_msg {
                 // Target ID priority: meta_info.target_id → protocol_message.key.id
-                // → fall back to msg_id (last resort; risks editing wrong msg)
+                // (the ORIGINAL message id) → fall back to msg_id (last resort).
                 let target_id = info
                     .meta_info
                     .target_id
                     .as_ref()
                     .map(|id| id.to_string())
                     .or_else(|| {
-                        msg.protocol_message
-                            .as_ref()
+                        edit_pm
                             .and_then(|pm| pm.key.as_ref())
                             .and_then(|k| k.id.clone())
                     })
                     .unwrap_or_else(|| msg_id.clone());
-                // Edits arrive wrapped in protocol_message.edited_message (tag 14).
-                // text_content() alone doesn't unwrap this layer, so check both.
-                let new_text = msg
-                    .text_content()
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        msg.protocol_message
-                            .as_ref()
-                            .and_then(|pm| pm.edited_message.as_deref())
-                            .and_then(|em| em.text_content().map(|s| s.to_string()))
-                    })
+                // The replacement text lives in the wrapped edited_message
+                // (conversation OR extendedTextMessage.text — text_content covers both).
+                let new_text = edit_pm
+                    .and_then(|pm| pm.edited_message.as_deref())
+                    .and_then(|em| em.text_content().map(|s| s.to_string()))
+                    .or_else(|| msg.text_content().map(|s| s.to_string()))
                     .unwrap_or_default();
                 log::info!(
                     "Message edit received: {target_id} in {chat_id} new_text={:?}",
                     new_text
                 );
+                // Never blank a bubble: an empty extraction (a media-body edit we
+                // don't render, or an unparsed shape) must not overwrite the stored
+                // text or emit an update.
+                if new_text.is_empty() {
+                    log::warn!(
+                        "Message edit for {target_id} in {chat_id} had empty text — skipping (not overwriting existing message)"
+                    );
+                    return;
+                }
                 {
                     let mut s = state.lock().unwrap();
                     if let Some(msgs) = s.history.get_mut(&chat_id) {
