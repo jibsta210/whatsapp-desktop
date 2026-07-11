@@ -1133,13 +1133,6 @@ impl ChatListPanel {
         }
     }
 
-    pub fn set_preview_to_previous(&self, chat_id: &str) {
-        let rows = self.inner.rows.borrow();
-        if let Some(row) = rows.get(chat_id) {
-            row.preview_label.set_text("🚫 Message deleted");
-        }
-    }
-
     pub fn clear_chat_messages(&self, chat_id: &str) {
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {

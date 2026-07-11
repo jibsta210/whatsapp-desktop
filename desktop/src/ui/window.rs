@@ -1304,10 +1304,18 @@ impl MainWindow {
             WaEvent::MessagePinned { chat_id, msg_id } => {
                 inner.chat_view.show_pinned_banner(&chat_id, &msg_id);
             }
-            WaEvent::MessageDeletedLocal { chat_id, msg_id } => {
+            WaEvent::MessageDeletedLocal {
+                chat_id,
+                msg_id,
+                new_preview,
+            } => {
                 inner.chat_view.remove_message(&chat_id, &msg_id);
-                // Update chat list preview to show the previous message
-                inner.chat_list.set_preview_to_previous(&chat_id);
+                // Only touch the sidebar preview if the deleted message actually
+                // affected it (was the latest) — an older deletion leaves the row
+                // showing the true latest message.
+                if let Some(preview) = new_preview {
+                    inner.chat_list.update_preview_text(&chat_id, &preview);
+                }
             }
             WaEvent::MessageEdited {
                 chat_id,

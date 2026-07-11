@@ -165,6 +165,11 @@ pub enum WaEvent {
     MessageDeletedLocal {
         chat_id: String,
         msg_id: String,
+        /// The new chat-list preview to show, if the deleted message affected it.
+        /// `Some("🚫 Message deleted")` when the latest message was revoked for
+        /// everyone; `Some(<preview of the new latest message>)` for delete-for-me;
+        /// `None` when an older message was deleted (the preview must not change).
+        new_preview: Option<String>,
     },
     /// Chat list preview text updated (e.g., after name resolution)
     ChatPreviewUpdated {

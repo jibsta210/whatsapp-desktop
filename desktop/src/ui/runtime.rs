@@ -2459,26 +2459,66 @@ async fn handle_wa_event(
                 EditAttribute::SenderRevoke | EditAttribute::AdminRevoke
             );
             if is_revoke {
-                // Target ID can be in meta_info.target_id or we fall back to msg_id
+                // Resolve the ORIGINAL message id from ProtocolMessage{type=Revoke}.key.id.
+                // meta_info.target_id is never populated in the receive parser, so the
+                // old fallback to msg_id targeted the revoke stanza's OWN fresh id — the
+                // delete removed nothing and the bubble never updated. `base` reaches a
+                // from-me echo wrapped in edited_message/DeviceSentMessage.
+                let base = msg.get_base_message();
+                let revoke_pm = msg
+                    .protocol_message
+                    .as_deref()
+                    .or(base.protocol_message.as_deref());
                 let target_id = info
                     .meta_info
                     .target_id
                     .as_ref()
                     .map(|id| id.to_string())
+                    .or_else(|| {
+                        revoke_pm
+                            .and_then(|pm| pm.key.as_ref())
+                            .and_then(|k| k.id.clone())
+                    })
                     .unwrap_or_else(|| msg_id.clone());
                 log::info!("Revoke message received: {target_id} in {chat_id}");
-                // Remove from cache
-                {
+                // Remove from cache (load from disk first if the chat isn't in memory,
+                // so the removal persists and was_latest is correct for chats never
+                // opened this session).
+                let new_preview = {
                     let mut s = state.lock().unwrap();
+                    if !s.history.contains_key(&chat_id) {
+                        let disk_msgs = load_messages(&chat_id);
+                        if !disk_msgs.is_empty() {
+                            s.history.insert(chat_id.clone(), disk_msgs);
+                        }
+                    }
+                    let mut was_latest = false;
                     if let Some(msgs) = s.history.get_mut(&chat_id) {
+                        was_latest = msgs
+                            .iter()
+                            .max_by_key(|m| m.timestamp)
+                            .map(|m| m.id == target_id)
+                            .unwrap_or(false);
                         msgs.retain(|m| m.id != target_id);
                         s.queue_save_messages(&chat_id);
                     }
-                }
+                    // Only touch the preview if the DELETED message was the latest;
+                    // otherwise the sidebar keeps showing the true latest message.
+                    if was_latest {
+                        if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
+                            c.last_message = "🚫 Message deleted".to_string();
+                        }
+                        let _ = s.save_tx.send(s.chats.clone());
+                        Some("🚫 Message deleted".to_string())
+                    } else {
+                        None
+                    }
+                };
                 let _ = tx
                     .send(WaEvent::MessageDeletedLocal {
                         chat_id,
                         msg_id: target_id,
+                        new_preview,
                     })
                     .await;
                 return;
@@ -4945,17 +4985,33 @@ async fn handle_command(
                 }
             }
             // Always remove locally
-            {
+            let new_preview = {
                 let mut s = state.lock().unwrap();
+                let mut was_latest = false;
                 if let Some(history) = s.history.get_mut(&chat_id) {
+                    was_latest = history
+                        .iter()
+                        .max_by_key(|m| m.timestamp)
+                        .map(|m| m.id == msg_id)
+                        .unwrap_or(false);
                     history.retain(|m| m.id != msg_id);
                     s.queue_save_messages(&chat_id);
                 }
-            }
+                if was_latest {
+                    if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
+                        c.last_message = "🚫 Message deleted".to_string();
+                    }
+                    let _ = s.save_tx.send(s.chats.clone());
+                    Some("🚫 Message deleted".to_string())
+                } else {
+                    None
+                }
+            };
             let _ = tx
                 .send(WaEvent::MessageDeletedLocal {
                     chat_id: chat_id.clone(),
                     msg_id: msg_id.clone(),
+                    new_preview,
                 })
                 .await;
         }
@@ -5906,15 +5962,43 @@ async fn handle_command(
             {
                 log::warn!("DeleteForMe server error (removing locally): {e:#}");
             }
-            {
+            let new_preview = {
                 let mut s = state.lock().unwrap();
+                let mut was_latest = false;
                 if let Some(history) = s.history.get_mut(&chat_id) {
+                    was_latest = history
+                        .iter()
+                        .max_by_key(|m| m.timestamp)
+                        .map(|m| m.id == msg_id)
+                        .unwrap_or(false);
                     history.retain(|m| m.id != msg_id);
                     s.queue_save_messages(&chat_id);
                 }
-            }
+                // Delete-for-me removes nothing for the other party, so the preview
+                // should fall back to the new latest REMAINING message, not a
+                // "deleted" stamp.
+                if was_latest {
+                    let preview = s
+                        .history
+                        .get(&chat_id)
+                        .and_then(|h| h.iter().max_by_key(|m| m.timestamp))
+                        .map(media_preview)
+                        .unwrap_or_default();
+                    if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
+                        c.last_message = preview.clone();
+                    }
+                    let _ = s.save_tx.send(s.chats.clone());
+                    Some(preview)
+                } else {
+                    None
+                }
+            };
             let _ = tx
-                .send(WaEvent::MessageDeletedLocal { chat_id, msg_id })
+                .send(WaEvent::MessageDeletedLocal {
+                    chat_id,
+                    msg_id,
+                    new_preview,
+                })
                 .await;
         }
 

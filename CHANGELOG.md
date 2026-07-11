@@ -10,6 +10,33 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## Chat-list preview fixes — execution of `FIXPLAN-PREVIEW.md`
+
+The sidebar preview tracked the latest *action* instead of the latest *message*: editing
+didn't refresh it, and deleting an OLDER message hijacked it to "deleted" while the
+bubble never updated. Baseline: tag **`pre-preview-fixes`** (commit `ed1ca43`). Undo whole
+pass: `git reset --hard pre-preview-fixes`.
+
+### Packet PV-B — delete/revoke: correct target + gated preview
+The inbound revoke branch read `meta_info.target_id` (never populated), falling back to
+the revoke stanza's OWN id — so the delete removed nothing (message resurrected on
+restart) and the bubble never updated. The preview was also stamped "🚫 Message deleted"
+unconditionally, regardless of whether the deleted message was the latest.
+- **desktop/src/ui/runtime.rs** (revoke branch): resolve the original id from
+  `ProtocolMessage{type=Revoke}.key.id` (via `msg.protocol_message` or `get_base_message`
+  for wrapped echoes) — same nesting fix as the edit resolver. Load history from disk if
+  the chat isn't in memory (removal now persists; also fixes never-opened chats). Compute
+  `was_latest` and only rewrite the preview (row + persisted `last_message`) when the
+  deleted message was the newest.
+- The two desktop-initiated delete sites got the same `was_latest` treatment;
+  **delete-for-me** recomputes the preview from the new latest *remaining* message (not a
+  "deleted" stamp — nothing was revoked for the other party).
+- **desktop/src/bridge.rs**: `MessageDeletedLocal` gained `new_preview: Option<String>`
+  (the exact preview to show, or `None` to leave the sidebar untouched).
+- **desktop/src/ui/window.rs**: gate the sidebar update on `new_preview`. Deleted the
+  misleadingly-named `set_preview_to_previous` (chat_list.rs) — its only caller.
+- Revert: `git revert <PV-B commit>`.
+
 ## Message-edit fixes — execution of `FIXPLAN-EDIT.md`
 
 Editing a sent WhatsApp message did nothing (no bubble update, no error, nothing on the
