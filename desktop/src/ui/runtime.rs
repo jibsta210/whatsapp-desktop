@@ -2634,29 +2634,35 @@ async fn handle_wa_event(
                     if !target_id.is_empty() {
                         // Persist reaction to message cache + capture the full
                         // updated reactions so the UI can rebuild (dedup/remove).
-                        let updated: Option<Vec<(String, String)>> = {
+                        let updated: Option<(Vec<(String, String)>, bool)> = {
                             let mut s = state.lock().unwrap();
                             let mut out = None;
                             if let Some(msgs) = s.history.get_mut(&chat_id) {
+                                let is_latest = msgs
+                                    .iter()
+                                    .max_by_key(|m| m.timestamp)
+                                    .map(|m| m.id == target_id)
+                                    .unwrap_or(false);
                                 if let Some(m) = msgs.iter_mut().find(|m| m.id == target_id) {
                                     // Replace-or-remove this sender's reaction.
                                     m.reactions.retain(|(s, _)| *s != sender);
                                     if !emoji.is_empty() {
                                         m.reactions.push((sender, emoji.clone()));
                                     }
-                                    out = Some(m.reactions.clone());
+                                    out = Some((m.reactions.clone(), is_latest));
                                 }
                                 s.queue_save_messages(&chat_id);
                             }
                             out
                         };
                         // Emit ALWAYS (including removals — empty vec clears the row).
-                        if let Some(reactions) = updated {
+                        if let Some((reactions, is_latest)) = updated {
                             let _ = tx
                                 .send(WaEvent::ReactionUpdated {
                                     chat_id: chat_id.clone(),
                                     msg_id: target_id,
                                     reactions,
+                                    is_latest,
                                 })
                                 .await;
                         }
@@ -5827,7 +5833,7 @@ async fn handle_command(
             if let Err(e) = client.send_message(jid, reaction).await {
                 log::warn!("SendReaction failed: {e:#}");
             } else {
-                let mut updated_reactions: Option<Vec<(String, String)>> = None;
+                let mut updated_reactions: Option<(Vec<(String, String)>, bool)> = None;
                 // Persist reaction to cache
                 {
                     let own_jid = {
@@ -5840,23 +5846,29 @@ async fn handle_command(
                     };
                     let mut s = state.lock().unwrap();
                     if let Some(msgs) = s.history.get_mut(&chat_id) {
+                        let is_latest = msgs
+                            .iter()
+                            .max_by_key(|m| m.timestamp)
+                            .map(|m| m.id == msg_id)
+                            .unwrap_or(false);
                         if let Some(m) = msgs.iter_mut().find(|m| m.id == msg_id) {
                             m.reactions.retain(|(s, _)| *s != own_jid);
                             // Empty emoji = clear our own reaction (toggle off).
                             if !emoji.is_empty() {
                                 m.reactions.push((own_jid, emoji.clone()));
                             }
-                            updated_reactions = Some(m.reactions.clone());
+                            updated_reactions = Some((m.reactions.clone(), is_latest));
                             s.queue_save_messages(&chat_id);
                         }
                     }
                 }
-                if let Some(reactions) = updated_reactions {
+                if let Some((reactions, is_latest)) = updated_reactions {
                     let _ = tx
                         .send(WaEvent::ReactionUpdated {
                             chat_id,
                             msg_id,
                             reactions,
+                            is_latest,
                         })
                         .await;
                 }

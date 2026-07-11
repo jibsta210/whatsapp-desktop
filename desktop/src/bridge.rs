@@ -155,6 +155,9 @@ pub enum WaEvent {
         /// rebuilds the whole row from this so it groups/dedups and handles
         /// removals (empty vec clears the row).
         reactions: Vec<(String, String)>,
+        /// True if the reacted-to message is the chat's latest — only then should
+        /// the reaction show as the sidebar preview ("Reacted 👍").
+        is_latest: bool,
     },
     MessageStarred {
         chat_id: String,

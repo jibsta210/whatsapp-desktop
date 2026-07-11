@@ -1284,11 +1284,14 @@ impl MainWindow {
                 chat_id,
                 msg_id,
                 reactions,
+                is_latest,
             } => {
                 // Rebuild the reaction row on the bubble from the full set.
                 inner.chat_view.show_reaction(&chat_id, &msg_id, &reactions);
-                // Show the newest reaction as the latest action in the chat list.
-                if let Some((_, emoji)) = reactions.last() {
+                // Only show "Reacted 👍" as the sidebar preview when the reaction is
+                // on the chat's LATEST message (and it's an add, not a removal) —
+                // otherwise a reaction on an old message would hijack the preview.
+                if is_latest && let Some((_, emoji)) = reactions.last() {
                     inner
                         .chat_list
                         .update_preview_text(&chat_id, &format!("Reacted {emoji}"));

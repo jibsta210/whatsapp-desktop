@@ -52,6 +52,17 @@ restart).
   when `is_latest`.
 - Revert: `git revert <PV-A commit>`.
 
+### Packet PV-C — reactions stop hijacking the preview
+A reaction on ANY message stamped "Reacted 👍" as the sidebar preview, even for an old
+message.
+- **desktop/src/bridge.rs**: `ReactionUpdated` gained `is_latest: bool`.
+- **desktop/src/ui/runtime.rs** (both WA reaction sites) and
+  **desktop/src/gmessages_runtime.rs** (SMS reaction site): compute `is_latest` from the
+  chat's sorted history alongside the existing reaction persist.
+- **desktop/src/ui/window.rs**: only set the "Reacted 👍" preview when `is_latest` (and it's
+  an add, not a removal — an empty reaction set no longer stamps a preview).
+- Revert: `git revert <PV-C commit>`.
+
 ## Message-edit fixes — execution of `FIXPLAN-EDIT.md`
 
 Editing a sent WhatsApp message did nothing (no bubble update, no error, nothing on the

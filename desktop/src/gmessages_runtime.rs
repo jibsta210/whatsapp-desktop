@@ -2012,6 +2012,11 @@ async fn handle_command(
                     let emo = emoji.clone();
                     let merged = tokio::task::spawn_blocking(move || {
                         let mut msgs = crate::ui::runtime::load_messages(&cid);
+                        let is_latest = msgs
+                            .iter()
+                            .max_by_key(|m| m.timestamp)
+                            .map(|m| m.id == mid)
+                            .unwrap_or(false);
                         if let Some(m) = msgs.iter_mut().find(|m| m.id == mid) {
                             m.reactions.retain(|(who, _)| who != "me");
                             if !emo.is_empty() {
@@ -2023,7 +2028,7 @@ async fn handle_command(
                                 MessageSource::GoogleMessages,
                                 &msgs,
                             );
-                            Some(merged)
+                            Some((merged, is_latest))
                         } else {
                             None
                         }
@@ -2036,21 +2041,24 @@ async fn handle_command(
                     // back to just our own change if the message wasn't cached.
                     // The bubble renders an EMPTY sender as "You", so translate
                     // the persisted self key ("me") back to "" for the event.
-                    let reactions = match merged {
-                        Some(r) => r
-                            .into_iter()
-                            .map(|(who, e)| {
-                                if who == "me" { (String::new(), e) } else { (who, e) }
-                            })
-                            .collect(),
-                        None if emoji.is_empty() => Vec::new(),
-                        None => vec![(String::new(), emoji.clone())],
+                    let (reactions, is_latest): (Vec<(String, String)>, bool) = match merged {
+                        Some((r, is_latest)) => (
+                            r.into_iter()
+                                .map(|(who, e)| {
+                                    if who == "me" { (String::new(), e) } else { (who, e) }
+                                })
+                                .collect(),
+                            is_latest,
+                        ),
+                        None if emoji.is_empty() => (Vec::new(), false),
+                        None => (vec![(String::new(), emoji.clone())], false),
                     };
                     let _ = event_tx
                         .send(WaEvent::ReactionUpdated {
                             chat_id: chat_id.clone(),
                             msg_id: msg_id.clone(),
                             reactions,
+                            is_latest,
                         })
                         .await;
                 }
