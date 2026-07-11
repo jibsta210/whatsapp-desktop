@@ -262,6 +262,38 @@ impl Client {
             }
         };
 
+        // Learn the PEER's LID → phone mapping from an own-echo DM's
+        // `peer_recipient_pn` (parsed into recipient_alt). Persisting it to the core
+        // store lets merge_lid_chats fold an existing "+<lid digits>" phantom chat
+        // into the real phone-keyed chat on next startup, and the desktop routes
+        // future echoes straight into the named chat.
+        if info.source.is_from_me
+            && info.source.chat.server == wacore_binary::jid::HIDDEN_USER_SERVER
+            && let Some(recipient_alt) = info.source.recipient_alt.as_ref()
+            && recipient_alt.server == wacore_binary::jid::DEFAULT_USER_SERVER
+        {
+            if let Err(err) = self
+                .add_lid_pn_mapping(
+                    &info.source.chat.user,
+                    &recipient_alt.user,
+                    crate::lid_pn_cache::LearningSource::PeerLidMessage,
+                )
+                .await
+            {
+                log::warn!(
+                    "Failed to persist peer LID->PN mapping {} -> {}: {err}",
+                    info.source.chat.user,
+                    recipient_alt.user
+                );
+            } else {
+                log::debug!(
+                    "Learned peer LID->PN mapping: {} -> {}",
+                    info.source.chat.user,
+                    recipient_alt.user
+                );
+            }
+        }
+
         // DIAG (catch-up self-msg bug): log every incoming message
         // with is_from_me + offline flag so we can correlate
         // resume-after-suspend behavior with which messages arrive.
@@ -2926,6 +2958,17 @@ mod tests {
         assert_eq!(
             info.source.sender.user, "100000000000001",
             "Sender should be own LID"
+        );
+
+        // recipient_alt now carries the peer's phone number (from peer_recipient_pn),
+        // which is what lets the desktop map the peer LID chat → phone JID.
+        assert_eq!(
+            info.source
+                .recipient_alt
+                .as_ref()
+                .map(|j| j.user.as_str()),
+            Some("559985213786"),
+            "recipient_alt should be populated from peer_recipient_pn"
         );
     }
 

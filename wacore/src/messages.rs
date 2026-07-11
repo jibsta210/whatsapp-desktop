@@ -176,6 +176,13 @@ pub fn parse_message_info(
         }
     } else if from.matches_user_or_lid(own_jid, own_lid) {
         let recipient = attrs.optional_jid("recipient");
+        // In LID-addressed own-echo DMs the peer's PHONE number rides the stanza
+        // as `peer_recipient_pn` (whatsmeow: MessageInfo.RecipientAlt). Capturing it
+        // lets the desktop map the peer LID → phone at message arrival instead of
+        // minting a phantom "+<lid digits>" chat.
+        let recipient_alt = attrs
+            .optional_jid("peer_recipient_pn")
+            .or_else(|| attrs.optional_jid("recipient_pn"));
         let chat = recipient
             .as_ref()
             .map(|r| r.to_non_ad())
@@ -185,6 +192,7 @@ pub fn parse_message_info(
             sender: from.clone(),
             is_from_me: true,
             recipient,
+            recipient_alt,
             ..Default::default()
         }
     } else {

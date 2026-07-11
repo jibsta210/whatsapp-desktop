@@ -10,6 +10,24 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## LID phantom-chat fixes — execution of `FIXPLAN-LID.md`
+
+Continuing a conversation from the phone with a saved contact created a duplicate
+"+<lid digits>" chat instead of routing into the contact's existing chat, because the
+peer's phone number (on the wire as `peer_recipient_pn`) was parsed and dropped. Baseline:
+tag **`pre-lid-fixes`** (commit `3e222fd`). Undo whole pass: `git reset --hard pre-lid-fixes`.
+
+### Packet LD-A — parse `peer_recipient_pn` + learn the mapping (core)
+- **wacore/src/messages.rs** (own-echo DM branch): parse `peer_recipient_pn` (fallback
+  `recipient_pn`) into `MessageSource.recipient_alt` — the whatsmeow-parity slot that was
+  `None` at every construction site.
+- **src/message.rs** (handle_incoming_message): when an own-echo DM's chat is a LID and
+  `recipient_alt` is a phone JID, persist the peer LID→phone mapping to the core store
+  (`add_lid_pn_mapping`, `PeerLidMessage`). This heals the EXISTING phantom at next startup
+  (merge_lid_chats resolves via this cache) and prevents new ones. Test asserts
+  `recipient_alt` is now populated.
+- Revert: `git revert <LD-A commit>`.
+
 ## Chat-list preview fixes — execution of `FIXPLAN-PREVIEW.md`
 
 The sidebar preview tracked the latest *action* instead of the latest *message*: editing
