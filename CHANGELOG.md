@@ -27,6 +27,23 @@ with a missing target for every peer edit, and dropped from_me edit echoes entir
   extraction can never blank a bubble.
 - Revert: `git revert <EB-B commit>`.
 
+### Packet EB-A — tmp→real id remap (outbound edit + all bubble-menu actions)
+Editing a just-sent message did nothing: the bubble's menu closures froze the optimistic
+`tmp-…` id at creation time, so Edit sent `key.id="tmp-…"` on the wire — the server ACKed
+it (no error) but the peer discarded an edit for an unknown id, and the local update
+missed the re-keyed bubble. The same staleness silently mis-targeted star/pin/react/
+delete/reply for freshly-sent messages.
+- **desktop/src/ui/chat_view.rs**: new `id_remap` (tmp→real) on ChatViewInner, populated in
+  `confirm_bubble`, cleared in `open_chat`. `show_message_menu` resolves the message id
+  through it (fixes Edit + all other menu actions); the do_send edit branch resolves again
+  at send time to cover the confirm-while-editing race.
+- **desktop/src/ui/runtime.rs** (EditMessage handler): guard — if the id is still `tmp-…`
+  (send not yet confirmed), emit `EditFailed` (bounces the text back to the composer)
+  instead of putting an unmatchable key on the wire.
+- With the real id supplied, the existing wire format and optimistic-update path work
+  unchanged — no protocol change.
+- Revert: `git revert <EB-A commit>`.
+
 ## Read-sync fixes — execution of `FIXPLAN-READSYNC.md`
 
 Fixes the offline-unread flood, phone-notification persistence, and SMS double-bubble,

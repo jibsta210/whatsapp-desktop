@@ -98,6 +98,11 @@ struct ChatViewInner {
     bubbles: RefCell<HashMap<String, MessageBubble>>,
     // msg_id → searchable text (for the in-chat search filter)
     search_texts: RefCell<HashMap<String, String>>,
+    // optimistic tmp id → real server id. Bubble menu closures capture the
+    // message (and its id) at bubble-creation time, when a just-sent message is
+    // still keyed by its "tmp-…" id; confirm_bubble records the mapping here so
+    // menu actions (edit/star/pin/react/delete/reply) resolve to the real id.
+    id_remap: RefCell<HashMap<String, String>>,
     // Ordered list of (msg_id, abs_path) for visual media (images/gifs/stickers) — powers the carousel
     media_items: RefCell<Vec<(String, String)>>,
     // Last message date seen — used to insert day separator labels
@@ -793,6 +798,7 @@ impl ChatViewPanel {
             goto_latest_btn: goto_latest_btn.clone(),
             bubbles: RefCell::new(HashMap::new()),
             search_texts: RefCell::new(HashMap::new()),
+            id_remap: RefCell::new(HashMap::new()),
             media_items: RefCell::new(Vec::new()),
             last_msg_date: RefCell::new(None),
             reply_context: RefCell::new(None),
@@ -2373,6 +2379,15 @@ impl ChatViewPanel {
         if let Some((edit_chat_id, edit_msg_id)) = editing {
             buf.set_text("");
             inner.edit_banner.set_reveal_child(false);
+            // Resolve tmp→real at SEND time. This also covers the case where the
+            // send confirmation landed after the user opened the editor but before
+            // they hit save (editing_msg would still hold the "tmp-…" id).
+            let edit_msg_id = inner
+                .id_remap
+                .borrow()
+                .get(&edit_msg_id)
+                .cloned()
+                .unwrap_or(edit_msg_id);
             inner.bridge.send_command(WaCommand::EditMessage {
                 chat_id: edit_chat_id,
                 msg_id: edit_msg_id,
@@ -2940,6 +2955,7 @@ impl ChatViewPanel {
         remove_all_children(&self.inner.messages_box);
         self.inner.bubbles.borrow_mut().clear();
         self.inner.search_texts.borrow_mut().clear();
+        self.inner.id_remap.borrow_mut().clear();
         self.inner.media_items.borrow_mut().clear();
         *self.inner.last_msg_date.borrow_mut() = None;
         self.inner.search_entry.set_text("");
@@ -3224,6 +3240,14 @@ impl ChatViewPanel {
     }
 
     pub fn confirm_bubble(&self, tmp_id: &str, real_id: &str) {
+        // Record tmp→real so bubble-menu closures (which froze the tmp id at
+        // creation time) can resolve to the real server id for edit/star/etc.
+        if tmp_id != real_id {
+            self.inner
+                .id_remap
+                .borrow_mut()
+                .insert(tmp_id.to_string(), real_id.to_string());
+        }
         let mut bubbles = self.inner.bubbles.borrow_mut();
         if let Some(bubble) = bubbles.remove(tmp_id) {
             if bubbles.contains_key(real_id) {
@@ -4826,6 +4850,17 @@ fn show_message_menu(
     x: f64,
     y: f64,
 ) {
+    // The menu closures captured this message at bubble-creation time, when a
+    // just-sent message was still keyed by its optimistic "tmp-…" id. Resolve to
+    // the real server id (recorded by confirm_bubble) so every menu action —
+    // edit, star, pin, react, delete, reply-quote — targets the message the
+    // server actually knows, not the dead optimistic id.
+    let mut resolved = msg.clone();
+    if let Some(real) = inner.id_remap.borrow().get(&resolved.id) {
+        resolved.id = real.clone();
+    }
+    let msg = &resolved;
+
     let is_failed = inner
         .bubbles
         .borrow()

@@ -7522,6 +7522,24 @@ async fn handle_command(
             msg_id,
             new_text,
         } => {
+            // Guard: an unresolved optimistic id would put an unmatchable key on
+            // the wire — the server ACKs it but the peer silently discards the
+            // edit. Bounce the text back to the composer instead (the UI resolves
+            // tmp→real before sending; this only fires if the send hadn't yet
+            // confirmed when the user saved the edit).
+            if msg_id.starts_with("tmp-") {
+                log::warn!(
+                    "EditMessage for unconfirmed message {msg_id} in {chat_id} — cannot edit until the send confirms"
+                );
+                let _ = tx
+                    .send(WaEvent::EditFailed {
+                        chat_id,
+                        msg_id,
+                        new_text,
+                    })
+                    .await;
+                return Ok(());
+            }
             let jid: Jid = chat_id.parse()?;
             let new_content = wa::Message {
                 conversation: Some(new_text.clone()),
