@@ -28,6 +28,14 @@ tag **`pre-lid-fixes`** (commit `3e222fd`). Undo whole pass: `git reset --hard p
   `recipient_alt` is now populated.
 - Revert: `git revert <LD-A commit>`.
 
+### Packet LD-B — desktop routing from recipient_alt + resolver observability
+- **desktop/src/ui/runtime.rs**: seed `lid_to_phone` from an own-echo DM's `recipient_alt`
+  BEFORE chat-key resolution, so the echo routes straight into the contact's existing
+  phone-keyed chat (no phantom, no usync). Extended `alt_phone` to fall back to
+  `recipient_alt` (no-op on inbound/group paths). `resolve_lid_batch` now logs its outcome
+  unconditionally (and warns on 0 resolved — the previously-silent LID→PN dead end).
+- Revert: `git revert <LD-B commit>`.
+
 ## Chat-list preview fixes — execution of `FIXPLAN-PREVIEW.md`
 
 The sidebar preview tracked the latest *action* instead of the latest *message*: editing

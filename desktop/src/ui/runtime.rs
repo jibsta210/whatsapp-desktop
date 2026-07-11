@@ -2054,8 +2054,13 @@ async fn resolve_lid_batch(
                     resolved += 1;
                 }
             }
+            log::info!("LID resolver: resolved {resolved}/{} JIDs", unresolved.len());
+            if resolved == 0 {
+                log::warn!(
+                    "LID resolver: 0 resolved — usync device query cannot map lid→pn; unresolved: {unresolved:?}"
+                );
+            }
             if resolved > 0 {
-                log::info!("LID resolver: resolved {resolved}/{} JIDs", unresolved.len());
                 // Persist mappings
                 let map = state.lock().unwrap().lid_to_phone.clone();
                 tokio::task::spawn_blocking(move || save_lid_phone_map(&map));
@@ -2359,6 +2364,23 @@ async fn handle_wa_event(
                 }
             }
 
+            // Seed the PEER's LID→phone mapping from an own-echo DM's recipient_alt
+            // (the `peer_recipient_pn` attr). Without this, the chat-key resolution
+            // below misses every branch and mints a phantom "+<lid digits>" chat for
+            // a contact you already have. Seeded BEFORE resolution so `cached` hits.
+            if info.source.is_from_me
+                && raw_chat_id.ends_with("@lid")
+                && let Some(ralt) = &info.source.recipient_alt
+            {
+                let ralt_str = ralt.to_string();
+                if ralt_str.ends_with("@s.whatsapp.net") {
+                    state
+                        .lock()
+                        .unwrap()
+                        .insert_lid_phone(raw_chat_id.clone(), ralt_str);
+                }
+            }
+
             // Resolve LID chat_id to phone JID: check sender_alt first (for 1:1 DMs),
             // then cached lid_to_phone mapping. IMPORTANT: only trust the mapping
             // if the resolved phone JID actually has an existing chat — otherwise
@@ -2366,10 +2388,14 @@ async fn handle_wa_event(
             // phone numbers (bug where self-sent messages from phone land in a
             // completely different chat).
             let (chat_id, needs_lid_resolve) = if raw_chat_id.ends_with("@lid") {
+                // For an own-echo DM the peer's phone is in recipient_alt (sender_alt
+                // is None); recipient_alt is None on all inbound-DM and group paths,
+                // so the `.or` is a safe no-op there.
                 let alt_phone = info
                     .source
                     .sender_alt
                     .as_ref()
+                    .or(info.source.recipient_alt.as_ref())
                     .filter(|a| a.to_string().ends_with("@s.whatsapp.net"))
                     .map(|a| a.to_string());
                 let s = state.lock().unwrap();
