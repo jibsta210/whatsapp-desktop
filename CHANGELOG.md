@@ -10,6 +10,40 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## Bulk LID↔phone population (fixes the 92%-unmapped root cause)
+
+PL-A's sweep learned 0 because `get_user_devices` uses `DeviceListSpec`, which never
+requests the `<lid/>` sidecar — and the deeper diagnosis found WhatsApp already PUSHES the
+full lid↔phone table through three bulk channels that our code dropped on the floor
+(fed display-name maps, never the protocol `lid_pn_cache`). Baseline: tag
+**`pre-bulk-lid`** (commit `835c44e`).
+
+### Packet BL-A — core bulk sources → lid_pn_cache
+- **src/client/lid_pn.rs**: `learn_lid_pn(lid_user, phone_user)` public API (strips
+  server/device suffixes; `MigrationSyncLatest` finally gets a production emit site).
+- **src/client.rs** (dispatch_app_state_mutation): app-state `contact` mutations now write
+  the cache — index[1] is the LID, `ContactAction.pn_jid` the phone; both were already
+  decoded and discarded. Every contact the phone syncs now maps in bulk, zero extra IQs.
+- **wacore/src/history_sync.rs + src/history_sync.rs**: decode the previously-discarded
+  `HistorySync.phoneNumberToLidMappings` (field 15) table and persist every pair
+  (`MigrationSyncOld`). Covers fresh pairings wholesale.
+- Skipped (documented): live `LidMigrationMappingSyncMessage` handling — proto types exist
+  but no decode path; a fresh protocol handler was out of scope.
+- Revert: `git revert <BL-A commit>`.
+
+### Packet BL-B/C — corrected resumable sweep + desktop consumers
+- **src/features/contacts.rs**: `resolve_contact_lids(phones)` — executes
+  `ContactInfoSpec` (the spec that actually requests `<lid/>`) and persists each returned
+  lid via `add_lid_pn_mapping(Usync)`.
+- **desktop/src/ui/runtime.rs**: `prewarm_contact_lids` rewritten — uses
+  `resolve_contact_lids`; RESUMABLE via a persisted swept-set (`wa_lid_sweep_done.bin`) so
+  it chips through the phonebook at 200 contacts/launch instead of timing out on 2000;
+  contacts with an existing chat sort FIRST (active conversations heal early); failed
+  chunks retry next launch; already-mapped contacts count as done.
+- Desktop consumers that already hold (lid, pn) pairs — the ContactUpdate handler and the
+  JoinedGroup lid+pn block — now also feed the core cache via `learn_lid_pn`.
+- Revert: `git revert <BL-B/C commit>`.
+
 ## Proactive contact resolution — execution of `FIXPLAN-PROACTIVE-LID.md`
 
 Every LID↔phone mapping write was reactive (needed a live message/notification), and the

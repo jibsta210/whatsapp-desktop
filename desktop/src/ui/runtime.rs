@@ -35,6 +35,12 @@ const MESSAGES_DIR: &str = "wa_messages";
 /// reconnect reseed (history sync / list_conversations) from resurrecting the
 /// unread badge of a chat the user already read. Missing file → empty map.
 const READ_WM_FILE: &str = "wa_read_watermarks.bin";
+/// Set of phone digit-strings already covered by the phone→LID prewarm sweep.
+/// The sweep is capped per launch (the ContactInfoSpec usync times out under
+/// large loads), so this lets each launch resume where the last stopped instead
+/// of re-usyncing the same head of the phonebook forever. See
+/// [`prewarm_contact_lids`]. Persisted as a bincode `HashSet<String>`.
+const LID_SWEEP_DONE_FILE: &str = "wa_lid_sweep_done.bin";
 
 // Magic header for versioned binary files: "WA01"
 // Bumped from '01' to '02' after adding is_edited + is_system_message to IncomingMessage.
@@ -426,6 +432,16 @@ pub fn load_lid_phone_map() -> HashMap<String, String> {
 
 fn save_lid_phone_map(map: &HashMap<String, String>) {
     write_bin(LID_PHONE_FILE, map);
+}
+
+/// Load the set of phone digit-strings already swept for phone→LID mapping.
+/// Missing/undecodable file → empty set (the sweep simply starts fresh).
+fn load_lid_sweep_done() -> std::collections::HashSet<String> {
+    read_bin::<std::collections::HashSet<String>>(LID_SWEEP_DONE_FILE).unwrap_or_default()
+}
+
+fn save_lid_sweep_done(done: &std::collections::HashSet<String>) {
+    write_bin(LID_SWEEP_DONE_FILE, done);
 }
 
 /// Old bincode header (pre-is_system_message). Used for fallback deserialization.
@@ -3515,13 +3531,36 @@ async fn handle_wa_event(
 
                 // Store LID→phone mapping from every JoinedGroup conversation
                 if chat_id.ends_with("@lid") && !pn_jid.is_empty() {
-                    let mut s = state.lock().unwrap();
-                    s.insert_lid_phone(chat_id.clone(), pn_jid.clone());
-                    // Also store contact name under phone JID if we have one for the LID
-                    if let Some(lid_name) = s.contact_names.get(&chat_id).cloned() {
-                        if !s.contact_names.contains_key(&pn_jid) {
-                            s.contact_names.insert(pn_jid.clone(), lid_name);
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.insert_lid_phone(chat_id.clone(), pn_jid.clone());
+                        // Also store contact name under phone JID if we have one for the LID
+                        if let Some(lid_name) = s.contact_names.get(&chat_id).cloned() {
+                            if !s.contact_names.contains_key(&pn_jid) {
+                                s.contact_names.insert(pn_jid.clone(), lid_name);
+                            }
                         }
+                    }
+                    // The (lid, pn) pair here is real — feed it to the CORE LID-PN
+                    // cache too so the client's own resolver learns it (not just
+                    // the desktop maps). Non-fatal, spawned off the event loop.
+                    let bare_user = |jid: &str| -> String {
+                        jid.split('@')
+                            .next()
+                            .unwrap_or(jid)
+                            .split(':')
+                            .next()
+                            .unwrap_or(jid)
+                            .trim_start_matches('+')
+                            .to_string()
+                    };
+                    let lid_user = bare_user(&chat_id);
+                    let phone_user = bare_user(&pn_jid);
+                    if !lid_user.is_empty() && !phone_user.is_empty() {
+                        let client = client.clone();
+                        tokio::spawn(async move {
+                            client.learn_lid_pn(&lid_user, &phone_user).await;
+                        });
                     }
                 }
                 // Extract push_names from history sync messages for group participants
@@ -3946,6 +3985,33 @@ async fn handle_wa_event(
                 (s.contact_names.clone(), phone)
             };
             tokio::task::spawn_blocking(move || save_contact_names(&names_snapshot));
+
+            // Feed the (lid, pn) pair the app-state carries into the CORE LID-PN
+            // cache too — previously we only wrote the desktop-side maps, so the
+            // client's own resolver never learned it. `resolved_phone` is the
+            // phone JID (explicit pn_jid or derived from lid_to_phone). Extract
+            // the bare user parts; skip if either is missing. Non-fatal: spawn
+            // it so a persist error can't wedge the event loop.
+            if lid_jid.ends_with("@lid") && !resolved_phone.is_empty() {
+                let bare_user = |jid: &str| -> String {
+                    jid.split('@')
+                        .next()
+                        .unwrap_or(jid)
+                        .split(':')
+                        .next()
+                        .unwrap_or(jid)
+                        .trim_start_matches('+')
+                        .to_string()
+                };
+                let lid_user = bare_user(&lid_jid);
+                let phone_user = bare_user(&resolved_phone);
+                if !lid_user.is_empty() && !phone_user.is_empty() {
+                    let client = client.clone();
+                    tokio::spawn(async move {
+                        client.learn_lid_pn(&lid_user, &phone_user).await;
+                    });
+                }
+            }
 
             // Notify the UI — use the phone JID if available (more likely to match a chat row)
             let chat_id = if resolved_phone.is_empty() {
@@ -8747,45 +8813,100 @@ async fn prewarm_contact_lids(client: &Arc<Client>, state: &Arc<Mutex<RuntimeSta
         s.did_phone_lid_sweep = true;
     }
 
+    // How much of the phonebook one launch is allowed to usync. The
+    // ContactInfoSpec IQ times out under big loads (a 2000-contact sweep hung a
+    // chunk), so we cover a small slice per launch and resume next time via the
+    // persisted "done" set below.
+    const CHUNK: usize = 50;
+    const MAX_CHUNKS: usize = 4; // 200 phones/launch — safely under the IQ timeout
+
+    // Resume set: phones already usynced on a previous launch. Contacts we
+    // already have a LID for count as done without spending an IQ.
+    let mut swept_done = load_lid_sweep_done();
+    let done_before = swept_done.len();
+
     let all_phones = crate::contacts::global().saved_contact_phones();
-    // Only usync contacts whose LID we don't already know — after the first
-    // session this shrinks to near-zero.
-    let mut to_sync: Vec<Jid> = Vec::new();
+
+    // Unswept = not in the resume set AND no cached LID yet. Already-mapped
+    // contacts are recorded as done so a later launch never revisits them.
+    let mut unswept: Vec<String> = Vec::new();
+    let mut newly_done = 0usize;
     for digits in &all_phones {
-        if client.get_lid_for_phone(digits).await.is_none() {
-            to_sync.push(Jid::pn(digits.clone()));
+        if swept_done.contains(digits) {
+            continue;
         }
+        if client.get_lid_for_phone(digits).await.is_some() {
+            // Already mapped (e.g. learned organically) — mark done, skip usync.
+            swept_done.insert(digits.clone());
+            newly_done += 1;
+            continue;
+        }
+        unswept.push(digits.clone());
     }
-    if to_sync.is_empty() {
+
+    if unswept.is_empty() {
+        if newly_done > 0 {
+            save_lid_sweep_done(&swept_done);
+        }
         log::info!(
-            "phone→LID prewarm: all {} saved contacts already mapped",
+            "phone→LID prewarm: nothing left to usync ({}/{} contacts swept)",
+            swept_done.len(),
             all_phones.len()
         );
         return;
     }
+
+    // Prioritize contacts likely to message: phones whose phone JID already
+    // matches an open chat go FIRST (active conversations — e.g. the Canadian
+    // contact whose phantom we want healed), so the small per-launch budget is
+    // spent where it heals something visible.
+    {
+        let s = state.lock().unwrap();
+        let active: std::collections::HashSet<String> =
+            s.chats.iter().map(|c| c.id.clone()).collect();
+        // sort_by_key is stable, so phonebook order is preserved within each band.
+        unswept.sort_by_key(|digits| {
+            let phone_jid = format!("{digits}@s.whatsapp.net");
+            u8::from(!active.contains(&phone_jid)) // 0 = active chat (first), 1 = rest
+        });
+    }
+
     log::info!(
-        "phone→LID prewarm: usyncing {}/{} unmapped saved contacts",
-        to_sync.len(),
-        all_phones.len()
+        "phone→LID prewarm: {} unswept (of {} contacts, {} already swept); usyncing up to {} this launch",
+        unswept.len(),
+        all_phones.len(),
+        done_before,
+        (MAX_CHUNKS * CHUNK).min(unswept.len())
     );
 
-    const CHUNK: usize = 50;
-    const MAX_CHUNKS: usize = 40; // hard cap (~2000 contacts) to bound connect cost
     let mut learned = 0usize;
-    for (i, chunk) in to_sync.chunks(CHUNK).enumerate() {
+    for (i, chunk) in unswept.chunks(CHUNK).enumerate() {
         if i >= MAX_CHUNKS {
-            log::warn!("phone→LID prewarm: capped at {} contacts", MAX_CHUNKS * CHUNK);
+            log::info!(
+                "phone→LID prewarm: hit per-launch cap of {} phones; resuming next launch",
+                MAX_CHUNKS * CHUNK
+            );
             break;
         }
-        if let Err(e) = client.get_user_devices(chunk).await {
-            log::warn!("phone→LID prewarm: usync chunk {i} failed: {e:#}");
-            continue;
+        // ContactInfoSpec requests the <lid/> sidecar and persists every
+        // discovered phone↔LID pair into the core LID-PN cache. Returns the
+        // count of new mappings; the desktop-side mirrors below read them back.
+        match client.resolve_contact_lids(chunk).await {
+            Ok(n) => {
+                learned += n;
+            }
+            Err(e) => {
+                log::warn!("phone→LID prewarm: usync chunk {i} failed: {e:#}");
+                // Don't mark this chunk done — retry it on the next launch.
+                continue;
+            }
         }
         // Mirror the just-learned mappings into the desktop sources that
-        // merge_lid_chats consults (UI lid_to_phone + contact-directory by_lid).
-        for jid in chunk {
-            let digits = jid.user.clone();
-            if let Some(lid_user) = client.get_lid_for_phone(&digits).await {
+        // merge_lid_chats consults (UI lid_to_phone + contact-directory by_lid),
+        // and mark each phone in this chunk as swept.
+        for digits in chunk {
+            swept_done.insert(digits.clone());
+            if let Some(lid_user) = client.get_lid_for_phone(digits).await {
                 let lid_jid = format!("{lid_user}@lid");
                 let phone_jid = format!("{digits}@s.whatsapp.net");
                 state
@@ -8793,19 +8914,24 @@ async fn prewarm_contact_lids(client: &Arc<Client>, state: &Arc<Mutex<RuntimeSta
                     .unwrap()
                     .insert_lid_phone(lid_jid.clone(), phone_jid.clone());
                 crate::contacts::global().record_lid_jid(&phone_jid, &lid_jid);
-                learned += 1;
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
 
-    // Persist the enriched maps so the next launch starts warm.
+    // Persist the enriched maps + resume set so the next launch starts warm and
+    // continues where this one stopped.
+    save_lid_sweep_done(&swept_done);
     let map = state.lock().unwrap().lid_to_phone.clone();
     if !map.is_empty() {
         std::thread::spawn(move || save_lid_phone_map(&map));
     }
     crate::contacts::global().save_if_dirty();
-    log::info!("phone→LID prewarm: learned {learned} new mapping(s)");
+    log::info!(
+        "phone→LID prewarm: learned {learned} new mapping(s); swept-set now {}/{} contacts",
+        swept_done.len(),
+        all_phones.len()
+    );
 }
 
 async fn resolve_all_lids(client: &Arc<Client>, state: &Arc<Mutex<RuntimeState>>) {

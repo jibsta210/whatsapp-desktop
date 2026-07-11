@@ -106,6 +106,51 @@ impl Client {
     pub fn contacts(&self) -> Contacts<'_> {
         Contacts::new(self)
     }
+
+    /// Resolve phone numbers to their LIDs via a ContactInfoSpec usync and
+    /// persist every discovered phone↔LID pair into the core LID-PN cache.
+    ///
+    /// Unlike `get_user_devices` (DeviceListSpec), ContactInfoSpec requests the
+    /// `<lid/>` sidecar, so the server actually returns a `<lid val="…"/>` child
+    /// for each phone-keyed user — the only usync direction that yields a mapping.
+    /// The desktop prewarm sweep calls this so an incoming LID resolves to the
+    /// right saved contact instead of minting a phantom "+<lid digits>" chat.
+    ///
+    /// `phones` are bare digit strings (no `@` / `+`); the spec adds the `+`.
+    /// Returns the number of new (lid, phone) mappings learned.
+    pub async fn resolve_contact_lids(&self, phones: &[String]) -> anyhow::Result<usize> {
+        if phones.is_empty() {
+            return Ok(0);
+        }
+
+        let request_id = self.generate_request_id();
+        let spec = ContactInfoSpec::new(phones.to_vec(), request_id);
+        let infos = self.execute(spec).await?;
+
+        let mut learned = 0usize;
+        for info in infos {
+            // Only phone-keyed results carry a usable LID sidecar. `jid.user` is
+            // the phone digits; `lid.user` is the opaque LID user part.
+            if let Some(lid) = info.lid {
+                let phone_user = info.jid.user.as_str();
+                let lid_user = lid.user.as_str();
+                if phone_user.is_empty() || lid_user.is_empty() {
+                    continue;
+                }
+                // Reachable because this method lives inside the whatsapp-rust crate.
+                if let Err(e) = self
+                    .add_lid_pn_mapping(lid_user, phone_user, wacore::types::LearningSource::Usync)
+                    .await
+                {
+                    debug!("resolve_contact_lids: persist {lid_user}↔{phone_user} failed: {e:#}");
+                    continue;
+                }
+                learned += 1;
+            }
+        }
+
+        Ok(learned)
+    }
 }
 
 #[cfg(test)]
