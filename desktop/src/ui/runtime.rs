@@ -8768,6 +8768,100 @@ async fn resolve_all_lids(client: &Arc<Client>, state: &Arc<Mutex<RuntimeState>>
     }
 }
 
+/// Merge a single @lid phantom chat into its resolved phone-JID chat: fold the
+/// message files (dedup by id, chronological), swap the chat-list entry, delete
+/// the @lid message file, and tell the UI to drop the phantom row + refresh the
+/// merged one. The caller must have already confirmed the mapping is trustworthy.
+async fn merge_one_lid_chat(
+    state: &Arc<Mutex<RuntimeState>>,
+    tx: &Sender<WaEvent>,
+    lid_chat: &ChatSummary,
+    phone_jid: &str,
+) {
+    log::info!("Merging {} → {}", lid_chat.id, phone_jid);
+
+    // Store the LID→phone mapping
+    state
+        .lock()
+        .unwrap()
+        .lid_to_phone
+        .insert(lid_chat.id.clone(), phone_jid.to_string());
+
+    // Load messages from both chats, remap + merge (dedup by id)
+    let mut lid_msgs = load_messages(&lid_chat.id);
+    let phone_msgs = load_messages(phone_jid);
+    let mut merged = phone_msgs.clone();
+    for mut m in lid_msgs.drain(..) {
+        m.chat_id = phone_jid.to_string();
+        if !merged.iter().any(|x| x.id == m.id) {
+            merged.push(m);
+        }
+    }
+    merged.sort_by_key(|m| m.timestamp);
+    save_messages_scoped(phone_jid, crate::bridge::MessageSource::WhatsApp, &merged);
+
+    // Build merged summary and update state (under mutex — serialized with JoinedGroup tasks)
+    let last_msg = merged
+        .iter()
+        .rev()
+        .find(|m| m.text.is_some() || m.media_type.is_some());
+    let timestamp = last_msg.map(|m| m.timestamp).unwrap_or(lid_chat.timestamp);
+    let preview = last_msg.map(media_preview).unwrap_or_default();
+
+    let merged_summary = {
+        let mut s = state.lock().unwrap();
+        let phone_name = if let Some(existing) = s.chats.iter().find(|c| c.id == phone_jid) {
+            if existing.name.contains('@') {
+                lid_chat.name.clone()
+            } else {
+                existing.name.clone()
+            }
+        } else {
+            lid_chat.name.clone()
+        };
+        let summary = ChatSummary {
+            id: phone_jid.to_string(),
+            name: phone_name,
+            last_message: preview,
+            timestamp,
+            unread_count: lid_chat.unread_count,
+            is_group: false,
+            is_muted: lid_chat.is_muted,
+            is_pinned: lid_chat.is_pinned,
+            is_archived: lid_chat.is_archived,
+            is_favorite: lid_chat.is_favorite,
+            label: lid_chat.label.clone(),
+            pinned_msg_id: lid_chat.pinned_msg_id.clone(),
+            auto_mark_read: lid_chat.auto_mark_read,
+        };
+        // Remove @lid entry, upsert @s.whatsapp.net — all within the same lock
+        s.chats.retain(|c| c.id != lid_chat.id);
+        s.chat_names.remove(&lid_chat.id);
+        s.upsert_chat(summary.clone(), false, false);
+        s.history.remove(&lid_chat.id);
+        s.history.insert(phone_jid.to_string(), merged.clone());
+        summary
+    };
+
+    // Delete the @lid messages file
+    let _ = std::fs::remove_file(messages_file(&lid_chat.id));
+
+    // Persist the updated LID→phone map so the resolution survives restart
+    let map = state.lock().unwrap().lid_to_phone.clone();
+    if !map.is_empty() {
+        std::thread::spawn(move || save_lid_phone_map(&map));
+    }
+
+    // Drop the phantom row (ChatsLoaded alone never removes rows) and refresh the
+    // merged row's preview/timestamp/name (add_chat upserts an existing row).
+    let _ = tx
+        .send(WaEvent::ChatDeleted {
+            chat_id: lid_chat.id.clone(),
+        })
+        .await;
+    let _ = tx.send(WaEvent::ChatAdded(merged_summary)).await;
+}
+
 async fn merge_lid_chats(
     client: &Arc<Client>,
     state: &Arc<Mutex<RuntimeState>>,
@@ -8787,100 +8881,28 @@ async fn merge_lid_chats(
     }
 
     log::info!("Resolving {} @lid chat(s)…", lid_chats.len());
-    let mut changed = false;
 
     for lid_chat in lid_chats {
-        let Some(phone_jid) = client.resolve_lid_to_phone_jid(&lid_chat.id).await else {
-            log::debug!("No LID→PN mapping for {}", lid_chat.id);
-            continue;
-        };
-
-        log::info!("Merging {} → {}", lid_chat.id, phone_jid);
-
-        // Store the LID→phone mapping
-        state
-            .lock()
-            .unwrap()
-            .lid_to_phone
-            .insert(lid_chat.id.clone(), phone_jid.clone());
-
-        // Load messages from both chats
-        let mut lid_msgs = load_messages(&lid_chat.id);
-        let mut phone_msgs = load_messages(&phone_jid);
-
-        // Remap chat_id on lid messages and merge (dedup by id)
-        let mut merged = phone_msgs.clone();
-        for mut m in lid_msgs.drain(..) {
-            m.chat_id = phone_jid.clone();
-            if !merged.iter().any(|x| x.id == m.id) {
-                merged.push(m);
-            }
-        }
-        merged.sort_by_key(|m| m.timestamp);
-        save_messages_scoped(
-            &phone_jid,
-            crate::bridge::MessageSource::WhatsApp,
-            &merged,
-        );
-
-        // Build merged summary and update state (under mutex — serialized with JoinedGroup tasks)
-        let last_msg = merged
-            .iter()
-            .rev()
-            .find(|m| m.text.is_some() || m.media_type.is_some());
-        let timestamp = last_msg.map(|m| m.timestamp).unwrap_or(lid_chat.timestamp);
-        let preview = last_msg.map(|m| media_preview(m)).unwrap_or_default();
-
-        let merged_summary = {
-            let mut s = state.lock().unwrap();
-            let phone_name = if let Some(existing) = s.chats.iter().find(|c| c.id == phone_jid) {
-                if existing.name.contains('@') {
-                    lid_chat.name.clone()
-                } else {
-                    existing.name.clone()
+        let phone_jid = match client.resolve_lid_to_phone_jid(&lid_chat.id).await {
+            Some(p) => p,
+            None => {
+                // Fall back to the UI-layer lid_to_phone map (populated at message
+                // arrival from peer_recipient_pn), but ONLY when the mapped phone
+                // chat already exists — a stale/corrupt mapping must never merge the
+                // lid history into a WRONG JID and then delete the lid file. That
+                // exists-guard is exactly the phantom scenario.
+                let s = state.lock().unwrap();
+                let candidate = s.lid_to_phone.get(&lid_chat.id).cloned();
+                match candidate {
+                    Some(p) if s.chats.iter().any(|c| c.id == p) => p,
+                    _ => {
+                        log::debug!("No usable LID→PN mapping for {}", lid_chat.id);
+                        continue;
+                    }
                 }
-            } else {
-                lid_chat.name.clone()
-            };
-            let summary = ChatSummary {
-                id: phone_jid.clone(),
-                name: phone_name,
-                last_message: preview,
-                timestamp,
-                unread_count: lid_chat.unread_count,
-                is_group: false,
-                is_muted: lid_chat.is_muted,
-                is_pinned: lid_chat.is_pinned,
-                is_archived: lid_chat.is_archived,
-                is_favorite: lid_chat.is_favorite,
-                label: lid_chat.label.clone(),
-                pinned_msg_id: lid_chat.pinned_msg_id.clone(),
-                auto_mark_read: lid_chat.auto_mark_read,
-            };
-            // Remove @lid entry, upsert @s.whatsapp.net — all within the same lock
-            s.chats.retain(|c| c.id != lid_chat.id);
-            s.chat_names.remove(&lid_chat.id);
-            s.upsert_chat(summary.clone(), false, false);
-            s.history.remove(&lid_chat.id);
-            s.history.insert(phone_jid.clone(), merged.clone());
-            summary
+            }
         };
-
-        // Delete the @lid messages file
-        let _ = std::fs::remove_file(messages_file(&lid_chat.id));
-
-        let _ = merged_summary; // used above
-        changed = true;
-    }
-
-    if changed {
-        // Persist updated LID→phone map so resolved chats survive restart
-        let map = state.lock().unwrap().lid_to_phone.clone();
-        if !map.is_empty() {
-            std::thread::spawn(move || save_lid_phone_map(&map));
-        }
-        let chats = state.lock().unwrap().chats_with_best_names();
-        let _ = tx.send(WaEvent::ChatsLoaded(chats)).await;
+        merge_one_lid_chat(state, tx, &lid_chat, &phone_jid).await;
     }
 }
 

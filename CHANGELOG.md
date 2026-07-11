@@ -36,6 +36,19 @@ tag **`pre-lid-fixes`** (commit `3e222fd`). Undo whole pass: `git reset --hard p
   unconditionally (and warns on 0 resolved — the previously-silent LID→PN dead end).
 - Revert: `git revert <LD-B commit>`.
 
+### Packet LD-C — retroactive phantom merge (heals the existing "+<lid>" chat)
+- **desktop/src/ui/runtime.rs**: extracted `merge_one_lid_chat` (folds message files with
+  dedup-by-id + chronological sort, swaps the chat-list entry, deletes the @lid file) and
+  made it emit `ChatDeleted` (drops the phantom row — `ChatsLoaded` never removes rows) +
+  `ChatAdded` (refreshes the merged row). `merge_lid_chats` (startup) now falls back to the
+  UI `lid_to_phone` map when the core cache misses, gated on the mapped phone chat already
+  existing so a stale mapping can never merge into the wrong chat and delete the file.
+- Heal path: after LD-A learns the mapping (from one more message to that contact), the next
+  startup's `merge_lid_chats` folds the existing phantom into the contact's chat. New
+  phantoms are prevented outright by LD-B. (Hot-path live-merge was intentionally left out
+  to avoid a message-file write race — the off-path startup merge is sufficient and safe.)
+- Revert: `git revert <LD-C commit>`.
+
 ## Chat-list preview fixes — execution of `FIXPLAN-PREVIEW.md`
 
 The sidebar preview tracked the latest *action* instead of the latest *message*: editing
