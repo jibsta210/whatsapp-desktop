@@ -49,6 +49,19 @@ tag **`pre-lid-fixes`** (commit `3e222fd`). Undo whole pass: `git reset --hard p
   to avoid a message-file write race — the off-path startup merge is sufficient and safe.)
 - Revert: `git revert <LD-C commit>`.
 
+### Packet LD-E — contact-directory as a merge source
+- **desktop/src/contacts.rs**: added `resolve_lid_to_phone` (uses the explicit, non-fuzzy
+  `by_lid` index).
+- **desktop/src/ui/runtime.rs**: `merge_lid_chats` now consults the contact directory
+  (trusted, ungated) between the core cache and the UI-map fallback; `merge_one_lid_chat`
+  resolves the merged chat's name from the directory so a phantom with no prior phone chat
+  still lands the contact's real name.
+- Note: only heals phantoms whose LID was pinned to a real phone in the directory (via
+  `record_lid_jid`). A phantom whose mapping exists NOWHERE on the desktop (core cache, UI
+  map, and directory all miss) still needs the mapping learned from a fresh message (LD-A)
+  before it can merge.
+- Revert: `git revert <LD-E commit>`.
+
 ## Chat-list preview fixes — execution of `FIXPLAN-PREVIEW.md`
 
 The sidebar preview tracked the latest *action* instead of the latest *message*: editing

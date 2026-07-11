@@ -463,6 +463,25 @@ impl ContactDirectory {
         self.lookup_full(key).map(|e| e.name)
     }
 
+    /// Resolve a `@lid` JID to its phone JID (`<digits>@s.whatsapp.net`) using the
+    /// explicit `by_lid` index (populated from contact sync — authoritative, never
+    /// fuzzy). Returns None if this directory has no mapping for the LID. Lets the
+    /// chat-list merge collapse a "+<lid digits>" phantom into the real contact even
+    /// when the core lid_pn_cache never learned the mapping.
+    pub fn resolve_lid_to_phone(&self, lid_jid: &str) -> Option<String> {
+        if !lid_jid.ends_with("@lid") {
+            return None;
+        }
+        let inner = match self.inner.read() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        inner
+            .by_lid
+            .get(lid_jid)
+            .map(|digits| format!("{digits}@s.whatsapp.net"))
+    }
+
     /// Look up the full entry (for debugging or source-aware code).
     pub fn lookup_full(&self, key: &str) -> Option<ContactEntry> {
         let inner = match self.inner.read() {
@@ -1034,3 +1053,4 @@ mod tests {
         assert_eq!(source_priority("unknown-src"), 0);
     }
 }
+

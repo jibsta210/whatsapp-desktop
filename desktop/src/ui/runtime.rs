@@ -8810,15 +8810,18 @@ async fn merge_one_lid_chat(
 
     let merged_summary = {
         let mut s = state.lock().unwrap();
-        let phone_name = if let Some(existing) = s.chats.iter().find(|c| c.id == phone_jid) {
-            if existing.name.contains('@') {
-                lid_chat.name.clone()
-            } else {
-                existing.name.clone()
-            }
-        } else {
-            lid_chat.name.clone()
-        };
+        // Prefer an existing named phone chat, else the contact directory's name
+        // for the phone JID, else the (usually "+<lid digits>") phantom name — so
+        // merging a phantom with no prior phone chat still lands the real name.
+        let phone_name = s
+            .chats
+            .iter()
+            .find(|c| c.id == phone_jid)
+            .map(|c| c.name.clone())
+            .filter(|n| !n.is_empty() && !n.contains('@'))
+            .or_else(|| crate::contacts::global().lookup(phone_jid))
+            .filter(|n| !n.is_empty() && !n.contains('@'))
+            .unwrap_or_else(|| lid_chat.name.clone());
         let summary = ChatSummary {
             id: phone_jid.to_string(),
             name: phone_name,
@@ -8884,23 +8887,31 @@ async fn merge_lid_chats(
 
     for lid_chat in lid_chats {
         let phone_jid = match client.resolve_lid_to_phone_jid(&lid_chat.id).await {
-            Some(p) => p,
-            None => {
-                // Fall back to the UI-layer lid_to_phone map (populated at message
-                // arrival from peer_recipient_pn), but ONLY when the mapped phone
-                // chat already exists — a stale/corrupt mapping must never merge the
-                // lid history into a WRONG JID and then delete the lid file. That
-                // exists-guard is exactly the phantom scenario.
-                let s = state.lock().unwrap();
-                let candidate = s.lid_to_phone.get(&lid_chat.id).cloned();
-                match candidate {
-                    Some(p) if s.chats.iter().any(|c| c.id == p) => p,
-                    _ => {
-                        log::debug!("No usable LID→PN mapping for {}", lid_chat.id);
-                        continue;
+            // Trusted source #2: the contact directory's explicit by_lid index
+            // (from contact sync — authoritative, never fuzzy). This heals a
+            // phantom whose mapping the core lid_pn_cache never learned, without
+            // needing a fresh message.
+            None => match crate::contacts::global().resolve_lid_to_phone(&lid_chat.id) {
+                Some(p) => p,
+                None => {
+                    // Last resort: the UI-layer lid_to_phone map (populated at
+                    // message arrival from peer_recipient_pn), but ONLY when the
+                    // mapped phone chat already exists — a stale/corrupt mapping
+                    // must never merge the lid history into a WRONG JID and then
+                    // delete the lid file. That exists-guard is exactly the
+                    // phantom scenario.
+                    let s = state.lock().unwrap();
+                    let candidate = s.lid_to_phone.get(&lid_chat.id).cloned();
+                    match candidate {
+                        Some(p) if s.chats.iter().any(|c| c.id == p) => p,
+                        _ => {
+                            log::debug!("No usable LID→PN mapping for {}", lid_chat.id);
+                            continue;
+                        }
                     }
                 }
-            }
+            },
+            Some(p) => p,
         };
         merge_one_lid_chat(state, tx, &lid_chat, &phone_jid).await;
     }
