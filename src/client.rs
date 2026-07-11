@@ -2826,6 +2826,35 @@ impl Client {
             }
         }
 
+        // Feed the LID<->PN cache from contact mutations before delegating.
+        // The chat-action delegation below is event-bus-only and cannot reach
+        // the cache, so this is the only place an app-state contact carries a
+        // (lid, pn) pair into the protocol layer. Index is ["contact", <LID JID>];
+        // the phone JID lives in ContactAction.pn_jid. Operation is already Set
+        // here (guarded above). Failures must not abort the mutation dispatch.
+        if m.index[0] == "contact"
+            && m.index.len() >= 2
+            && let Some(val) = &m.action_value
+            && let Some(contact) = &val.contact_action
+            && let Some(pn_str) = &contact.pn_jid
+            && let Ok(lid) = m.index[1].parse::<wacore_binary::jid::Jid>()
+            && lid.is_lid()
+            && let Ok(phone) = pn_str.parse::<wacore_binary::jid::Jid>()
+            && phone.is_pn()
+        {
+            debug!(target: "Client/AppState", "learned lid<->pn from app-state contact");
+            if let Err(e) = self
+                .add_lid_pn_mapping(
+                    &lid.user,
+                    &phone.user,
+                    crate::lid_pn_cache::LearningSource::MigrationSyncLatest,
+                )
+                .await
+            {
+                warn!(target: "Client/AppState", "Failed to learn lid<->pn from contact mutation: {e:?}");
+            }
+        }
+
         // Delegate chat-related mutations (mute, pin, archive, star, contact, etc.)
         if crate::features::chat_actions::dispatch_chat_mutation(&self.core.event_bus, m, full_sync)
         {

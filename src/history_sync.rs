@@ -245,6 +245,31 @@ impl Client {
                     log::info!("Updating own push name from history sync to '{new_name}'");
                     self.update_push_name_and_notify(new_name).await;
                 }
+
+                // Feed the LID<->PN cache from the bulk phoneNumberToLidMappings
+                // table. Entries are (phone_user, lid_user); add_lid_pn_mapping
+                // takes (lid, phone). Failures on individual rows are logged but
+                // must not abort the rest of the history sync processing.
+                if !sync_result.pn_lid_mappings.is_empty() {
+                    let mut learned = 0usize;
+                    for (phone_user, lid_user) in &sync_result.pn_lid_mappings {
+                        if let Err(e) = self
+                            .add_lid_pn_mapping(
+                                lid_user,
+                                phone_user,
+                                crate::lid_pn_cache::LearningSource::MigrationSyncOld,
+                            )
+                            .await
+                        {
+                            log::warn!(
+                                "history sync: failed to learn lid<->pn {lid_user}<->{phone_user}: {e:?}"
+                            );
+                        } else {
+                            learned += 1;
+                        }
+                    }
+                    log::info!("history sync: learned {learned} lid<->pn mappings");
+                }
             }
             Some(Err(e)) => {
                 log::error!("Failed to process HistorySync data: {:?}", e);

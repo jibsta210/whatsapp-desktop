@@ -20,6 +20,12 @@ pub struct HistorySyncResult {
     pub own_pushname: Option<String>,
 
     pub conversations_processed: usize,
+
+    /// (phone_user, lid_user) pairs decoded from the HistorySync
+    /// phoneNumberToLidMappings table (proto field 15). Entries are the bare
+    /// user parts extracted from the JID strings; the protocol layer feeds
+    /// these into the LID<->PN cache.
+    pub pn_lid_mappings: Vec<(String, String)>,
 }
 
 mod wire_type {
@@ -111,6 +117,28 @@ where
                 pos = end;
             }
 
+            // field 15 = phoneNumberToLidMappings (repeated, length-delimited).
+            // Each PhoneNumberToLidMapping carries a pn_jid + lid_jid; we keep
+            // only the bare user parts as (phone_user, lid_user) so the protocol
+            // layer can feed them straight into the LID<->PN cache.
+            15 if wire_type_raw == wire_type::LENGTH_DELIMITED => {
+                let (len, vlen) = read_varint(&buf[pos..])?;
+                pos += vlen;
+                let end = checked_end(pos, len, buf.len(), "pn_lid_mapping")?;
+
+                if let Ok(mapping) = wa::PhoneNumberToLidMapping::decode(&buf[pos..end])
+                    && let (Some(pn_jid), Some(lid_jid)) = (mapping.pn_jid, mapping.lid_jid)
+                {
+                    // Reduce JID strings to their bare user parts (drop @server).
+                    let pn_user = jid_user_part(&pn_jid);
+                    let lid_user = jid_user_part(&lid_jid);
+                    if !pn_user.is_empty() && !lid_user.is_empty() {
+                        result.pn_lid_mappings.push((pn_user, lid_user));
+                    }
+                }
+                pos = end;
+            }
+
             _ => {
                 pos = skip_field(wire_type_raw, &buf, pos)?;
             }
@@ -118,6 +146,18 @@ where
     }
 
     Ok(result)
+}
+
+/// Extract the bare user part from a JID string, dropping the "@server" suffix
+/// and any device/agent suffix (":device" / ".device"). Returns "" when empty.
+#[inline]
+fn jid_user_part(jid: &str) -> String {
+    let no_server = jid.split('@').next().unwrap_or(jid);
+    no_server
+        .split([':', '.'])
+        .next()
+        .unwrap_or(no_server)
+        .to_string()
 }
 
 /// Compute `pos + len` with overflow and bounds checking.

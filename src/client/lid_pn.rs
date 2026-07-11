@@ -10,7 +10,7 @@
 //! - Bidirectional lookup (LID to PN and PN to LID)
 
 use anyhow::Result;
-use log::debug;
+use log::{debug, warn};
 use wacore_binary::jid::Jid;
 
 use super::Client;
@@ -90,6 +90,35 @@ impl Client {
         }
 
         Ok(())
+    }
+
+    /// Learn a LID<->PN mapping from a bulk source (app-state contacts, history
+    /// sync mapping tables). Public API consumed by the desktop layer.
+    ///
+    /// Inputs may be full JIDs, user parts, or user parts carrying a device
+    /// suffix (e.g. "12345:2"); we defensively reduce to the bare user part so
+    /// the cache is keyed consistently regardless of caller hygiene.
+    pub async fn learn_lid_pn(&self, lid_user: &str, phone_user: &str) {
+        // Strip any "@server" and ":device" / ".device" suffix, keeping only the
+        // user digits. add_lid_pn_mapping keys the cache on the bare user part,
+        // so a stray device suffix would create a phantom mapping that never hits.
+        let strip = |s: &str| -> String {
+            let no_server = s.split('@').next().unwrap_or(s);
+            no_server
+                .split([':', '.'])
+                .next()
+                .unwrap_or(no_server)
+                .to_string()
+        };
+        let lid = strip(lid_user);
+        let phone = strip(phone_user);
+
+        if let Err(e) = self
+            .add_lid_pn_mapping(&lid, &phone, LearningSource::MigrationSyncLatest)
+            .await
+        {
+            warn!("learn_lid_pn: failed to persist mapping {lid}<->{phone}: {e:?}");
+        }
     }
 
     /// Resolve a @lid JID string to its corresponding @s.whatsapp.net JID string.
