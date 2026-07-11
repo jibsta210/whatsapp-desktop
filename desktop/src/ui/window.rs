@@ -1321,10 +1321,17 @@ impl MainWindow {
                 chat_id,
                 msg_id,
                 new_text,
+                is_latest,
             } => {
                 inner
                     .chat_view
                     .update_message_text(&chat_id, &msg_id, &new_text, true);
+                // Refresh the sidebar preview only when the edited message is the
+                // chat's latest (update_preview_text changes the label only — no
+                // reorder, which is the desired edit semantics).
+                if is_latest {
+                    inner.chat_list.update_preview_text(&chat_id, &new_text);
+                }
             }
             WaEvent::EditFailed {
                 chat_id,

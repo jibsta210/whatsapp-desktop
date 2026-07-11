@@ -37,6 +37,21 @@ unconditionally, regardless of whether the deleted message was the latest.
   misleadingly-named `set_preview_to_previous` (chat_list.rs) — its only caller.
 - Revert: `git revert <PV-B commit>`.
 
+### Packet PV-A — edit refreshes the preview (only when latest)
+The `MessageEdited` handler updated only the bubble; neither apply-site touched the
+sidebar or the persisted `last_message`, so the row kept the pre-edit text (even after
+restart).
+- **desktop/src/bridge.rs**: `MessageEdited` gained `is_latest: bool`.
+- **desktop/src/ui/runtime.rs** (both edit apply-sites — inbound + outbound Ok-path):
+  compute `is_latest` from the timestamp-sorted history; when the edited message is the
+  latest, also update the persisted `ChatSummary.last_message` (no timestamp/unread change
+  — edits don't reorder). The inbound branch now loads history from disk if the chat isn't
+  in memory, which also fixes a pre-existing bug where edits to evicted chats weren't
+  persisted at all.
+- **desktop/src/ui/window.rs**: refresh the sidebar preview (`update_preview_text`) only
+  when `is_latest`.
+- Revert: `git revert <PV-A commit>`.
+
 ## Message-edit fixes — execution of `FIXPLAN-EDIT.md`
 
 Editing a sent WhatsApp message did nothing (no bubble update, no error, nothing on the

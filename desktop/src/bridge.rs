@@ -80,6 +80,9 @@ pub enum WaEvent {
         chat_id: String,
         msg_id: String,
         new_text: String,
+        /// True if the edited message is the chat's latest — only then should the
+        /// sidebar preview be refreshed (editing an older message must not touch it).
+        is_latest: bool,
     },
     /// An outgoing edit failed — restore the edited text so it isn't lost.
     EditFailed {

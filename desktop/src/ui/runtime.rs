@@ -2575,21 +2575,46 @@ async fn handle_wa_event(
                     );
                     return;
                 }
-                {
+                let is_latest = {
                     let mut s = state.lock().unwrap();
+                    // Load history from disk if this chat isn't in memory — otherwise the
+                    // edit wouldn't persist and is_latest would be a false negative for a
+                    // chat not opened this session.
+                    if !s.history.contains_key(&chat_id) {
+                        let disk_msgs = load_messages(&chat_id);
+                        if !disk_msgs.is_empty() {
+                            s.history.insert(chat_id.clone(), disk_msgs);
+                        }
+                    }
+                    let mut is_latest = false;
                     if let Some(msgs) = s.history.get_mut(&chat_id) {
                         if let Some(m) = msgs.iter_mut().find(|m| m.id == target_id) {
                             m.text = Some(new_text.clone());
                             m.is_edited = true;
                         }
+                        is_latest = msgs
+                            .iter()
+                            .max_by_key(|m| m.timestamp)
+                            .map(|m| m.id == target_id)
+                            .unwrap_or(false);
                         s.queue_save_messages(&chat_id);
                     }
-                }
+                    // If the edited message is the chat's latest, refresh the persisted
+                    // preview too (no timestamp/unread change — edits don't reorder).
+                    if is_latest {
+                        if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
+                            c.last_message = new_text.clone();
+                        }
+                        let _ = s.save_tx.send(s.chats.clone());
+                    }
+                    is_latest
+                };
                 let _ = tx
                     .send(WaEvent::MessageEdited {
                         chat_id,
                         msg_id: target_id,
                         new_text,
+                        is_latest,
                     })
                     .await;
                 return;
@@ -7632,21 +7657,35 @@ async fn handle_command(
             match client.edit_message(jid, &msg_id, new_content).await {
                 Ok(_) => {
                     // Update local cache
-                    {
+                    let is_latest = {
                         let mut s = state.lock().unwrap();
+                        let mut is_latest = false;
                         if let Some(msgs) = s.history.get_mut(&chat_id) {
                             if let Some(m) = msgs.iter_mut().find(|m| m.id == msg_id) {
                                 m.text = Some(new_text.clone());
                                 m.is_edited = true;
                             }
+                            is_latest = msgs
+                                .iter()
+                                .max_by_key(|m| m.timestamp)
+                                .map(|m| m.id == msg_id)
+                                .unwrap_or(false);
                             s.queue_save_messages(&chat_id);
                         }
-                    }
+                        if is_latest {
+                            if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
+                                c.last_message = new_text.clone();
+                            }
+                            let _ = s.save_tx.send(s.chats.clone());
+                        }
+                        is_latest
+                    };
                     let _ = tx
                         .send(WaEvent::MessageEdited {
                             chat_id,
                             msg_id,
                             new_text,
+                            is_latest,
                         })
                         .await;
                 }
