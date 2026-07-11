@@ -482,6 +482,27 @@ impl ContactDirectory {
             .map(|digits| format!("{digits}@s.whatsapp.net"))
     }
 
+    /// Every saved contact's phone-digits key — real named contacts only, never
+    /// `@lid`-keyed phantom rows and never digits-only "names". This is the input
+    /// set for the proactive phone→LID usync prewarm (usync resolves phone→LID
+    /// reliably, unlike LID→phone).
+    pub fn saved_contact_phones(&self) -> Vec<String> {
+        let inner = match self.inner.read() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        inner
+            .by_digits
+            .iter()
+            .filter(|(digits, entry)| {
+                !entry.is_lid
+                    && digits.len() >= 7
+                    && entry.name.chars().any(|c| c.is_alphabetic())
+            })
+            .map(|(digits, _)| digits.clone())
+            .collect()
+    }
+
     /// Look up the full entry (for debugging or source-aware code).
     pub fn lookup_full(&self, key: &str) -> Option<ContactEntry> {
         let inner = match self.inner.read() {
@@ -767,6 +788,22 @@ mod tests {
         assert_eq!(dir.lookup("+1 (416) 400-0790").as_deref(), Some("Lorne"));
         assert_eq!(dir.lookup("14164000790@s.whatsapp.net").as_deref(), Some("Lorne"));
         assert_eq!(dir.lookup("16472876066").as_deref(), None);
+    }
+
+    #[test]
+    fn saved_contact_phones_filters_real_contacts_only() {
+        let dir = ContactDirectory::new();
+        dir.insert("14164000790", "Lorne", "test"); // real named contact → included
+        dir.insert("15551234567", "+1 555-123-4567", "t"); // digits-only "name" → excluded
+        let phones = dir.saved_contact_phones();
+        assert!(
+            phones.contains(&"14164000790".to_string()),
+            "a named saved contact must be included in the prewarm set"
+        );
+        assert!(
+            !phones.iter().any(|p| p == "15551234567"),
+            "a contact whose only 'name' is its own number must be excluded"
+        );
     }
 
     #[test]

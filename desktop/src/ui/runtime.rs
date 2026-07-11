@@ -1152,6 +1152,8 @@ struct RuntimeState {
     own_phone: String,
     own_lid: String,
     connect_count: u32,
+    /// True once the proactive phone→LID prewarm sweep has run this session.
+    did_phone_lid_sweep: bool,
     /// Per-chat read watermark (chat_id → last-read message timestamp).
     /// Persisted to [`READ_WM_FILE`]; consulted by [`RuntimeState::upsert_chat`]
     /// to defend a locally-read chat against a stale reconnect reseed.
@@ -1228,6 +1230,7 @@ impl RuntimeState {
             own_phone: String::new(),
             own_lid: String::new(),
             connect_count: 0,
+            did_phone_lid_sweep: false,
             read_watermarks,
             receipt_watermarks: HashMap::new(),
             active_chat: None,
@@ -2251,6 +2254,10 @@ async fn handle_wa_event(
                         log::info!("RegularLow collection resync completed");
                     }
                 }
+                // Proactively resolve saved contacts' LIDs (phone→LID usync) BEFORE
+                // the merge, so freshly-learned mappings collapse existing phantoms
+                // this same launch and future LID messages resolve on arrival.
+                prewarm_contact_lids(&client_clone, &state_clone).await;
                 resolve_all_lids(&client_clone, &state_clone).await;
                 merge_lid_chats(&client_clone, &state_clone, &tx_clone).await;
                 fetch_and_update_group_names(&client_clone, &state_clone, &tx_clone).await;
@@ -8724,6 +8731,83 @@ async fn execute_media_download(
 /// Resolve all known LID JIDs to phone JIDs using the client's LID-PN cache.
 /// This populates the lid_to_phone mapping in RuntimeState so that
 /// resolve_sender_name can find names for LID-addressed group messages.
+/// Proactively resolve saved contacts' LID mappings by usyncing their PHONE
+/// numbers (the direction the server actually answers — usync returns a `<lid>`
+/// child only for phone-keyed queries). This pre-warms phone↔LID for the whole
+/// phonebook so an incoming LID resolves on arrival instead of minting a phantom
+/// "+<lid digits>" chat, and lets the subsequent merge collapse any existing
+/// phantom whose contact is in the phonebook (and whose LID is current). Runs
+/// once per session, skips already-mapped contacts, chunked + throttled.
+async fn prewarm_contact_lids(client: &Arc<Client>, state: &Arc<Mutex<RuntimeState>>) {
+    {
+        let mut s = state.lock().unwrap();
+        if s.did_phone_lid_sweep {
+            return;
+        }
+        s.did_phone_lid_sweep = true;
+    }
+
+    let all_phones = crate::contacts::global().saved_contact_phones();
+    // Only usync contacts whose LID we don't already know — after the first
+    // session this shrinks to near-zero.
+    let mut to_sync: Vec<Jid> = Vec::new();
+    for digits in &all_phones {
+        if client.get_lid_for_phone(digits).await.is_none() {
+            to_sync.push(Jid::pn(digits.clone()));
+        }
+    }
+    if to_sync.is_empty() {
+        log::info!(
+            "phone→LID prewarm: all {} saved contacts already mapped",
+            all_phones.len()
+        );
+        return;
+    }
+    log::info!(
+        "phone→LID prewarm: usyncing {}/{} unmapped saved contacts",
+        to_sync.len(),
+        all_phones.len()
+    );
+
+    const CHUNK: usize = 50;
+    const MAX_CHUNKS: usize = 40; // hard cap (~2000 contacts) to bound connect cost
+    let mut learned = 0usize;
+    for (i, chunk) in to_sync.chunks(CHUNK).enumerate() {
+        if i >= MAX_CHUNKS {
+            log::warn!("phone→LID prewarm: capped at {} contacts", MAX_CHUNKS * CHUNK);
+            break;
+        }
+        if let Err(e) = client.get_user_devices(chunk).await {
+            log::warn!("phone→LID prewarm: usync chunk {i} failed: {e:#}");
+            continue;
+        }
+        // Mirror the just-learned mappings into the desktop sources that
+        // merge_lid_chats consults (UI lid_to_phone + contact-directory by_lid).
+        for jid in chunk {
+            let digits = jid.user.clone();
+            if let Some(lid_user) = client.get_lid_for_phone(&digits).await {
+                let lid_jid = format!("{lid_user}@lid");
+                let phone_jid = format!("{digits}@s.whatsapp.net");
+                state
+                    .lock()
+                    .unwrap()
+                    .insert_lid_phone(lid_jid.clone(), phone_jid.clone());
+                crate::contacts::global().record_lid_jid(&phone_jid, &lid_jid);
+                learned += 1;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    // Persist the enriched maps so the next launch starts warm.
+    let map = state.lock().unwrap().lid_to_phone.clone();
+    if !map.is_empty() {
+        std::thread::spawn(move || save_lid_phone_map(&map));
+    }
+    crate::contacts::global().save_if_dirty();
+    log::info!("phone→LID prewarm: learned {learned} new mapping(s)");
+}
+
 async fn resolve_all_lids(client: &Arc<Client>, state: &Arc<Mutex<RuntimeState>>) {
     // Collect all unique LID JIDs from contact_names keys and chat sender_ids
     let lid_jids: Vec<String> = {

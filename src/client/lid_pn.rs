@@ -103,6 +103,14 @@ impl Client {
         Some(format!("{}@s.whatsapp.net", phone))
     }
 
+    /// Cached current LID (user part) for a phone number (digits only), or None if
+    /// no mapping is known. Public wrapper over the lid_pn_cache so the desktop's
+    /// proactive phone→LID prewarm can skip already-mapped contacts and read back
+    /// the LID a usync just learned.
+    pub async fn get_lid_for_phone(&self, phone_digits: &str) -> Option<String> {
+        self.lid_pn_cache.get_current_lid(phone_digits).await
+    }
+
     /// Ensure phone-to-LID mappings are resolved for the given JIDs.
     /// Matches WhatsApp Web's WAWebManagePhoneNumberMappingJob.ensurePhoneNumberToLidMapping().
     /// Should be called before establishing new E2E sessions to avoid duplicate sessions.

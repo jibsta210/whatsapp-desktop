@@ -10,6 +10,28 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## Proactive contact resolution — execution of `FIXPLAN-PROACTIVE-LID.md`
+
+Every LID↔phone mapping write was reactive (needed a live message/notification), and the
+desktop's LID resolvers queried usync with `@lid` JIDs — which usync never answers (it only
+returns the `<lid>` child for phone-keyed queries). So a saved contact never messaged (or
+messaged before LD-A) learned its mapping from nowhere → a phantom "+<lid digits>" chat.
+Baseline: tag **`pre-proactive-lid`** (commit `a36f68d`).
+
+### Packet PL-A — startup phone→LID prewarm sweep
+- **src/client/lid_pn.rs**: added `get_lid_for_phone` (public phone→LID cache accessor).
+- **desktop/src/contacts.rs**: added `saved_contact_phones` (real named contacts only) + test.
+- **desktop/src/ui/runtime.rs**: on the post-connect background task (before the existing
+  merge), `prewarm_contact_lids` usyncs saved contacts' PHONE numbers — the direction usync
+  resolves — populating phone↔LID bidirectionally, then mirrors the results into the UI map
+  and contact-directory `by_lid` so `merge_lid_chats` collapses matching phantoms the same
+  launch. Guarded: once per session (`did_phone_lid_sweep`), skips already-mapped contacts,
+  chunked (50) + 300ms throttle + 40-chunk cap, off the hot path.
+- Effect: future LID messages for saved contacts resolve on arrival (no phantom); an existing
+  phantom heals if its contact is in the phonebook AND its LID is still current (a rotated LID
+  still needs a fresh message).
+- Revert: `git revert <PL-A commit>`.
+
 ## LID phantom-chat fixes — execution of `FIXPLAN-LID.md`
 
 Continuing a conversation from the phone with a saved contact created a duplicate
