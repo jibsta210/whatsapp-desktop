@@ -503,37 +503,6 @@ pub fn load_messages(chat_id: &str) -> Vec<IncomingMessage> {
     msgs
 }
 
-/// Update one chat-list row's preview/timestamp directly on disk without
-/// going through the WhatsApp runtime's owned `RuntimeState`. Used by the
-/// gmessages runtime so that when an SMS arrives for a merged WhatsApp
-/// chat, `wa_chats.bin` reflects the new preview after restart.
-///
-/// Only touches the row matching `chat_id`; if the row doesn't exist, this
-/// is a no-op (the SMS-only chat case is already handled by the gmessages
-/// runtime's own `gm_chats.bin`).
-pub fn touch_wa_chat_preview(chat_id: &str, preview: &str, timestamp: i64, is_from_me: bool) {
-    let mut chats = match read_bin::<Vec<ChatSummary>>(CHATS_FILE) {
-        Some(v) => v,
-        None => return,
-    };
-    let mut changed = false;
-    if let Some(c) = chats.iter_mut().find(|c| c.id == chat_id) {
-        // Only overwrite if newer than what's stored.
-        if timestamp > c.timestamp {
-            c.last_message = preview.to_string();
-            c.timestamp = timestamp;
-            if !is_from_me {
-                c.unread_count = c.unread_count.saturating_add(1);
-            }
-            changed = true;
-        }
-    }
-    if changed {
-        chats.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
-        write_bin(CHATS_FILE, &chats);
-    }
-}
-
 /// Global serialization for message-file writes. [`save_messages_scoped`]
 /// is a read-modify-write (it reads the *other* protocol's messages off
 /// disk, splices, and writes back). Without this lock the WhatsApp
@@ -1186,6 +1155,12 @@ struct RuntimeState {
     /// looking at it), so the persisted `unread_count` stays a true source of
     /// truth that survives restart.
     active_chat: Option<String>,
+    /// Projection tap: the shared UI event channel. Set once in `run_inner`
+    /// right after state construction. `emit_row` uses it to push an
+    /// authoritative `ChatRowChanged` whenever a WA-owned summary mutates —
+    /// the sidebar is a pure projection of this persisted state. `None` only
+    /// during the brief window before `run_inner` wires it up.
+    ui_tx: Option<Sender<WaEvent>>,
 }
 
 impl RuntimeState {
@@ -1250,6 +1225,38 @@ impl RuntimeState {
             read_watermarks,
             receipt_watermarks: HashMap::new(),
             active_chat: None,
+            ui_tx: None,
+        }
+    }
+
+    /// Push an authoritative sidebar-row refresh for one chat. Renders the
+    /// chat's current persisted summary VERBATIM on the UI side — no guards,
+    /// no UI clock. `gm:` ids are owned by the gmessages runtime, never the WA
+    /// runtime, so we hard-skip them here (they are not even in `self.chats`).
+    /// `try_send` is sync-safe (this runs under the state lock on tokio
+    /// workers) and the channel is unbounded so it never blocks or drops.
+    fn emit_row(&self, chat_id: &str) {
+        if chat_id.starts_with("gm:") {
+            return; // ownership rule: gm rows are emitted only by gmessages_runtime
+        }
+        if let (Some(tx), Some(c)) = (&self.ui_tx, self.chats.iter().find(|c| c.id == chat_id)) {
+            let _ = tx.try_send(WaEvent::ChatRowChanged(c.clone()));
+        }
+    }
+
+    /// Emit an EPHEMERAL row refresh: render `preview` now, but DO NOT persist
+    /// it (state is untouched, nothing hits disk). Used for reaction previews
+    /// ("Reacted 👍") — the sidebar shows the reaction live, but a restart
+    /// intentionally falls back to the underlying message text. No-op for `gm:`
+    /// ids and for chats not in `self.chats`.
+    fn emit_row_ephemeral(&self, chat_id: &str, preview: &str) {
+        if chat_id.starts_with("gm:") {
+            return;
+        }
+        if let (Some(tx), Some(c)) = (&self.ui_tx, self.chats.iter().find(|c| c.id == chat_id)) {
+            let mut clone = c.clone();
+            clone.last_message = preview.to_string();
+            let _ = tx.try_send(WaEvent::ChatRowChanged(clone));
         }
     }
 
@@ -1430,6 +1437,30 @@ impl RuntimeState {
         }
         if changed {
             let _ = self.save_tx.send(self.chats.clone());
+            // The badge (and possibly the watermark) moved — refresh the row so
+            // the sidebar clears the unread pill without a second UI-side write.
+            self.emit_row(chat_id);
+        }
+    }
+
+    /// Set a chat's preview text WITHOUT touching its timestamp (so the row
+    /// does not reorder) or its unread count. This is the single choke point
+    /// for the "latest message's TEXT changed but not its position" cases:
+    /// an edit of the latest message, a revoke/delete of the latest message,
+    /// a re-resolved group-sender prefix, and ClearChat (preview → ""). It
+    /// persists and emits an authoritative row refresh. No-op if the chat is
+    /// absent or the text is already what's stored.
+    fn set_chat_preview(&mut self, chat_id: &str, preview: &str) {
+        let mut changed = false;
+        if let Some(c) = self.chats.iter_mut().find(|c| c.id == chat_id) {
+            if c.last_message != preview {
+                c.last_message = preview.to_string();
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.save_tx.send(self.chats.clone());
+            self.emit_row(chat_id);
         }
     }
 
@@ -1460,12 +1491,42 @@ impl RuntimeState {
         let incoming_ts = summary.timestamp;
         let incoming_unread = summary.unread_count;
         let read_watermark = self.read_watermarks.get(&summary.id).copied();
+        // Captured before `summary` is moved into the row, so the post-sort
+        // `emit_row` can find the entry by id. `row_changed` gates the emit.
+        let emit_id = summary.id.clone();
+        let row_changed;
         if let Some(existing) = self.chats.iter_mut().find(|c| c.id == summary.id) {
-            // Preserve the newer last_message + timestamp
-            let keep_old_preview =
-                existing.timestamp > summary.timestamp && !existing.last_message.is_empty();
+            // Snapshot the pre-mutation row so we can decide, AFTER the merge
+            // below, whether anything the sidebar renders actually changed —
+            // and skip the emit if not (prevents an event flood during
+            // history-sync / reconnect reseed storms; ChatsLoaded covers bulk).
+            let snap_before = (
+                existing.last_message.clone(),
+                existing.timestamp,
+                existing.unread_count,
+                existing.is_pinned,
+                existing.is_muted,
+                existing.is_archived,
+                existing.is_favorite,
+                existing.label.clone(),
+                existing.auto_mark_read,
+            );
+
+            // Producer-side monotonicity hardening (replaces the deleted UI
+            // guard): keep the old preview when the existing row is
+            // strictly-newer-and-non-empty (as before) OR when the incoming
+            // preview is empty but the existing one is not — an empty preview
+            // must never clobber real text (CreateGroup / StartNewChat upsert
+            // ts=now + empty preview and would otherwise blank a live row).
+            let keep_old_preview = (existing.timestamp > summary.timestamp
+                && !existing.last_message.is_empty())
+                || (summary.last_message.is_empty() && !existing.last_message.is_empty());
             let old_msg = existing.last_message.clone();
             let old_ts = existing.timestamp;
+            // Never move the row's sort clock backward: if the incoming
+            // timestamp is older than what we already have, keep the old one
+            // (a stale reseed / a ts=now placeholder must not sink the row).
+            let keep_old_timestamp = summary.timestamp < existing.timestamp;
 
             // Preserve unread count if incoming summary has 0 but existing has unread
             let old_unread = existing.unread_count;
@@ -1505,9 +1566,14 @@ impl RuntimeState {
                 existing.pinned_msg_id = old_pinned_msg;
             }
 
-            // But restore the preview/timestamp if the old one was newer
+            // But restore the preview if the old one was newer / the incoming
+            // one was an empty clobber.
             if keep_old_preview {
                 existing.last_message = old_msg;
+            }
+            // Restore the old (newer) timestamp independently — an empty-preview
+            // guard and a backward-timestamp guard are separate concerns.
+            if keep_old_timestamp {
                 existing.timestamp = old_ts;
             }
             // Don't reset unread to 0 if the update doesn't carry unread info.
@@ -1541,11 +1607,32 @@ impl RuntimeState {
                     }
                 }
             }
+            // Change-detection for the row emit: compare the sidebar-visible
+            // fields against the pre-mutation snapshot. A no-op upsert (common
+            // during reseed storms — every conversation re-arrives unchanged)
+            // emits nothing, so the UI channel isn't flooded.
+            let snap_after = (
+                existing.last_message.clone(),
+                existing.timestamp,
+                existing.unread_count,
+                existing.is_pinned,
+                existing.is_muted,
+                existing.is_archived,
+                existing.is_favorite,
+                existing.label.clone(),
+                existing.auto_mark_read,
+            );
+            row_changed = snap_after != snap_before;
         } else {
             self.chats.push(summary);
+            row_changed = true; // a brand-new row always needs an emit
         }
         self.chats.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         let _ = self.save_tx.send(self.chats.clone());
+        // Authoritative sidebar refresh — only when something actually changed.
+        if row_changed {
+            self.emit_row(&emit_id);
+        }
     }
 
     /// Build a chat list with the best available names applied.
@@ -1680,15 +1767,19 @@ impl RuntimeState {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver<WaCommand>) {
-    // Sibling: Google Messages integration. No-op unless GMESSAGES_ENABLE=1.
-    let gm_data_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let gm_cmd_tx = crate::gmessages_runtime::spawn(&gm_data_dir, event_tx.clone());
-
     // Fork the command stream: anything addressed to a `gm:` chat goes to
     // the gmessages runtime; everything else flows to the WhatsApp runtime.
     // If gmessages is disabled, we just forward everything to WhatsApp (the
-    // `gm_cmd_tx.is_none()` path below).
+    // `gm_cmd_tx.is_none()` path below). Created BEFORE the gm spawn so the gm
+    // runtime can send WaCommand::TouchChatSummary back to us for merged-chat
+    // SMS (it owns no non-gm summaries — the WA runtime is the sole writer).
     let (wa_cmd_tx, mut wa_cmd_rx) = tokio::sync::mpsc::unbounded_channel::<WaCommand>();
+
+    // Sibling: Google Messages integration. No-op unless GMESSAGES_ENABLE=1.
+    let gm_data_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let gm_cmd_tx =
+        crate::gmessages_runtime::spawn(&gm_data_dir, event_tx.clone(), wa_cmd_tx.clone());
+
     {
         let mut cmd_rx = cmd_rx;
         tokio::spawn(async move {
@@ -1728,6 +1819,23 @@ pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver
                         }
                     }
                     if wa_cmd_tx.send(WaCommand::MarkUnread { chat_id }).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // SetActiveChat must reach BOTH runtimes: the WA runtime owns
+                // unread suppression for WA/merged chats; the gm runtime owns it
+                // for gm: (SMS) chats (G2's live increment). Fan it out so a
+                // merged SMS to the actively-viewed chat isn't counted twice or
+                // missed. gm applies it INLINE in its select loop (its
+                // handle_command is spawned — spawning would race rapid switches).
+                if let WaCommand::SetActiveChat { chat_id } = cmd {
+                    if let Some(tx) = &gm_cmd_tx {
+                        let _ = tx.send(WaCommand::SetActiveChat {
+                            chat_id: chat_id.clone(),
+                        });
+                    }
+                    if wa_cmd_tx.send(WaCommand::SetActiveChat { chat_id }).is_err() {
                         break;
                     }
                     continue;
@@ -1901,6 +2009,9 @@ async fn run_inner(
         .await;
 
     let state = Arc::new(Mutex::new(RuntimeState::new(save_tx, msg_save_tx)));
+    // Wire the projection tap: every WA-owned summary mutation now emits an
+    // authoritative ChatRowChanged onto the shared UI channel (see `emit_row`).
+    state.lock().unwrap().ui_tx = Some(event_tx.clone());
 
     // ── Centralized LID resolver ──
     // Any handler that encounters an unresolved @lid JID sends it here.
@@ -2554,10 +2665,9 @@ async fn handle_wa_event(
                     // Only touch the preview if the DELETED message was the latest;
                     // otherwise the sidebar keeps showing the true latest message.
                     if was_latest {
-                        if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
-                            c.last_message = "🚫 Message deleted".to_string();
-                        }
-                        let _ = s.save_tx.send(s.chats.clone());
+                        // set_chat_preview keeps the timestamp (no reorder),
+                        // persists, and emits the authoritative row refresh.
+                        s.set_chat_preview(&chat_id, "🚫 Message deleted");
                         Some("🚫 Message deleted".to_string())
                     } else {
                         None
@@ -2651,10 +2761,7 @@ async fn handle_wa_event(
                     // If the edited message is the chat's latest, refresh the persisted
                     // preview too (no timestamp/unread change — edits don't reorder).
                     if is_latest {
-                        if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
-                            c.last_message = new_text.clone();
-                        }
-                        let _ = s.save_tx.send(s.chats.clone());
+                        s.set_chat_preview(&chat_id, &new_text);
                     }
                     is_latest
                 };
@@ -2706,6 +2813,16 @@ async fn handle_wa_event(
                         };
                         // Emit ALWAYS (including removals — empty vec clears the row).
                         if let Some((reactions, is_latest)) = updated {
+                            // Ephemeral sidebar override for a reaction on the
+                            // LATEST message (only when adding, not clearing).
+                            // Rendered live but never persisted — restart shows
+                            // the underlying message text again (A6).
+                            if is_latest && !emoji.is_empty() {
+                                state.lock().unwrap().emit_row_ephemeral(
+                                    &chat_id,
+                                    &format!("Reacted {emoji}"),
+                                );
+                            }
                             let _ = tx
                                 .send(WaEvent::ReactionUpdated {
                                     chat_id: chat_id.clone(),
@@ -4268,14 +4385,11 @@ async fn handle_wa_event(
                 is_system_message: true,
             };
 
-            // Persist and send to UI
-            {
-                let mut s = state.lock().unwrap();
-                if let Some(msgs) = s.history.get_mut(&chat_id) {
-                    msgs.push(sys_msg.clone());
-                    s.queue_save_messages(&chat_id);
-                }
-            }
+            // Persist through the message choke point so the chat summary
+            // (preview + timestamp) updates and emits a ChatRowChanged — a bare
+            // history push froze the row on "You added X" events. Unread stays
+            // suppressed (persist_new_message skips the bump for is_system_message).
+            persist_new_message(&sys_msg, state);
             let _ = tx.send(WaEvent::MessageReceived(sys_msg)).await;
 
             // Refresh the member list by requesting fresh group info
@@ -4568,7 +4682,9 @@ fn persist_new_message(
         (name, false)
     };
 
-    let preview = media_preview(m);
+    // Producer-side preview: group prefixes + @mention resolution baked in,
+    // so the persisted preview matches what the sidebar renders (A7).
+    let preview = row_preview(m, is_group);
     let summary = ChatSummary {
         id: chat_id.clone(),
         name: resolved_name.clone(),
@@ -4645,6 +4761,53 @@ fn media_preview(m: &IncomingMessage) -> String {
         Some(crate::bridge::MediaType::Sticker) => "🎭 Sticker".to_string(),
         Some(crate::bridge::MediaType::Gif) => "🎞 GIF".to_string(),
         None => "📎 Message".to_string(),
+    }
+}
+
+/// Build the sidebar-row preview for a message, producer-side. This is the
+/// authoritative preview text — the UI renders it VERBATIM. Moves the group
+/// "You: " / "{sender}: " prefixing and the `@<jid-digits>` → `@Name` mention
+/// resolution that used to live in chat_list.rs's now-deleted
+/// `update_last_message` onto the runtime, so restart-loaded previews finally
+/// match live-rendered ones (wa_chats.bin previews now carry prefixes).
+///
+/// `crate::contacts::global()` is a cross-thread global directory, safe to call
+/// from any runtime thread.
+pub fn row_preview(m: &IncomingMessage, is_group: bool) -> String {
+    let content = media_preview(m);
+    // Resolve raw `@<jid-digits>` mentions to `@Name`. Message bodies carry
+    // mentions in the protocol form; the bubble renderer resolves them and the
+    // preview must too, else "@agnes" shows as a bare digit blob.
+    let clean = if content.contains('@') {
+        let mut c = content.clone();
+        for word in content.split_whitespace() {
+            if word.starts_with('@')
+                && word.len() > 4
+                && word[1..]
+                    .chars()
+                    .next()
+                    .map(|ch| ch.is_ascii_digit())
+                    .unwrap_or(false)
+            {
+                let jid_part = &word[1..];
+                let replacement = crate::contacts::global()
+                    .lookup(jid_part)
+                    .filter(|n| !n.is_empty() && !n.contains('@'))
+                    .map(|n| format!("@{n}"))
+                    .unwrap_or_else(|| "@user".to_string());
+                c = c.replace(word, &replacement);
+            }
+        }
+        c
+    } else {
+        content
+    };
+    if is_group && !m.is_from_me && !m.sender_name.is_empty() {
+        format!("{}: {clean}", m.sender_name)
+    } else if is_group && m.is_from_me {
+        format!("You: {clean}")
+    } else {
+        clean
     }
 }
 
@@ -5128,10 +5291,8 @@ async fn handle_command(
                     s.queue_save_messages(&chat_id);
                 }
                 if was_latest {
-                    if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
-                        c.last_message = "🚫 Message deleted".to_string();
-                    }
-                    let _ = s.save_tx.send(s.chats.clone());
+                    // Preview → deleted stamp; timestamp/sort untouched (A5).
+                    s.set_chat_preview(&chat_id, "🚫 Message deleted");
                     Some("🚫 Message deleted".to_string())
                 } else {
                     None
@@ -5372,24 +5533,12 @@ async fn handle_command(
             if chat_id.ends_with("@g.us") {
                 if let Some(last) = messages.last() {
                     if !last.is_from_me && !last.sender_name.is_empty() {
-                        let preview_text = media_preview(last);
-                        let preview = format!("{}: {preview_text}", last.sender_name);
-                        // Update persisted chat summary too
-                        {
-                            let mut s = state.lock().unwrap();
-                            if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
-                                if c.last_message != preview {
-                                    c.last_message = preview.clone();
-                                    let _ = s.save_tx.send(s.chats.clone());
-                                }
-                            }
-                        }
-                        let _ = tx
-                            .send(WaEvent::ChatPreviewUpdated {
-                                chat_id: chat_id.clone(),
-                                preview,
-                            })
-                            .await;
+                        // Rebuild the preview with the now-resolved sender name
+                        // (and @mention resolution) via the shared producer.
+                        // set_chat_preview persists + emits ChatRowChanged; the
+                        // old ChatPreviewUpdated emission is retired.
+                        let preview = row_preview(last, true);
+                        state.lock().unwrap().set_chat_preview(&chat_id, &preview);
                     }
                 }
             }
@@ -5526,6 +5675,72 @@ async fn handle_command(
 
         WaCommand::SetActiveChat { chat_id } => {
             state.lock().unwrap().active_chat = chat_id;
+        }
+
+        // INTERNAL (gm→WA): an SMS/MMS landed on / was sent from / was reacted-to
+        // on a chat merged into a WhatsApp row. The WA runtime is the sole owner
+        // of non-gm summaries, so the gm thread routes the update here instead of
+        // writing wa_chats.bin behind our back (which raced the save_tx flusher).
+        WaCommand::TouchChatSummary {
+            chat_id,
+            preview,
+            timestamp,
+            is_from_me,
+            ephemeral,
+        } => {
+            // Ephemeral (reaction preview): render-only, NO state mutation, NO
+            // save — restart intentionally shows the underlying message again.
+            if ephemeral {
+                state.lock().unwrap().emit_row_ephemeral(&chat_id, &preview);
+            } else {
+                let mut s = state.lock().unwrap();
+                // Apply only to an EXISTING WA row (a merged chat already has one);
+                // never create a row from a gm touch. Monotonic guards mirror
+                // upsert_chat: timestamp never moves backward, an empty preview
+                // never clobbers a non-empty one. Same-second updates still
+                // refresh the text (parity with the retired touch_wa_chat_preview,
+                // but not dropping a merged send echo that shares a second).
+                let mut applied = false;
+                let active = s.active_chat.clone();
+                let wm = s.read_watermarks.get(&chat_id).copied().unwrap_or(0);
+                if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
+                    if timestamp > c.timestamp {
+                        c.timestamp = timestamp;
+                        if !preview.is_empty() {
+                            c.last_message = preview;
+                        }
+                        applied = true;
+                    } else if timestamp == c.timestamp
+                        && !preview.is_empty()
+                        && c.last_message != preview
+                    {
+                        c.last_message = preview;
+                        applied = true;
+                    }
+                    // Unread accounting for an incoming (not-from-me) merged SMS
+                    // to a background chat past its read watermark. A sent one
+                    // (is_from_me) clears the badge via mark_chat_read_local below.
+                    if applied
+                        && !is_from_me
+                        && active.as_deref() != Some(chat_id.as_str())
+                        && timestamp > wm
+                    {
+                        c.unread_count = c.unread_count.saturating_add(1);
+                    }
+                }
+                if applied {
+                    s.chats.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                    let _ = s.save_tx.send(s.chats.clone());
+                    // is_from_me: mark read (zeros badge + stamps watermark).
+                    // That emit is conditional on a badge change, so ALSO emit
+                    // the row unconditionally here — the preview/timestamp moved
+                    // even when the badge was already 0.
+                    if is_from_me {
+                        s.mark_chat_read_local(&chat_id);
+                    }
+                    s.emit_row(&chat_id);
+                }
+            }
         }
 
         WaCommand::MarkRead { chat_id } => {
@@ -5809,13 +6024,12 @@ async fn handle_command(
                     save_read_watermarks(&s.read_watermarks);
                     let chats = s.chats.clone();
                     let _ = s.save_tx.send(chats);
+                    // Authoritative badge refresh (replaces ChatMarkedUnread).
+                    // No-op for gm: ids (not in self.chats) — the gm runtime's
+                    // MarkUnread leg emits their ChatRowChanged instead.
+                    s.emit_row(&chat_id);
                 }
             }
-            let _ = tx
-                .send(WaEvent::ChatMarkedUnread {
-                    chat_id: chat_id.clone(),
-                })
-                .await;
             // WhatsApp-server mark-unread only applies to real JIDs.
             if let Ok(jid) = chat_id.parse::<Jid>() {
                 let _ = client
@@ -5855,6 +6069,10 @@ async fn handle_command(
             {
                 let mut s = state.lock().unwrap();
                 s.history.remove(&chat_id);
+                // Blank the preview but KEEP the timestamp (so the row holds
+                // its position and renders a sane date, not the 1970 epoch the
+                // old clear path produced). Persists + emits the row refresh.
+                s.set_chat_preview(&chat_id, "");
             }
             let _ = tokio::task::spawn_blocking({
                 let chat_id = chat_id.clone();
@@ -5863,6 +6081,7 @@ async fn handle_command(
                 }
             })
             .await;
+            // Keep ChatCleared for chat_view (clears the open conversation).
             let _ = tx.send(WaEvent::ChatCleared { chat_id }).await;
         }
 
@@ -5962,6 +6181,14 @@ async fn handle_command(
                     }
                 }
                 if let Some((reactions, is_latest)) = updated_reactions {
+                    // Ephemeral "Reacted 👍" sidebar override on the latest
+                    // message (adds only). Rendered live, never persisted (A6).
+                    if is_latest && !emoji.is_empty() {
+                        state
+                            .lock()
+                            .unwrap()
+                            .emit_row_ephemeral(&chat_id, &format!("Reacted {emoji}"));
+                    }
                     let _ = tx
                         .send(WaEvent::ReactionUpdated {
                             chat_id,
@@ -6114,16 +6341,15 @@ async fn handle_command(
                 // should fall back to the new latest REMAINING message, not a
                 // "deleted" stamp.
                 if was_latest {
+                    let is_group = chat_id.ends_with("@g.us");
                     let preview = s
                         .history
                         .get(&chat_id)
                         .and_then(|h| h.iter().max_by_key(|m| m.timestamp))
-                        .map(media_preview)
+                        .map(|m| row_preview(m, is_group))
                         .unwrap_or_default();
-                    if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
-                        c.last_message = preview.clone();
-                    }
-                    let _ = s.save_tx.send(s.chats.clone());
+                    // Timestamp preserved (no reorder); persists + emits row.
+                    s.set_chat_preview(&chat_id, &preview);
                     Some(preview)
                 } else {
                     None
@@ -6487,8 +6713,21 @@ async fn handle_command(
                         pinned_msg_id: None,
                 auto_mark_read: false,
                     };
-                    persist_chat(state, summary.clone());
-                    let _ = tx.send(WaEvent::ChatAdded(summary)).await;
+                    persist_chat(state, summary);
+                    // Emit the POST-upsert summary: upsert_chat's hardening
+                    // guards may have preserved a real preview/timestamp over
+                    // this ts=now + empty-preview payload, so the pre-upsert
+                    // value would be stale (correction 4). Read it back.
+                    let stored = state
+                        .lock()
+                        .unwrap()
+                        .chats
+                        .iter()
+                        .find(|c| c.id == chat_id)
+                        .cloned();
+                    if let Some(stored) = stored {
+                        let _ = tx.send(WaEvent::ChatAdded(stored)).await;
+                    }
                     log::info!("Created group: {chat_id}");
                 }
                 Err(e) => log::warn!("CreateGroup failed: {e:#}"),
@@ -7065,8 +7304,20 @@ async fn handle_command(
                     pinned_msg_id: None,
                 auto_mark_read: false,
                 };
-                persist_chat(state, summary.clone());
-                let _ = tx.send(WaEvent::ChatAdded(summary)).await;
+                persist_chat(state, summary);
+                // Emit the POST-upsert summary (correction 4) — upsert_chat may
+                // have preserved a pre-existing preview/timestamp for this JID
+                // over the ts=now + empty payload.
+                let stored = state
+                    .lock()
+                    .unwrap()
+                    .chats
+                    .iter()
+                    .find(|c| c.id == resolved_jid)
+                    .cloned();
+                if let Some(stored) = stored {
+                    let _ = tx.send(WaEvent::ChatAdded(stored)).await;
+                }
             }
             // Always send LoadChat so the UI opens it
             let name = {
@@ -7784,10 +8035,9 @@ async fn handle_command(
                             s.queue_save_messages(&chat_id);
                         }
                         if is_latest {
-                            if let Some(c) = s.chats.iter_mut().find(|c| c.id == chat_id) {
-                                c.last_message = new_text.clone();
-                            }
-                            let _ = s.save_tx.send(s.chats.clone());
+                            // Edit of the latest message: refresh preview text,
+                            // keep timestamp (no reorder); persists + emits (A5).
+                            s.set_chat_preview(&chat_id, &new_text);
                         }
                         is_latest
                     };
@@ -8114,6 +8364,28 @@ async fn handle_command(
                             };
                             match client.send_message(jid, msg).await {
                                 Ok(real_id) => {
+                                    // Build a sent voice-note message and route it
+                                    // through the choke point (mirror SendImage):
+                                    // persists the summary (→ ChatRowChanged) AND
+                                    // the message itself. Without this the row
+                                    // froze on voice-note sends once
+                                    // bump_chat_to_top was deleted — and the note
+                                    // was never persisted at all (correction 1).
+                                    let mut sent_msg = IncomingMessage::outgoing(
+                                        real_id.clone(),
+                                        chat_id.clone(),
+                                        None,
+                                        now_ts,
+                                    );
+                                    sent_msg.media_type = Some(crate::bridge::MediaType::Audio);
+                                    // Persist out of /tmp so it survives a reboot.
+                                    sent_msg.media_local_path =
+                                        Some(persist_outgoing_media(&path));
+                                    sent_msg.receipt_status = ReceiptStatus::Sent;
+                                    let (_, new_chat) = persist_new_message(&sent_msg, state);
+                                    if let Some(s) = new_chat {
+                                        let _ = tx.send(WaEvent::ChatAdded(s)).await;
+                                    }
                                     let _ = tx
                                         .send(WaEvent::MessageConfirmed {
                                             tmp_id,
@@ -8121,6 +8393,7 @@ async fn handle_command(
                                             chat_id,
                                         })
                                         .await;
+                                    let _ = tx.send(WaEvent::MessageReceived(sent_msg)).await;
                                 }
                                 Err(e) => {
                                     log::warn!("SendAudio send failed: {e:#}");
@@ -8242,14 +8515,13 @@ async fn handle_command(
                             Some(text.clone()),
                             now_ts,
                         );
-                        // Add to in-memory cache + queue background disk write
-                        {
-                            let mut s = state.lock().unwrap();
-                            s.history
-                                .entry(cid.clone())
-                                .or_default()
-                                .push(self_msg.clone());
-                            s.queue_save_messages(cid);
+                        // Route through the choke point so each target row's
+                        // preview/timestamp updates and emits ChatRowChanged —
+                        // the bare history push left broadcast rows frozen once
+                        // bump_chat_to_top was deleted (correction 1).
+                        let (_, new_chat) = persist_new_message(&self_msg, state);
+                        if let Some(s) = new_chat {
+                            let _ = tx.send(WaEvent::ChatAdded(s)).await;
                         }
                         let _ = tx.send(WaEvent::MessageReceived(self_msg)).await;
                     }
@@ -9050,10 +9322,33 @@ async fn merge_one_lid_chat(
         // Remove @lid entry, upsert @s.whatsapp.net — all within the same lock
         s.chats.retain(|c| c.id != lid_chat.id);
         s.chat_names.remove(&lid_chat.id);
-        s.upsert_chat(summary.clone(), false, false);
+        s.upsert_chat(summary, false, false);
         s.history.remove(&lid_chat.id);
         s.history.insert(phone_jid.to_string(), merged.clone());
-        summary
+        // Return the POST-upsert row (correction 4): upsert_chat's guards may
+        // have preserved a newer preview/timestamp for an existing phone chat,
+        // so the pre-upsert payload would be stale for the ChatAdded below.
+        // We just upserted phone_jid, so this find always succeeds in practice;
+        // the fallback is a defensive placeholder only.
+        s.chats
+            .iter()
+            .find(|c| c.id == phone_jid)
+            .cloned()
+            .unwrap_or_else(|| ChatSummary {
+                id: phone_jid.to_string(),
+                name: String::new(),
+                last_message: String::new(),
+                timestamp,
+                unread_count: 0,
+                is_group: false,
+                is_muted: false,
+                is_pinned: false,
+                is_archived: false,
+                is_favorite: false,
+                label: None,
+                pinned_msg_id: None,
+                auto_mark_read: false,
+            })
     };
 
     // Delete the @lid messages file

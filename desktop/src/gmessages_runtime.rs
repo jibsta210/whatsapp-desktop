@@ -54,7 +54,11 @@ const CHAT_PREFIX: &str = "gm:";
 /// Caller should forward any `WaCommand` whose `chat_id` starts with `gm:`
 /// (see [`is_gm_chat`]) to the returned sender. The WhatsApp runtime should
 /// drop those commands so they don't try to parse `gm:...` as a JID.
-pub fn spawn(data_dir: &Path, event_tx: Sender<WaEvent>) -> Option<TokioUnboundedSender<WaCommand>> {
+pub fn spawn(
+    data_dir: &Path,
+    event_tx: Sender<WaEvent>,
+    wa_cmd_tx: TokioUnboundedSender<WaCommand>,
+) -> Option<TokioUnboundedSender<WaCommand>> {
     if std::env::var("GMESSAGES_ENABLE").as_deref() != Ok("1") {
         log::info!("gmessages: GMESSAGES_ENABLE not set; skipping (set GMESSAGES_ENABLE=1 to enable)");
         return None;
@@ -63,7 +67,7 @@ pub fn spawn(data_dir: &Path, event_tx: Sender<WaEvent>) -> Option<TokioUnbounde
     log::info!("gmessages: ENABLED — spawning runtime; data_dir={}", data_dir.display());
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
-        if let Err(e) = run(data_dir, event_tx.clone(), cmd_rx).await {
+        if let Err(e) = run(data_dir, event_tx.clone(), cmd_rx, wa_cmd_tx).await {
             log::error!("gmessages runtime error: {e:#}");
             let _ = event_tx.send(WaEvent::ErrorToast(format!("gmessages: {e}"))).await;
         }
@@ -238,6 +242,33 @@ fn gm_save_chats_cache(path: &Path, chats: &[ChatSummary]) {
     }
 }
 
+/// Derive a sidebar preview string from an [`IncomingMessage`]: its text /
+/// caption, else a media-type placeholder. Shared by the STEP 3/4 handlers and
+/// the send-echo paths so their previews stay identical.
+fn gm_preview_text(im: &IncomingMessage) -> String {
+    im.text
+        .clone()
+        .or_else(|| im.media_caption.clone())
+        .unwrap_or_else(|| match im.media_type {
+            Some(MediaType::Image) => "📷 Photo".into(),
+            Some(MediaType::Video) => "🎥 Video".into(),
+            Some(MediaType::Audio) => "🎵 Audio".into(),
+            Some(MediaType::Document) => "📄 Document".into(),
+            Some(MediaType::Sticker) => "🎭 Sticker".into(),
+            Some(MediaType::Gif) => "🎞 GIF".into(),
+            None => String::new(),
+        })
+}
+
+/// Incrementally upsert one gm chat's entry in `gm_chats.bin` and return the
+/// POST-upsert summary (so the caller can emit an authoritative
+/// `ChatRowChanged`). `None` only if the chat is neither present nor creatable
+/// (never happens — we always create).
+///
+/// `is_active` = the conversation is the one the user is currently viewing, and
+/// `read_wm` = the gm read watermark for this conv. Together they gate the live
+/// unread increment (G2): an incoming background message past the watermark
+/// bumps the badge (previously this NEVER incremented for an existing chat — D2).
 fn upsert_gm_chat_cache(
     path: &Path,
     chat_id: &str,
@@ -245,20 +276,31 @@ fn upsert_gm_chat_cache(
     timestamp: i64,
     is_from_me: bool,
     sender_name: &str,
-) {
+    is_active: bool,
+    read_wm: i64,
+) -> Option<ChatSummary> {
     let mut cache: Vec<ChatSummary> = gm_load_chats_cache(path);
 
+    let result;
     if let Some(existing) = cache.iter_mut().find(|c| c.id == chat_id) {
         // Move forward only — an out-of-order older message in a batch
-        // must not rewrite a newer preview / timestamp.
+        // must not rewrite a newer preview / timestamp. Never overwrite a
+        // non-empty preview with an empty one (an outgoing RCS with empty
+        // display_content used to blank the row).
         if timestamp >= existing.timestamp {
-            existing.last_message = preview.to_string();
+            if !preview.is_empty() {
+                existing.last_message = preview.to_string();
+            }
             existing.timestamp = timestamp;
         }
         if is_from_me {
             existing.unread_count = 0;
+        } else if !is_active && timestamp > read_wm {
+            // Live unread increment for a background gm chat (G2/D2 fix).
+            existing.unread_count = existing.unread_count.saturating_add(1);
         }
         // Never overwrite an existing (likely better-resolved) name.
+        result = existing.clone();
     } else {
         // Brand-new gm chat. Best-effort name: an incoming message's
         // resolved sender name if it looks real, else the conversation
@@ -272,12 +314,13 @@ fn upsert_gm_chat_cache(
         } else {
             strip_prefix(chat_id).to_string()
         };
-        cache.push(ChatSummary {
+        let summary = ChatSummary {
             id: chat_id.to_string(),
             name,
             last_message: preview.to_string(),
             timestamp,
-            unread_count: if is_from_me { 0 } else { 1 },
+            // A brand-new incoming chat is unread unless it's actively viewed.
+            unread_count: if is_from_me || is_active { 0 } else { 1 },
             is_group: false,
             is_muted: false,
             is_pinned: false,
@@ -286,10 +329,13 @@ fn upsert_gm_chat_cache(
             label: None,
             pinned_msg_id: None,
             auto_mark_read: false,
-        });
+        };
+        cache.push(summary.clone());
+        result = summary;
     }
 
     gm_save_chats_cache(path, &cache);
+    Some(result)
 }
 
 /// Build phone-digits → wa_chat_id (JID) index from the persisted WhatsApp
@@ -479,6 +525,7 @@ async fn run(
     data_dir: PathBuf,
     event_tx: Sender<WaEvent>,
     mut cmd_rx: TokioUnboundedReceiver<WaCommand>,
+    wa_cmd_tx: TokioUnboundedSender<WaCommand>,
 ) -> Result<()> {
     // Capture the data dir so free functions can resolve gm_media/ paths.
     let _ = GM_DATA_DIR.set(data_dir.clone());
@@ -535,6 +582,15 @@ async fn run(
     // as we learn participant data.
     let merge_map: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>> =
         std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // The conversation the user is currently viewing (raw conv id, gm-prefix
+    // stripped). Updated INLINE by the SetActiveChat command (see the select
+    // loop) — never via the spawned handle_command, which would race rapid
+    // A→B→A switches. G2's live-unread increment consults this to suppress a
+    // badge bump for a message arriving in the open chat. A merged WA id is
+    // reverse-mapped through merge_map to its conv id before storing.
+    let active_conv: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
 
     // Local SMS read watermarks (raw conversation_id → last-read timestamp),
     // persisted so a chat the user read stays read across restart instead of
@@ -970,6 +1026,16 @@ async fn run(
                             })
                             .await;
                     }
+                    // G6 monotonic overlay: re-read gm_chats.bin (kept current
+                    // message-by-message by G2/G4) so a stale server reseed can't
+                    // regress a row's preview/timestamp. The UI-side strict->
+                    // guard that used to absorb stale reseeds is gone, so any
+                    // staleness must die HERE. Keyed by conv id.
+                    let live_overlay: std::collections::HashMap<String, ChatSummary> =
+                        gm_load_chats_cache(&gm_chats_cache_path)
+                            .into_iter()
+                            .map(|c| (strip_prefix(&c.id).to_string(), c))
+                            .collect();
                     for summary in &summaries {
                         let conv_id = strip_prefix(&summary.id);
                         if mm_snap.contains_key(conv_id) {
@@ -982,6 +1048,19 @@ async fn run(
                             // 2FA shortcode — routed into the Verification Codes
                             // inbox; don't reseed a standalone (unread) row.
                             continue;
+                        }
+                        // Overlay a newer live preview/timestamp if gm_chats.bin
+                        // holds one for this conv (a message arrived after the
+                        // server list was fetched).
+                        let mut summary = summary.clone();
+                        if let Some(live) = live_overlay.get(conv_id) {
+                            if live.timestamp > summary.timestamp {
+                                summary.timestamp = live.timestamp;
+                                if !live.last_message.is_empty() {
+                                    summary.last_message = live.last_message.clone();
+                                }
+                                summary.unread_count = live.unread_count;
+                            }
                         }
                         log::debug!(
                             "gmessages → desktop: ChatAdded({} \"{}\")",
@@ -1432,66 +1511,54 @@ async fn run(
                         // why merged SMS used to vanish until an app restart).
                         crate::ui::runtime::mark_gm_dirty(&im.chat_id);
                     }
-                    // STEP 3: if the redirect targeted a WhatsApp chat row,
-                    // update wa_chats.bin so the preview/timestamp survive
-                    // a restart. Without this, on next launch the chat list
-                    // shows the LAST WhatsApp message as the preview even
-                    // though an SMS was the most recent thing — and the
-                    // chat doesn't bump to the top.
+                    // STEP 3: if the redirect targeted a WhatsApp chat row (a
+                    // MERGED gm conversation), route the preview/timestamp
+                    // update to the WA runtime via TouchChatSummary. The WA
+                    // runtime is the sole owner of non-gm summaries — it applies
+                    // the monotonic guards, persists wa_chats.bin through its own
+                    // save_tx flusher, and emits ChatRowChanged. (This replaces
+                    // the old touch_wa_chat_preview behind-the-back disk write
+                    // that raced the flusher.)
                     if let WaEvent::MessageReceived(im) = &wa_event
                         && (im.chat_id.ends_with("@s.whatsapp.net") || im.chat_id.ends_with("@lid"))
                     {
-                        let preview = im
-                            .text
-                            .clone()
-                            .or_else(|| im.media_caption.clone())
-                            .unwrap_or_else(|| match im.media_type {
-                                Some(crate::bridge::MediaType::Image) => "📷 Photo".into(),
-                                Some(crate::bridge::MediaType::Video) => "🎥 Video".into(),
-                                Some(crate::bridge::MediaType::Audio) => "🎵 Audio".into(),
-                                Some(crate::bridge::MediaType::Document) => "📄 Document".into(),
-                                Some(crate::bridge::MediaType::Sticker) => "🎭 Sticker".into(),
-                                Some(crate::bridge::MediaType::Gif) => "🎞 GIF".into(),
-                                None => String::new(),
-                            });
-                        crate::ui::runtime::touch_wa_chat_preview(
-                            &im.chat_id,
-                            &preview,
-                            im.timestamp,
-                            im.is_from_me,
-                        );
+                        let preview = gm_preview_text(im);
+                        let _ = wa_cmd_tx.send(WaCommand::TouchChatSummary {
+                            chat_id: im.chat_id.clone(),
+                            preview,
+                            timestamp: im.timestamp,
+                            is_from_me: im.is_from_me,
+                            ephemeral: false,
+                        });
                     }
                     // STEP 4: for an UNMERGED gm chat (chat_id still
                     // `gm:N` after redirect), incrementally update
-                    // gm_chats.bin. The cache was previously written
+                    // gm_chats.bin AND emit an authoritative ChatRowChanged from
+                    // the returned summary. The cache was previously written
                     // ONLY by list_conversations (once per startup), so
                     // any SMS chat created or updated mid-session never
                     // made it to disk and vanished on the next restart.
-                    // This keeps the cache current message-by-message.
                     if let WaEvent::MessageReceived(im) = &wa_event
                         && is_gm_chat(&im.chat_id)
                     {
-                        let preview = im
-                            .text
-                            .clone()
-                            .or_else(|| im.media_caption.clone())
-                            .unwrap_or_else(|| match im.media_type {
-                                Some(crate::bridge::MediaType::Image) => "📷 Photo".into(),
-                                Some(crate::bridge::MediaType::Video) => "🎥 Video".into(),
-                                Some(crate::bridge::MediaType::Audio) => "🎵 Audio".into(),
-                                Some(crate::bridge::MediaType::Document) => "📄 Document".into(),
-                                Some(crate::bridge::MediaType::Sticker) => "🎭 Sticker".into(),
-                                Some(crate::bridge::MediaType::Gif) => "🎞 GIF".into(),
-                                None => String::new(),
-                            });
-                        upsert_gm_chat_cache(
+                        let preview = gm_preview_text(im);
+                        let conv = strip_prefix(&im.chat_id).to_string();
+                        let is_active =
+                            active_conv.lock().unwrap().as_deref() == Some(conv.as_str());
+                        let read_wm =
+                            gm_read_watermarks.lock().await.get(&conv).copied().unwrap_or(0);
+                        if let Some(summary) = upsert_gm_chat_cache(
                             &gm_chats_cache_path,
                             &im.chat_id,
                             &preview,
                             im.timestamp,
                             im.is_from_me,
                             &im.sender_name,
-                        );
+                            is_active,
+                            read_wm,
+                        ) {
+                            let _ = event_tx.send(WaEvent::ChatRowChanged(summary)).await;
+                        }
                     }
                     log::info!(
                         "gmessages → desktop: forwarding {}",
@@ -1504,6 +1571,28 @@ async fn run(
                 }
             }
             Some(cmd) = cmd_rx.recv() => {
+                // SetActiveChat is applied INLINE (not via the spawned
+                // handle_command): its handler is tokio::spawn'd, so a rapid
+                // A→B→A switch could land a stale `Some(A)` after `Some(B)` and
+                // mis-suppress B's unread bumps — the same race the WA runtime
+                // fixes inline. Store the conv id (gm-prefix stripped, or the
+                // merge_map reverse-lookup for a merged WA id) so G2's increment
+                // can suppress a bump for the actively-viewed conversation.
+                if let WaCommand::SetActiveChat { chat_id } = &cmd {
+                    let conv = match chat_id {
+                        Some(id) if is_gm_chat(id) => Some(strip_prefix(id).to_string()),
+                        Some(id) => {
+                            // Merged WA id → find the conv that maps to it.
+                            let mm = merge_map.lock().await;
+                            mm.iter()
+                                .find(|(_, target)| *target == id)
+                                .map(|(conv, _)| conv.clone())
+                        }
+                        None => None,
+                    };
+                    *active_conv.lock().unwrap() = conv;
+                    continue;
+                }
                 if matches!(cmd, WaCommand::GmessagesRepair) {
                     log::warn!("gmessages: re-pair requested via WaCommand");
                     let _ = client.disconnect().await;
@@ -1526,6 +1615,8 @@ async fn run(
                 let gm_read_watermarks = gm_read_watermarks.clone();
                 let gm_read_wm_path = gm_read_wm_path.clone();
                 let gm_verification_convs = gm_verification_convs.clone();
+                let wa_cmd_tx = wa_cmd_tx.clone();
+                let gm_chats_cache_path = gm_chats_cache_path.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_command(
                         &client,
@@ -1534,6 +1625,8 @@ async fn run(
                         &gm_read_watermarks,
                         &gm_read_wm_path,
                         &gm_verification_convs,
+                        &wa_cmd_tx,
+                        &gm_chats_cache_path,
                         cmd,
                     )
                     .await
@@ -1555,6 +1648,49 @@ async fn run(
     }
 }
 
+/// Persist + emit the sidebar-row update for a locally-built SEND echo (an
+/// SMS/MMS we just sent). `chat_id` is the `gm:` pair id the UI sent with (never
+/// merge-redirected — see correction 6). If that conversation is merged into a
+/// WhatsApp row, we route the update to the WA runtime (the sole owner of that
+/// row) via `TouchChatSummary` with the WA id; otherwise we update `gm_chats.bin`
+/// and emit a `ChatRowChanged` for the gm: id. Without this a sent SMS never
+/// moved its row once `bump_chat_to_top` was deleted.
+async fn emit_sent_echo_row(
+    echo: &IncomingMessage,
+    merge_map: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, String>>>,
+    wa_cmd_tx: &TokioUnboundedSender<WaCommand>,
+    gm_chats_cache_path: &std::path::Path,
+    event_tx: &Sender<WaEvent>,
+) {
+    let preview = gm_preview_text(echo);
+    let conv = strip_prefix(&echo.chat_id).to_string();
+    let merged_target = merge_map.lock().await.get(&conv).cloned();
+    if let Some(wa_id) = merged_target {
+        // Merged chat: the visible row is the WA row — route via the WA runtime.
+        let _ = wa_cmd_tx.send(WaCommand::TouchChatSummary {
+            chat_id: wa_id,
+            preview,
+            timestamp: echo.timestamp,
+            is_from_me: true,
+            ephemeral: false,
+        });
+    } else {
+        // Unmerged gm chat: is_from_me clears unread; watermark/active irrelevant.
+        if let Some(summary) = upsert_gm_chat_cache(
+            gm_chats_cache_path,
+            &echo.chat_id,
+            &preview,
+            echo.timestamp,
+            true,
+            &echo.sender_name,
+            false,
+            0,
+        ) {
+            let _ = event_tx.send(WaEvent::ChatRowChanged(summary)).await;
+        }
+    }
+}
+
 /// Handle a `WaCommand` whose `chat_id` belongs to a gmessages chat.
 async fn handle_command(
     client: &Arc<Client>,
@@ -1563,6 +1699,8 @@ async fn handle_command(
     read_watermarks: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>>,
     wm_path: &std::path::Path,
     verification_convs: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+    wa_cmd_tx: &TokioUnboundedSender<WaCommand>,
+    gm_chats_cache_path: &std::path::Path,
     cmd: WaCommand,
 ) -> Result<()> {
     use crate::bridge::IncomingMessage;
@@ -1635,6 +1773,9 @@ async fn handle_command(
                         is_edited: false,
                         is_system_message: false,
                     };
+                    // Persist + bump the row (merged → WA runtime, else gm cache).
+                    emit_sent_echo_row(&echo, merge_map, wa_cmd_tx, gm_chats_cache_path, event_tx)
+                        .await;
                     let _ = event_tx.send(WaEvent::MessageReceived(echo)).await;
                 }
                 Err(e) => {
@@ -1708,6 +1849,8 @@ async fn handle_command(
                         is_edited: false,
                         is_system_message: false,
                     };
+                    emit_sent_echo_row(&echo, merge_map, wa_cmd_tx, gm_chats_cache_path, event_tx)
+                        .await;
                     let _ = event_tx.send(WaEvent::MessageReceived(echo)).await;
                 }
                 Err(e) => {
@@ -1900,15 +2043,23 @@ async fn handle_command(
                 let cache_path = parent.join("gm_chats.bin");
                 let mut cache = gm_load_chats_cache(&cache_path);
                 let mut changed = false;
+                // Collect the cleared summaries so we can emit an authoritative
+                // ChatRowChanged for each (the WA runtime's emit_row is a no-op
+                // for gm: ids — gm rows are not in RuntimeState.chats).
+                let mut cleared: Vec<ChatSummary> = Vec::new();
                 for c in cache.iter_mut() {
                     let cid = strip_prefix(&c.id);
                     if c.unread_count != 0 && convs.iter().any(|conv| conv == cid) {
                         c.unread_count = 0;
                         changed = true;
+                        cleared.push(c.clone());
                     }
                 }
                 if changed {
                     gm_save_chats_cache(&cache_path, &cache);
+                    for summary in cleared {
+                        let _ = event_tx.send(WaEvent::ChatRowChanged(summary)).await;
+                    }
                 }
             }
 
@@ -1977,6 +2128,31 @@ async fn handle_command(
             if let Some(snap) = snapshot {
                 log::info!("gmessages: MarkUnread cleared read watermark for {convs:?}");
                 save_gm_watermarks(wm_path, &snap);
+            }
+            // Persist unread=1 into gm_chats.bin AND emit ChatRowChanged for each
+            // affected gm row. With ChatMarkedUnread deleted and the WA inline
+            // block a no-op for gm ids, this is the ONLY thing that gives an
+            // SMS-only chat its badge — and makes it survive restart + reseed.
+            {
+                let mut cache = gm_load_chats_cache(gm_chats_cache_path);
+                let mut changed = false;
+                let mut marked: Vec<ChatSummary> = Vec::new();
+                for c in cache.iter_mut() {
+                    let cid = strip_prefix(&c.id);
+                    if convs.iter().any(|conv| conv == cid) {
+                        if c.unread_count == 0 {
+                            c.unread_count = 1;
+                        }
+                        changed = true;
+                        marked.push(c.clone());
+                    }
+                }
+                if changed {
+                    gm_save_chats_cache(gm_chats_cache_path, &cache);
+                    for summary in marked {
+                        let _ = event_tx.send(WaEvent::ChatRowChanged(summary)).await;
+                    }
+                }
             }
         }
         WaCommand::SetTyping { chat_id, is_typing } => {
@@ -2053,6 +2229,33 @@ async fn handle_command(
                         None if emoji.is_empty() => (Vec::new(), false),
                         None => (vec![(String::new(), emoji.clone())], false),
                     };
+                    // Ephemeral "Reacted 👍" sidebar override on the latest
+                    // message (adds only, never persisted — restart shows the
+                    // underlying text). For a gm: row, emit ChatRowChanged from
+                    // the gm store clone; for a merged conv, route it to the WA
+                    // runtime via TouchChatSummary with ephemeral:true so the
+                    // visible WA row shows the reaction (correction 3).
+                    if is_latest && !emoji.is_empty() {
+                        let ephem_preview = format!("Reacted {emoji}");
+                        let merged_target = merge_map.lock().await.get(&conv).cloned();
+                        if let Some(wa_id) = merged_target {
+                            let _ = wa_cmd_tx.send(WaCommand::TouchChatSummary {
+                                chat_id: wa_id,
+                                preview: ephem_preview,
+                                timestamp: 0,
+                                is_from_me: true,
+                                ephemeral: true,
+                            });
+                        } else if is_gm_chat(&chat_id) {
+                            if let Some(mut summary) = gm_load_chats_cache(gm_chats_cache_path)
+                                .into_iter()
+                                .find(|c| c.id == chat_id)
+                            {
+                                summary.last_message = ephem_preview;
+                                let _ = event_tx.send(WaEvent::ChatRowChanged(summary)).await;
+                            }
+                        }
+                    }
                     let _ = event_tx
                         .send(WaEvent::ReactionUpdated {
                             chat_id: chat_id.clone(),
@@ -2163,6 +2366,8 @@ async fn handle_command(
                         is_edited: false,
                         is_system_message: false,
                     };
+                    emit_sent_echo_row(&echo, merge_map, wa_cmd_tx, gm_chats_cache_path, event_tx)
+                        .await;
                     let _ = event_tx.send(WaEvent::MessageReceived(echo)).await;
                 }
                 Err(e) => {
