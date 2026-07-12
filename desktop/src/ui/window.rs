@@ -636,7 +636,13 @@ impl MainWindow {
             WaEvent::ChatNameUpdated { chat_id, name } => {
                 format!("NameUpdated: {chat_id} → {name}")
             }
-            WaEvent::ChatPreviewUpdated { chat_id, .. } => format!("PreviewUpdated: {chat_id}"),
+            WaEvent::ChatRowChanged(c) => format!(
+                "ChatRowChanged: {} unread={} ts={} preview={:?}",
+                c.id,
+                c.unread_count,
+                c.timestamp,
+                c.last_message.chars().take(40).collect::<String>()
+            ),
             WaEvent::MediaReady {
                 msg_id, chat_id, ..
             } => format!("MediaReady: {msg_id} in {chat_id}"),
@@ -887,7 +893,10 @@ impl MainWindow {
                     if chat.id.ends_with("@s.whatsapp.net") {
                         inner.chat_list.remove_lid_duplicate(&chat.name);
                     }
-                    inner.chat_list.add_chat(chat.clone());
+                    // Bulk load: apply_summary creates missing rows AND refreshes
+                    // existing ones verbatim (add_chat is now create-only, meant
+                    // for ChatAdded's non-monotonic payloads).
+                    inner.chat_list.apply_summary(chat);
                 }
                 inner.chat_list.invalidate();
 
@@ -920,7 +929,8 @@ impl MainWindow {
                             if chat.id.ends_with("@s.whatsapp.net") {
                                 chat_list.remove_lid_duplicate(&chat.name);
                             }
-                            chat_list.add_chat(chat.clone());
+                            // Bulk load: create-or-refresh verbatim (see above).
+                            chat_list.apply_summary(chat);
                         }
                         chunk_idx.set(idx + 1);
                         // If this is the last chunk, do a final invalidate
@@ -955,6 +965,14 @@ impl MainWindow {
                     );
                 }
             }
+            WaEvent::ChatRowChanged(chat) => {
+                // Authoritative row refresh from the owning runtime. apply_summary
+                // is the SOLE row-state writer — it renders this verbatim. Note:
+                // deliberately NO remove_lid_duplicate / rail refresh here (that's
+                // why ChatAdded is not reused — its handler has per-chat side
+                // effects that must not fire on every message).
+                inner.chat_list.apply_summary(&chat);
+            }
             WaEvent::MessageReceived(msg) => {
                 let current_chat = inner.chat_view.current_chat_id();
                 let is_current_chat = current_chat.as_deref() == Some(&msg.chat_id);
@@ -983,11 +1001,13 @@ impl MainWindow {
                 // the chat list preview updates (fixes visual race condition).
                 inner.chat_view.append_message(msg.clone());
 
-                // Update chat list preview + sort order
-                // Pass current_chat_id so it doesn't increment unread for the viewed chat
-                inner
-                    .chat_list
-                    .update_last_message(&msg.chat_id, &msg, current_chat.as_deref());
+                // Feed the stealth-peek cache and clear any typing overlay. The
+                // row's preview/time/unread/sort are NOT touched here — the
+                // owning runtime emits ChatRowChanged (adjacent on the same FIFO
+                // channel) as the sole row writer. For merged SMS that event may
+                // even arrive AFTER this MessageReceived (command-channel detour),
+                // so nothing here may assume row freshness.
+                inner.chat_list.note_recent_message(&msg.chat_id, &msg);
                 // If viewing this chat OR chat has auto-mark-read enabled, mark as read.
                 // The is_current_chat arm is gated on window focus: a chat that is
                 // "current" but sitting in the tray (or behind another window) must
@@ -1101,10 +1121,15 @@ impl MainWindow {
             WaEvent::MessageConfirmed {
                 tmp_id,
                 real_id,
-                chat_id,
+                chat_id: _,
             } => {
+                // Re-key the optimistic bubble only. The row no longer bumps here:
+                // bump_chat_to_top used a UI clock (SystemTime::now) that could
+                // out-race the send's real timestamp. The runtime now moves the
+                // row via ChatRowChanged (persist_new_message → emit_row) using
+                // the single post-send timestamp — the only clock that reaches
+                // the row.
                 inner.chat_view.confirm_bubble(&tmp_id, &real_id);
-                inner.chat_list.bump_chat_to_top(&chat_id);
             }
             WaEvent::MessageFailed { msg_id, chat_id: _ } => {
                 inner
@@ -1223,9 +1248,6 @@ impl MainWindow {
                 inner.chat_view.update_chat_name(&chat_id, &name);
                 inner.profile_panel.update_name(&chat_id, &name);
             }
-            WaEvent::ChatPreviewUpdated { chat_id, preview } => {
-                inner.chat_list.update_preview_text(&chat_id, &preview);
-            }
             WaEvent::MediaReady {
                 msg_id,
                 chat_id,
@@ -1256,9 +1278,6 @@ impl MainWindow {
                     populate_rail_favourites(&rail, &chats, &cv, &br);
                 });
             }
-            WaEvent::ChatMarkedUnread { chat_id } => {
-                inner.chat_list.mark_chat_unread(&chat_id);
-            }
             WaEvent::ChatFavorited { chat_id, favorite } => {
                 inner.chat_list.set_chat_favorite(&chat_id, favorite);
                 let rail = inner.rail_favourites.clone();
@@ -1273,7 +1292,10 @@ impl MainWindow {
                 inner.chat_list.remove_chat(&chat_id);
             }
             WaEvent::ChatCleared { chat_id } => {
-                inner.chat_list.clear_chat_messages(&chat_id);
+                // Row preview is now cleared by the runtime's ClearChat handler
+                // (set_chat_preview "" with the timestamp preserved → emit_row →
+                // ChatRowChanged), which also fixes the old epoch-date render.
+                // Here we only wipe the open conversation view.
                 inner.chat_view.clear_chat(&chat_id);
             }
             WaEvent::ChatLabeled { chat_id, label } => {
@@ -1284,18 +1306,14 @@ impl MainWindow {
                 chat_id,
                 msg_id,
                 reactions,
-                is_latest,
+                is_latest: _,
             } => {
                 // Rebuild the reaction row on the bubble from the full set.
+                // The "Reacted 👍" sidebar preview is now emitted by the runtime
+                // as an EPHEMERAL ChatRowChanged (render-don't-persist, so a
+                // restart shows the underlying message again) — see A6. The row
+                // is no longer written here.
                 inner.chat_view.show_reaction(&chat_id, &msg_id, &reactions);
-                // Only show "Reacted 👍" as the sidebar preview when the reaction is
-                // on the chat's LATEST message (and it's an add, not a removal) —
-                // otherwise a reaction on an old message would hijack the preview.
-                if is_latest && let Some((_, emoji)) = reactions.last() {
-                    inner
-                        .chat_list
-                        .update_preview_text(&chat_id, &format!("Reacted {emoji}"));
-                }
             }
             WaEvent::MessageStarred { starred, .. } => {
                 inner.toast_overlay.add_toast(adw::Toast::new(if starred {
@@ -1310,31 +1328,28 @@ impl MainWindow {
             WaEvent::MessageDeletedLocal {
                 chat_id,
                 msg_id,
-                new_preview,
+                new_preview: _,
             } => {
+                // Remove the bubble only. The sidebar preview (if the deleted
+                // message was the latest) now updates via ChatRowChanged: the
+                // runtime's delete handlers call set_chat_preview (timestamp
+                // preserved) → emit_row. `new_preview` is retired by A/cleanup.
                 inner.chat_view.remove_message(&chat_id, &msg_id);
-                // Only touch the sidebar preview if the deleted message actually
-                // affected it (was the latest) — an older deletion leaves the row
-                // showing the true latest message.
-                if let Some(preview) = new_preview {
-                    inner.chat_list.update_preview_text(&chat_id, &preview);
-                }
             }
             WaEvent::MessageEdited {
                 chat_id,
                 msg_id,
                 new_text,
-                is_latest,
+                is_latest: _,
             } => {
+                // Update the bubble only. The sidebar preview (when the edited
+                // message is the chat's latest) now refreshes via ChatRowChanged:
+                // the runtime's edit handler calls set_chat_preview with the
+                // timestamp UNCHANGED, so the preview text changes without
+                // reordering the row — the desired edit semantics.
                 inner
                     .chat_view
                     .update_message_text(&chat_id, &msg_id, &new_text, true);
-                // Refresh the sidebar preview only when the edited message is the
-                // chat's latest (update_preview_text changes the label only — no
-                // reorder, which is the desired edit semantics).
-                if is_latest {
-                    inner.chat_list.update_preview_text(&chat_id, &new_text);
-                }
             }
             WaEvent::EditFailed {
                 chat_id,

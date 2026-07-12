@@ -138,9 +138,6 @@ pub enum WaEvent {
         chat_id: String,
         pinned: bool,
     },
-    ChatMarkedUnread {
-        chat_id: String,
-    },
     ChatFavorited {
         chat_id: String,
         favorite: bool,
@@ -184,11 +181,6 @@ pub enum WaEvent {
         /// everyone; `Some(<preview of the new latest message>)` for delete-for-me;
         /// `None` when an older message was deleted (the preview must not change).
         new_preview: Option<String>,
-    },
-    /// Chat list preview text updated (e.g., after name resolution)
-    ChatPreviewUpdated {
-        chat_id: String,
-        preview: String,
     },
     ForwardComplete {
         to_chat_id: String,

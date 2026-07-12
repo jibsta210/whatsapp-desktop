@@ -37,15 +37,13 @@ struct ChatListInner {
     rows: RefCell<HashMap<String, ChatRow>>,
     timestamps: RefCell<HashMap<String, i64>>,
     active_filter: RefCell<ChatFilter>,
-    /// Saved preview text for chats where a typing indicator is shown
-    typing_previews: RefCell<HashMap<String, String>>,
     /// Active typers per chat (for multi-typer display)
     active_typers: RefCell<HashMap<String, Vec<String>>>,
     /// Message search results section (visible when search query matches messages)
     msg_results_section: Box,
     msg_results_box: ListBox,
     /// In-memory cache of recent messages per chat for stealth peek.
-    /// Updated on every update_last_message. Keeps last 10 per chat.
+    /// Updated on every note_recent_message. Keeps last 10 per chat.
     /// Wrapped in Rc so stealth hover closures can share it.
     recent_messages: Rc<RefCell<HashMap<String, Vec<IncomingMessage>>>>,
     /// Stored so we can clear it programmatically when a chat is selected
@@ -193,7 +191,6 @@ impl ChatListPanel {
             rows: RefCell::new(HashMap::new()),
             timestamps: RefCell::new(HashMap::new()),
             active_filter: RefCell::new(ChatFilter::All),
-            typing_previews: RefCell::new(HashMap::new()),
             active_typers: RefCell::new(HashMap::new()),
             msg_results_section,
             msg_results_box,
@@ -442,11 +439,11 @@ impl ChatListPanel {
                         // input_view.grab_focus in chat_view::open_chat),
                         // so Ctrl+V reaches the message input correctly.
                         (inner.on_select)(chat_id.clone(), chat_name.clone());
-                        // LoadChat + MarkRead are now handled by the on_select callback
-                        let mut rows = inner.rows.borrow_mut();
-                        if let Some(row) = rows.get_mut(&chat_id) {
-                            row.set_unread(0);
-                        }
+                        // LoadChat + MarkRead are now handled by the on_select callback.
+                        // The unread badge is NOT optimistically cleared here: the
+                        // runtime owns unread and clears it via mark_chat_read_local →
+                        // ChatRowChanged, one channel hop (~ms) after MarkRead. A
+                        // second UI-side writer would race that authoritative value.
                     }
                 });
         }
@@ -460,23 +457,6 @@ impl ChatListPanel {
 
     pub fn connect_new_chat(&self, callback: impl Fn() + 'static) {
         self.inner.new_chat_btn.connect_clicked(move |_| callback());
-    }
-
-    pub fn load_chats(&self, chats: Vec<ChatSummary>) {
-        let inner = &self.inner;
-
-        // Build a set of incoming chat IDs for fast lookup.
-        let incoming_ids: std::collections::HashSet<&str> =
-            chats.iter().map(|c| c.id.as_str()).collect();
-
-        self.remove_stale(&incoming_ids);
-
-        // Add or update each incoming chat — reuses existing widgets.
-        for chat in chats {
-            self.add_chat(chat);
-        }
-
-        self.invalidate();
     }
 
     /// Remove rows whose IDs are not in the provided set.
@@ -507,308 +487,117 @@ impl ChatListPanel {
         self.inner.list_box.invalidate_filter();
     }
 
+    /// Create-only. Used by the `ChatAdded` event, whose payload may be a
+    /// PRE-upsert stale snapshot (runtime emits it before mutating state) or a
+    /// non-monotonic gm boot/reseed row. If the row already exists we IGNORE
+    /// the payload entirely — authoritative row data flows only via
+    /// `ChatRowChanged` (single owner per id) and the bulk `ChatsLoaded` path
+    /// (which calls `apply_summary`). Verbatim-applying a `ChatAdded` here would
+    /// regress a fresher row.
     pub fn add_chat(&self, chat: ChatSummary) {
-        // If the chat already exists, only update if the incoming data is NEWER.
-        // During sync, old batches arrive after newer ones — never overwrite
-        // a recent preview with an older one.
-        {
-            let rows = self.inner.rows.borrow();
-            if let Some(row) = rows.get(&chat.id) {
-                // Always update flags (mute, pin, etc.)
-                row.is_pinned.set(chat.is_pinned);
-                row.is_muted.set(chat.is_muted);
-                row.is_archived.set(chat.is_archived);
-                row.is_favorite.set(chat.is_favorite);
-                row.pin_indicator.set_visible(chat.is_pinned);
-                row.mute_indicator.set_visible(chat.is_muted);
-                row.auto_mark_read.set(chat.auto_mark_read);
-                row.auto_mr_indicator.set_visible(chat.auto_mark_read);
-                // Trust the server's unread count directly. The server knows
-                // what's been read on any device. If this wipes a real-time
-                // increment from a MessageReceived that fired during sync,
-                // the next MessageReceived or server refresh will correct it.
-                // (Using max() here was wrong — it traps stale counts from
-                // disk when the user reads on phone before reopening desktop.)
-                row.set_unread(chat.unread_count);
-
-                // Update timestamp INDEPENDENTLY of preview. The two used
-                // to be coupled by an && — but the server sometimes hands
-                // us a chat with a fresh timestamp and an empty
-                // last_message (e.g. outgoing RCS where display_content
-                // isn't filled). If we skipped both updates in that case,
-                // the chat stayed at its old sort position even though a
-                // newer message had arrived. Now timestamp moves the row
-                // up; preview only updates when there's actually text.
-                let existing_ts = self
-                    .inner
-                    .timestamps
-                    .borrow()
-                    .get(&chat.id)
-                    .copied()
-                    .unwrap_or(0);
-                let mut moved = false;
-                if chat.timestamp > existing_ts {
-                    if !chat.last_message.is_empty() {
-                        row.update_preview(&chat.last_message, chat.timestamp);
-                    } else {
-                        // Just bump the timestamp displayed on the row.
-                        row.update_preview_timestamp(chat.timestamp);
-                    }
-                    moved = true;
-                }
-                drop(rows);
-                if moved {
-                    self.inner
-                        .timestamps
-                        .borrow_mut()
-                        .insert(chat.id.clone(), chat.timestamp);
-                    self.inner.list_box.invalidate_sort();
-                }
-                self.inner.list_box.invalidate_filter();
-                return;
-            }
+        if self.inner.rows.borrow().contains_key(&chat.id) {
+            return;
         }
         self.add_chat_row(chat);
     }
 
-    pub fn update_last_message(
-        &self,
-        chat_id: &str,
-        msg: &IncomingMessage,
-        current_chat_id: Option<&str>,
-    ) {
-        // If this chat doesn't exist yet, create it on the fly. `add_chat`
-        // already seeds unread_count=1 for an incoming message, so the live
-        // increment below must be skipped for a just-created row (was showing 2).
-        let just_created = !self.inner.rows.borrow().contains_key(chat_id);
-        if just_created {
-            let preview = msg
-                .text
-                .as_deref()
-                .or(msg.media_caption.as_deref())
-                .unwrap_or("")
-                .to_string();
-            // Name resolution priority for a brand-new chat row:
-            //   1. msg.sender_name if it looks like a real name (alphabetic
-            //      and not a numeric internal ID like "6")
-            //   2. Cross-protocol global directory lookup by chat_id
-            //      (covers gm: chats whose phone is in WhatsApp contacts)
-            //   3. display_name_from_jid (WhatsApp JID → contact name)
-            //   4. msg.sender_name as a last resort (better than nothing)
-            let sender_looks_real = !msg.sender_name.is_empty()
-                && !msg.is_from_me
-                && msg.sender_name.chars().any(|c| c.is_alphabetic())
-                && !msg
-                    .sender_name
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || c == '+' || c == ' ' || c == '(' || c == ')' || c == '-');
-            let name = if sender_looks_real {
-                msg.sender_name.clone()
-            } else if let Some(n) = crate::contacts::global().lookup(chat_id) {
-                n
-            } else {
-                let from_jid = crate::ui::runtime::display_name_from_jid(chat_id);
-                if from_jid.is_empty() || from_jid == chat_id {
-                    if msg.sender_name.is_empty() {
-                        chat_id.to_string()
-                    } else {
-                        msg.sender_name.clone()
-                    }
-                } else {
-                    from_jid
-                }
-            };
-            self.add_chat(crate::bridge::ChatSummary {
-                id: chat_id.to_string(),
-                name,
-                last_message: preview,
-                timestamp: msg.timestamp,
-                unread_count: if msg.is_from_me || current_chat_id == Some(chat_id) {
-                    0
-                } else {
-                    1
-                },
-                is_group: chat_id.ends_with("@g.us"),
-                is_muted: false,
-                is_pinned: false,
-                is_archived: false,
-                is_favorite: false,
-                label: None,
-                pinned_msg_id: None,
-                auto_mark_read: false,
-            });
-        }
-        // Set inside the row block; consumed after `drop(rows)` to gate
-        // the timestamp/sort update.
-        let mut is_newer = false;
-        let row_existed: bool;
-        let existing_ts_dbg: i64;
+    /// The SOLE writer of sidebar row state (preview, timestamp, unread, flags,
+    /// sort key). Renders the owning runtime's persisted `ChatSummary` VERBATIM
+    /// — no guards, no `SystemTime::now`, no monotonicity checks (those live
+    /// producer-side in upsert_chat / gmessages upsert). If the row is absent
+    /// this falls through to `add_chat_row` (creation path, keeps phone-dedup);
+    /// otherwise every field is applied exactly as the summary states.
+    ///
+    /// Deliberately does NOT touch chat_name/name_label — the name flow keeps
+    /// its hardened downgrade heuristics via `update_chat_name*`. The typing
+    /// overlay is also untouched: preview_label's text may be updated while the
+    /// typing_box is visible (the label is hidden, so the change isn't seen;
+    /// `note_recent_message` / `set_typing` own the overlay visibility).
+    pub fn apply_summary(&self, chat: &ChatSummary) {
         {
-            let rows_snap = self.inner.rows.borrow();
-            row_existed = rows_snap.contains_key(chat_id);
+            let rows = self.inner.rows.borrow();
+            let Some(row) = rows.get(&chat.id) else {
+                drop(rows);
+                // Creation path — keeps phone-dedup (add_chat_row 1163-1181).
+                self.add_chat_row(chat.clone());
+                return;
+            };
+
+            // Preview + time + unread: render verbatim. GTK's Label::set_text /
+            // set_visible already short-circuit internally when the value is
+            // unchanged, so a reseed storm that re-applies identical summaries
+            // (item 8 of the corrections) costs only the comparisons, not a
+            // relayout. The expensive part — invalidate_sort — is gated below on
+            // an actual timestamp change.
+            row.update_preview(&chat.last_message, chat.timestamp);
+            row.set_unread(chat.unread_count);
+
+            // Flags verbatim (as in the old add_chat 518-525 / set_chat_label
+            // 1143-1156). Indicators mirror the backing Cells.
+            row.is_pinned.set(chat.is_pinned);
+            row.is_muted.set(chat.is_muted);
+            row.is_archived.set(chat.is_archived);
+            row.is_favorite.set(chat.is_favorite);
+            row.pin_indicator.set_visible(chat.is_pinned);
+            row.mute_indicator.set_visible(chat.is_muted);
+            row.auto_mark_read.set(chat.auto_mark_read);
+            row.auto_mr_indicator.set_visible(chat.auto_mark_read);
+            match chat.label.as_deref() {
+                Some(l) => {
+                    row.label_badge.set_text(l);
+                    row.label_badge.set_visible(true);
+                }
+                None => row.label_badge.set_visible(false),
+            }
         }
-        existing_ts_dbg = self
+
+        // Sort key = summary timestamp, nothing else, ever. Only invalidate the
+        // sort when the timestamp actually moved (perf — item 8).
+        let ts_moved = self
             .inner
             .timestamps
             .borrow()
-            .get(chat_id)
+            .get(&chat.id)
             .copied()
-            .unwrap_or(0);
-        if msg.is_from_me {
-            log::info!(
-                "update_last_message[self]: chat={chat_id} msg_ts={} existing_ts={existing_ts_dbg} row_existed={row_existed} preview={:?}",
-                msg.timestamp,
-                msg.text.as_deref().unwrap_or("<media>"),
-            );
-        }
-        let rows = self.inner.rows.borrow();
-        if let Some(row) = rows.get(chat_id) {
-            let doc_preview: String;
-            let content = msg
-                .text
-                .as_deref()
-                .or(msg.media_caption.as_deref())
-                .unwrap_or(match &msg.media_type {
-                    Some(crate::bridge::MediaType::Image) => "📷 Photo",
-                    Some(crate::bridge::MediaType::Video) => "🎥 Video",
-                    Some(crate::bridge::MediaType::Audio) => "🎵 Audio",
-                    Some(crate::bridge::MediaType::Document) => {
-                        let fname = msg.media_filename.as_deref().unwrap_or("Document");
-                        let icon = crate::ui::message_bubble::file_type_icon(fname);
-                        let ext = fname.rsplit('.').next().unwrap_or("").to_uppercase();
-                        doc_preview = if ext.is_empty() || ext == fname.to_uppercase() {
-                            format!("{icon} Document")
-                        } else {
-                            format!("{icon} {ext} File")
-                        };
-                        &doc_preview
-                    }
-                    Some(crate::bridge::MediaType::Sticker) => "🎭 Sticker",
-                    Some(crate::bridge::MediaType::Gif) => "🎞 GIF",
-                    None => "",
-                });
-            // Resolve any raw @JID mentions in the preview to the
-            // contact's name. Message bodies carry mentions as
-            // `@<jid-digits>` (the protocol form); the bubble renderer
-            // resolves them, and the chat-list preview must too — else
-            // a "@agnes" mention shows as the generic "@user".
-            let clean = if content.contains('@') {
-                let mut c = content.to_string();
-                for word in content.split_whitespace() {
-                    if word.starts_with('@')
-                        && word.len() > 4
-                        && word[1..]
-                            .chars()
-                            .next()
-                            .map(|ch| ch.is_ascii_digit())
-                            .unwrap_or(false)
-                    {
-                        let jid_part = &word[1..];
-                        // Global cross-protocol directory does digits /
-                        // last-10 / last-7 / LID-JID resolution.
-                        let replacement = crate::contacts::global()
-                            .lookup(jid_part)
-                            .filter(|n| !n.is_empty() && !n.contains('@'))
-                            .map(|n| format!("@{n}"))
-                            .unwrap_or_else(|| "@user".to_string());
-                        c = c.replace(word, &replacement);
-                    }
-                }
-                c
-            } else {
-                content.to_string()
-            };
-            let preview = if row.is_group && !msg.is_from_me && !msg.sender_name.is_empty() {
-                format!("{}: {clean}", msg.sender_name)
-            } else if row.is_group && msg.is_from_me {
-                format!("You: {clean}")
-            } else {
-                clean
-            };
-            // Only let this message become the row's "latest" (preview +
-            // sort timestamp) if it's actually NEWER than what we have.
-            // gmessages delivers messages in batches — opening an SMS
-            // thread pulls in old history — and processing an older
-            // message last would otherwise rewrite the preview to stale
-            // text AND sink the whole chat to the bottom of the list
-            // (sort key = timestamp). That's the "chat vanished from the
-            // list after I clicked it" bug.
-            let existing_ts = self
-                .inner
-                .timestamps
-                .borrow()
-                .get(chat_id)
-                .copied()
-                .unwrap_or(0);
-            is_newer = msg.timestamp >= existing_ts;
-            if msg.is_from_me {
-                log::info!(
-                    "update_last_message[self]: chat={chat_id} is_newer={is_newer} (msg_ts={} >= existing_ts={existing_ts})",
-                    msg.timestamp
-                );
-            }
-            if is_newer {
-                row.update_preview(&preview, msg.timestamp);
-            }
-            // Cache message for stealth peek (keep last 10)
-            let is_duplicate_id;
-            {
-                let mut cache = self.inner.recent_messages.borrow_mut();
-                let entry = cache.entry(chat_id.to_string()).or_default();
-                // Dedup by message id
-                is_duplicate_id = entry.iter().any(|m| m.id == msg.id);
-                if !is_duplicate_id {
-                    entry.push(msg.clone());
-                    if entry.len() > 10 {
-                        entry.remove(0);
-                    }
-                }
-            }
-            // Only increment unread if NOT from us, NOT the chat we're viewing,
-            // for a genuinely newer message, not a row we just created with
-            // unread already seeded (else the first message double-counts to 2),
-            // and not a redelivery of a message id we've already counted (server
-            // re-pushes on reconnect would otherwise double-count the badge).
-            let is_viewing = current_chat_id == Some(chat_id);
-            if !msg.is_from_me
-                && !msg.is_system_message
-                && !is_viewing
-                && is_newer
-                && !just_created
-                && !is_duplicate_id
-            {
-                let new_count = row.unread_count.get() + 1;
-                row.set_unread(new_count);
-            } else if msg.is_from_me && is_newer && !msg.is_system_message {
-                // Our own message (including the echo of a message sent from the
-                // phone) marks the chat read — clear the badge immediately so the
-                // UI matches the persisted state (persist_new_message runs
-                // mark_chat_read_local for the same case).
-                row.set_unread(0);
-            }
-        }
-        drop(rows);
-        // Clear typing indicator state — a real message supersedes it
-        self.inner.typing_previews.borrow_mut().remove(chat_id);
-        self.inner.active_typers.borrow_mut().remove(chat_id);
-        // Reset dots visibility
-        {
-            let rows = self.inner.rows.borrow();
-            if let Some(row) = rows.get(chat_id) {
-                row.preview_label.set_visible(true);
-                row.typing_box.set_visible(false);
-            }
-        }
-        // Move the sort timestamp FORWARD only — never let an
-        // out-of-order older message in a batch drag the chat down.
-        if is_newer {
+            .unwrap_or(i64::MIN)
+            != chat.timestamp;
+        if ts_moved {
             self.inner
                 .timestamps
                 .borrow_mut()
-                .insert(chat_id.to_string(), msg.timestamp);
+                .insert(chat.id.clone(), chat.timestamp);
             self.inner.list_box.invalidate_sort();
         }
         self.inner.list_box.invalidate_filter();
+    }
+
+    /// Feed a just-arrived message into the stealth-peek cache and let it
+    /// supersede any typing overlay. This is the ONLY thing `MessageReceived`
+    /// does to a row now — it never touches preview/time/unread/timestamps
+    /// (those are owned by `ChatRowChanged`, which the runtime emits alongside
+    /// the message). For merged SMS the `ChatRowChanged` may even arrive AFTER
+    /// this (command-channel detour through a spawned handler), so this must not
+    /// assume anything about row freshness.
+    pub fn note_recent_message(&self, chat_id: &str, msg: &IncomingMessage) {
+        // Cache message for stealth peek (dedup by id, keep last 10).
+        {
+            let mut cache = self.inner.recent_messages.borrow_mut();
+            let entry = cache.entry(chat_id.to_string()).or_default();
+            if !entry.iter().any(|m| m.id == msg.id) {
+                entry.push(msg.clone());
+                if entry.len() > 10 {
+                    entry.remove(0);
+                }
+            }
+        }
+        // A real message supersedes typing — clear the overlay + restore the
+        // preview label's visibility (its text is owned by ChatRowChanged).
+        self.inner.active_typers.borrow_mut().remove(chat_id);
+        let rows = self.inner.rows.borrow();
+        if let Some(row) = rows.get(chat_id) {
+            row.preview_label.set_visible(true);
+            row.typing_box.set_visible(false);
+        }
     }
 
     pub fn has_chat(&self, chat_id: &str) -> bool {
@@ -855,19 +644,10 @@ impl ChatListPanel {
             .map(|r| r.chat_name.clone())
     }
 
-    /// Force a chat to the top of the list by updating its timestamp to now.
-    pub fn bump_chat_to_top(&self, chat_id: &str) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        self.inner
-            .timestamps
-            .borrow_mut()
-            .insert(chat_id.to_string(), now);
-        self.inner.list_box.invalidate_sort();
-    }
-
+    /// Clear a chat's unread badge. KEPT (not folded into apply_summary): gm
+    /// (SMS) rows are not in RuntimeState.chats, so the WA runtime's emit_row is
+    /// a no-op for gm: ids — this is the only badge-clear for a gm row read on
+    /// the phone (called from ChatReadOnOtherDevice in window.rs).
     pub fn reset_unread(&self, chat_id: &str) {
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
@@ -1096,17 +876,6 @@ impl ChatListPanel {
         self.inner.list_box.invalidate_sort();
     }
 
-    pub fn mark_chat_unread(&self, chat_id: &str) {
-        let rows = self.inner.rows.borrow();
-        if let Some(row) = rows.get(chat_id) {
-            if row.unread_count.get() == 0 {
-                row.set_unread(1);
-            }
-        }
-        drop(rows);
-        self.inner.list_box.invalidate_filter();
-    }
-
     pub fn set_chat_favorite(&self, chat_id: &str, favorite: bool) {
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
@@ -1122,22 +891,6 @@ impl ChatListPanel {
             self.inner.list_box.remove(&row.gtk_row);
         }
         self.inner.timestamps.borrow_mut().remove(chat_id);
-    }
-
-    /// Update chat list preview after a message was deleted.
-    /// Shows "🚫 This message was deleted" as the preview.
-    pub fn update_preview_text(&self, chat_id: &str, text: &str) {
-        let rows = self.inner.rows.borrow();
-        if let Some(row) = rows.get(chat_id) {
-            row.preview_label.set_text(text);
-        }
-    }
-
-    pub fn clear_chat_messages(&self, chat_id: &str) {
-        let rows = self.inner.rows.borrow();
-        if let Some(row) = rows.get(chat_id) {
-            row.update_preview("", 0);
-        }
     }
 
     pub fn set_chat_label(&self, chat_id: &str, label: Option<&str>) {
@@ -2040,13 +1793,6 @@ impl ChatRow {
 
     fn update_preview(&self, text: &str, timestamp: i64) {
         self.preview_label.set_text(text);
-        self.time_label.set_text(&format_timestamp(timestamp));
-    }
-
-    /// Update only the displayed timestamp, leaving preview text alone.
-    /// Used when the server sends a fresh `last_message_timestamp` but
-    /// no usable `display_content` (e.g. some outgoing RCS).
-    fn update_preview_timestamp(&self, timestamp: i64) {
         self.time_label.set_text(&format_timestamp(timestamp));
     }
 

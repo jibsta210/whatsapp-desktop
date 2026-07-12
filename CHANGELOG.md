@@ -10,6 +10,53 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## Preview single-source-of-truth refactor (`FIXPLAN-PREVIEW-SSOT.md`)
+
+The sidebar row was patched by 16 independent UI-side writers using 4 different clocks —
+the log-proven bug: `bump_chat_to_top` (on MessageConfirmed) minted its own `now()` one
+second ahead of the message's timestamp, so the follow-up preview update was discarded as
+"older" and the row froze on stale text. Whack-a-mole ends here: rows are now a PURE
+PROJECTION of the owning runtime's persisted summary. Baseline: tag **`pre-preview-ssot`**
+(the contract commit immediately after it does not build alone; revert the whole feature
+with `git reset --hard pre-preview-ssot`).
+
+### Contract (bridge.rs)
+`WaEvent::ChatRowChanged(ChatSummary)` — the ONLY event that writes row state; rendered
+verbatim (no guards, no UI clocks). Single owner per id (`gm:` → gmessages runtime, rest →
+WA runtime); producers guarantee monotonicity. `WaCommand::TouchChatSummary{..., ephemeral}`
+— gm→WA route for merged-chat updates (retires the gm thread's behind-the-back
+wa_chats.bin write); `ephemeral: true` renders without persisting (reaction previews).
+
+### Producers (runtime.rs + gmessages_runtime.rs)
+- `emit_row` choke points: upsert_chat (change-detected — no reseed floods; hardened: empty
+  preview never clobbers non-empty, timestamp never moves backward), mark_chat_read_local,
+  MarkUnread, new `set_chat_preview` (timestamp-preserving — edits/deletes no longer
+  reorder), TouchChatSummary handler (monotonic + unread accounting + ephemeral).
+- Coverage gaps CLOSED (froze rows otherwise): SendAudio now persists + echoes (voice notes
+  were never persisted at all — pre-existing bug), MultiSend routes through
+  persist_new_message, group system messages persist.
+- Preview formatting moved producer-side (`row_preview`: "You:"/sender prefixes + mention
+  resolution) — persisted previews finally match live rendering across restarts.
+- Reactions are ephemeral overrides ("Reacted 👍" renders, never persists) from all three
+  producers (send/incoming/gm).
+- gm: send echoes + MarkRead/MarkUnread persist into gm_chats.bin AND emit; live SMS unread
+  increment (active-conv + watermark gated) — badge now survives restart; reseed overlays
+  newer live state before emitting; SetActiveChat fanned out and applied INLINE (no
+  rapid-switch race); merged chats route via TouchChatSummary with merge_map redirect.
+
+### Consumers (chat_list.rs + window.rs)
+- `apply_summary` = the sole row writer; `note_recent_message` keeps stealth-peek +
+  typing-overlay reset. ChatAdded is create-only (stale payloads ignored); ChatsLoaded
+  applies verbatim.
+- DELETED: update_last_message, bump_chat_to_top (the self-clocked racer), update_preview_
+  text, clear_chat_messages, mark_chat_unread, typing_previews, optimistic click-clear,
+  the ChatPreviewUpdated + ChatMarkedUnread events. `grep SystemTime::now chat_list.rs` → 0.
+- Kept: reset_unread on ChatReadOnOtherDevice (gm badge clear), notifications/sound/2FA
+  byte-identical.
+
+Flagged follow-up (out of scope, same one-line fix as MultiSend): MultiForward still
+pushes history without persist_new_message.
+
 ## Bulk LID↔phone population (fixes the 92%-unmapped root cause)
 
 PL-A's sweep learned 0 because `get_user_devices` uses `DeviceListSpec`, which never
