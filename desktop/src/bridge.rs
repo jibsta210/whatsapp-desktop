@@ -22,6 +22,14 @@ pub enum WaEvent {
     ChatsLoaded(Vec<ChatSummary>),
     /// Single chat appeared from history sync (incremental)
     ChatAdded(ChatSummary),
+    /// Authoritative refresh of one chat's sidebar row. The row renders this
+    /// VERBATIM — preview, timestamp, unread, flags — no guards, no UI-side
+    /// clocks. Producer contract: ids starting "gm:" are emitted ONLY by the
+    /// gmessages runtime; all other ids ONLY by the WA runtime (single owner
+    /// per id). Producers guarantee monotonicity — never emit older-than-last
+    /// state for a chat. This is the ONLY event that writes row state; the
+    /// sidebar is a pure projection of the owning runtime's persisted summary.
+    ChatRowChanged(ChatSummary),
     /// New or updated message arrived
     MessageReceived(IncomingMessage),
     /// Server confirmed an outgoing message; GTK should re-key the optimistic bubble.
@@ -340,6 +348,21 @@ pub enum WaCommand {
     /// means no chat is open.
     SetActiveChat {
         chat_id: Option<String>,
+    },
+    /// INTERNAL (gm→WA): an SMS/MMS landed on (or was sent from, or was
+    /// reacted-to on) a chat merged into a WhatsApp row. The WA runtime — sole
+    /// owner of non-gm chat summaries — applies it to RuntimeState.chats
+    /// (monotonic guards: timestamp never moves backward, empty preview never
+    /// clobbers non-empty), persists, and emits ChatRowChanged. Replaces the
+    /// old `touch_wa_chat_preview` behind-the-back disk write.
+    /// `ephemeral: true` means render-but-don't-persist (reaction previews —
+    /// restart intentionally shows the underlying message again).
+    TouchChatSummary {
+        chat_id: String,
+        preview: String,
+        timestamp: i64,
+        is_from_me: bool,
+        ephemeral: bool,
     },
     /// Toggle "auto-mark read on receive" for a chat (local-only flag,
     /// not synced to phone). When enabled, incoming messages trigger
