@@ -4,28 +4,54 @@
 //! Uses MEX (GraphQL) for metadata/management and standard IQ for message operations.
 //! Newsletter messages are plaintext (no Signal E2E encryption).
 
+use wacore::WireEnum;
+
 use crate::client::Client;
 use crate::features::mex::{MexError, MexRequest};
 use prost::Message as ProtoMessage;
 use serde_json::json;
+use wacore::iq::mex_ids::newsletter as newsletter_docs;
 use wacore::iq::newsletter::NEWSLETTER_XMLNS;
 use wacore::request::InfoQuery;
+use wacore_binary::Jid;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::jid::Jid;
-use wacore_binary::node::{Node, NodeContent};
+use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 use waproto::whatsapp as wa;
 
 // Types
 
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+#[non_exhaustive]
+pub enum NewsletterMessageType {
+    #[wire = "text"]
+    Text,
+    #[wire = "media"]
+    Media,
+    #[wire = "reaction"]
+    Reaction,
+    #[wire = "revoke"]
+    Revoke,
+    #[wire = "poll_creation"]
+    PollCreation,
+    #[wire = "poll_vote"]
+    PollVote,
+    #[wire = "edit"]
+    Edit,
+    #[wire_fallback]
+    Other(String),
+}
+
 /// Newsletter verification status.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NewsletterVerification {
     Verified,
     Unverified,
 }
 
 /// Newsletter state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NewsletterState {
     Active,
     Suspended,
@@ -33,7 +59,8 @@ pub enum NewsletterState {
 }
 
 /// The viewer's role in a newsletter.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NewsletterRole {
     Owner,
     Admin,
@@ -42,7 +69,7 @@ pub enum NewsletterRole {
 }
 
 /// Metadata for a newsletter (channel).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewsletterMetadata {
     pub jid: Jid,
     pub name: String,
@@ -71,8 +98,8 @@ pub struct NewsletterMessage {
     pub server_id: u64,
     /// Message timestamp (Unix seconds).
     pub timestamp: u64,
-    /// Message type ("text", "media", etc.).
-    pub message_type: String,
+    /// Message type (text, media, reaction, etc.).
+    pub message_type: NewsletterMessageType,
     /// Whether the viewer is the sender.
     pub is_sender: bool,
     /// Decoded protobuf message (from `<plaintext>` bytes).
@@ -97,7 +124,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .query(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::LIST_SUBSCRIBED,
+                doc: newsletter_docs::LIST_SUBSCRIBED,
                 variables: json!({}),
             })
             .await?;
@@ -120,7 +147,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .query(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::FETCH_METADATA,
+                doc: newsletter_docs::FETCH_METADATA,
                 variables: json!({
                     "input": {
                         "key": jid.to_string(),
@@ -164,7 +191,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .mutate(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::CREATE,
+                doc: newsletter_docs::CREATE,
                 variables: json!({ "input": input }),
             })
             .await?;
@@ -189,7 +216,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .mutate(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::JOIN,
+                doc: newsletter_docs::JOIN,
                 variables: json!({
                     "newsletter_id": jid.to_string()
                 }),
@@ -215,7 +242,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .mutate(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::LEAVE,
+                doc: newsletter_docs::LEAVE,
                 variables: json!({
                     "newsletter_id": jid.to_string()
                 }),
@@ -253,7 +280,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .mutate(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::UPDATE,
+                doc: newsletter_docs::UPDATE,
                 variables: json!({
                     "newsletter_id": jid.to_string(),
                     "updates": updates
@@ -283,7 +310,7 @@ impl<'a> Newsletter<'a> {
             .client
             .mex()
             .query(MexRequest {
-                doc_id: wacore::iq::newsletter::mex_docs::FETCH_METADATA,
+                doc: newsletter_docs::FETCH_METADATA,
                 variables: json!({
                     "input": {
                         "key": invite_code,
@@ -327,43 +354,15 @@ impl<'a> Newsletter<'a> {
         );
 
         let response = self.client.send_iq(iq).await?;
-        let duration = response
+        let nr = response.get();
+        let duration = nr
             .get_optional_child("live_updates")
-            .and_then(|n| n.attrs.get("duration"))
+            .and_then(|n| n.get_attr("duration"))
             .map(|v| v.as_str())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(300);
 
         Ok(duration)
-    }
-
-    // ─── Message operations ────────────────────────────────────────────
-
-    /// Send a message to a newsletter.
-    ///
-    /// Newsletter messages are plaintext (no Signal E2E encryption).
-    /// Returns the message ID assigned by the client.
-    ///
-    /// **Note:** This sends the raw protobuf as plaintext. For media messages
-    /// (images, videos, etc.), the media must be uploaded separately using the
-    /// newsletter-specific upload endpoint first. Text messages work directly.
-    pub async fn send_message(
-        &self,
-        jid: &Jid,
-        message: &wa::Message,
-    ) -> Result<String, anyhow::Error> {
-        let request_id = self.client.generate_message_id().await;
-        let encoded = message.encode_to_vec();
-
-        let stanza = NodeBuilder::new("message")
-            .attr("to", jid.clone())
-            .attr("type", "text")
-            .attr("id", &request_id)
-            .children([NodeBuilder::new("plaintext").bytes(encoded).build()])
-            .build();
-
-        self.client.send_node(stanza).await?;
-        Ok(request_id)
     }
 
     /// Send a reaction to a newsletter message.
@@ -376,18 +375,9 @@ impl<'a> Newsletter<'a> {
         server_id: u64,
         reaction: &str,
     ) -> Result<(), anyhow::Error> {
-        let request_id = self.client.generate_message_id().await;
-
-        let stanza = NodeBuilder::new("message")
-            .attr("to", jid.clone())
-            .attr("type", "reaction")
-            .attr("id", &request_id)
-            .attr("server_id", server_id.to_string())
-            .children([NodeBuilder::new("reaction").attr("code", reaction).build()])
-            .build();
-
-        self.client.send_node(stanza).await?;
-        Ok(())
+        self.client
+            .send_server_reaction(jid, server_id, reaction)
+            .await
     }
 
     /// Fetch message history from a newsletter.
@@ -400,9 +390,9 @@ impl<'a> Newsletter<'a> {
         count: u32,
         before: Option<u64>,
     ) -> Result<Vec<NewsletterMessage>, anyhow::Error> {
-        let mut messages_node = NodeBuilder::new("messages").attr("count", count.to_string());
+        let mut messages_node = NodeBuilder::new("messages").attr("count", count);
         if let Some(before_id) = before {
-            messages_node = messages_node.attr("before", before_id.to_string());
+            messages_node = messages_node.attr("before", before_id);
         }
 
         let iq = InfoQuery::get(
@@ -412,7 +402,7 @@ impl<'a> Newsletter<'a> {
         );
 
         let response = self.client.send_iq(iq).await?;
-        parse_newsletter_messages_response(&response)
+        parse_newsletter_messages_response(response.get())
     }
 }
 
@@ -430,9 +420,7 @@ fn parse_newsletter_metadata(value: &serde_json::Value) -> Result<NewsletterMeta
     let jid_str = value["id"]
         .as_str()
         .ok_or_else(|| MexError::PayloadParsing("missing newsletter id".into()))?;
-    let jid: Jid = jid_str
-        .parse()
-        .map_err(|e| MexError::PayloadParsing(format!("invalid newsletter JID: {e}")))?;
+    let jid: Jid = jid_str.parse()?;
 
     let thread = &value["thread_metadata"];
 
@@ -499,23 +487,22 @@ fn parse_newsletter_metadata(value: &serde_json::Value) -> Result<NewsletterMeta
 
 /// Parse reaction counts from a `<reactions>` node.
 /// Used by both message history parsing and notification handling.
-pub(crate) fn parse_reaction_counts(node: &Node) -> Vec<NewsletterReactionCount> {
+pub(crate) fn parse_reaction_counts(node: &NodeRef<'_>) -> Vec<NewsletterReactionCount> {
     let mut reactions = Vec::new();
     if let Some(reactions_node) = node.get_optional_child("reactions")
         && let Some(children) = reactions_node.children()
     {
         for r in children.iter().filter(|n| n.tag.as_ref() == "reaction") {
             let Some(code) = r
-                .attrs
-                .get("code")
-                .map(|v| v.as_str().into_owned())
+                .get_attr("code")
+                .map(|v| v.as_str())
                 .filter(|s| !s.is_empty())
+                .map(|s| s.into_owned())
             else {
                 continue;
             };
             let count = r
-                .attrs
-                .get("count")
+                .get_attr("count")
                 .map(|v| v.as_str())
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
@@ -539,7 +526,7 @@ pub(crate) fn parse_reaction_counts(node: &Node) -> Vec<NewsletterReactionCount>
 /// </messages>
 /// ```
 fn parse_newsletter_messages_response(
-    response: &Node,
+    response: &NodeRef<'_>,
 ) -> Result<Vec<NewsletterMessage>, anyhow::Error> {
     // Response is the IQ result node; find <messages> child
     let messages_node = response
@@ -555,8 +542,7 @@ fn parse_newsletter_messages_response(
     for msg_node in children.iter().filter(|n| n.tag.as_ref() == "message") {
         // Skip nodes without a valid server_id (required for pagination/correlation)
         let Some(server_id) = msg_node
-            .attrs
-            .get("server_id")
+            .get_attr("server_id")
             .map(|v| v.as_str())
             .and_then(|s| s.parse::<u64>().ok())
         else {
@@ -564,27 +550,29 @@ fn parse_newsletter_messages_response(
         };
 
         let timestamp = msg_node
-            .attrs
-            .get("t")
+            .get_attr("t")
             .map(|v| v.as_str())
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
 
         let message_type = msg_node
-            .attrs
-            .get("type")
-            .map(|v| v.as_str().into_owned())
-            .unwrap_or_default();
+            .get_attr("type")
+            .map(|v| v.as_str())
+            .map(|s| NewsletterMessageType::from(s.as_ref()))
+            .unwrap_or(NewsletterMessageType::Text);
 
-        let is_sender = msg_node.attrs.get("is_sender").is_some_and(|v| v == "true");
+        let is_sender = msg_node
+            .get_attr("is_sender")
+            .is_some_and(|v| v.as_str() == "true");
 
         // Decode <plaintext> protobuf bytes
-        let message = msg_node
-            .get_optional_child("plaintext")
-            .and_then(|pt| match &pt.content {
-                Some(NodeContent::Bytes(bytes)) => wa::Message::decode(bytes.as_slice()).ok(),
-                _ => None,
-            });
+        let message =
+            msg_node
+                .get_optional_child("plaintext")
+                .and_then(|pt| match pt.content.as_deref() {
+                    Some(NodeContentRef::Bytes(bytes)) => wa::Message::decode(bytes.as_ref()).ok(),
+                    _ => None,
+                });
 
         let reactions = parse_reaction_counts(msg_node);
 
@@ -599,4 +587,42 @@ fn parse_newsletter_messages_response(
     }
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wacore_binary::builder::NodeBuilder;
+
+    #[test]
+    fn test_missing_type_attribute_defaults_to_text() {
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("messages")
+                .children([NodeBuilder::new("message")
+                    .attr("server_id", "42")
+                    .attr("t", "1700000000")
+                    .build()])
+                .build()])
+            .build();
+
+        let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message_type, NewsletterMessageType::Text);
+    }
+
+    #[test]
+    fn test_explicit_type_attribute_parsed() {
+        let response = NodeBuilder::new("iq")
+            .children([NodeBuilder::new("messages")
+                .children([NodeBuilder::new("message")
+                    .attr("server_id", "1")
+                    .attr("t", "1700000000")
+                    .attr("type", "media")
+                    .build()])
+                .build()])
+            .build();
+
+        let msgs = parse_newsletter_messages_response(&response.as_node_ref()).unwrap();
+        assert_eq!(msgs[0].message_type, NewsletterMessageType::Media);
+    }
 }

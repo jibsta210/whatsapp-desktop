@@ -1,7 +1,7 @@
-use crate::types::events::{Event, LazyConversation};
-use bytes::Bytes;
+use crate::types::events::{Event, LazyHistorySync};
 use std::sync::Arc;
-use wacore::history_sync::process_history_sync;
+use wacore::history_sync::{TcTokenCandidate, process_history_sync};
+use wacore::store::traits::TcTokenEntry;
 use waproto::whatsapp::message::HistorySyncNotification;
 
 use crate::client::Client;
@@ -56,10 +56,9 @@ impl Client {
         }
     }
 
-    /// Process history sync with streaming and lazy parsing.
-    ///
-    /// Memory efficient: raw bytes are wrapped in LazyConversation and only
-    /// parsed if the event handler actually accesses the conversation data.
+    /// Process history sync: decompress, extract internal data (tctokens,
+    /// pushname, nct_salt), then dispatch a single `Event::HistorySync`
+    /// with the full decompressed blob for on-demand consumer decoding.
     pub(crate) async fn process_history_sync_task(
         self: &Arc<Self>,
         message_id: String,
@@ -108,8 +107,11 @@ impl Client {
             inline_payload
         } else {
             log::info!("Downloading external history sync blob...");
-            if self.is_shutting_down() {
-                log::debug!("Aborting history sync {} before blob download", message_id);
+            if self.is_shutting_down() || !self.is_connected() {
+                log::debug!(
+                    "Aborting history sync {} before blob download: client disconnected",
+                    message_id
+                );
                 return;
             }
             // Stream-decrypt: reads encrypted chunks (8KB) from the network and
@@ -124,105 +126,53 @@ impl Client {
                     cursor.into_inner()
                 }
                 Err(e) => {
-                    log::error!("Failed to download history sync blob: {:?}", e);
+                    if self.is_shutting_down() {
+                        log::debug!(
+                            "History sync blob download aborted during shutdown: {:?}",
+                            e
+                        );
+                    } else {
+                        log::error!("Failed to download history sync blob: {:?}", e);
+                    }
                     return;
                 }
             }
         };
 
-        // Get own user for pushname extraction (moved into blocking task, no clone needed)
         let own_user = {
             let device_snapshot = self.persistence_manager.get_device_snapshot().await;
             device_snapshot.pn.as_ref().map(|j| j.to_non_ad().user)
         };
 
-        // Check if anyone is listening for events
         let has_listeners = self.core.event_bus.has_handlers();
 
-        let parse_result = if has_listeners {
-            // Use a bounded channel to stream raw conversation bytes as Bytes (zero-copy)
-            let (tx, rx) = async_channel::bounded::<Bytes>(4);
-
-            // Run streaming parsing in blocking thread
-            // own_user is moved directly, no clone needed
+        // Small blobs (PushName, Recent): decode inline to avoid spawn_blocking overhead.
+        // Large blobs: use blocking thread to avoid stalling the async runtime.
+        const INLINE_THRESHOLD: usize = 256 * 1024;
+        let parse_result = if compressed_data.len() < INLINE_THRESHOLD {
+            Some(process_history_sync(
+                compressed_data,
+                own_user.as_deref(),
+                has_listeners,
+                compressed_size_hint,
+            ))
+        } else {
             let (result_tx, result_rx) = futures::channel::oneshot::channel();
-            // Spawn the blocking work concurrently — it runs while we
-            // process channel items below.
             let blocking_fut = self.runtime.spawn_blocking(Box::new(move || {
-                let own_user_ref = own_user.as_deref();
-
-                // Streaming: decompresses and extracts raw bytes incrementally
-                // No parsing happens here - just raw byte extraction
-                // Uses Bytes for zero-copy reference counting
                 let result = process_history_sync(
                     compressed_data,
-                    own_user_ref,
-                    Some(|raw_bytes: Bytes| {
-                        // Send Bytes through channel (zero-copy clone)
-                        #[cfg(not(target_arch = "wasm32"))]
-                        let _ = tx.send_blocking(raw_bytes);
-                        #[cfg(target_arch = "wasm32")]
-                        let _ = tx.try_send(raw_bytes);
-                    }),
+                    own_user.as_deref(),
+                    has_listeners,
                     compressed_size_hint,
                 );
-                // tx dropped here, closing channel
                 let _ = result_tx.send(result);
             }));
-            // Drive the blocking future to completion in the background
             self.runtime
                 .spawn(Box::pin(async move {
                     blocking_fut.await;
                 }))
                 .detach();
-
-            // Receive and dispatch lazy conversations as they come in
-            let mut conv_count = 0usize;
-            while let Ok(raw_bytes) = rx.recv().await {
-                if self.is_shutting_down() {
-                    log::debug!(
-                        "Stopping history sync {} event dispatch during shutdown",
-                        message_id
-                    );
-                    break;
-                }
-                conv_count += 1;
-                if conv_count.is_multiple_of(25) {
-                    log::info!("History sync progress: {conv_count} conversations processed...");
-                }
-                // Wrap Bytes in LazyConversation using from_bytes (true zero-copy)
-                // Parsing only happens if the event handler calls .conversation() or .get()
-                let lazy_conv = LazyConversation::from_bytes(raw_bytes);
-                self.core.event_bus.dispatch(&Event::JoinedGroup(lazy_conv));
-            }
-
-            // Drop receiver before awaiting the blocking task. If we broke out
-            // of the loop during shutdown, the sender may be blocked on
-            // tx.send_blocking() — dropping rx causes it to return Err and
-            // unblock, preventing a deadlock.
-            drop(rx);
-
-            // Wait for parsing result
             result_rx.await.ok()
-        } else {
-            // No listeners - skip conversation processing entirely
-            log::debug!("No event handlers registered, skipping conversation processing");
-
-            // own_user is moved directly, no clone needed
-            Some(
-                wacore::runtime::blocking(&*self.runtime, move || {
-                    let own_user_ref = own_user.as_deref();
-
-                    // Pass None for callback - conversations are skipped at protobuf level
-                    process_history_sync::<fn(Bytes)>(
-                        compressed_data,
-                        own_user_ref,
-                        None,
-                        compressed_size_hint,
-                    )
-                })
-                .await,
-            )
         };
 
         if self.is_shutting_down() {
@@ -246,29 +196,39 @@ impl Client {
                     self.update_push_name_and_notify(new_name).await;
                 }
 
-                // Feed the LID<->PN cache from the bulk phoneNumberToLidMappings
-                // table. Entries are (phone_user, lid_user); add_lid_pn_mapping
-                // takes (lid, phone). Failures on individual rows are logged but
-                // must not abort the rest of the history sync processing.
-                if !sync_result.pn_lid_mappings.is_empty() {
-                    let mut learned = 0usize;
-                    for (phone_user, lid_user) in &sync_result.pn_lid_mappings {
-                        if let Err(e) = self
-                            .add_lid_pn_mapping(
-                                lid_user,
-                                phone_user,
-                                crate::lid_pn_cache::LearningSource::MigrationSyncOld,
-                            )
-                            .await
-                        {
-                            log::warn!(
-                                "history sync: failed to learn lid<->pn {lid_user}<->{phone_user}: {e:?}"
-                            );
-                        } else {
-                            learned += 1;
-                        }
-                    }
-                    log::info!("history sync: learned {learned} lid<->pn mappings");
+                // Store NCT salt if found.
+                // WA Web: storeNctSaltFromHistorySync in MsgHandlerAction.js
+                if let Some(salt) = sync_result.nct_salt {
+                    log::info!(
+                        "History sync provided NCT salt ({} bytes); applying as backfill only",
+                        salt.len()
+                    );
+                    self.persistence_manager
+                        .process_command(
+                            wacore::store::commands::DeviceCommand::SetNctSaltFromHistorySync(salt),
+                        )
+                        .await;
+                }
+
+                // Store tctokens extracted during streaming (move to avoid cloning)
+                for candidate in sync_result.tc_token_candidates {
+                    self.store_tc_token_candidate(candidate).await;
+                }
+
+                // Dispatch a single event with the full decompressed blob
+                if let Some(decompressed) = sync_result.decompressed_bytes {
+                    let lazy_hs = LazyHistorySync::new(
+                        decompressed,
+                        notification.sync_type().into(),
+                        notification.chunk_order,
+                        notification.progress,
+                    )
+                    .with_peer_data_request_session_id(
+                        notification.peer_data_request_session_id.take(),
+                    );
+                    self.core
+                        .event_bus
+                        .dispatch(Event::HistorySync(Box::new(lazy_hs)));
                 }
             }
             Some(Err(e)) => {
@@ -277,6 +237,59 @@ impl Client {
             None => {
                 log::error!("History sync blocking task was cancelled");
             }
+        }
+    }
+
+    /// Store a tctoken candidate extracted during history sync streaming.
+    async fn store_tc_token_candidate(&self, candidate: TcTokenCandidate) {
+        let jid: wacore_binary::Jid = match candidate.id.parse() {
+            Ok(j) => j,
+            Err(_) => return,
+        };
+
+        let resolved_lid = if jid.is_lid() {
+            None
+        } else {
+            self.lid_pn_cache.get_current_lid(&jid.user).await
+        };
+        let token_key: &str = resolved_lid.as_deref().unwrap_or(&jid.user);
+
+        let backend = self.persistence_manager.backend();
+
+        // Avoid clobbering a newer local sender_timestamp from post-send issuance
+        let incoming_sender_ts = candidate.tc_token_sender_timestamp.map(|ts| ts as i64);
+        let merged_sender_ts = if let Ok(Some(existing)) = backend.get_tc_token(token_key).await {
+            if (existing.token_timestamp as u64) > candidate.tc_token_timestamp {
+                return;
+            }
+            match (existing.sender_timestamp, incoming_sender_ts) {
+                (Some(e), Some(i)) => Some(e.max(i)),
+                (Some(e), None) => Some(e),
+                (None, i) => i,
+            }
+        } else {
+            incoming_sender_ts
+        };
+
+        let entry = TcTokenEntry {
+            token: candidate.tc_token,
+            token_timestamp: candidate.tc_token_timestamp as i64,
+            sender_timestamp: merged_sender_ts,
+        };
+
+        if let Err(e) = backend.put_tc_token(token_key, &entry).await {
+            log::warn!(
+                target: "Client/TcToken",
+                "Failed to store history sync tctoken for {}: {e}",
+                token_key
+            );
+        } else {
+            log::debug!(
+                target: "Client/TcToken",
+                "Stored tctoken from history sync for {} (t={})",
+                token_key,
+                candidate.tc_token_timestamp
+            );
         }
     }
 }

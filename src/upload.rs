@@ -61,15 +61,16 @@ fn parse_upload_progress(resp: &HttpResponse, total_size: u64) -> UploadExistsRe
 
 fn build_upload_request(
     hostname: &str,
-    mms_type: &str,
+    upload_path: &str,
     auth: &str,
     token: &str,
     body: &[u8],
     file_offset: Option<u64>,
 ) -> HttpRequest {
-    let mut url = format!("https://{hostname}/mms/{mms_type}/{token}?auth={auth}&token={token}");
+    let mut url = format!("https://{hostname}{upload_path}/{token}?auth={auth}&token={token}");
     if let Some(offset) = file_offset {
-        url.push_str(&format!("&file_offset={offset}"));
+        url.push_str("&file_offset=");
+        url.push_str(itoa::Buffer::new().format(offset));
     }
 
     HttpRequest::post(url)
@@ -80,12 +81,11 @@ fn build_upload_request(
 
 fn build_resume_check_request(
     hostname: &str,
-    mms_type: &str,
+    upload_path: &str,
     auth: &str,
     token: &str,
 ) -> HttpRequest {
-    let url =
-        format!("https://{hostname}/mms/{mms_type}/{token}?auth={auth}&token={token}&resume=1");
+    let url = format!("https://{hostname}{upload_path}/{token}?auth={auth}&token={token}&resume=1");
     HttpRequest::post(url).with_header("Origin", "https://web.whatsapp.com")
 }
 
@@ -111,6 +111,7 @@ async fn upload_media_with_retry<
     enc: &wacore::upload::EncryptedMedia,
     media_type: MediaType,
     file_length: u64,
+    media_key_timestamp: i64,
     mut get_media_conn: GetMediaConn,
     mut invalidate_media_conn: InvalidateMediaConn,
     mut execute_request: ExecuteRequest,
@@ -124,7 +125,7 @@ where
     ExecuteRequestFut: std::future::Future<Output = Result<HttpResponse>>,
 {
     let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(enc.file_enc_sha256);
-    let mms_type = media_type.mms_type();
+    let upload_path = media_type.upload_path();
     let mut force_refresh = false;
     let mut last_error: Option<anyhow::Error> = None;
 
@@ -143,8 +144,12 @@ where
             let mut file_offset: Option<u64> = None;
 
             if enc.data_to_upload.len() >= RESUMABLE_UPLOAD_THRESHOLD {
-                let check_req =
-                    build_resume_check_request(&host.hostname, mms_type, &media_conn.auth, &token);
+                let check_req = build_resume_check_request(
+                    &host.hostname,
+                    upload_path,
+                    &media_conn.auth,
+                    &token,
+                );
                 if let Ok(check_resp) = execute_request(check_req).await {
                     let total = enc.data_to_upload.len() as u64;
                     match parse_upload_progress(&check_resp, total) {
@@ -152,16 +157,25 @@ where
                             return Ok(UploadResponse {
                                 url,
                                 direct_path,
-                                media_key: enc.media_key.to_vec(),
-                                file_enc_sha256: enc.file_enc_sha256.to_vec(),
-                                file_sha256: enc.file_sha256.to_vec(),
+                                media_key: enc.media_key,
+                                file_enc_sha256: enc.file_enc_sha256,
+                                file_sha256: enc.file_sha256,
                                 file_length,
+                                media_key_timestamp,
                             });
                         }
                         UploadExistsResult::Resume { byte_offset } => {
-                            log::info!("Resuming upload from byte {byte_offset}/{total}");
-                            upload_data = &enc.data_to_upload[byte_offset as usize..];
-                            file_offset = Some(byte_offset);
+                            let offset = byte_offset as usize;
+                            if offset >= enc.data_to_upload.len() {
+                                log::warn!(
+                                    "Server resume offset {offset} exceeds data length {}; uploading from start",
+                                    enc.data_to_upload.len()
+                                );
+                            } else {
+                                log::info!("Resuming upload from byte {byte_offset}/{total}");
+                                upload_data = &enc.data_to_upload[offset..];
+                                file_offset = Some(byte_offset);
+                            }
                         }
                         UploadExistsResult::NotFound => {}
                     }
@@ -171,7 +185,7 @@ where
 
             let request = build_upload_request(
                 &host.hostname,
-                mms_type,
+                upload_path,
                 &media_conn.auth,
                 &token,
                 upload_data,
@@ -191,10 +205,11 @@ where
                 return Ok(UploadResponse {
                     url: raw.url,
                     direct_path: raw.direct_path,
-                    media_key: enc.media_key.to_vec(),
-                    file_enc_sha256: enc.file_enc_sha256.to_vec(),
-                    file_sha256: enc.file_sha256.to_vec(),
+                    media_key: enc.media_key,
+                    file_enc_sha256: enc.file_enc_sha256,
+                    file_sha256: enc.file_sha256,
                     file_length,
+                    media_key_timestamp,
                 });
             }
 
@@ -227,10 +242,38 @@ where
 pub struct UploadResponse {
     pub url: String,
     pub direct_path: String,
-    pub media_key: Vec<u8>,
-    pub file_enc_sha256: Vec<u8>,
-    pub file_sha256: Vec<u8>,
+    pub media_key: [u8; 32],
+    pub file_enc_sha256: [u8; 32],
+    pub file_sha256: [u8; 32],
     pub file_length: u64,
+    /// Unix timestamp (seconds) when the media key was generated.
+    pub media_key_timestamp: i64,
+}
+
+impl From<UploadResponse> for wacore::sticker_pack::MediaUploadInfo {
+    fn from(r: UploadResponse) -> Self {
+        Self::new(
+            r.direct_path,
+            r.media_key,
+            r.file_sha256,
+            r.file_enc_sha256,
+            r.file_length,
+            r.media_key_timestamp,
+        )
+    }
+}
+
+impl UploadResponse {
+    /// Convert crypto fields to `Vec<u8>` for protobuf message construction.
+    pub fn media_key_vec(&self) -> Vec<u8> {
+        self.media_key.to_vec()
+    }
+    pub fn file_sha256_vec(&self) -> Vec<u8> {
+        self.file_sha256.to_vec()
+    }
+    pub fn file_enc_sha256_vec(&self) -> Vec<u8> {
+        self.file_enc_sha256.to_vec()
+    }
 }
 
 #[derive(Deserialize)]
@@ -239,18 +282,54 @@ struct RawUploadResponse {
     direct_path: String,
 }
 
+#[non_exhaustive]
+#[derive(Default, Clone)]
+pub struct UploadOptions {
+    /// Reuse an existing media key instead of generating a fresh one.
+    pub media_key: Option<[u8; 32]>,
+}
+
+impl std::fmt::Debug for UploadOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UploadOptions")
+            .field("media_key", &self.media_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+impl UploadOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_media_key(mut self, key: [u8; 32]) -> Self {
+        self.media_key = Some(key);
+        self
+    }
+}
+
 impl Client {
-    pub async fn upload(&self, data: Vec<u8>, media_type: MediaType) -> Result<UploadResponse> {
-        let enc = wacore::runtime::blocking(&*self.runtime, {
-            let data = data.clone();
-            move || wacore::upload::encrypt_media(&data, media_type)
+    /// Encrypts and uploads media to WhatsApp's CDN.
+    ///
+    /// Only needed for new or modified media. To forward existing media unchanged,
+    /// reuse the original message's CDN fields directly, no round-trip required.
+    pub async fn upload(
+        &self,
+        data: Vec<u8>,
+        media_type: MediaType,
+        options: UploadOptions,
+    ) -> Result<UploadResponse> {
+        let file_length = data.len() as u64;
+        let enc = wacore::runtime::blocking(&*self.runtime, move || {
+            wacore::upload::encrypt_media_with_key(&data, media_type, options.media_key.as_ref())
         })
         .await?;
 
         upload_media_with_retry(
             &enc,
             media_type,
-            data.len() as u64,
+            file_length,
+            wacore::time::now_secs(),
             |force| async move { self.refresh_media_conn(force).await.map_err(Into::into) },
             || async { self.invalidate_media_conn().await },
             |request| async move { self.http_client.execute(request).await },
@@ -294,6 +373,7 @@ mod tests {
             &enc,
             MediaType::Image,
             8,
+            0,
             {
                 let refresh_calls = Arc::clone(&refresh_calls);
                 move |force| {
@@ -350,6 +430,7 @@ mod tests {
         assert!(seen_urls[1].contains("auth=fresh-auth"));
         assert_eq!(result.direct_path, "/v/t62.7118-24/123");
         assert_eq!(result.url, "https://cdn2.example.com/file");
+        assert_eq!(result.media_key_timestamp, 0);
     }
 
     #[tokio::test]
@@ -363,6 +444,7 @@ mod tests {
             &enc,
             MediaType::Image,
             10,
+            0,
             move |_force| {
                 let conn = conn.clone();
                 async move { Ok(conn) }
@@ -397,5 +479,6 @@ mod tests {
         assert!(seen_urls[0].contains("cdn1.example.com"));
         assert!(seen_urls[1].contains("cdn2.example.com"));
         assert_eq!(result.direct_path, "/v/t62.7118-24/456");
+        assert_eq!(result.media_key_timestamp, 0);
     }
 }

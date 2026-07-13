@@ -15,6 +15,13 @@ use wacore::libsignal::store::{
     PreKeyStore as WacorePreKeyStore, SignedPreKeyStore as WacoreSignedPreKeyStore,
 };
 
+fn signal_err<E>(context: &'static str) -> impl FnOnce(E) -> SignalProtocolError
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+{
+    move |e| SignalProtocolError::BackendError(context, e.into())
+}
+
 #[derive(Clone)]
 struct SharedDevice {
     device: Arc<RwLock<Device>>,
@@ -53,6 +60,24 @@ impl SignalProtocolStoreAdapter {
             sender_key_store: SenderKeyAdapter(shared),
         }
     }
+
+    pub fn as_signal_stores(
+        &mut self,
+    ) -> wacore::send::SignalStores<
+        '_,
+        SessionAdapter,
+        IdentityAdapter,
+        PreKeyAdapter,
+        SignedPreKeyAdapter,
+    > {
+        wacore::send::SignalStores {
+            session_store: &mut self.session_store,
+            identity_store: &mut self.identity_store,
+            prekey_store: &mut self.pre_key_store,
+            signed_prekey_store: &self.signed_pre_key_store,
+            sender_key_store: &mut self.sender_key_store,
+        }
+    }
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -67,7 +92,16 @@ impl SessionStore for SessionAdapter {
             .cache
             .get_session(address, &*device.backend)
             .await
-            .map_err(|e| SignalProtocolError::InvalidState("backend", e.to_string()))
+            .map_err(signal_err("backend"))
+    }
+
+    async fn has_session(&self, address: &ProtocolAddress) -> Result<bool, SignalProtocolError> {
+        let device = self.0.device.read().await;
+        self.0
+            .cache
+            .has_session(address, &*device.backend)
+            .await
+            .map_err(signal_err("backend"))
     }
 
     async fn store_session(
@@ -87,16 +121,14 @@ impl IdentityKeyStore for IdentityAdapter {
         let device = self.0.device.read().await;
         IdentityKeyStore::get_identity_key_pair(&*device)
             .await
-            .map_err(|e| SignalProtocolError::InvalidState("get_identity_key_pair", e.to_string()))
+            .map_err(signal_err("get_identity_key_pair"))
     }
 
     async fn get_local_registration_id(&self) -> Result<u32, SignalProtocolError> {
         let device = self.0.device.read().await;
         IdentityKeyStore::get_local_registration_id(&*device)
             .await
-            .map_err(|e| {
-                SignalProtocolError::InvalidState("get_local_registration_id", e.to_string())
-            })
+            .map_err(signal_err("get_local_registration_id"))
     }
 
     async fn save_identity(
@@ -106,17 +138,10 @@ impl IdentityKeyStore for IdentityAdapter {
     ) -> Result<IdentityChange, SignalProtocolError> {
         let existing_identity = self.get_identity(address).await?;
 
-        // Update the Device's in-memory identity store first (for is_trusted_identity checks).
-        // Cache is only marked dirty after Device accepts the identity.
-        let mut device = self.0.device.write().await;
-        IdentityKeyStore::save_identity(&mut *device, address, identity)
-            .await
-            .map_err(|e| SignalProtocolError::InvalidState("save_identity", e.to_string()))?;
-        drop(device);
-
-        // Device accepted — now write to cache (deferred flush to DB)
-        // Store raw 32-byte public key (not 33-byte serialized form with 0x05 prefix),
-        // matching what SignalStore::put_identity expects.
+        // Cache-first: write to cache only. The cache flushes to the backend
+        // during flush_signal_cache(). This avoids a synchronous backend write
+        // on every encrypt/decrypt. is_trusted_identity always returns true
+        // (matching WA Web), so the Device-level save is redundant.
         self.0
             .cache
             .put_identity(address, identity.public_key().public_key_bytes())
@@ -131,14 +156,16 @@ impl IdentityKeyStore for IdentityAdapter {
 
     async fn is_trusted_identity(
         &self,
-        address: &ProtocolAddress,
-        identity: &IdentityKey,
-        direction: Direction,
+        _address: &ProtocolAddress,
+        _identity: &IdentityKey,
+        _direction: Direction,
     ) -> Result<bool, SignalProtocolError> {
-        let device = self.0.device.read().await;
-        IdentityKeyStore::is_trusted_identity(&*device, address, identity, direction)
-            .await
-            .map_err(|e| SignalProtocolError::InvalidState("is_trusted_identity", e.to_string()))
+        // WAWebProtocolStoreUnifiedApi.isTrustedIdentity always returns true;
+        // identity changes surface via save_identity. Avoid acquiring the
+        // device RwLock just to delegate to a stub — the read is acquired N
+        // times per group send (once per recipient device) and adds
+        // contention pressure under any future parallel encrypt path.
+        Ok(true)
     }
 
     async fn get_identity(
@@ -151,7 +178,7 @@ impl IdentityKeyStore for IdentityAdapter {
             .cache
             .get_identity(address, &*device.backend)
             .await
-            .map_err(|e| SignalProtocolError::InvalidState("get_identity", e.to_string()))?
+            .map_err(signal_err("get_identity"))?
         {
             Some(data) if !data.is_empty() => {
                 // Cache and backend store raw 32-byte DJB public key bytes
@@ -171,7 +198,7 @@ impl PreKeyStore for PreKeyAdapter {
         let device = self.0.device.read().await;
         WacorePreKeyStore::load_prekey(&*device, prekey_id.into())
             .await
-            .map_err(|e| SignalProtocolError::InvalidState("backend", e.to_string()))?
+            .map_err(signal_err("backend"))?
             .ok_or(SignalProtocolError::InvalidPreKeyId)
             .and_then(wacore_record::prekey_structure_to_record)
     }
@@ -184,13 +211,13 @@ impl PreKeyStore for PreKeyAdapter {
         let structure = wacore_record::prekey_record_to_structure(record)?;
         WacorePreKeyStore::store_prekey(&*device, prekey_id.into(), structure, false)
             .await
-            .map_err(|e| SignalProtocolError::InvalidState("backend", e.to_string()))
+            .map_err(signal_err("backend"))
     }
     async fn remove_pre_key(&mut self, prekey_id: PreKeyId) -> Result<(), SignalProtocolError> {
         let device = self.0.device.read().await;
         WacorePreKeyStore::remove_prekey(&*device, prekey_id.into())
             .await
-            .map_err(|e| SignalProtocolError::InvalidState("backend", e.to_string()))
+            .map_err(signal_err("backend"))
     }
 }
 
@@ -204,7 +231,7 @@ impl SignedPreKeyStore for SignedPreKeyAdapter {
         let device = self.0.device.read().await;
         WacoreSignedPreKeyStore::load_signed_prekey(&*device, signed_prekey_id.into())
             .await
-            .map_err(|e| SignalProtocolError::InvalidState("backend", e.to_string()))?
+            .map_err(signal_err("backend"))?
             .ok_or(SignalProtocolError::InvalidSignedPreKeyId)
             .and_then(wacore_record::signed_prekey_structure_to_record)
     }
@@ -230,7 +257,7 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
     }
 
     async fn load_sender_key(
-        &mut self,
+        &self,
         sender_key_name: &SenderKeyName,
     ) -> wacore::libsignal::protocol::error::Result<
         Option<wacore::libsignal::protocol::SenderKeyRecord>,
@@ -240,11 +267,6 @@ impl wacore::libsignal::protocol::SenderKeyStore for SenderKeyAdapter {
             .cache
             .get_sender_key(sender_key_name, &*device.backend)
             .await
-            .map_err(|e| {
-                wacore::libsignal::protocol::SignalProtocolError::InvalidState(
-                    "backend",
-                    e.to_string(),
-                )
-            })
+            .map_err(signal_err("backend"))
     }
 }

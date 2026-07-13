@@ -31,9 +31,12 @@ enum KeepaliveResult {
 fn classify_keepalive_error(e: &IqError) -> KeepaliveResult {
     match e {
         IqError::Socket(_)
+        | IqError::EncryptSend(_)
+        | IqError::ClientState(_)
         | IqError::Disconnected(_)
         | IqError::NotConnected
-        | IqError::InternalChannelClosed => KeepaliveResult::FatalFailure,
+        | IqError::InternalChannelClosed
+        | IqError::EncodeError(_) => KeepaliveResult::FatalFailure,
         // Exhaustive: forces a compile error when new IqError variants are added
         // so the developer must decide the classification.
         IqError::Timeout | IqError::ServerError { .. } | IqError::ParseError(_) => {
@@ -62,19 +65,22 @@ impl Client {
 
         debug!(target: "Client/Keepalive", "Sending keepalive ping");
 
+        // wall_rtt_ms feeds the WA Web onClockSkewUpdate formula, which
+        // mixes start_ms with serverTime — both halves must be wall-clock.
+        // rtt_monotonic is for the log only.
         let start_ms = wacore::time::now_millis();
+        let rtt_start = wacore::time::Instant::now();
         let iq = wacore::iq::keepalive::KeepaliveSpec::with_timeout(KEEP_ALIVE_RESPONSE_DEADLINE)
             .build_iq();
         match self.send_iq(iq).await {
             Ok(response_node) => {
-                let end_ms = wacore::time::now_millis();
-                let rtt_ms = end_ms - start_ms;
-                debug!(target: "Client/Keepalive", "Received keepalive pong (RTT: {rtt_ms}ms)");
-                // WA Web: onClockSkewUpdate — Math.round((startTime + rtt/2) / 1000 - serverTime)
+                let rtt_monotonic = rtt_start.elapsed();
+                let wall_rtt_ms = wacore::time::now_millis().saturating_sub(start_ms).max(0);
+                debug!(target: "Client/Keepalive", "Received keepalive pong (RTT: {rtt_monotonic:.2?})");
                 self.unified_session.update_server_time_offset_with_rtt(
-                    &response_node,
+                    response_node.get(),
                     start_ms,
-                    rtt_ms,
+                    wall_rtt_ms,
                 );
                 KeepaliveResult::Ok
             }
@@ -90,11 +96,15 @@ impl Client {
         let mut error_count = 0u32;
         let mut cleanup_counter = 0u32;
         let sent_msg_ttl = self.cache_config.sent_message_ttl_secs;
+        // Capture the per-connection signal once — re-subscribing each iteration
+        // would let a racing reset_connection_shutdown swap the underlying
+        // notifier mid-loop and strand this task on the next connection's signal.
+        let shutdown_signal = self.connection_shutdown_signal();
 
         loop {
-            // Register the shutdown listener BEFORE calculating the sleep
-            // duration so we never miss a notification between loop iterations.
-            let shutdown = self.shutdown_notifier.listen();
+            // Fresh listener each iteration (event_listener is edge-triggered);
+            // the Weak underneath stays pinned to this connection's notifier.
+            let shutdown = wacore::runtime::wait_for_shutdown(&shutdown_signal);
 
             let interval_ms = rand::make_rng::<rand::rngs::StdRng>().random_range(
                 KEEP_ALIVE_INTERVAL_MIN.as_millis()..=KEEP_ALIVE_INTERVAL_MAX.as_millis(),
@@ -177,22 +187,26 @@ impl Client {
                         KeepaliveResult::TransientFailure => {
                             error_count += 1;
                             warn!(target: "Client/Keepalive", "Keepalive timeout, error count: {error_count}");
-
-                            // Dead-socket check after a failed ping.  Re-read
-                            // timestamps because send_keepalive updated last_sent.
-                            let last_sent = self.last_data_sent_ms.load(Ordering::Relaxed);
-                            let last_recv = self.last_data_received_ms.load(Ordering::Relaxed);
-                            if is_dead_socket(last_sent, last_recv) {
-                                let elapsed = ms_since(last_sent).unwrap_or(0);
-                                warn!(
-                                    target: "Client/Keepalive",
-                                    "No data received for {:.1}s after send (dead socket), forcing reconnect.",
-                                    elapsed as f64 / 1000.0
-                                );
-                                self.reconnect_immediately().await;
-                                return;
-                            }
                         }
+                    }
+
+                    // WA Web: deadSocketTimer is an independent 20s watchdog armed on
+                    // every send and cancelled on every receive. We approximate this by
+                    // checking is_dead_socket on EVERY keepalive tick — not just after
+                    // a failed ping. This catches scenarios where pending IQs caused
+                    // the ping to be skipped, or where the ping "succeeded" but the
+                    // connection died immediately after.
+                    let last_sent = self.last_data_sent_ms.load(Ordering::Relaxed);
+                    let last_recv = self.last_data_received_ms.load(Ordering::Relaxed);
+                    if is_dead_socket(last_sent, last_recv) {
+                        let elapsed = ms_since(last_sent).unwrap_or(0);
+                        warn!(
+                            target: "Client/Keepalive",
+                            "No data received for {:.1}s after send (dead socket), forcing reconnect.",
+                            elapsed as f64 / 1000.0
+                        );
+                        self.reconnect_immediately().await;
+                        return;
                     }
                 },
                 _ = shutdown.fuse() => {
@@ -238,7 +252,7 @@ mod tests {
     #[test]
     fn test_classify_socket_error_is_fatal() {
         assert_eq!(
-            classify_keepalive_error(&IqError::Socket(SocketError::Crypto("test".to_string()))),
+            classify_keepalive_error(&IqError::Socket(SocketError::SocketClosed)),
             KeepaliveResult::FatalFailure,
         );
     }

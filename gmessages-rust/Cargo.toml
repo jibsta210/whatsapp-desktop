@@ -10,13 +10,13 @@ default = []
 
 [dependencies]
 # Crypto
-sha1 = { workspace = true }
-aes = { workspace = true }
-aes-gcm = { workspace = true }
-ctr = { workspace = true }
-hkdf = { workspace = true }
-hmac = { workspace = true }
-sha2 = { workspace = true }
+sha1 = "0.10.6"
+aes = "0.8.3"
+aes-gcm = { version = "0.10.2", features = ["aes", "alloc", "std"] }
+ctr = "0.9"
+hkdf = "0.12.3"
+hmac = "0.12.1"
+sha2 = "0.10.6"
 rand = { workspace = true }
 
 # Encoding
@@ -51,10 +51,9 @@ p256 = { version = "0.13", default-features = false, features = ["ecdh", "ecdsa"
 elliptic-curve = { version = "0.13", default-features = false, features = ["sec1", "std"] }
 
 # Firefox cookie reader for Gaia pairing.
-# Use rusqlite 0.39 to match the workspace's libsqlite3-sys 0.35
-# (whatsapp-rust-sqlite-storage already pulls in libsqlite3-sys at that
-# version; cargo refuses two distinct major versions of a `links =` crate).
-rusqlite = { version = "0.37", features = ["bundled"] }
+# Match the stable WhatsApp storage crate's libsqlite3-sys release; Cargo
+# permits only one crate linking sqlite3 in the application dependency graph.
+rusqlite = { version = "0.38", features = ["bundled"] }
 tempfile = "3"
 
 [build-dependencies]

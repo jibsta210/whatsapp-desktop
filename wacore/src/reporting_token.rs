@@ -19,12 +19,12 @@
 
 use anyhow::{Result, anyhow};
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use prost::Message;
 use sha2::Sha256;
+use wacore_binary::Jid;
+use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::jid::Jid;
-use wacore_binary::node::Node;
 use waproto::whatsapp as wa;
 
 /// Wire type constants for protobuf parsing
@@ -268,7 +268,8 @@ pub fn generate_message_secret() -> [u8; MESSAGE_SECRET_SIZE] {
 /// The info is constructed as: stanza_id || sender_jid || remote_jid || "Report Token"
 /// This matches WhatsApp Web's Binary.build(stanzaId, senderJid, remoteJid, REPORT_TOKEN)
 fn build_hkdf_info(stanza_id: &str, sender_jid: &str, remote_jid: &str) -> Vec<u8> {
-    let mut info = Vec::new();
+    let cap = stanza_id.len() + sender_jid.len() + remote_jid.len() + USE_CASE_REPORT_TOKEN.len();
+    let mut info = Vec::with_capacity(cap);
     info.extend_from_slice(stanza_id.as_bytes());
     info.extend_from_slice(sender_jid.as_bytes());
     info.extend_from_slice(remote_jid.as_bytes());
@@ -856,7 +857,7 @@ mod tests {
 
     #[test]
     fn test_build_reporting_node() {
-        use wacore_binary::node::NodeContent;
+        use wacore_binary::NodeContent;
 
         let expected_token = [
             0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,

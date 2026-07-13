@@ -1,6 +1,11 @@
-pub use wacore::{iq::privacy as privacy_settings, proto_helpers, store::traits};
+pub use wacore::client_profile::ClientProfile;
+pub use wacore::{
+    iq::privacy as privacy_settings, proto_helpers, sticker_pack, store::traits, webp,
+};
+pub use wacore_binary::CompactString;
+pub use wacore_binary::OwnedNodeRef;
 pub use wacore_binary::builder::NodeBuilder;
-pub use wacore_binary::jid::Jid;
+pub use wacore_binary::{Jid, Server};
 pub use waproto;
 
 pub mod cache;
@@ -10,11 +15,14 @@ pub mod portable_cache;
 pub mod cache_config;
 pub use cache_config::{CacheConfig, CacheEntryConfig, CacheStores};
 pub mod cache_store;
+pub(crate) mod pending_device_sync;
+pub(crate) mod sender_key_device_cache;
 pub use cache_store::CacheStore;
 pub mod http;
 pub mod types;
 
 pub mod client;
+pub(crate) mod flush_scope;
 pub use client::Client;
 #[cfg(feature = "debug-diagnostics")]
 pub use client::MemoryDiagnostics;
@@ -36,12 +44,13 @@ pub mod runtime_impl;
 pub use runtime_impl::TokioRuntime;
 pub use wacore::runtime::Runtime;
 pub mod send;
-pub use send::{RevokeType, SendOptions};
+pub use send::{PinDuration, RevokeType, SendOptions, SendResult};
 pub mod session;
 pub mod socket;
 pub mod store;
 pub mod transport;
 pub mod upload;
+pub use upload::UploadOptions;
 
 pub mod pdo;
 pub mod prekeys;
@@ -55,17 +64,20 @@ pub mod usync;
 
 pub mod features;
 pub use features::{
-    Blocking, BlocklistEntry, ChatActions, ChatStateType, Chatstate, Community, CommunitySubgroup,
-    ContactInfo, Contacts, CreateCommunityOptions, CreateCommunityResult, CreateGroupResult,
-    GroupCreateOptions, GroupDescription, GroupMetadata, GroupParticipant, GroupParticipantOptions,
-    GroupSubject, GroupType, Groups, IsOnWhatsAppResult, JoinGroupResult, LinkSubgroupsResult,
-    MediaRetryResult, MediaReupload, MediaReuploadRequest, MemberAddMode, MemberLinkMode,
-    MembershipApprovalMode, MembershipRequest, Mex, MexError, MexErrorExtensions, MexRequest,
-    MexResponse, Newsletter, NewsletterMessage, NewsletterMetadata, NewsletterReactionCount,
-    NewsletterRole, NewsletterState, NewsletterVerification, ParticipantChangeResponse, Presence,
-    PresenceError, PresenceStatus, Profile, ProfilePicture, SetProfilePictureResponse, Status,
-    StatusPrivacySetting, StatusSendOptions, SyncActionMessageRange, TcToken,
-    UnlinkSubgroupsResult, UserInfo, group_type, message_key, message_range,
+    BatchGroupResult, Blocking, BlocklistEntry, ChatActions, ChatStateType, Chatstate, Community,
+    CommunitySubgroup, Contacts, CreateCommunityOptions, CreateCommunityResult, CreateGroupResult,
+    EncryptedEdit, GroupCreateOptions, GroupDescription, GroupJoinError, GroupMetadata,
+    GroupParticipant, GroupParticipantOptions, GroupProfilePicture, GroupSubject, GroupType,
+    Groups, GrowthLockInfo, InviteInfoError, IsOnWhatsAppResult, JoinGroupResult,
+    LinkSubgroupsResult, MediaRetryResult, MediaReupload, MediaReuploadRequest, MemberAddMode,
+    MemberLinkMode, MemberShareHistoryMode, MembershipApprovalMode, MembershipRequest, Mex,
+    MexError, MexErrorExtensions, MexRequest, MexResponse, Newsletter, NewsletterMessage,
+    NewsletterMessageType, NewsletterMetadata, NewsletterReactionCount, NewsletterRole,
+    NewsletterState, NewsletterVerification, ParticipantChangeResponse, ParticipantType,
+    PictureType, Presence, PresenceError, PresenceStatus, Profile, ProfilePicture,
+    SetProfilePictureResponse, Signal, Status, StatusPrivacySetting, StatusSendOptions,
+    SyncActionMessageRange, TcToken, UnlinkSubgroupsResult, UserInfo, group_type, message_key,
+    message_range,
 };
 
 pub mod bot;

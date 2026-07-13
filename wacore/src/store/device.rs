@@ -1,9 +1,10 @@
+use crate::client_profile::ClientProfile;
 use crate::libsignal::protocol::{IdentityKeyPair, KeyPair};
-use once_cell::sync::Lazy;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
-use wacore_binary::jid::Jid;
+use std::sync::LazyLock;
+use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
 /// Protobuf-bytes serde for `AdvSignedDeviceIdentity` (prost types lack `Deserialize`).
@@ -67,6 +68,8 @@ pub mod key_pair_serde {
         if bytes.len() != 64 {
             return Err(serde::de::Error::invalid_length(bytes.len(), &"64"));
         }
+        // reason: serde::de::Error::custom flattens to a String at the boundary —
+        // serde's error model has no source-chain preservation.
         let private_key = PrivateKey::deserialize(&bytes[0..32])
             .map_err(|e| serde::de::Error::custom(e.to_string()))?;
         let public_key = PublicKey::from_djb_public_key_bytes(&bytes[32..64])
@@ -77,94 +80,118 @@ pub mod key_pair_serde {
 
 fn build_base_client_payload(
     app_version: wa::client_payload::user_agent::AppVersion,
+    profile: &ClientProfile,
 ) -> wa::ClientPayload {
-    use std::sync::atomic::Ordering;
-    // Build Chrome version string from the atomics updated by refresh_chrome_version()
-    // (e.g. "147.0.7727.101"). This gets sent as os_version / os_build_number on
-    // every login — WhatsApp checks these to decide if the client is outdated.
-    let chrome_version = format!(
-        "{}.{}.{}",
-        CHROME_VERSION_PRIMARY.load(Ordering::Relaxed),
-        CHROME_VERSION_SECONDARY.load(Ordering::Relaxed),
-        CHROME_VERSION_TERTIARY.load(Ordering::Relaxed),
-    );
     wa::ClientPayload {
         user_agent: Some(wa::client_payload::UserAgent {
-            platform: Some(wa::client_payload::user_agent::Platform::Web as i32),
+            platform: Some(profile.user_agent_platform as i32),
             release_channel: Some(wa::client_payload::user_agent::ReleaseChannel::Release as i32),
             app_version: Some(app_version),
             mcc: Some("000".to_string()),
             mnc: Some("000".to_string()),
-            os_version: Some(chrome_version.clone()),
-            manufacturer: Some("Google".to_string()),
-            device: Some("Desktop".to_string()),
-            os_build_number: Some(chrome_version),
+            os_version: Some(profile.os_version.clone()),
+            manufacturer: Some(profile.manufacturer.clone()),
+            device: Some(profile.device.clone()),
+            os_build_number: Some(profile.os_version.clone()),
             locale_language_iso6391: Some("en".to_string()),
             locale_country_iso31661_alpha2: Some("en".to_string()),
             ..Default::default()
         }),
-        web_info: Some(wa::client_payload::WebInfo {
-            web_sub_platform: Some(wa::client_payload::web_info::WebSubPlatform::WebBrowser as i32),
-            ..Default::default()
-        }),
+        web_info: profile
+            .include_web_info
+            .then(|| wa::client_payload::WebInfo {
+                web_sub_platform: Some(
+                    wa::client_payload::web_info::WebSubPlatform::WebBrowser as i32,
+                ),
+                ..Default::default()
+            }),
         connect_type: Some(wa::client_payload::ConnectType::WifiUnknown as i32),
         connect_reason: Some(wa::client_payload::ConnectReason::UserActivated as i32),
         ..Default::default()
     }
 }
 
-// Chrome version we claim to be running. Defaults to a recent known-good
-// version (147 as of mid-2026). The higher-level client overrides this at
-// startup by fetching the current stable Chrome release from Google's
-// versionhistory.googleapis.com endpoint — see `whatsapp-rust`'s version
-// module. This keeps us from looking "too old" as Chrome advances.
-pub static CHROME_VERSION_PRIMARY: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(147);
-pub static CHROME_VERSION_SECONDARY: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(0);
-pub static CHROME_VERSION_TERTIARY: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(7727);
-const DEFAULT_DEVICE_OS: &str = "Linux";
-
-pub fn set_chrome_version(primary: u32, secondary: u32, tertiary: u32) {
-    use std::sync::atomic::Ordering;
-    CHROME_VERSION_PRIMARY.store(primary, Ordering::Relaxed);
-    CHROME_VERSION_SECONDARY.store(secondary, Ordering::Relaxed);
-    CHROME_VERSION_TERTIARY.store(tertiary, Ordering::Relaxed);
+/// Override for selected `DeviceProps` fields before pairing. `None` fields
+/// preserve the current value on the device.
+#[derive(Debug, Clone, Default)]
+pub struct DevicePropsOverride {
+    pub os: Option<String>,
+    pub version: Option<wa::device_props::AppVersion>,
+    pub platform_type: Option<wa::device_props::PlatformType>,
+    pub history_sync_config: Option<wa::device_props::HistorySyncConfig>,
 }
 
-/// Device properties identify THIS client to WhatsApp. The os name and
-/// version are surfaced in the phone's "Linked Devices" list. WhatsApp
-/// flags devices with unknown OS / ancient version as "older version" —
-/// so we claim to be a current Chrome-on-Linux desktop client, matching
-/// what real WhatsApp Web sends.
-///
-/// Rebuilt on every call so it picks up the latest Chrome version set by
-/// the HTTP-layer version fetcher.
-pub fn device_props() -> wa::DeviceProps {
-    use std::sync::atomic::Ordering;
-    wa::DeviceProps {
-        os: Some(DEFAULT_DEVICE_OS.to_string()),
-        version: Some(wa::device_props::AppVersion {
-            primary: Some(CHROME_VERSION_PRIMARY.load(Ordering::Relaxed)),
-            secondary: Some(CHROME_VERSION_SECONDARY.load(Ordering::Relaxed)),
-            tertiary: Some(CHROME_VERSION_TERTIARY.load(Ordering::Relaxed)),
-            ..Default::default()
-        }),
-        platform_type: Some(wa::device_props::PlatformType::Chrome as i32),
-        require_full_sync: Some(true),
-        history_sync_config: Some(wa::device_props::HistorySyncConfig {
-            full_sync_days_limit: Some(30),
-            inline_initial_payload_in_e2_ee_msg: Some(true),
-            storage_quota_mb: Some(10240),
-            ..Default::default()
-        }),
+impl DevicePropsOverride {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_os(mut self, os: impl Into<String>) -> Self {
+        self.os = Some(os.into());
+        self
+    }
+
+    pub fn with_version(mut self, version: wa::device_props::AppVersion) -> Self {
+        self.version = Some(version);
+        self
+    }
+
+    pub fn with_platform_type(mut self, platform_type: wa::device_props::PlatformType) -> Self {
+        self.platform_type = Some(platform_type);
+        self
+    }
+
+    /// Replaces the entire `HistorySyncConfig`. Spread [`default_history_sync_config`]
+    /// into the literal to patch only specific fields while keeping sane defaults.
+    pub fn with_history_sync_config(
+        mut self,
+        history_sync_config: wa::device_props::HistorySyncConfig,
+    ) -> Self {
+        self.history_sync_config = Some(history_sync_config);
+        self
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.os.is_none()
+            && self.version.is_none()
+            && self.platform_type.is_none()
+            && self.history_sync_config.is_none()
     }
 }
 
-/// Kept for backwards compatibility — callers that referenced DEVICE_PROPS
-/// now get a freshly-built DeviceProps with the current Chrome version.
-pub static DEVICE_PROPS: Lazy<wa::DeviceProps> = Lazy::new(device_props);
+/// Default `HistorySyncConfig` aligned with WA Web's static claims
+/// (`Payload.js` in `WAWebClientPayload`). Runtime-derived fields like
+/// `storage_quota_mb`, `on_demand_ready`, and justknobx-gated flags are left
+/// unset so callers can populate them through
+/// [`DevicePropsOverride::with_history_sync_config`] without fighting stale
+/// hardcoded values.
+pub fn default_history_sync_config() -> wa::device_props::HistorySyncConfig {
+    wa::device_props::HistorySyncConfig {
+        full_sync_days_limit: Some(30),
+        inline_initial_payload_in_e2_ee_msg: Some(true),
+        support_bot_user_agent_chat_history: Some(true),
+        support_cag_reactions_and_polls: Some(true),
+        support_recent_sync_chunk_message_count_tuning: Some(true),
+        support_hosted_group_msg: Some(true),
+        support_biz_hosted_msg: Some(true),
+        support_fbid_bot_chat_history: Some(true),
+        support_message_association: Some(true),
+        ..Default::default()
+    }
+}
+
+pub static DEVICE_PROPS: LazyLock<wa::DeviceProps> = LazyLock::new(|| wa::DeviceProps {
+    os: Some("rust".to_string()),
+    version: Some(wa::device_props::AppVersion {
+        primary: Some(0),
+        secondary: Some(1),
+        tertiary: Some(0),
+        ..Default::default()
+    }),
+    platform_type: Some(wa::device_props::PlatformType::Unknown as i32),
+    require_full_sync: Some(true),
+    history_sync_config: Some(default_history_sync_config()),
+});
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Device {
@@ -190,6 +217,9 @@ pub struct Device {
     pub app_version_last_fetched_ms: i64,
     #[serde(skip)]
     pub device_props: wa::DeviceProps,
+    /// Runtime-only. Set before `connect()` on every process start.
+    #[serde(skip)]
+    pub client_profile: ClientProfile,
     /// Edge routing info received from server, used for optimized reconnection.
     /// When present, this should be sent as a pre-intro before the Noise handshake.
     #[serde(default)]
@@ -203,6 +233,61 @@ pub struct Device {
     /// Prevents prekey ID collisions when prekeys are consumed non-sequentially.
     #[serde(default)]
     pub next_pre_key_id: u32,
+    /// Persisted flag matching WA Web's `signal_sever_has_pre_keys` metadata.
+    #[serde(default)]
+    pub server_has_prekeys: bool,
+    /// NCT salt provisioned by the server via app state sync or history sync.
+    #[serde(default)]
+    pub nct_salt: Option<Vec<u8>>,
+    /// Runtime-only marker that an authoritative nct_salt_sync mutation was seen.
+    /// This prevents stale history sync data from resurrecting a cleared salt.
+    #[serde(skip)]
+    pub nct_salt_sync_seen: bool,
+    /// Server cert chain cached from the last successful XX (or XX-fallback)
+    /// handshake. Enables Noise IK on the next connect by exposing
+    /// `leaf.key` as the server's static public key, and lets us reject
+    /// stale entries via `not_after` before even attempting IK.
+    /// `None` forces XX on the next connect.
+    #[serde(default)]
+    pub server_cert_chain: Option<CachedServerCertChain>,
+}
+
+/// Minimal cached form of a Noise certificate. Mirrors the JSON shape WA Web
+/// persists in `waNoiseInfo.certificateChainBuffer` (only `key` plus the
+/// validity window — signatures and issuer_serial are intentionally dropped).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedNoiseCert {
+    /// 32-byte X25519 public key from `NoiseCertificate.Details.key`.
+    pub key: [u8; 32],
+    /// Unix epoch seconds. Validation window from `NoiseCertificate.Details`.
+    pub not_before: i64,
+    pub not_after: i64,
+}
+
+/// Cached form of the server's two-cert chain. `leaf.key` is the server
+/// static public key consumed by Noise IK; the intermediate is kept solely
+/// to mirror WA Web's expiry checks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedServerCertChain {
+    pub intermediate: CachedNoiseCert,
+    pub leaf: CachedNoiseCert,
+}
+
+impl From<wacore_noise::VerifiedServerCertChain> for CachedServerCertChain {
+    fn from(v: wacore_noise::VerifiedServerCertChain) -> Self {
+        Self {
+            intermediate: CachedNoiseCert {
+                key: v.intermediate_key,
+                not_before: v.intermediate_not_before,
+                not_after: v.intermediate_not_after,
+            },
+            leaf: CachedNoiseCert {
+                key: v.leaf_key,
+                not_before: v.leaf_not_before,
+                not_after: v.leaf_not_after,
+            },
+        }
+    }
 }
 
 impl Default for Device {
@@ -248,50 +333,62 @@ impl Device {
             push_name: String::new(),
             app_version_primary: 2,
             app_version_secondary: 3000,
-            app_version_tertiary: 1031424117,
+            app_version_tertiary: 1035617621,
             app_version_last_fetched_ms: 0,
-            device_props: device_props(),
+            device_props: DEVICE_PROPS.clone(),
+            client_profile: ClientProfile::web(),
             edge_routing_info: None,
             props_hash: None,
             next_pre_key_id: 1,
+            server_has_prekeys: false,
+            nct_salt: None,
+            nct_salt_sync_seen: false,
+            server_cert_chain: None,
         }
     }
 
     /// Returns the default OS string used for device props
     pub fn default_os() -> &'static str {
-        DEFAULT_DEVICE_OS
+        "rust"
     }
 
-    /// Returns the current default device props version.
-    ///
-    /// This reads the same atomics as [`device_props`], so callers see the
-    /// Chrome version selected at startup rather than the retired `0.1.0`
-    /// placeholder.
+    /// Returns the default device props version
     pub fn default_device_props_version() -> wa::device_props::AppVersion {
-        device_props()
-            .version
-            .expect("default device props always include a Chrome version")
+        wa::device_props::AppVersion {
+            primary: Some(0),
+            secondary: Some(1),
+            tertiary: Some(0),
+            ..Default::default()
+        }
     }
 
     pub fn is_ready_for_presence(&self) -> bool {
         self.pn.is_some() && !self.push_name.is_empty()
     }
 
-    pub fn set_device_props(
-        &mut self,
-        os: Option<String>,
-        version: Option<wa::device_props::AppVersion>,
-        platform_type: Option<wa::device_props::PlatformType>,
-    ) {
-        if let Some(os) = os {
+    /// Mirrors WA Web `WAWebUserPrefsMultiDevice.isRegistered()`:
+    /// `!!(m() && getMaybeMeDevicePn())`.
+    pub fn is_registered(&self) -> bool {
+        self.pn.is_some()
+    }
+
+    pub fn set_device_props(&mut self, o: DevicePropsOverride) {
+        if let Some(os) = o.os {
             self.device_props.os = Some(os);
         }
-        if let Some(version) = version {
+        if let Some(version) = o.version {
             self.device_props.version = Some(version);
         }
-        if let Some(platform_type) = platform_type {
+        if let Some(platform_type) = o.platform_type {
             self.device_props.platform_type = Some(platform_type as i32);
         }
+        if let Some(history_sync_config) = o.history_sync_config {
+            self.device_props.history_sync_config = Some(history_sync_config);
+        }
+    }
+
+    pub fn set_client_profile(&mut self, profile: ClientProfile) {
+        self.client_profile = profile;
     }
 
     pub fn get_client_payload(&self) -> wa::ClientPayload {
@@ -308,7 +405,7 @@ impl Device {
             tertiary: Some(self.app_version_tertiary),
             ..Default::default()
         };
-        let mut payload = build_base_client_payload(app_version);
+        let mut payload = build_base_client_payload(app_version, &self.client_profile);
         payload.username = jid.user.parse::<u64>().ok();
         payload.device = Some(jid.device as u32);
         payload.passive = Some(true);
@@ -322,7 +419,7 @@ impl Device {
             tertiary: Some(self.app_version_tertiary),
             ..Default::default()
         };
-        let mut payload = build_base_client_payload(app_version);
+        let mut payload = build_base_client_payload(app_version, &self.client_profile);
 
         let device_props_bytes = self.device_props.encode_to_vec();
 
@@ -398,6 +495,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_device_server_cert_chain_serde_roundtrip() {
+        let mut device = Device::new();
+        device.server_cert_chain = Some(CachedServerCertChain {
+            intermediate: CachedNoiseCert {
+                key: [0xAA; 32],
+                not_before: 1_700_000_000,
+                not_after: 1_900_000_000,
+            },
+            leaf: CachedNoiseCert {
+                key: [0xBB; 32],
+                not_before: 1_700_000_500,
+                not_after: 1_899_999_500,
+            },
+        });
+
+        let json = serde_json::to_string(&device).expect("serialize should succeed");
+        let restored: Device = serde_json::from_str(&json).expect("deserialize should succeed");
+        assert_eq!(device.server_cert_chain, restored.server_cert_chain);
+    }
+
+    #[test]
+    fn test_device_legacy_record_without_cert_chain_deserializes() {
+        // Devices serialized before this field existed must still load — the
+        // #[serde(default)] attribute is what makes that work.
+        let mut device = Device::new();
+        device.server_cert_chain = None;
+        let json = serde_json::to_string(&device).expect("serialize should succeed");
+        // Strip the field as if a legacy file lacked it entirely.
+        let stripped = json.replace(",\"server_cert_chain\":null", "");
+        assert_ne!(stripped, json, "field was expected to be present in JSON");
+
+        let restored: Device =
+            serde_json::from_str(&stripped).expect("legacy record should deserialize");
+        assert!(restored.server_cert_chain.is_none());
+    }
+
     /// Regression: #403
     #[test]
     fn test_device_serde_preserves_account() {
@@ -424,6 +558,173 @@ mod tests {
         );
         assert_eq!(acc.account_signature.as_deref(), Some([2u8; 64].as_slice()));
         assert_eq!(acc.device_signature.as_deref(), Some([3u8; 64].as_slice()));
+    }
+
+    /// Override survives the ClientPayload → bytes → DeviceProps round-trip;
+    /// `None` fields preserve the prior value.
+    #[test]
+    fn set_device_props_override_reaches_registration_payload() {
+        let mut device = Device::new();
+        assert!(device.pn.is_none());
+
+        device.set_device_props(
+            DevicePropsOverride::new()
+                .with_os("Android 14")
+                .with_platform_type(wa::device_props::PlatformType::AndroidPhone),
+        );
+
+        let payload = device.get_client_payload();
+        let reg = payload.device_pairing_data.expect("device_pairing_data");
+        let bytes = reg.device_props.expect("device_props bytes");
+        let props = wa::DeviceProps::decode(bytes.as_slice()).expect("decode DeviceProps");
+
+        assert_eq!(props.os.as_deref(), Some("Android 14"));
+        assert_eq!(
+            props.platform_type,
+            Some(wa::device_props::PlatformType::AndroidPhone as i32)
+        );
+        // None preserves the default version.
+        assert_eq!(props.version, Some(Device::default_device_props_version()));
+    }
+
+    /// `HistorySyncConfig` override is delivered whole — users patch by
+    /// spreading [`default_history_sync_config`] into the literal.
+    #[test]
+    fn history_sync_config_override_reaches_registration_payload() {
+        let mut device = Device::new();
+        device.set_device_props(DevicePropsOverride::new().with_history_sync_config(
+            wa::device_props::HistorySyncConfig {
+                full_sync_days_limit: Some(365),
+                support_group_history: Some(true),
+                ..default_history_sync_config()
+            },
+        ));
+
+        let payload = device.get_client_payload();
+        let bytes = payload
+            .device_pairing_data
+            .expect("device_pairing_data")
+            .device_props
+            .expect("device_props bytes");
+        let props = wa::DeviceProps::decode(bytes.as_slice()).expect("decode DeviceProps");
+        let hsc = props.history_sync_config.expect("history_sync_config");
+
+        assert_eq!(hsc.full_sync_days_limit, Some(365));
+        assert_eq!(hsc.support_group_history, Some(true));
+        // Defaults spread in via default_history_sync_config() survive.
+        assert_eq!(hsc.support_message_association, Some(true));
+        assert_eq!(hsc.inline_initial_payload_in_e2_ee_msg, Some(true));
+    }
+
+    /// After pairing, `device_props` must not leak into the login payload —
+    /// WA Web only sends it during registration.
+    #[test]
+    fn login_payload_has_no_device_props() {
+        let mut device = Device::new();
+        device.pn = Some("12345@s.whatsapp.net".parse().unwrap());
+        device.set_device_props(
+            DevicePropsOverride::new()
+                .with_platform_type(wa::device_props::PlatformType::AndroidPhone),
+        );
+
+        let payload = device.get_client_payload();
+        assert!(
+            payload.device_pairing_data.is_none(),
+            "login payload must not carry device_pairing_data"
+        );
+    }
+
+    #[test]
+    fn default_profile_emits_legacy_web_payload() {
+        let device = Device::new();
+        let payload = device.get_client_payload();
+        let ua = payload.user_agent.expect("user_agent");
+        assert_eq!(ua.platform(), wa::client_payload::user_agent::Platform::Web);
+        assert_eq!(ua.device.as_deref(), Some("Desktop"));
+        assert_eq!(ua.os_version.as_deref(), Some("0.1.0"));
+        assert_eq!(ua.os_build_number.as_deref(), Some("0.1.0"));
+        assert_eq!(ua.manufacturer.as_deref(), Some(""));
+        let web_info = payload.web_info.expect("web profile must include web_info");
+        assert_eq!(
+            web_info.web_sub_platform(),
+            wa::client_payload::web_info::WebSubPlatform::WebBrowser
+        );
+    }
+
+    #[test]
+    fn android_profile_emits_android_payload_without_web_info() {
+        let mut device = Device::new();
+        device.set_client_profile(ClientProfile::android("13"));
+
+        let payload = device.get_client_payload();
+        let ua = payload.user_agent.expect("user_agent");
+        assert_eq!(
+            ua.platform(),
+            wa::client_payload::user_agent::Platform::Android
+        );
+        assert_eq!(ua.device.as_deref(), Some("Smartphone"));
+        assert_eq!(ua.os_version.as_deref(), Some("13"));
+        assert_eq!(ua.os_build_number.as_deref(), Some("13"));
+        assert!(
+            payload.web_info.is_none(),
+            "android profile must omit web_info"
+        );
+    }
+
+    #[test]
+    fn android_profile_survives_login_payload_path() {
+        let mut device = Device::new();
+        device.set_client_profile(ClientProfile::android("13"));
+        device.pn = Some("12345@s.whatsapp.net".parse().unwrap());
+
+        let payload = device.get_client_payload();
+        let ua = payload.user_agent.expect("user_agent");
+        assert_eq!(
+            ua.platform(),
+            wa::client_payload::user_agent::Platform::Android
+        );
+        assert!(payload.web_info.is_none());
+        assert!(
+            payload.device_pairing_data.is_none(),
+            "login payload still must not carry device_pairing_data"
+        );
+    }
+
+    #[test]
+    fn client_profile_independent_of_device_props_platform_type() {
+        let mut device = Device::new();
+        device.set_device_props(
+            DevicePropsOverride::new()
+                .with_platform_type(wa::device_props::PlatformType::AndroidPhone),
+        );
+
+        let payload = device.get_client_payload();
+        let ua = payload.user_agent.expect("user_agent");
+        assert_eq!(ua.platform(), wa::client_payload::user_agent::Platform::Web);
+        assert!(payload.web_info.is_some());
+    }
+
+    #[test]
+    fn every_native_profile_drops_web_info_in_payload() {
+        for profile in [
+            ClientProfile::android("13"),
+            ClientProfile::smb_android("13"),
+            ClientProfile::ios("17.4"),
+            ClientProfile::macos("14.4"),
+            ClientProfile::windows("10.0.22631"),
+        ] {
+            let mut device = Device::new();
+            let platform = profile.user_agent_platform;
+            device.set_client_profile(profile);
+
+            let payload = device.get_client_payload();
+            let ua = payload.user_agent.expect("user_agent");
+            assert_eq!(ua.platform(), platform);
+            assert!(
+                payload.web_info.is_none(),
+                "{platform:?} must omit web_info"
+            );
+        }
     }
 
     /// Backward compat: missing `account` field deserializes as `None`.

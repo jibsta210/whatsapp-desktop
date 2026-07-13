@@ -39,3 +39,6 @@ docs
 /dist/
 *.app
 .DS_Store
+__pycache__
+.codex
+dhat-heap*.json

@@ -1,4 +1,7 @@
-use crate::libsignal::crypto::{CryptographicMac, aes_256_cbc_decrypt_into};
+use crate::libsignal::crypto::{
+    CryptographicMac, DecryptionError as AesCbcDecryptionError, Error as CryptoError,
+    aes_256_cbc_decrypt_into,
+};
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use base64::prelude::*;
@@ -17,12 +20,15 @@ pub enum MediaDecryptionError {
     PayloadTooShort,
     #[error("invalid MAC signature")]
     InvalidMac,
-    #[error("decryption error: {0}")]
-    Decryption(String),
+    #[error("AES-CBC decryption failed")]
+    Decryption(#[source] AesCbcDecryptionError),
+    #[error("HMAC initialization failed")]
+    Mac(#[source] CryptoError),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaType {
     Image,
@@ -35,7 +41,11 @@ pub enum MediaType {
     AppState,
     Sticker,
     StickerPack,
+    StickerPackThumbnail,
     LinkThumbnail,
+    /// Product catalog image — unencrypted, uploads to `/product/image`.
+    /// WA Web: CreateMediaKeys.js throws for this type (no encryption).
+    ProductCatalogImage,
 }
 
 impl MediaType {
@@ -49,10 +59,15 @@ impl MediaType {
             MediaType::AppState => "WhatsApp App State Keys",
             MediaType::Sticker => "WhatsApp Image Keys",
             MediaType::StickerPack => "WhatsApp Sticker Pack Keys",
+            MediaType::StickerPackThumbnail => "WhatsApp Sticker Pack Thumbnail Keys",
             MediaType::LinkThumbnail => "WhatsApp Link Thumbnail Keys",
+            // Unencrypted: app_info unused, but keep a value for the type system.
+            MediaType::ProductCatalogImage => "WhatsApp Image Keys",
         }
     }
 
+    /// Media type string for MMS path construction.
+    /// Matches WAWebMmsMediaTypes and ClientFormatHashUrl.js path mapping.
     pub fn mms_type(&self) -> &'static str {
         match self {
             MediaType::Image | MediaType::Sticker => "image",
@@ -63,8 +78,33 @@ impl MediaType {
             MediaType::History => "md-msg-hist",
             MediaType::AppState => "md-app-state",
             MediaType::StickerPack => "sticker-pack",
+            MediaType::StickerPackThumbnail => "thumbnail-sticker-pack",
             MediaType::LinkThumbnail => "thumbnail-link",
+            MediaType::ProductCatalogImage => "product-catalog-image",
         }
+    }
+
+    /// URL path prefix for upload/download.
+    pub fn upload_path(&self) -> &'static str {
+        match self {
+            MediaType::Image | MediaType::Sticker => "/mms/image",
+            MediaType::Video => "/mms/video",
+            MediaType::Audio => "/mms/audio",
+            MediaType::Ptt => "/mms/ptt",
+            MediaType::Document => "/mms/document",
+            MediaType::History => "/mms/md-msg-hist",
+            MediaType::AppState => "/mms/md-app-state",
+            MediaType::StickerPack => "/mms/sticker-pack",
+            MediaType::StickerPackThumbnail => "/mms/thumbnail-sticker-pack",
+            MediaType::LinkThumbnail => "/mms/thumbnail-link",
+            MediaType::ProductCatalogImage => "/product/image",
+        }
+    }
+
+    /// Whether this media type is encrypted (E2E).
+    /// Product catalog images are unencrypted per WA Web (CreateMediaKeys.js:75-76).
+    pub fn is_encrypted(&self) -> bool {
+        !matches!(self, MediaType::ProductCatalogImage)
     }
 }
 
@@ -170,6 +210,11 @@ impl_downloadable!(
 );
 impl_downloadable!(wa::message::AudioMessage, MediaType::Audio, file_length);
 impl_downloadable!(wa::message::StickerMessage, MediaType::Sticker, file_length);
+impl_downloadable!(
+    wa::message::StickerPackMessage,
+    MediaType::StickerPack,
+    file_length
+);
 impl_downloadable!(ExternalBlobReference, MediaType::AppState, file_size_bytes);
 impl_downloadable!(HistorySyncNotification, MediaType::History, file_length);
 
@@ -333,7 +378,7 @@ impl DownloadUtils {
             cipher: &Aes256,
             prev_block: &[u8; BLOCK],
         ) -> Result<([u8; BLOCK], [u8; BLOCK])> {
-            use aes::cipher::{Block, BlockDecrypt};
+            use aes::cipher::{Block, BlockCipherDecrypt};
             let cblock_arr: [u8; BLOCK] = cblock
                 .try_into()
                 .map_err(|_| anyhow!("Invalid block size"))?;
@@ -348,7 +393,7 @@ impl DownloadUtils {
 
         let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, app_info)?;
 
-        let mut hmac = <Hmac<Sha256> as hmac::Mac>::new_from_slice(&mac_key)
+        let mut hmac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&mac_key)
             .map_err(|_| anyhow!("Failed to init HMAC"))?;
         hmac.update(&iv);
 
@@ -356,7 +401,7 @@ impl DownloadUtils {
             Aes256::new_from_slice(&cipher_key).map_err(|_| anyhow!("Bad AES key length"))?;
 
         let mut bytes_written: u64 = 0;
-        let mut tail: Vec<u8> = Vec::with_capacity(BLOCK + MAC_SIZE);
+        let mut tail: Vec<u8> = Vec::with_capacity(CHUNK + BLOCK + MAC_SIZE);
         let mut prev_block = iv;
 
         let mut read_buf = [0u8; CHUNK];
@@ -403,9 +448,6 @@ impl DownloadUtils {
             let (decrypted, cblock_arr) = decrypt_cbc_block(cblock, &cipher, &prev_block)?;
             final_plain.extend_from_slice(&decrypted);
             prev_block = cblock_arr;
-        }
-        if final_plain.is_empty() {
-            return Err(anyhow!("Empty plaintext after decrypt"));
         }
         let pad_len = match final_plain.last() {
             Some(&v) => v as usize,
@@ -464,7 +506,7 @@ impl DownloadUtils {
     pub fn decrypt_cbc(cipher_key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
         let mut output = Vec::new();
         aes_256_cbc_decrypt_into(ciphertext, cipher_key, iv, &mut output)
-            .map_err(|e| anyhow!(e.to_string()))?;
+            .map_err(anyhow::Error::new)?;
         Ok(output)
     }
 
@@ -484,8 +526,8 @@ impl DownloadUtils {
         let (iv, cipher_key, mac_key) = Self::get_media_keys(media_key, media_type)?;
 
         let computed_mac_full = {
-            let mut mac = CryptographicMac::new("HmacSha256", &mac_key)
-                .map_err(|e| MediaDecryptionError::Decryption(e.to_string()))?;
+            let mut mac =
+                CryptographicMac::new("HmacSha256", &mac_key).map_err(MediaDecryptionError::Mac)?;
             mac.update(&iv);
             mac.update(ciphertext);
             mac.finalize()
@@ -496,7 +538,7 @@ impl DownloadUtils {
 
         let mut output = Vec::new();
         aes_256_cbc_decrypt_into(ciphertext, &cipher_key, &iv, &mut output)
-            .map_err(|e| MediaDecryptionError::Decryption(e.to_string()))?;
+            .map_err(MediaDecryptionError::Decryption)?;
         Ok(output)
     }
 }
@@ -674,5 +716,27 @@ mod tests {
             DownloadUtils::copy_and_validate_plaintext_to_writer(reader, &wrong_hash, &mut writer)
                 .unwrap_err();
         assert!(err.to_string().contains("SHA-256 mismatch"));
+    }
+
+    #[test]
+    fn media_decryption_decryption_preserves_aes_cbc_source() {
+        let inner = AesCbcDecryptionError::BadKeyOrIv;
+        let mde = MediaDecryptionError::Decryption(inner);
+        let src = std::error::Error::source(&mde).expect("source preserved");
+        let cbc = src
+            .downcast_ref::<AesCbcDecryptionError>()
+            .expect("downcasts to AesCbcDecryptionError");
+        assert!(matches!(cbc, AesCbcDecryptionError::BadKeyOrIv));
+    }
+
+    #[test]
+    fn media_decryption_mac_preserves_crypto_error_source() {
+        let inner = CryptoError::UnknownAlgorithm("MAC", "BogusAlg".into());
+        let mde = MediaDecryptionError::Mac(inner);
+        let src = std::error::Error::source(&mde).expect("source preserved");
+        let ce = src
+            .downcast_ref::<CryptoError>()
+            .expect("downcasts to CryptoError");
+        assert!(matches!(ce, CryptoError::UnknownAlgorithm("MAC", _)));
     }
 }

@@ -3,14 +3,15 @@ use crate::types::events::{Event, Receipt};
 use crate::types::presence::ReceiptType;
 use log::debug;
 use std::sync::Arc;
+use wacore::types::message::MessageCategory;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::jid::{Jid, JidExt as _};
+use wacore_binary::{Jid, JidExt as _};
 
-use wacore_binary::node::Node;
+use wacore_binary::OwnedNodeRef;
 
 impl Client {
     fn should_send_delivery_receipt(info: &crate::types::message::MessageInfo) -> bool {
-        use wacore_binary::jid::STATUS_BROADCAST_USER;
+        use wacore_binary::STATUS_BROADCAST_USER;
 
         if info.id.is_empty()
             || info.source.chat.user == STATUS_BROADCAST_USER
@@ -23,11 +24,12 @@ impl Client {
         // messages (category="peer").  These tell the primary phone that
         // this companion device received the message.
         // For all other messages, skip receipts for our own messages.
-        info.category == "peer" || !info.source.is_from_me
+        info.category == MessageCategory::Peer || !info.source.is_from_me
     }
 
-    pub(crate) async fn handle_receipt(self: &Arc<Self>, node: Arc<Node>) {
-        let mut attrs = node.attrs();
+    pub(crate) async fn handle_receipt(self: &Arc<Self>, node: Arc<OwnedNodeRef>) {
+        let nr = node.get();
+        let mut attrs = nr.attrs();
         let from = attrs.jid("from");
         let id = match attrs.optional_string("id") {
             Some(id) => id.to_string(),
@@ -39,84 +41,31 @@ impl Client {
         let receipt_type_cow = attrs.optional_string("type");
         let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
         let participant = attrs.optional_jid("participant");
-        let recipient = attrs.optional_jid("recipient");
-        // `t` is the read/delivery time in unix seconds. Use it — NOT local
-        // arrival time — so a self-read receipt that arrives in the reconnect
-        // backlog stamps its watermark at the moment the phone actually read,
-        // rather than at connect time (which would over-suppress messages that
-        // are genuinely unread on the phone).
-        let receipt_ts = attrs
-            .optional_u64("t")
-            .filter(|&t| t > 0)
-            .and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0))
-            .unwrap_or_else(wacore::time::now_utc);
 
-        let receipt_type = ReceiptType::from(receipt_type_str.to_string());
+        let receipt_type = ReceiptType::parse(receipt_type_str);
 
         debug!("Received receipt type '{receipt_type:?}' for message {id} from {from}");
 
-        // Collect EVERY acked message id: the primary `id` attr plus any in the
-        // <list><item id="..."/></list> extension. Official clients ack all unread
-        // ids in one receipt; without this only the first id updated tick state.
-        let mut message_ids = vec![id.clone()];
-        if let Some(list) = node.get_optional_child("list") {
-            for item in list.get_children_by_tag("item") {
-                if let Some(item_id) = item.attrs().optional_string("id") {
-                    let item_id = item_id.to_string();
-                    if item_id != id {
-                        message_ids.push(item_id);
-                    }
-                }
-            }
-        }
-
-        let from_clone = from.clone();
-        let sender = if from.is_group() {
-            if let Some(participant) = participant.clone() {
-                participant
-            } else {
-                from_clone
-            }
+        let is_group = from.is_group();
+        let sender = if is_group {
+            participant.unwrap_or_else(|| from.clone())
         } else {
             from.clone()
         };
 
-        // Resolve whether this receipt reports OUR OWN read fanned back to this
-        // companion by the server. For a DM self-read the stanza carries
-        // from=<own jid> and the real chat in the `recipient` attr; without
-        // resolving it the chat wrongly becomes our own JID (whatsmeow
-        // parseMessageSource parity).
-        let snapshot = self.persistence_manager.get_device_snapshot().await;
-        let from_is_self = match (&snapshot.pn, &snapshot.lid) {
-            (Some(pn), lid) => from.matches_user_or_lid(pn, lid.as_ref()),
-            (None, Some(lid)) => from.is_same_user_as(lid),
-            (None, None) => false,
-        };
-        let (chat, is_from_me) = if from_is_self && !from.is_group() {
-            match recipient {
-                Some(r) => (r.to_non_ad(), true),
-                None => (from.to_non_ad(), true),
-            }
-        } else {
-            (from.clone(), false)
-        };
-
         let receipt = Receipt {
-            message_ids: message_ids.clone(),
+            message_ids: vec![id],
             source: crate::types::message::MessageSource {
-                chat,
-                sender: sender.clone(),
-                is_from_me,
+                chat: from,
+                sender,
                 ..Default::default()
             },
-            timestamp: receipt_ts,
-            r#type: receipt_type.clone(),
-            message_sender: sender.clone(),
+            timestamp: wacore::time::now_utc(),
+            r#type: receipt_type,
         };
 
-        if receipt_type == ReceiptType::Retry {
+        if receipt.r#type == ReceiptType::Retry {
             let client_clone = Arc::clone(self);
-            // Arc clone is cheap - just reference count increment
             let node_clone = Arc::clone(&node);
             self.runtime
                 .spawn(Box::pin(async move {
@@ -132,36 +81,36 @@ impl Client {
                     }
                 }))
                 .detach();
-        } else if receipt_type == ReceiptType::EncRekeyRetry {
+        } else if receipt.r#type == ReceiptType::EncRekeyRetry {
             // WA Web: both "retry" and "enc_rekey_retry" route through
             // handleMessageRetryRequest, but enc_rekey_retry branches to the
             // VoIP stack's resendEncRekeyRetry(peerJid, retryCount).
             // Since we don't have a VoIP stack yet, log and dispatch as a
             // Receipt event so consumers can observe it. When VoIP is
             // implemented (#345), this will route to the VoIP re-key handler.
-            if let Some(child) = node.get_optional_child("enc_rekey") {
-                let mut attrs = child.attrs();
+            if let Some(child) = nr.get_optional_child("enc_rekey") {
+                let mut child_attrs = child.attrs();
                 log::debug!(
                     "Received enc_rekey_retry receipt for call-id={} from {} \
                      (call-creator={}, count={}). VoIP not implemented, forwarding as event.",
-                    attrs
+                    child_attrs
                         .optional_string("call-id")
                         .as_deref()
                         .unwrap_or_default(),
-                    from,
-                    attrs
+                    receipt.source.chat,
+                    child_attrs
                         .optional_string("call-creator")
                         .as_deref()
                         .unwrap_or_default(),
-                    attrs
+                    child_attrs
                         .optional_string("count")
                         .and_then(|s| s.parse::<u8>().ok())
                         .unwrap_or(1),
                 );
             }
-            self.core.event_bus.dispatch(&Event::Receipt(receipt));
+            self.core.event_bus.dispatch(Event::Receipt(receipt));
         } else {
-            self.core.event_bus.dispatch(&Event::Receipt(receipt));
+            self.core.event_bus.dispatch(Event::Receipt(receipt));
         }
     }
 
@@ -181,26 +130,28 @@ impl Client {
 
         let mut builder = NodeBuilder::new("receipt")
             .attr("id", &info.id)
-            .attr("to", info.source.chat.clone());
+            .attr("to", &info.source.chat);
 
         // WA Web: peer device messages (category="peer") use type="peer_msg".
         // Normal delivery receipts omit the type attribute (DROP_ATTR).
-        if info.category == "peer" {
+        if info.category == MessageCategory::Peer {
             builder = builder.attr("type", "peer_msg");
         }
 
         // For group messages, the 'participant' attribute is required to identify the sender.
         if info.source.is_group {
-            builder = builder.attr("participant", info.source.sender.clone());
+            builder = builder.attr("participant", &info.source.sender);
         }
 
         let receipt_node = builder.build();
 
         debug!(target: "Client/Receipt", "Sending {} receipt for message {} to {}",
-            if info.category == "peer" { "peer_msg" } else { "delivery" },
+            if info.category == MessageCategory::Peer { "peer_msg" } else { "delivery" },
             info.id, info.source.sender);
 
-        if let Err(e) = self.send_node(receipt_node).await {
+        if let Err(e) = self.send_node(receipt_node).await
+            && !matches!(e, crate::client::ClientError::NotConnected)
+        {
             log::warn!(target: "Client/Receipt", "Failed to send delivery receipt for message {}: {:?}", info.id, e);
         }
     }
@@ -221,18 +172,18 @@ impl Client {
         let timestamp = (wacore::time::now_secs() as u64).to_string();
 
         let mut builder = NodeBuilder::new("receipt")
-            .attr("to", chat.clone())
+            .attr("to", chat)
             .attr("type", "read")
             .attr("id", &message_ids[0])
             .attr("t", &timestamp);
 
         if let Some(sender) = sender {
-            builder = builder.attr("participant", sender.clone());
+            builder = builder.attr("participant", sender);
         }
 
         // Additional message IDs go into <list><item id="..."/></list>
         if message_ids.len() > 1 {
-            let items: Vec<wacore_binary::node::Node> = message_ids[1..]
+            let items: Vec<wacore_binary::Node> = message_ids[1..]
                 .iter()
                 .map(|id| NodeBuilder::new("item").attr("id", id).build())
                 .collect();
@@ -253,32 +204,11 @@ impl Client {
 mod tests {
     use super::*;
     use crate::store::persistence_manager::PersistenceManager;
-    use crate::test_utils::MockHttpClient;
+    use crate::test_utils::{MockHttpClient, TestEventCollector};
     use crate::types::message::{MessageInfo, MessageSource};
-    use std::sync::Mutex;
-    use wacore::types::events::EventHandler;
 
-    #[derive(Default)]
-    struct TestEventCollector {
-        events: Mutex<Vec<Event>>,
-    }
-
-    impl EventHandler for TestEventCollector {
-        fn handle_event(&self, event: &Event) {
-            self.events
-                .lock()
-                .expect("collector mutex should not be poisoned")
-                .push(event.clone());
-        }
-    }
-
-    impl TestEventCollector {
-        fn events(&self) -> Vec<Event> {
-            self.events
-                .lock()
-                .expect("collector mutex should not be poisoned")
-                .clone()
-        }
+    fn node_to_arc(node: wacore_binary::Node) -> Arc<OwnedNodeRef> {
+        crate::test_utils::node_to_owned_ref(&node)
     }
 
     #[tokio::test]
@@ -516,7 +446,7 @@ mod tests {
                 is_group: false,
                 ..Default::default()
             },
-            category: "peer".to_string(),
+            category: MessageCategory::Peer,
             ..Default::default()
         };
 
@@ -555,7 +485,7 @@ mod tests {
         let (client, collector) = setup_client_with_collector().await;
 
         // Build an enc_rekey_retry receipt node matching WA Web structure
-        let node = Arc::new(
+        let node = node_to_arc(
             NodeBuilder::new("receipt")
                 .attr("from", "5511999999999@s.whatsapp.net")
                 .attr("id", "3EB0AABBCCDD")
@@ -579,7 +509,7 @@ mod tests {
         let events = collector.events();
         let receipt_events: Vec<_> = events
             .iter()
-            .filter_map(|e| match e {
+            .filter_map(|e| match &**e {
                 Event::Receipt(r) => Some(r),
                 _ => None,
             })
@@ -604,7 +534,7 @@ mod tests {
         let (client, collector) = setup_client_with_collector().await;
 
         // Malformed: no <enc_rekey> child
-        let node = Arc::new(
+        let node = node_to_arc(
             NodeBuilder::new("receipt")
                 .attr("from", "5511999999999@s.whatsapp.net")
                 .attr("id", "3EB0AABBCCDD")
@@ -618,7 +548,7 @@ mod tests {
         let events = collector.events();
         let receipt_events: Vec<_> = events
             .iter()
-            .filter_map(|e| match e {
+            .filter_map(|e| match &**e {
                 Event::Receipt(r) => Some(r),
                 _ => None,
             })
@@ -660,7 +590,7 @@ mod tests {
     /// ensuring the NodeValue::Jid optimization is not accidentally regressed to to_string.
     #[test]
     fn test_receipt_node_uses_jid_attrs() {
-        use wacore_binary::node::NodeValue;
+        use wacore_binary::NodeValue;
 
         let chat_jid: Jid = "120363021033254949@g.us"
             .parse()
@@ -696,51 +626,5 @@ mod tests {
             participant_attr
         );
         assert_eq!(participant_attr.to_jid().unwrap(), sender_jid);
-    }
-
-    /// A read receipt with a <list><item id=.../> extension must surface EVERY
-    /// message id (primary `id` + all items) in the dispatched Receipt event, and
-    /// must parse the `t` attribute into the receipt timestamp (not local time).
-    #[tokio::test]
-    async fn test_read_receipt_collects_list_item_ids_and_t() {
-        let (client, collector) = setup_client_with_collector().await;
-
-        let node = Arc::new(
-            NodeBuilder::new("receipt")
-                .attr("from", "5511999999999@s.whatsapp.net")
-                .attr("id", "MSG-1")
-                .attr("type", "read")
-                .attr("t", "1700000000")
-                .children([NodeBuilder::new("list")
-                    .children([
-                        NodeBuilder::new("item").attr("id", "MSG-2").build(),
-                        NodeBuilder::new("item").attr("id", "MSG-3").build(),
-                        // Duplicate of the primary id must not be added twice.
-                        NodeBuilder::new("item").attr("id", "MSG-1").build(),
-                    ])
-                    .build()])
-                .build(),
-        );
-
-        client.handle_receipt(node).await;
-
-        let events = collector.events();
-        let receipt = events
-            .iter()
-            .find_map(|e| match e {
-                Event::Receipt(r) => Some(r),
-                _ => None,
-            })
-            .expect("must dispatch a Receipt event");
-        assert_eq!(
-            receipt.message_ids,
-            vec!["MSG-1", "MSG-2", "MSG-3"],
-            "receipt must ack the primary id plus all <list><item> ids, deduped"
-        );
-        assert_eq!(
-            receipt.timestamp.timestamp(),
-            1_700_000_000,
-            "the `t` attribute must be parsed into the receipt timestamp"
-        );
     }
 }

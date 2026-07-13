@@ -9,17 +9,18 @@ use crate::features::groups::GroupParticipant;
 use crate::features::mex::{MexError, MexRequest};
 use log::warn;
 use serde_json::json;
-use wacore::iq::community::mex_docs;
 use wacore::iq::groups::{
     DeleteCommunityIq, GetLinkedGroupsParticipantsIq, GroupCreateIq, GroupCreateOptions,
     JoinLinkedGroupIq, LinkSubgroupsIq, QueryLinkedGroupIq, UnlinkSubgroupsIq,
 };
-use wacore_binary::jid::Jid;
+use wacore::iq::mex_ids::community as community_docs;
+use wacore_binary::Jid;
 
 // Types
 
 /// Classification of a group within the community hierarchy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GroupType {
     /// Regular standalone group (not part of a community).
     Default,
@@ -34,7 +35,7 @@ pub enum GroupType {
 }
 
 /// Options for creating a new community.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateCommunityOptions {
     pub name: String,
     pub description: Option<String>,
@@ -61,12 +62,11 @@ impl CreateCommunityOptions {
 /// Result of creating a community.
 #[derive(Debug, Clone)]
 pub struct CreateCommunityResult {
-    /// JID of the created community parent group.
-    pub gid: Jid,
+    pub metadata: GroupMetadata,
 }
 
 /// A subgroup within a community.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommunitySubgroup {
     pub id: Jid,
     pub subject: String,
@@ -76,14 +76,14 @@ pub struct CommunitySubgroup {
 }
 
 /// Result of linking subgroups to a community.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinkSubgroupsResult {
     pub linked_jids: Vec<Jid>,
     pub failed_groups: Vec<(Jid, u32)>,
 }
 
 /// Result of unlinking subgroups from a community.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnlinkSubgroupsResult {
     pub unlinked_jids: Vec<Jid>,
     pub failed_groups: Vec<(Jid, u32)>,
@@ -134,22 +134,23 @@ impl<'a> Community<'a> {
             ..Default::default()
         };
 
-        let gid = self
+        let group = self
             .client
             .execute(GroupCreateIq::new(create_options))
             .await?;
+        let mut metadata = GroupMetadata::from(group);
 
-        // Set description via follow-up IQ if provided
         if let Some(desc_text) = description
             && let Ok(desc) = wacore::iq::groups::GroupDescription::new(&desc_text)
         {
             self.client
                 .groups()
-                .set_description(&gid, Some(desc), None)
+                .set_description(&metadata.id, Some(desc), None)
                 .await?;
+            metadata.description = Some(desc_text);
         }
 
-        Ok(CreateCommunityResult { gid })
+        Ok(CreateCommunityResult { metadata })
     }
 
     /// Deactivate (delete) a community. Subgroups are unlinked but not deleted.
@@ -171,8 +172,8 @@ impl<'a> Community<'a> {
             .execute(LinkSubgroupsIq::new(community_jid, subgroup_jids))
             .await?;
 
-        let mut linked_jids = Vec::new();
-        let mut failed_groups = Vec::new();
+        let mut linked_jids = Vec::with_capacity(response.groups.len());
+        let mut failed_groups = Vec::with_capacity(response.groups.len());
 
         for group in response.groups {
             if let Some(error) = group.error {
@@ -204,8 +205,8 @@ impl<'a> Community<'a> {
             ))
             .await?;
 
-        let mut unlinked_jids = Vec::new();
-        let mut failed_groups = Vec::new();
+        let mut unlinked_jids = Vec::with_capacity(response.groups.len());
+        let mut failed_groups = Vec::with_capacity(response.groups.len());
 
         for group in response.groups {
             if let Some(error) = group.error {
@@ -230,7 +231,7 @@ impl<'a> Community<'a> {
             .client
             .mex()
             .query(MexRequest {
-                doc_id: mex_docs::FETCH_ALL_SUBGROUPS,
+                doc: community_docs::FETCH_ALL_SUBGROUPS,
                 variables: json!({
                     "group_id": community_jid.to_string()
                 }),
@@ -277,7 +278,7 @@ impl<'a> Community<'a> {
             .client
             .mex()
             .query(MexRequest {
-                doc_id: mex_docs::FETCH_SUBGROUP_PARTICIPANT_COUNT,
+                doc: community_docs::FETCH_SUBGROUP_PARTICIPANT_COUNT,
                 variables: json!({
                     "input": {
                         "group_jid": community_jid.to_string()
@@ -291,11 +292,13 @@ impl<'a> Community<'a> {
             .ok_or_else(|| MexError::PayloadParsing("missing data field".into()))?;
 
         let group_query = &data["xwa2_group_query_by_id"];
-        let mut counts = Vec::new();
+        let edges_ref = group_query
+            .get("sub_groups")
+            .and_then(|s| s.get("edges"))
+            .and_then(|e| e.as_array());
+        let mut counts = Vec::with_capacity(edges_ref.map_or(0, |e| e.len()));
 
-        if let Some(sub_groups) = group_query.get("sub_groups")
-            && let Some(edges) = sub_groups.get("edges").and_then(|e| e.as_array())
-        {
+        if let Some(edges) = edges_ref {
             for edge in edges {
                 if let Some(node) = edge.get("node") {
                     let id_str = node["id"].as_str().unwrap_or_default();

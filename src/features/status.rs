@@ -1,23 +1,25 @@
-use wacore::StringEnum;
-use wacore_binary::jid::Jid;
+use wacore::WireEnum;
+use wacore_binary::Jid;
 use waproto::whatsapp as wa;
 
 use crate::client::Client;
+use crate::send::SendResult;
 use crate::upload::UploadResponse;
 
 /// Privacy setting sent in the `<meta>` node of the status stanza.
 /// Matches WhatsApp Web's `status_setting` attribute.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StringEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
+#[non_exhaustive]
 pub enum StatusPrivacySetting {
     /// Send to all contacts in address book.
-    #[string_default]
-    #[str = "contacts"]
+    #[wire_default]
+    #[wire = "contacts"]
     Contacts,
     /// Send only to contacts in an allow list.
-    #[str = "allowlist"]
+    #[wire = "allowlist"]
     AllowList,
     /// Send to all contacts except those in a deny list.
-    #[str = "denylist"]
+    #[wire = "denylist"]
     DenyList,
 }
 
@@ -47,9 +49,9 @@ impl<'a> Status<'a> {
         text: &str,
         background_argb: u32,
         font: i32,
-        recipients: Vec<Jid>,
+        recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<SendResult, anyhow::Error> {
         let message = wa::Message {
             extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
                 text: Some(text.to_string()),
@@ -71,19 +73,19 @@ impl<'a> Status<'a> {
     /// the `UploadResponse`, JPEG thumbnail bytes, and optional caption.
     pub async fn send_image(
         &self,
-        upload: &UploadResponse,
+        upload: UploadResponse,
         thumbnail: Vec<u8>,
         caption: Option<&str>,
-        recipients: Vec<Jid>,
+        recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<SendResult, anyhow::Error> {
         let message = wa::Message {
             image_message: Some(Box::new(wa::message::ImageMessage {
-                url: Some(upload.url.clone()),
-                direct_path: Some(upload.direct_path.clone()),
-                media_key: Some(upload.media_key.clone()),
-                file_sha256: Some(upload.file_sha256.clone()),
-                file_enc_sha256: Some(upload.file_enc_sha256.clone()),
+                url: Some(upload.url),
+                direct_path: Some(upload.direct_path),
+                media_key: Some(upload.media_key.to_vec()),
+                file_sha256: Some(upload.file_sha256.to_vec()),
+                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
                 file_length: Some(upload.file_length),
                 mimetype: Some("image/jpeg".to_string()),
                 jpeg_thumbnail: Some(thumbnail),
@@ -104,20 +106,20 @@ impl<'a> Status<'a> {
     /// the `UploadResponse`, JPEG thumbnail bytes, duration in seconds, and optional caption.
     pub async fn send_video(
         &self,
-        upload: &UploadResponse,
+        upload: UploadResponse,
         thumbnail: Vec<u8>,
         duration_seconds: u32,
         caption: Option<&str>,
-        recipients: Vec<Jid>,
+        recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<SendResult, anyhow::Error> {
         let message = wa::Message {
             video_message: Some(Box::new(wa::message::VideoMessage {
-                url: Some(upload.url.clone()),
-                direct_path: Some(upload.direct_path.clone()),
-                media_key: Some(upload.media_key.clone()),
-                file_sha256: Some(upload.file_sha256.clone()),
-                file_enc_sha256: Some(upload.file_enc_sha256.clone()),
+                url: Some(upload.url),
+                direct_path: Some(upload.direct_path),
+                media_key: Some(upload.media_key.to_vec()),
+                file_sha256: Some(upload.file_sha256.to_vec()),
+                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
                 file_length: Some(upload.file_length),
                 mimetype: Some("video/mp4".to_string()),
                 jpeg_thumbnail: Some(thumbnail),
@@ -139,9 +141,9 @@ impl<'a> Status<'a> {
     pub async fn send_raw(
         &self,
         message: wa::Message,
-        recipients: Vec<Jid>,
+        recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<SendResult, anyhow::Error> {
         self.client
             .send_status_message(message, recipients, options)
             .await
@@ -154,9 +156,9 @@ impl<'a> Status<'a> {
     pub async fn revoke(
         &self,
         message_id: impl Into<String>,
-        recipients: Vec<Jid>,
+        recipients: &[Jid],
         options: StatusSendOptions,
-    ) -> Result<String, anyhow::Error> {
+    ) -> Result<SendResult, anyhow::Error> {
         let message_id = message_id.into();
         let to = Jid::status_broadcast();
 
@@ -186,10 +188,10 @@ impl Client {
     /// # Example
     /// ```no_run
     /// # async fn example(client: &whatsapp_rust::Client) -> anyhow::Result<()> {
-    /// let recipients = vec![whatsapp_rust::Jid::pn("15551234567")];
+    /// let recipients = [whatsapp_rust::Jid::pn("15551234567")];
     /// let id = client
     ///     .status()
-    ///     .send_text("Hello!", 0xFF1E6E4F, 0, recipients, Default::default())
+    ///     .send_text("Hello!", 0xFF1E6E4F, 0, &recipients, Default::default())
     ///     .await?;
     /// # Ok(())
     /// # }

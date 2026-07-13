@@ -10,9 +10,9 @@
 use crate::appstate::hash::HashState;
 use crate::store::error::Result;
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use wacore_appstate::processor::AppStateMutationMAC;
-use wacore_binary::jid::Jid;
 
 /// App state synchronization key for WhatsApp's app state protocol.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -70,6 +70,10 @@ pub struct DeviceListRecord {
     pub timestamp: i64,
     /// Participant hash from usync, if available
     pub phash: Option<String>,
+    /// ADV raw_id from `ADVKeyIndexList` — used to detect identity changes.
+    /// When this changes, all sessions and sender keys for the user must be cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_id: Option<u32>,
 }
 
 /// Signal protocol cryptographic storage operations.
@@ -84,8 +88,8 @@ pub trait SignalStore: Send + Sync {
     /// Store an identity key for a remote address.
     async fn put_identity(&self, address: &str, key: [u8; 32]) -> Result<()>;
 
-    /// Load an identity key for a remote address.
-    async fn load_identity(&self, address: &str) -> Result<Option<Vec<u8>>>;
+    /// Load an identity key for a remote address (always 32 bytes).
+    async fn load_identity(&self, address: &str) -> Result<Option<[u8; 32]>>;
 
     /// Delete an identity key.
     async fn delete_identity(&self, address: &str) -> Result<()>;
@@ -93,7 +97,7 @@ pub trait SignalStore: Send + Sync {
     // --- Session Operations ---
 
     /// Get an encrypted session for an address.
-    async fn get_session(&self, address: &str) -> Result<Option<Vec<u8>>>;
+    async fn get_session(&self, address: &str) -> Result<Option<Bytes>>;
 
     /// Store an encrypted session.
     async fn put_session(&self, address: &str, session: &[u8]) -> Result<()>;
@@ -113,7 +117,7 @@ pub trait SignalStore: Send + Sync {
 
     /// Store multiple pre-keys in a single batch operation.
     /// Default implementation falls back to individual `store_prekey` calls.
-    async fn store_prekeys_batch(&self, keys: &[(u32, Vec<u8>)], uploaded: bool) -> Result<()> {
+    async fn store_prekeys_batch(&self, keys: &[(u32, Bytes)], uploaded: bool) -> Result<()> {
         for (id, record) in keys {
             self.store_prekey(*id, record, uploaded).await?;
         }
@@ -121,7 +125,19 @@ pub trait SignalStore: Send + Sync {
     }
 
     /// Load a pre-key by ID.
-    async fn load_prekey(&self, id: u32) -> Result<Option<Vec<u8>>>;
+    async fn load_prekey(&self, id: u32) -> Result<Option<Bytes>>;
+
+    /// Load multiple pre-keys by ID in a single batch operation.
+    /// Returns only the keys that exist.
+    async fn load_prekeys_batch(&self, ids: &[u32]) -> Result<Vec<(u32, Bytes)>> {
+        let mut result = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(record) = self.load_prekey(id).await? {
+                result.push((id, record));
+            }
+        }
+        Ok(result)
+    }
 
     /// Remove a pre-key.
     async fn remove_prekey(&self, id: u32) -> Result<()>;
@@ -199,16 +215,28 @@ pub trait AppSyncStore: Send + Sync {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait ProtocolStore: Send + Sync {
-    // --- SKDM Tracking ---
+    // --- Per-Device Sender Key Tracking (matches WA Web's participant.senderKey Map) ---
 
-    /// Get device JIDs that have received SKDM for a group.
-    async fn get_skdm_recipients(&self, group_jid: &str) -> Result<Vec<Jid>>;
+    /// Get the sender key distribution status for all known devices in a group.
+    /// Returns `(device_jid_string, has_key)` pairs where `has_key` indicates
+    /// whether the device has a valid sender key (`true`) or needs fresh SKDM (`false`).
+    async fn get_sender_key_devices(&self, group_jid: &str) -> Result<Vec<(String, bool)>>;
 
-    /// Record devices that have received SKDM for a group.
-    async fn add_skdm_recipients(&self, group_jid: &str, device_jids: &[Jid]) -> Result<()>;
+    /// Set sender key status for devices. Called with `has_key=true` after successful
+    /// SKDM distribution (WA Web: `markHasSenderKey`), or `has_key=false` to mark
+    /// devices as needing fresh SKDM (WA Web: `markForgetSenderKey`).
+    async fn set_sender_key_status(&self, group_jid: &str, entries: &[(&str, bool)]) -> Result<()>;
 
-    /// Clear SKDM recipients for a group (call when sender key is rotated).
-    async fn clear_skdm_recipients(&self, group_jid: &str) -> Result<()>;
+    /// Clear all sender key device tracking for a group (on sender key rotation).
+    async fn clear_sender_key_devices(&self, group_jid: &str) -> Result<()>;
+
+    /// Delete specific `sender_key_devices` rows by device JID across all groups.
+    /// Mirrors WA Web's per-group `senderKey.delete(deviceJid)` cleanup.
+    async fn delete_sender_key_device_rows(&self, device_jids: &[&str]) -> Result<()>;
+
+    /// Clear all sender key device tracking across ALL groups.
+    /// Called on identity change (raw_id mismatch) to force SKDM redistribution.
+    async fn clear_all_sender_key_devices(&self) -> Result<()>;
 
     // --- LID-PN Mapping ---
 
@@ -220,6 +248,16 @@ pub trait ProtocolStore: Send + Sync {
 
     /// Store or update a LID-PN mapping.
     async fn put_lid_mapping(&self, entry: &LidPnMappingEntry) -> Result<()>;
+
+    /// Batched variant of `put_lid_mapping`. Backends should override with a
+    /// single transaction; the default loops for correctness. Mirrors WA Web's
+    /// `WAWebDBCreateLidPnMappings.createLidPnMappings({ mappings, … })`.
+    async fn put_lid_mappings(&self, entries: &[LidPnMappingEntry]) -> Result<()> {
+        for entry in entries {
+            self.put_lid_mapping(entry).await?;
+        }
+        Ok(())
+    }
 
     /// Get all LID-PN mappings (for cache warm-up).
     async fn get_all_lid_mappings(&self) -> Result<Vec<LidPnMappingEntry>>;
@@ -245,17 +283,22 @@ pub trait ProtocolStore: Send + Sync {
     /// Update the device list for a user (called after usync responses).
     async fn update_device_list(&self, record: DeviceListRecord) -> Result<()>;
 
+    /// Batched variant of `update_device_list`. Backends should override with
+    /// a single transaction; the default loops for correctness. Important on
+    /// usync of large groups, where the per-row commit + spawn_blocking
+    /// overhead dominates wall-clock time when called once per participant.
+    async fn update_device_lists(&self, records: Vec<DeviceListRecord>) -> Result<()> {
+        for record in records {
+            self.update_device_list(record).await?;
+        }
+        Ok(())
+    }
+
     /// Get all known devices for a user.
     async fn get_devices(&self, user: &str) -> Result<Option<DeviceListRecord>>;
 
-    // --- Sender Key Status (Lazy Deletion) ---
-
-    /// Mark a participant's sender key as needing regeneration for a group.
-    async fn mark_forget_sender_key(&self, group_jid: &str, participant: &str) -> Result<()>;
-
-    /// Get participants that need fresh SKDM (marked for forget).
-    /// Consumes the marks (deletes them after reading).
-    async fn consume_forget_marks(&self, group_jid: &str) -> Result<Vec<String>>;
+    /// Delete a device list record, forcing a network re-fetch on next query.
+    async fn delete_devices(&self, user: &str) -> Result<()>;
 
     // --- TcToken Storage ---
 

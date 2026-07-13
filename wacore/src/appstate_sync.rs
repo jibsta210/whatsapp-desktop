@@ -9,22 +9,38 @@ use thiserror::Error;
 
 use crate::appstate::hash::HashState;
 use crate::appstate::keys::ExpandedAppStateKeys;
-use crate::appstate::patch_decode::{PatchList, WAPatchName, parse_patch_list, parse_patch_lists};
+use crate::appstate::patch_decode::{
+    PatchList, WAPatchName, parse_patch_list, parse_patch_list_ref, parse_patch_lists,
+    parse_patch_lists_ref,
+};
 use crate::appstate::{
     collect_key_ids_from_patch_list, expand_app_state_keys, process_patch, process_snapshot,
 };
 use crate::store::traits::Backend;
-use wacore_binary::node::Node;
+use wacore_binary::{Node, NodeRef};
 use waproto::whatsapp as wa;
 
 // Re-export Mutation from appstate for convenience
 pub use crate::appstate::Mutation;
 
+fn lookup_app_state_key(
+    keys_map: &HashMap<String, Arc<ExpandedAppStateKeys>>,
+    key_id: &[u8],
+) -> Result<ExpandedAppStateKeys, crate::appstate::AppStateError> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD_NO_PAD;
+    let id_b64 = STANDARD_NO_PAD.encode(key_id);
+    keys_map
+        .get(&id_b64)
+        .map(|arc| (**arc).clone())
+        .ok_or(crate::appstate::AppStateError::KeyNotFound)
+}
+
 #[derive(Debug, Error)]
 pub enum AppStateSyncError {
     #[error("app state key not found: {0}")]
     KeyNotFound(String),
-    #[error("store error: {0}")]
+    #[error("store error")]
     Store(#[from] crate::store::error::StoreError),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -77,6 +93,66 @@ impl AppStateProcessor {
             let _ = self.get_app_state_key(&key_id).await;
         }
         Ok(())
+    }
+
+    pub async fn decode_patch_list_ref<FDownload>(
+        &self,
+        stanza_root: &NodeRef<'_>,
+        download: FDownload,
+        validate_macs: bool,
+    ) -> Result<(Vec<Mutation>, HashState, PatchList)>
+    where
+        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
+    {
+        let mut pl = parse_patch_list_ref(stanza_root)?;
+
+        // Download external snapshot if present (matches WhatsApp Web behavior)
+        if pl.snapshot.is_none()
+            && let Some(ext) = &pl.snapshot_ref
+            && let Ok(data) = download(ext)
+            && let Ok(snapshot) = wa::SyncdSnapshot::decode(data.as_slice())
+        {
+            pl.snapshot = Some(snapshot);
+        }
+
+        // Download external mutations for each patch (matches WhatsApp Web behavior)
+        for patch in &mut pl.patches {
+            if let Some(ext) = &patch.external_mutations {
+                let patch_version = patch.version.as_ref().and_then(|v| v.version).unwrap_or(0);
+                match download(ext) {
+                    Ok(data) => match wa::SyncdMutations::decode(data.as_slice()) {
+                        Ok(ext_mutations) => {
+                            log::trace!(
+                                target: "AppState",
+                                "Downloaded external mutations for patch v{}: {} mutations (inline had {})",
+                                patch_version,
+                                ext_mutations.mutations.len(),
+                                patch.mutations.len()
+                            );
+                            patch.mutations = ext_mutations.mutations;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                target: "AppState",
+                                "Failed to decode external mutations for patch v{}: {}",
+                                patch_version,
+                                e
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        log::warn!(
+                            target: "AppState",
+                            "Failed to download external mutations for patch v{}: {}",
+                            patch_version,
+                            e
+                        );
+                    }
+                }
+            }
+        }
+
+        self.process_patch_list(pl, validate_macs).await
     }
 
     pub async fn decode_patch_list<FDownload>(
@@ -140,6 +216,20 @@ impl AppStateProcessor {
         self.process_patch_list(pl, validate_macs).await
     }
 
+    pub async fn decode_multi_patch_list_ref<FDownload>(
+        &self,
+        stanza_root: &NodeRef<'_>,
+        download: &FDownload,
+        validate_macs: bool,
+    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>>
+    where
+        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
+    {
+        let patch_lists = parse_patch_lists_ref(stanza_root)?;
+        self.process_patch_lists(patch_lists, download, validate_macs)
+            .await
+    }
+
     /// Decode a multi-collection IQ response into per-collection results.
     /// Each collection is parsed and processed independently.
     pub async fn decode_multi_patch_list<FDownload>(
@@ -152,6 +242,19 @@ impl AppStateProcessor {
         FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
     {
         let patch_lists = parse_patch_lists(stanza_root)?;
+        self.process_patch_lists(patch_lists, download, validate_macs)
+            .await
+    }
+
+    async fn process_patch_lists<FDownload>(
+        &self,
+        patch_lists: Vec<PatchList>,
+        download: &FDownload,
+        validate_macs: bool,
+    ) -> Result<Vec<(Vec<Mutation>, HashState, PatchList)>>
+    where
+        FDownload: Fn(&wa::ExternalBlobReference) -> Result<Vec<u8>> + Send + Sync,
+    {
         let mut results = Vec::with_capacity(patch_lists.len());
 
         for mut pl in patch_lists {
@@ -254,24 +357,11 @@ impl AppStateProcessor {
 
             // Offload CPU-intensive snapshot processing to a blocking thread
             let result = crate::runtime::blocking(&*self.runtime, move || {
-                let get_keys = |key_id: &[u8]| -> Result<
-                    ExpandedAppStateKeys,
-                    crate::appstate::AppStateError,
-                > {
-                    use base64::Engine;
-                    use base64::engine::general_purpose::STANDARD_NO_PAD;
-                    let id_b64 = STANDARD_NO_PAD.encode(key_id);
-                    keys_map
-                        .get(&id_b64)
-                        .map(|arc| (**arc).clone())
-                        .ok_or(crate::appstate::AppStateError::KeyNotFound)
-                };
-
                 let mut snapshot_state = HashState::default();
                 let result = process_snapshot(
                     &snapshot_clone,
                     &mut snapshot_state,
-                    get_keys,
+                    |key_id| lookup_app_state_key(&keys_map, key_id),
                     validate_macs,
                     &collection_name_owned,
                 )?;
@@ -339,18 +429,6 @@ impl AppStateProcessor {
 
             // Offload CPU-intensive patch processing to a blocking thread
             let result = crate::runtime::blocking(&*self.runtime, move || {
-                let get_keys = |key_id: &[u8]| -> Result<
-                    ExpandedAppStateKeys,
-                    crate::appstate::AppStateError,
-                > {
-                    use base64::Engine;
-                    use base64::engine::general_purpose::STANDARD_NO_PAD;
-                    let id_b64 = STANDARD_NO_PAD.encode(key_id);
-                    keys.get(&id_b64)
-                        .map(|arc| (**arc).clone())
-                        .ok_or(crate::appstate::AppStateError::KeyNotFound)
-                };
-
                 let get_prev_value_mac = |index_mac: &[u8]| -> Result<
                     Option<Vec<u8>>,
                     crate::appstate::AppStateError,
@@ -360,7 +438,7 @@ impl AppStateProcessor {
                 process_patch(
                     &patch_clone,
                     &mut state,
-                    get_keys,
+                    |key_id| lookup_app_state_key(&keys, key_id),
                     get_prev_value_mac,
                     validate_macs,
                     &coll,
@@ -415,7 +493,7 @@ impl AppStateProcessor {
     pub async fn build_patch(
         &self,
         collection_name: &str,
-        mutations: Vec<(wa::SyncdMutation, Vec<u8>)>, // (mutation, value_mac)
+        mutations: Vec<wa::SyncdMutation>,
     ) -> Result<(Vec<u8>, u64)> {
         use crate::appstate::hash::generate_patch_mac;
 
@@ -431,14 +509,10 @@ impl AppStateProcessor {
         let mut state = self.backend.get_version(collection_name).await?;
         let base_version = state.version;
 
-        // Collect the SyncdMutation list
-        let syncd_mutations: Vec<wa::SyncdMutation> =
-            mutations.iter().map(|(m, _)| m.clone()).collect();
-
         // Pre-fetch previous value MACs for all index MACs in the mutations
         let mut db_prev: std::collections::HashMap<Vec<u8>, Vec<u8>> =
             std::collections::HashMap::new();
-        for (m, _) in &mutations {
+        for m in &mutations {
             if let Some(rec) = &m.record
                 && let Some(ind) = &rec.index
                 && let Some(index_mac) = &ind.blob
@@ -452,7 +526,7 @@ impl AppStateProcessor {
         }
 
         // Update hash state
-        let (_, hash_result) = state.update_hash(&syncd_mutations, |index_mac, _| {
+        let (_, hash_result) = state.update_hash(&mutations, |index_mac, _| {
             Ok(db_prev.get(index_mac).cloned())
         });
         hash_result?;
@@ -468,7 +542,7 @@ impl AppStateProcessor {
             key_id: Some(wa::KeyId {
                 id: Some(key_id.clone()),
             }),
-            mutations: syncd_mutations,
+            mutations,
             ..Default::default()
         };
 
@@ -484,7 +558,7 @@ impl AppStateProcessor {
 
     pub async fn get_missing_key_ids(&self, pl: &PatchList) -> Result<Vec<Vec<u8>>> {
         let key_ids = collect_key_ids_from_patch_list(pl.snapshot.as_ref(), &pl.patches);
-        let mut missing = Vec::new();
+        let mut missing = Vec::with_capacity(key_ids.len());
         for id in key_ids {
             if self.backend.get_sync_key(&id).await?.is_none() {
                 missing.push(id);

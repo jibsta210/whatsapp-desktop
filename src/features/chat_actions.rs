@@ -7,14 +7,13 @@
 use crate::appstate_sync::Mutation;
 use crate::client::Client;
 use anyhow::Result;
-use chrono::DateTime;
 use log::debug;
 use wacore::appstate::patch_decode::WAPatchName;
 use wacore::types::events::{
     ArchiveUpdate, ContactUpdate, DeleteChatUpdate, DeleteMessageForMeUpdate, Event,
-    MarkChatAsReadUpdate, MuteUpdate, PinUpdate, QuickReplyUpdate, StarUpdate,
+    MarkChatAsReadUpdate, MuteUpdate, PinUpdate, StarUpdate,
 };
-use wacore_binary::jid::{Jid, JidExt};
+use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
 /// WA Web uses `-1` for indefinite mute.
@@ -68,34 +67,6 @@ pub(crate) fn dispatch_chat_mutation(
 
     let kind = &m.index[0];
 
-    // Special-case: lid_contact_action can arrive under various kind strings.
-    // Catch it regardless of kind by checking for the action payload itself.
-    // This populates contact_names for LID participants in groups so raw
-    // '@lid' JIDs get resolved to display names immediately on startup.
-    if let Some(val) = &m.action_value {
-        if let Some(act) = &val.lid_contact_action {
-            // index[1] should be the LID JID
-            if let Some(jid_str) = m.index.get(1) {
-                if let Ok(jid) = jid_str.parse::<Jid>() {
-                    event_bus.dispatch(&Event::ContactUpdate(ContactUpdate {
-                        jid,
-                        timestamp: DateTime::from_timestamp_millis(val.timestamp.unwrap_or(0))
-                            .unwrap_or_else(wacore::time::now_utc),
-                        action: Box::new(wa::sync_action_value::ContactAction {
-                            full_name: act.full_name.clone(),
-                            first_name: act.first_name.clone(),
-                            username: act.username.clone(),
-                            ..Default::default()
-                        }),
-                        from_full_sync: full_sync,
-                    }));
-                    return true;
-                }
-            }
-        }
-    }
-
-    // Log unhandled mutation kinds so we can discover the correct key for quick replies
     if !matches!(
         kind.as_str(),
         "mute"
@@ -108,20 +79,7 @@ pub(crate) fn dispatch_chat_mutation(
             | "markChatAsRead"
             | "deleteChat"
             | "deleteMessageForMe"
-            | "quick_reply"
-            | "quick_reply_action"
-            | "quickReply"
-            | "quickReplyAction"
     ) {
-        // Check if this mutation has a quick_reply_action even under a different key
-        if let Some(val) = &m.action_value {
-            if val.quick_reply_action.is_some() {
-                log::warn!(
-                    "QuickReplyAction found under unexpected key: '{kind}' index={:?}",
-                    m.index
-                );
-            }
-        }
         return false;
     }
 
@@ -130,31 +88,7 @@ pub(crate) fn dispatch_chat_mutation(
         .as_ref()
         .and_then(|v| v.timestamp)
         .unwrap_or(0);
-    let time = DateTime::from_timestamp_millis(ts).unwrap_or_else(wacore::time::now_utc);
-
-    // Handle quick_reply BEFORE JID parsing — quick reply index[1] is a shortcut ID, not a JID
-    if matches!(
-        kind.as_str(),
-        "quick_reply" | "quick_reply_action" | "quickReply" | "quickReplyAction"
-    ) {
-        if let Some(val) = &m.action_value
-            && let Some(act) = &val.quick_reply_action
-        {
-            let shortcut = m
-                .index
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| String::from("unknown"));
-            event_bus.dispatch(&Event::QuickReplyUpdate(QuickReplyUpdate {
-                shortcut,
-                timestamp: time,
-                action: Box::new(act.clone()),
-                from_full_sync: full_sync,
-            }));
-        }
-        return true;
-    }
-
+    let time = wacore::time::from_millis_or_now(ts);
     let jid: Jid = if m.index.len() > 1 {
         match m.index[1].parse() {
             Ok(j) => j,
@@ -177,7 +111,7 @@ pub(crate) fn dispatch_chat_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = &val.mute_action
             {
-                event_bus.dispatch(&Event::MuteUpdate(MuteUpdate {
+                event_bus.dispatch(Event::MuteUpdate(MuteUpdate {
                     jid,
                     timestamp: time,
                     action: Box::new(*act),
@@ -190,7 +124,7 @@ pub(crate) fn dispatch_chat_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = &val.pin_action
             {
-                event_bus.dispatch(&Event::PinUpdate(PinUpdate {
+                event_bus.dispatch(Event::PinUpdate(PinUpdate {
                     jid,
                     timestamp: time,
                     action: Box::new(*act),
@@ -203,7 +137,7 @@ pub(crate) fn dispatch_chat_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = &val.archive_chat_action
             {
-                event_bus.dispatch(&Event::ArchiveUpdate(ArchiveUpdate {
+                event_bus.dispatch(Event::ArchiveUpdate(ArchiveUpdate {
                     jid,
                     timestamp: time,
                     action: Box::new(act.clone()),
@@ -218,7 +152,7 @@ pub(crate) fn dispatch_chat_mutation(
                 && let Some((message_id, from_me, participant_jid)) =
                     parse_message_key_fields(kind, &m.index)
             {
-                event_bus.dispatch(&Event::StarUpdate(StarUpdate {
+                event_bus.dispatch(Event::StarUpdate(StarUpdate {
                     chat_jid: jid,
                     participant_jid,
                     message_id,
@@ -234,7 +168,7 @@ pub(crate) fn dispatch_chat_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = &val.contact_action
             {
-                event_bus.dispatch(&Event::ContactUpdate(ContactUpdate {
+                event_bus.dispatch(Event::ContactUpdate(ContactUpdate {
                     jid,
                     timestamp: time,
                     action: Box::new(act.clone()),
@@ -247,7 +181,7 @@ pub(crate) fn dispatch_chat_mutation(
             if let Some(val) = &m.action_value
                 && let Some(act) = &val.mark_chat_as_read_action
             {
-                event_bus.dispatch(&Event::MarkChatAsReadUpdate(MarkChatAsReadUpdate {
+                event_bus.dispatch(Event::MarkChatAsReadUpdate(MarkChatAsReadUpdate {
                     jid,
                     timestamp: time,
                     action: Box::new(act.clone()),
@@ -262,7 +196,7 @@ pub(crate) fn dispatch_chat_mutation(
             {
                 // delete_media is in index[2], not in the proto (which only has messageRange)
                 let delete_media = m.index.get(2).is_none_or(|v| v != "0");
-                event_bus.dispatch(&Event::DeleteChatUpdate(DeleteChatUpdate {
+                event_bus.dispatch(Event::DeleteChatUpdate(DeleteChatUpdate {
                     jid,
                     delete_media,
                     timestamp: time,
@@ -278,7 +212,7 @@ pub(crate) fn dispatch_chat_mutation(
                 && let Some((message_id, from_me, participant_jid)) =
                     parse_message_key_fields(kind, &m.index)
             {
-                event_bus.dispatch(&Event::DeleteMessageForMeUpdate(DeleteMessageForMeUpdate {
+                event_bus.dispatch(Event::DeleteMessageForMeUpdate(DeleteMessageForMeUpdate {
                     chat_jid: jid,
                     participant_jid,
                     message_id,
@@ -563,7 +497,7 @@ impl<'a> ChatActions<'a> {
             mute_action: Some(wa::sync_action_value::MuteAction {
                 muted: Some(muted),
                 mute_end_timestamp: mute_end,
-                auto_muted: None,
+                ..Default::default()
             }),
             timestamp: Some(wacore::time::now_millis()),
             ..Default::default()
@@ -593,11 +527,11 @@ impl<'a> ChatActions<'a> {
             .await
     }
 
-    /// Create or update a quick reply and sync to WhatsApp servers.
+    /// Create or update a quick reply and sync it across linked devices.
     pub async fn save_quick_reply(&self, shortcut: &str, message: &str) -> Result<()> {
         let index = serde_json::to_vec(&["quick_reply", shortcut])?;
         let value = wa::SyncActionValue {
-            timestamp: Some(wacore::time::now_utc().timestamp_millis()),
+            timestamp: Some(wacore::time::now_millis()),
             quick_reply_action: Some(wa::sync_action_value::QuickReplyAction {
                 shortcut: Some(shortcut.to_string()),
                 message: Some(message.to_string()),
@@ -611,11 +545,11 @@ impl<'a> ChatActions<'a> {
             .await
     }
 
-    /// Delete a quick reply and sync to WhatsApp servers.
+    /// Delete a quick reply and sync the tombstone across linked devices.
     pub async fn delete_quick_reply(&self, shortcut: &str) -> Result<()> {
         let index = serde_json::to_vec(&["quick_reply", shortcut])?;
         let value = wa::SyncActionValue {
-            timestamp: Some(wacore::time::now_utc().timestamp_millis()),
+            timestamp: Some(wacore::time::now_millis()),
             quick_reply_action: Some(wa::sync_action_value::QuickReplyAction {
                 shortcut: Some(shortcut.to_string()),
                 message: None,
@@ -635,34 +569,6 @@ impl<'a> ChatActions<'a> {
         index: &[u8],
         value: &wa::SyncActionValue,
     ) -> Result<()> {
-        self.send_mutation_op(
-            collection,
-            wa::syncd_mutation::SyncdOperation::Set,
-            index,
-            value,
-        )
-        .await
-    }
-
-    async fn send_remove_mutation(&self, collection: WAPatchName, index: &[u8]) -> Result<()> {
-        // Remove operations still need a value (empty) for the MAC computation
-        let value = wa::SyncActionValue::default();
-        self.send_mutation_op(
-            collection,
-            wa::syncd_mutation::SyncdOperation::Remove,
-            index,
-            &value,
-        )
-        .await
-    }
-
-    async fn send_mutation_op(
-        &self,
-        collection: WAPatchName,
-        operation: wa::syncd_mutation::SyncdOperation,
-        index: &[u8],
-        value: &wa::SyncActionValue,
-    ) -> Result<()> {
         use rand::Rng;
         use wacore::appstate::encode::encode_record;
 
@@ -678,10 +584,17 @@ impl<'a> ChatActions<'a> {
         let mut iv = [0u8; 16];
         rand::make_rng::<rand::rngs::StdRng>().fill_bytes(&mut iv);
 
-        let (mutation, value_mac) = encode_record(operation, index, value, &keys, &key_id, &iv);
+        let (mutation, _) = encode_record(
+            wa::syncd_mutation::SyncdOperation::Set,
+            index,
+            value,
+            &keys,
+            &key_id,
+            &iv,
+        );
 
         self.client
-            .send_app_state_patch(collection.as_str(), vec![(mutation, value_mac)])
+            .send_app_state_patch(collection.as_str(), vec![mutation])
             .await
     }
 }

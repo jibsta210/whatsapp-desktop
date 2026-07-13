@@ -4,10 +4,11 @@ use std::collections::HashMap;
 
 use anyhow::{Result, anyhow};
 use wacore::poll;
-use wacore_binary::jid::{Jid, JidExt};
+use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
 use crate::client::Client;
+use crate::send::SendResult;
 
 #[derive(Debug, Clone)]
 pub struct PollOptionResult {
@@ -24,14 +25,14 @@ impl<'a> Polls<'a> {
         Self { client }
     }
 
-    /// Returns `(message_id, message_secret)`. Caller needs `message_secret` to decrypt votes.
+    /// Caller needs the returned `message_secret` to decrypt votes.
     pub async fn create(
         &self,
         to: &Jid,
         name: &str,
         options: &[String],
         selectable_count: u32,
-    ) -> Result<(String, Vec<u8>)> {
+    ) -> Result<(SendResult, Vec<u8>)> {
         if options.len() < 2 {
             return Err(anyhow!("Poll must have at least 2 options"));
         }
@@ -70,6 +71,7 @@ impl<'a> Polls<'a> {
             poll_content_type: None,
             poll_type: None,
             correct_answer: None,
+            ..Default::default()
         };
 
         // WA Web: v3 for single-select, v1 for multi-select (GeneratePollCreationMessageProto.js:39-41)
@@ -99,8 +101,8 @@ impl<'a> Polls<'a> {
             ..Default::default()
         });
 
-        let msg_id = self.client.send_message(to.clone(), message).await?;
-        Ok((msg_id, message_secret))
+        let result = self.client.send_message(to.clone(), message).await?;
+        Ok((result, message_secret))
     }
 
     pub async fn vote(
@@ -110,13 +112,14 @@ impl<'a> Polls<'a> {
         poll_creator_jid: &Jid,
         message_secret: &[u8],
         option_names: &[String],
-    ) -> Result<String> {
+    ) -> Result<SendResult> {
         let my_jid = self
             .client
             .get_pn()
             .await
             .ok_or_else(|| anyhow!("Not logged in — cannot determine own JID"))?;
-        let voter_jid_str = my_jid.to_non_ad().to_string();
+        let my_base = my_jid.to_non_ad();
+        let voter_jid_str = my_base.to_string();
         let creator_jid_str = poll_creator_jid.to_non_ad().to_string();
 
         let selected_hashes: Vec<Vec<u8>> = option_names
@@ -124,17 +127,15 @@ impl<'a> Polls<'a> {
             .map(|name| poll::compute_option_hash(name).to_vec())
             .collect();
 
-        let key = poll::derive_vote_encryption_key(
+        let (enc_payload, iv) = poll::encrypt_poll_vote_with_secret(
+            &selected_hashes,
             message_secret,
             poll_msg_id,
             &creator_jid_str,
             &voter_jid_str,
         )?;
 
-        let (enc_payload, iv) =
-            poll::encrypt_poll_vote(&selected_hashes, &key, poll_msg_id, &voter_jid_str)?;
-
-        let from_me = my_jid.to_non_ad() == poll_creator_jid.to_non_ad();
+        let from_me = my_base.is_same_user_as(poll_creator_jid);
 
         let poll_update = wa::message::PollUpdateMessage {
             poll_creation_message_key: Some(wa::MessageKey {
@@ -175,8 +176,14 @@ impl<'a> Polls<'a> {
     ) -> Result<Vec<Vec<u8>>> {
         let creator = poll_creator_jid.to_non_ad().to_string();
         let voter = voter_jid.to_non_ad().to_string();
-        let key = poll::derive_vote_encryption_key(message_secret, poll_msg_id, &creator, &voter)?;
-        poll::decrypt_poll_vote(enc_payload, enc_iv, &key, poll_msg_id, &voter)
+        poll::decrypt_poll_vote_with_secret(
+            enc_payload,
+            enc_iv,
+            message_secret,
+            poll_msg_id,
+            &creator,
+            &voter,
+        )
     }
 
     /// Decrypts each vote and tallies per-option results.
@@ -194,24 +201,28 @@ impl<'a> Polls<'a> {
             .map(|name| (poll::compute_option_hash(name), name.as_str()))
             .collect();
 
+        // `creator_str` is invariant across voters; `decrypt_vote` used to
+        // recompute it per voter via `poll_creator_jid.to_non_ad().to_string()`.
+        let creator_str = poll_creator_jid.to_non_ad().to_string();
+
         // Last-vote-wins: each new vote from the same voter replaces the previous
-        let mut latest_votes: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut latest_votes: HashMap<String, Vec<Vec<u8>>> = HashMap::with_capacity(votes.len());
         for (voter_jid, enc_payload, enc_iv) in votes {
-            let voter_key = voter_jid.to_non_ad().to_string();
-            match Self::decrypt_vote(
+            let voter_str = voter_jid.to_non_ad().to_string();
+            match poll::decrypt_poll_vote_with_secret(
                 enc_payload,
                 enc_iv,
                 message_secret,
                 poll_msg_id,
-                poll_creator_jid,
-                voter_jid,
+                &creator_str,
+                &voter_str,
             ) {
                 Ok(selected_hashes) => {
                     if selected_hashes.is_empty() {
                         // Empty selection = voter cleared their vote
-                        latest_votes.remove(&voter_key);
+                        latest_votes.remove(&voter_str);
                     } else {
-                        latest_votes.insert(voter_key, selected_hashes);
+                        latest_votes.insert(voter_str, selected_hashes);
                     }
                 }
                 Err(e) => {

@@ -8,58 +8,6 @@ use std::sync::Arc;
 pub use wacore::version::parse_sw_js;
 
 const SW_URL: &str = "https://web.whatsapp.com/sw.js";
-const CHROME_VERSION_URL: &str = "https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/stable/versions?pageSize=1";
-
-/// Fetch the current stable Chrome version for Linux from Google's
-/// versionhistory API. Returns (primary, secondary, tertiary).
-/// On failure, falls back to the compiled-in default (via wacore).
-pub async fn fetch_latest_chrome_version(
-    http_client: &Arc<dyn HttpClient>,
-) -> Result<(u32, u32, u32)> {
-    let request = HttpRequest::get(CHROME_VERSION_URL);
-    let response = http_client
-        .execute(request)
-        .await
-        .map_err(|e| anyhow!("Chrome version fetch failed: {}", e))?;
-
-    let body = response
-        .body_string()
-        .map_err(|e| anyhow!("Chrome version body decode failed: {}", e))?;
-
-    // Minimal parse — look for "version": "147.0.7727.101"
-    let version_str = body
-        .split("\"version\":")
-        .nth(1)
-        .and_then(|s| s.split('"').nth(1))
-        .ok_or_else(|| anyhow!("Chrome version not found in response"))?;
-
-    let mut parts = version_str.split('.');
-    let primary: u32 = parts
-        .next()
-        .ok_or_else(|| anyhow!("missing primary"))?
-        .parse()?;
-    let secondary: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let tertiary: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-    Ok((primary, secondary, tertiary))
-}
-
-/// Fetch and apply the latest Chrome version to the shared atomic statics
-/// in wacore. Called at startup — a failure just keeps the compiled-in
-/// fallback. Never errors out the caller.
-pub async fn refresh_chrome_version(http_client: &Arc<dyn HttpClient>) {
-    match fetch_latest_chrome_version(http_client).await {
-        Ok((p, s, t)) => {
-            log::info!("Fetched current Chrome version: {}.{}.{}", p, s, t);
-            wacore::store::device::set_chrome_version(p, s, t);
-        }
-        Err(e) => {
-            log::warn!(
-                "Failed to fetch Chrome version ({}), using compiled default",
-                e
-            );
-        }
-    }
-}
 
 pub async fn fetch_latest_app_version(
     http_client: &Arc<dyn HttpClient>,
@@ -98,51 +46,27 @@ pub async fn resolve_and_update_version(
     let device = persistence_manager.get_device_snapshot().await;
     let last_fetched_ms = device.app_version_last_fetched_ms;
 
-    // ALWAYS refetch the version on startup. WhatsApp rolls out new client
-    // revisions frequently, and an older cached version triggers "you're
-    // using an older version" warnings from the server. The HTTP fetch
-    // takes <1s, so the cache isn't worth the stale-version bugs.
-    // If the fetch fails, fall back to the cached value.
-    let needs_fetch = true;
-    // Keep this variable referenced to avoid unused warnings when the
-    // cache path is restored in the future.
-    let _cache_staleness_check = match chrono::DateTime::from_timestamp_millis(last_fetched_ms) {
-        Some(last_fetched_dt) => {
-            wacore::time::now_utc().signed_duration_since(last_fetched_dt)
-                > chrono::Duration::hours(6)
+    let needs_fetch = if last_fetched_ms == 0 {
+        true
+    } else {
+        match wacore::time::from_millis(last_fetched_ms) {
+            Some(last_fetched_dt) => {
+                wacore::time::now_utc().signed_duration_since(last_fetched_dt)
+                    > chrono::Duration::hours(24)
+            }
+            None => true,
         }
-        None => true,
     };
 
     if needs_fetch {
-        debug!("Fetching latest WhatsApp Web version...");
-        match fetch_latest_app_version(http_client).await {
-            Ok((p, s, t)) => {
-                debug!("Fetched latest version: {}.{}.{}", p, s, t);
-                persistence_manager
-                    .process_command(DeviceCommand::SetAppVersion((p, s, t)))
-                    .await;
-            }
-            Err(e) => {
-                // Fetch failed (no network, Meta CDN down, etc). Fall back
-                // to the cached version if we have one — better than crashing
-                // the client during startup.
-                if device.app_version_primary != 0 {
-                    log::warn!(
-                        "Failed to fetch latest WhatsApp version: {}. Using cached {}.{}.{}",
-                        e,
-                        device.app_version_primary,
-                        device.app_version_secondary,
-                        device.app_version_tertiary
-                    );
-                } else {
-                    return Err(anyhow!(
-                        "Failed to fetch WhatsApp version and no cached version available: {}",
-                        e
-                    ));
-                }
-            }
-        }
+        debug!("WhatsApp version is stale or missing, fetching latest...");
+        let (p, s, t) = fetch_latest_app_version(http_client)
+            .await
+            .map_err(|e| anyhow!("Failed to fetch latest WhatsApp version: {}", e))?;
+        debug!("Fetched latest version: {}.{}.{}", p, s, t);
+        persistence_manager
+            .process_command(DeviceCommand::SetAppVersion((p, s, t)))
+            .await;
     } else {
         debug!(
             "Using cached version: {}.{}.{}",

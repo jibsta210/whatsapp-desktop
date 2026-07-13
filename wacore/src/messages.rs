@@ -7,40 +7,46 @@ use waproto::whatsapp as wa;
 pub struct MessageUtils;
 
 impl MessageUtils {
-    pub fn pad_message_v2(mut plaintext: Vec<u8>) -> Vec<u8> {
+    fn random_pad_len() -> u8 {
         use rand::RngExt;
         let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+        let v = rng.random::<u8>() & 0x0F;
+        if v == 0 { 0x0F } else { v }
+    }
 
-        let mut pad_val = rng.random::<u8>() & 0x0F;
-        if pad_val == 0 {
-            pad_val = 0x0F;
-        }
-
-        let padding = vec![pad_val; pad_val as usize];
-        plaintext.extend_from_slice(&padding);
+    pub fn pad_message_v2(mut plaintext: Vec<u8>) -> Vec<u8> {
+        let pad = Self::random_pad_len();
+        plaintext.resize(plaintext.len() + pad as usize, pad);
         plaintext
     }
 
-    pub fn participant_list_hash(devices: &[wacore_binary::jid::Jid]) -> Result<String> {
+    /// Encode + pad in a single pre-sized allocation.
+    pub fn encode_and_pad(msg: &wa::Message) -> Vec<u8> {
+        let pad = Self::random_pad_len();
+        let mut buf = Vec::with_capacity(msg.encoded_len() + pad as usize);
+        msg.encode(&mut buf).expect("encode into pre-sized Vec");
+        buf.resize(buf.len() + pad as usize, pad);
+        buf
+    }
+
+    pub fn participant_list_hash(devices: &[wacore_binary::Jid]) -> Result<String> {
+        // Hash sorted ad_strings incrementally (avoids join() allocation).
         let mut jids: Vec<String> = devices.iter().map(|j| j.to_ad_string()).collect();
-        jids.sort();
+        jids.sort_unstable();
 
-        let concatenated_jids = jids.join("");
+        let mut h = CryptographicHash::new("SHA-256")
+            .map_err(|e| anyhow!("failed to initialize SHA-256 hasher: {:?}", e))?;
+        for jid in &jids {
+            h.update(jid.as_bytes());
+        }
 
-        // Use finalize_sha256_array() for zero-allocation hash finalization
-        let full_hash = {
-            let mut h = CryptographicHash::new("SHA-256")
-                .map_err(|e| anyhow!("failed to initialize SHA-256 hasher: {:?}", e))?;
-            h.update(concatenated_jids.as_bytes());
-            h.finalize_sha256_array()
-                .map_err(|e| anyhow!("failed to finalize hash: {:?}", e))?
-        };
-
-        let truncated_hash = &full_hash[..6];
+        let full_hash = h
+            .finalize_sha256_array()
+            .map_err(|e| anyhow!("failed to finalize hash: {:?}", e))?;
 
         Ok(format!(
             "2:{hash}",
-            hash = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(truncated_hash)
+            hash = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(&full_hash[..6])
         ))
     }
 
@@ -104,16 +110,28 @@ pub fn unwrap_device_sent(mut msg: wa::Message) -> wa::Message {
 /// `pkmsg` enc node.  We must process it (store the sender key) but should
 /// not surface it as a user event.
 pub fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
-    let has_skdm = msg.sender_key_distribution_message.is_some()
-        || msg
+    if msg.sender_key_distribution_message.is_none()
+        && msg
             .fast_ratchet_key_sender_key_distribution_message
-            .is_some();
-
-    if !has_skdm {
+            .is_none()
+    {
         return false;
     }
 
-    // Strip protocol-only fields and check if anything user-visible remains.
+    // Fast path: most common user-visible fields (avoids clone for the typical case).
+    if msg.conversation.is_some()
+        || msg.extended_text_message.is_some()
+        || msg.image_message.is_some()
+        || msg.video_message.is_some()
+        || msg.audio_message.is_some()
+        || msg.document_message.is_some()
+        || msg.reaction_message.is_some()
+        || msg.protocol_message.is_some()
+    {
+        return false;
+    }
+
+    // Slow path: clone and compare to default to catch all current and future fields.
     let mut stripped = msg.clone();
     stripped.sender_key_distribution_message = None;
     stripped.fast_ratchet_key_sender_key_distribution_message = None;
@@ -127,12 +145,14 @@ pub fn is_sender_key_distribution_only(msg: &wa::Message) -> bool {
 /// attributes. It requires the own JID and optional LID to determine
 /// `is_from_me`.
 pub fn parse_message_info(
-    node: &wacore_binary::node::Node,
-    own_jid: &wacore_binary::jid::Jid,
-    own_lid: Option<&wacore_binary::jid::Jid>,
+    node: &wacore_binary::NodeRef<'_>,
+    own_jid: &wacore_binary::Jid,
+    own_lid: Option<&wacore_binary::Jid>,
 ) -> Result<crate::types::message::MessageInfo> {
-    use crate::types::message::{AddressingMode, EditAttribute, MessageInfo, MessageSource};
-    use wacore_binary::jid::{self, JidExt as _};
+    use crate::types::message::{
+        AddressingMode, EditAttribute, MessageCategory, MessageInfo, MessageSource,
+    };
+    use wacore_binary::{JidExt as _, STATUS_BROADCAST_USER, Server};
 
     let mut attrs = node.attrs();
     let from = attrs.jid("from");
@@ -140,20 +160,31 @@ pub fn parse_message_info(
         .optional_string("addressing_mode")
         .and_then(|s| AddressingMode::try_from(s.as_ref()).ok());
 
-    let mut source = if from.server == jid::BROADCAST_SERVER {
+    let mut source = if from.server == Server::Broadcast {
         let participant = attrs.jid("participant");
         let is_from_me = participant.matches_user_or_lid(own_jid, own_lid);
+
+        // Match WAWebMsgParser: read participant_lid/_pn unconditionally so
+        // the LID-PN cache can re-warm from the stanza.
+        let sender_alt = if participant.server.is_pn_family() {
+            attrs.optional_jid("participant_lid")
+        } else if participant.server.is_lid_family() {
+            attrs.optional_jid("participant_pn")
+        } else {
+            None
+        };
 
         MessageSource {
             chat: from.clone(),
             sender: participant.clone(),
             is_from_me,
             is_group: true,
-            broadcast_list_owner: if from.user != jid::STATUS_BROADCAST_USER {
+            broadcast_list_owner: if from.user != STATUS_BROADCAST_USER {
                 Some(participant.clone())
             } else {
                 None
             },
+            sender_alt,
             ..Default::default()
         }
     } else if from.is_group() {
@@ -176,27 +207,28 @@ pub fn parse_message_info(
         }
     } else if from.matches_user_or_lid(own_jid, own_lid) {
         let recipient = attrs.optional_jid("recipient");
-        // In LID-addressed own-echo DMs the peer's PHONE number rides the stanza
-        // as `peer_recipient_pn` (whatsmeow: MessageInfo.RecipientAlt). Capturing it
-        // lets the desktop map the peer LID → phone at message arrival instead of
-        // minting a phantom "+<lid digits>" chat.
-        let recipient_alt = attrs
-            .optional_jid("peer_recipient_pn")
-            .or_else(|| attrs.optional_jid("recipient_pn"));
         let chat = recipient
             .as_ref()
             .map(|r| r.to_non_ad())
             .unwrap_or_else(|| from.to_non_ad());
+        // Populate sender_alt so LID-PN cache warms from self-messages
+        let sender_alt = if from.server == Server::Lid {
+            Some(own_jid.clone())
+        } else if from.server == Server::Pn && own_lid.is_some() {
+            own_lid.cloned()
+        } else {
+            None
+        };
         MessageSource {
             chat,
             sender: from.clone(),
             is_from_me: true,
             recipient,
-            recipient_alt,
+            sender_alt,
             ..Default::default()
         }
     } else {
-        let sender_alt = if from.server == jid::HIDDEN_USER_SERVER {
+        let sender_alt = if from.server == Server::Lid {
             attrs.optional_jid("sender_pn")
         } else {
             attrs.optional_jid("sender_lid")
@@ -215,7 +247,7 @@ pub fn parse_message_info(
 
     let category = attrs
         .optional_string("category")
-        .map(|s| s.to_string())
+        .map(|s| MessageCategory::from(s.as_ref()))
         .unwrap_or_default();
 
     let id = attrs.required_string("id")?.to_string();
@@ -229,6 +261,8 @@ pub fn parse_message_info(
         source.chat.agent = 0;
     }
 
+    let is_offline = attrs.optional_string("offline").is_some();
+
     Ok(MessageInfo {
         source,
         id,
@@ -237,13 +271,84 @@ pub fn parse_message_info(
             .optional_string("notify")
             .map(|s| s.to_string())
             .unwrap_or_default(),
-        timestamp: chrono::DateTime::from_timestamp(attrs.unix_time("t"), 0)
-            .unwrap_or_else(chrono::Utc::now),
+        timestamp: crate::time::from_secs_or_now(attrs.unix_time("t")),
         category,
         edit: attrs
             .optional_string("edit")
             .map(|s| EditAttribute::from(s.to_string()))
             .unwrap_or_default(),
+        is_offline,
         ..Default::default()
     })
+}
+
+#[cfg(test)]
+mod parse_message_info_tests {
+    use super::*;
+    use std::str::FromStr;
+    use wacore_binary::Jid;
+    use wacore_binary::builder::NodeBuilder;
+
+    #[test]
+    fn status_broadcast_with_participant_lid_populates_sender_alt() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let own_lid = Jid::from_str("100000000000000@lid").unwrap();
+        let pn_user = "559980000001";
+        let lid_user = "100000012345678";
+        let node = NodeBuilder::new("message")
+            .attr("from", "status@broadcast")
+            .attr("type", "media")
+            .attr("id", "TEST_MSG_ID")
+            .attr("t", "1777415965")
+            .attr("participant", format!("{pn_user}@s.whatsapp.net").as_str())
+            .attr("participant_lid", format!("{lid_user}@lid").as_str())
+            .build();
+
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, Some(&own_lid))
+            .expect("parse_message_info should succeed for status broadcast");
+
+        assert_eq!(info.source.sender.user, pn_user);
+        assert_eq!(info.source.sender.server, wacore_binary::Server::Pn);
+        let alt = info
+            .source
+            .sender_alt
+            .as_ref()
+            .expect("status broadcast must expose participant_lid as sender_alt");
+        assert_eq!(alt.user, lid_user);
+        assert_eq!(alt.server, wacore_binary::Server::Lid);
+    }
+
+    /// Symmetric branch: when `participant` is a LID, `sender_alt` must come
+    /// from `participant_pn`. Pins the `Server::Lid`/`is_lid_family()` arm.
+    #[test]
+    fn status_broadcast_with_participant_pn_populates_sender_alt() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let own_lid = Jid::from_str("100000000000000@lid").unwrap();
+        let pn_user = "559980000001";
+        let lid_user = "100000012345678";
+        let node = NodeBuilder::new("message")
+            .attr("from", "status@broadcast")
+            .attr("type", "media")
+            .attr("id", "TEST_LID_FIRST_MSG_ID")
+            .attr("t", "1777415965")
+            .attr("participant", format!("{lid_user}@lid").as_str())
+            .attr(
+                "participant_pn",
+                format!("{pn_user}@s.whatsapp.net").as_str(),
+            )
+            .build();
+
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, Some(&own_lid))
+            .expect("parse_message_info should succeed for LID-addressed status");
+
+        assert_eq!(info.source.sender.user, lid_user);
+        assert_eq!(info.source.sender.server, wacore_binary::Server::Lid);
+        let alt = info
+            .source
+            .sender_alt
+            .as_ref()
+            .expect("LID-addressed status broadcast must expose participant_pn as sender_alt");
+        assert_eq!(alt.user, pn_user);
+        assert_eq!(alt.server, wacore_binary::Server::Pn);
+    }
 }

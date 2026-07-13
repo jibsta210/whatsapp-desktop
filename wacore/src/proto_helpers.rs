@@ -1,5 +1,5 @@
 use std::str::FromStr;
-use wacore_binary::jid::{Jid, JidExt};
+use wacore_binary::{Jid, JidExt};
 use waproto::whatsapp as wa;
 
 /// Invokes a callback macro with the list of all message types that have `context_info`.
@@ -95,6 +95,9 @@ pub trait MessageExt {
     /// wrapper types (device_sent, ephemeral, view_once, etc.) without cloning.
     fn into_base_message(self) -> wa::Message;
     fn is_ephemeral(&self) -> bool;
+    /// Covers the legacy `view_once_message{_v2,_v2_extension}` wrappers (in any
+    /// nesting order under `device_sent`/`ephemeral`) and the inline `view_once`
+    /// flag on modern image/video/audio/extended-text payloads.
     fn is_view_once(&self) -> bool;
     /// Gets the caption for media messages (Image, Video, Document).
     fn get_caption(&self) -> Option<&str>;
@@ -146,6 +149,14 @@ pub trait MessageExt {
     /// reply.set_context_info(context);
     /// ```
     fn set_context_info(&mut self, context: wa::ContextInfo) -> bool;
+
+    /// Reads `context_info.expiration` from the first message type that has it.
+    fn get_ephemeral_expiration(&self) -> Option<u32>;
+
+    /// Sets `context_info.expiration` on the first message type found.
+    /// Creates a default `context_info` if needed. Returns `false` for
+    /// bare `conversation` messages (use `ExtendedTextMessage` instead).
+    fn set_ephemeral_expiration(&mut self, expiration: u32) -> bool;
 }
 
 impl MessageExt for wa::Message {
@@ -223,7 +234,49 @@ impl MessageExt for wa::Message {
     }
 
     fn is_view_once(&self) -> bool {
-        self.view_once_message.is_some() || self.view_once_message_v2.is_some()
+        let mut current = self;
+        loop {
+            if current.view_once_message.is_some()
+                || current.view_once_message_v2.is_some()
+                || current.view_once_message_v2_extension.is_some()
+            {
+                return true;
+            }
+            if let Some(inner) = current
+                .device_sent_message
+                .as_ref()
+                .and_then(|m| m.message.as_ref())
+            {
+                current = inner;
+                continue;
+            }
+            if let Some(inner) = current
+                .ephemeral_message
+                .as_ref()
+                .and_then(|m| m.message.as_ref())
+            {
+                current = inner;
+                continue;
+            }
+            break;
+        }
+
+        let base = self.get_base_message();
+        matches!(
+            base.image_message.as_deref().and_then(|m| m.view_once),
+            Some(true)
+        ) || matches!(
+            base.video_message.as_deref().and_then(|m| m.view_once),
+            Some(true)
+        ) || matches!(
+            base.audio_message.as_deref().and_then(|m| m.view_once),
+            Some(true)
+        ) || matches!(
+            base.extended_text_message
+                .as_deref()
+                .and_then(|m| m.view_once),
+            Some(true)
+        )
     }
 
     fn get_caption(&self) -> Option<&str> {
@@ -263,6 +316,45 @@ impl MessageExt for wa::Message {
 
     fn set_context_info(&mut self, context: wa::ContextInfo) -> bool {
         set_context_info_on_message!(self, Box::new(context))
+    }
+
+    fn get_ephemeral_expiration(&self) -> Option<u32> {
+        macro_rules! check {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if let Some(ref m) = self.$field {
+                        if let Some(ref ctx) = m.context_info {
+                            if let Some(exp) = ctx.expiration {
+                                if exp > 0 {
+                                    return Some(exp);
+                                }
+                            }
+                        }
+                    }
+                )+
+            };
+        }
+        with_context_info_fields!(check!());
+        None
+    }
+
+    fn set_ephemeral_expiration(&mut self, expiration: u32) -> bool {
+        if expiration == 0 {
+            return false;
+        }
+        macro_rules! try_set {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if let Some(ref mut m) = self.$field {
+                        let ctx = m.context_info.get_or_insert_with(|| Box::new(wa::ContextInfo::default()));
+                        ctx.expiration = Some(expiration);
+                        return true;
+                    }
+                )+
+            };
+        }
+        with_context_info_fields!(try_set!());
+        false
     }
 }
 
@@ -418,44 +510,22 @@ pub fn build_quote_context(
     }
 }
 
-/// Builds a quote context with proper participant resolution for special message types.
+/// Builds a quote ContextInfo matching WA Web's EProtoGenerator + getQuotedParticipantForContextInfo.
 ///
-/// This matches WhatsApp Web's `getQuotedParticipantForContextInfo` (3JJWKHeu5-P.js:144304-144311)
-/// which resolves the participant based on message type:
-/// - Newsletter messages: uses the chat JID (the newsletter itself)
-/// - Group status messages: uses the sender (author field not available here)
-/// - Normal messages: uses the sender JID
-///
-/// # Arguments
-/// * `message_id` - The ID of the message being quoted
-/// * `sender_jid` - The JID of the sender of the message being quoted
-/// * `chat_jid` - The JID of the chat where the message was sent
-/// * `quoted_message` - The message being quoted
-///
-/// # Example
-///
-/// ```ignore
-/// use wacore::proto_helpers::{build_quote_context_with_info, MessageExt};
-///
-/// let context = build_quote_context_with_info(
-///     "3EB0123456789",
-///     &sender_jid,
-///     &chat_jid,
-///     &original_message,
-/// );
-/// ```
+/// Sets `remote_jid` (required by iOS to scope the quote) and resolves `participant`
+/// based on chat type (newsletter → channel JID, otherwise → sender JID).
 pub fn build_quote_context_with_info(
     message_id: impl Into<String>,
     sender_jid: &Jid,
     chat_jid: &Jid,
     quoted_message: &wa::Message,
 ) -> wa::ContextInfo {
-    // Match WhatsApp Web's participant resolution.
+    // WA Web always sets remoteJid to the chat JID (EProtoGenerator.js:108).
+    let remote_jid = chat_jid.to_string();
+
+    // Newsletter quotes use the channel JID as participant; others use the sender.
     let participant = if chat_jid.is_newsletter() {
-        chat_jid.to_string()
-    } else if chat_jid.is_status_broadcast() {
-        // Author isn't available here; fall back to sender.
-        sender_jid.to_string()
+        remote_jid.clone()
     } else {
         sender_jid.to_string()
     };
@@ -463,7 +533,36 @@ pub fn build_quote_context_with_info(
     wa::ContextInfo {
         stanza_id: Some(message_id.into()),
         participant: Some(participant),
+        remote_jid: Some(remote_jid),
         quoted_message: Some(quoted_message.prepare_for_quote()),
+        ..Default::default()
+    }
+}
+
+/// Wraps a media message as an album child (WA Web `EProtoGenerator` parity).
+/// Lifts `message_context_info` to the outer message and adds the album association.
+pub fn wrap_as_album_child(
+    mut inner_message: wa::Message,
+    parent_key: wa::MessageKey,
+) -> wa::Message {
+    let existing_context = inner_message.message_context_info.take();
+
+    // WA Web's outgoing association (ProtoUtils.js function m) only sets
+    // associationType + parentMessageKey, not messageIndex.
+    let association = wa::MessageAssociation {
+        association_type: Some(wa::message_association::AssociationType::MediaAlbum as i32),
+        parent_message_key: Some(parent_key),
+        message_index: None,
+    };
+
+    let mut outer_context = existing_context.unwrap_or_default();
+    outer_context.message_association = Some(association);
+
+    wa::Message {
+        associated_child_message: Some(Box::new(wa::message::FutureProofMessage {
+            message: Some(Box::new(inner_message)),
+        })),
+        message_context_info: Some(outer_context),
         ..Default::default()
     }
 }
@@ -1454,5 +1553,298 @@ mod tests {
             2,
             "should keep inner thread_id when non-empty"
         );
+    }
+
+    #[test]
+    fn quote_context_sets_remote_jid_for_group() {
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let group: Jid = "120363098765432100@g.us".parse().unwrap();
+        let msg = wa::Message {
+            conversation: Some("hello".into()),
+            ..Default::default()
+        };
+
+        let ctx = build_quote_context_with_info("msg-id-123", &sender, &group, &msg);
+
+        assert_eq!(ctx.stanza_id.as_deref(), Some("msg-id-123"));
+        assert_eq!(
+            ctx.participant.as_deref(),
+            Some("551199887766@s.whatsapp.net")
+        );
+        assert_eq!(ctx.remote_jid.as_deref(), Some("120363098765432100@g.us"));
+        assert!(ctx.quoted_message.is_some());
+        assert!(ctx.mentioned_jid.is_empty());
+    }
+
+    #[test]
+    fn quote_context_sets_remote_jid_for_dm() {
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let chat: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let msg = wa::Message {
+            conversation: Some("ping".into()),
+            ..Default::default()
+        };
+
+        let ctx = build_quote_context_with_info("msg-id-456", &sender, &chat, &msg);
+
+        assert_eq!(
+            ctx.remote_jid.as_deref(),
+            Some("551199887766@s.whatsapp.net")
+        );
+        assert_eq!(
+            ctx.participant.as_deref(),
+            Some("551199887766@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn quote_context_newsletter_uses_channel_as_participant() {
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let newsletter: Jid = "120363099999999999@newsletter".parse().unwrap();
+        let msg = wa::Message::default();
+
+        let ctx = build_quote_context_with_info("msg-id-789", &sender, &newsletter, &msg);
+
+        assert_eq!(
+            ctx.participant.as_deref(),
+            Some("120363099999999999@newsletter")
+        );
+        assert_eq!(
+            ctx.remote_jid.as_deref(),
+            Some("120363099999999999@newsletter")
+        );
+    }
+
+    #[test]
+    fn quote_context_strips_mentions_from_quoted_message() {
+        let sender: Jid = "551199887766@s.whatsapp.net".parse().unwrap();
+        let group: Jid = "120363098765432100@g.us".parse().unwrap();
+        let msg = create_message_with_mentions();
+
+        let ctx = build_quote_context_with_info("msg-id", &sender, &group, &msg);
+
+        // The quoted message's nested context_info should have mentions stripped
+        let quoted = ctx.quoted_message.unwrap();
+        let inner_ctx = quoted.extended_text_message.unwrap().context_info.unwrap();
+        assert!(inner_ctx.mentioned_jid.is_empty());
+        assert!(inner_ctx.group_mentions.is_empty());
+        // The outer context should have no mentions
+        assert!(ctx.mentioned_jid.is_empty());
+    }
+
+    fn sample_parent_key() -> wa::MessageKey {
+        wa::MessageKey {
+            remote_jid: Some("5511999999999@s.whatsapp.net".to_string()),
+            from_me: Some(true),
+            id: Some("PARENT_MSG_ID".to_string()),
+            participant: None,
+        }
+    }
+
+    #[test]
+    fn test_wrap_as_album_child_basic() {
+        let inner = wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                url: Some("https://mmg.whatsapp.net/test".to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+
+        let wrapped = wrap_as_album_child(inner, sample_parent_key());
+
+        let future_proof = wrapped.associated_child_message.as_ref().unwrap();
+        let inner_msg = future_proof.message.as_ref().unwrap();
+        assert!(inner_msg.image_message.is_some());
+        assert!(inner_msg.message_context_info.is_none());
+
+        let ctx = wrapped.message_context_info.as_ref().unwrap();
+        let assoc = ctx.message_association.as_ref().unwrap();
+        assert_eq!(
+            assoc.association_type,
+            Some(wa::message_association::AssociationType::MediaAlbum as i32)
+        );
+        assert_eq!(assoc.parent_message_key, Some(sample_parent_key()));
+        assert_eq!(assoc.message_index, None);
+    }
+
+    #[test]
+    fn test_wrap_as_album_child_lifts_existing_context() {
+        let secret = vec![1u8; 32];
+        let inner = wa::Message {
+            video_message: Some(Box::new(wa::message::VideoMessage {
+                url: Some("https://mmg.whatsapp.net/vid".to_string()),
+                ..Default::default()
+            })),
+            message_context_info: Some(wa::MessageContextInfo {
+                message_secret: Some(secret.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let wrapped = wrap_as_album_child(inner, sample_parent_key());
+
+        let ctx = wrapped.message_context_info.as_ref().unwrap();
+        assert_eq!(ctx.message_secret.as_deref(), Some(secret.as_slice()));
+        assert!(ctx.message_association.is_some());
+    }
+
+    #[test]
+    fn is_view_once_detects_legacy_wrapper() {
+        let msg = wa::Message {
+            view_once_message: Some(Box::new(wa::message::FutureProofMessage {
+                message: Some(Box::new(wa::Message::default())),
+            })),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+
+        let msg_v2 = wa::Message {
+            view_once_message_v2: Some(Box::new(wa::message::FutureProofMessage {
+                message: Some(Box::new(wa::Message::default())),
+            })),
+            ..Default::default()
+        };
+        assert!(msg_v2.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_wrapper_nested_in_device_sent() {
+        let msg = wa::Message {
+            device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+                message: Some(Box::new(wa::Message {
+                    view_once_message_v2: Some(Box::new(wa::message::FutureProofMessage {
+                        message: Some(Box::new(wa::Message::default())),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_inline_image_flag() {
+        let msg = wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                view_once: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_inline_video_flag() {
+        let msg = wa::Message {
+            video_message: Some(Box::new(wa::message::VideoMessage {
+                view_once: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_inline_audio_flag() {
+        let msg = wa::Message {
+            audio_message: Some(Box::new(wa::message::AudioMessage {
+                view_once: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_inline_extended_text_flag() {
+        let msg = wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                view_once: Some(true),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_inline_flag_through_device_sent() {
+        let msg = wa::Message {
+            device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+                message: Some(Box::new(wa::Message {
+                    image_message: Some(Box::new(wa::message::ImageMessage {
+                        view_once: Some(true),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_false_for_plain_image() {
+        let msg = wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage::default())),
+            ..Default::default()
+        };
+        assert!(!msg.is_view_once());
+
+        let msg_explicit_false = wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                view_once: Some(false),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(!msg_explicit_false.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_false_for_empty_message() {
+        assert!(!wa::Message::default().is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_v2_extension_wrapper() {
+        let msg = wa::Message {
+            view_once_message_v2_extension: Some(Box::new(wa::message::FutureProofMessage {
+                message: Some(Box::new(wa::Message::default())),
+            })),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
+    }
+
+    #[test]
+    fn is_view_once_detects_ephemeral_device_sent_view_once() {
+        let msg = wa::Message {
+            ephemeral_message: Some(Box::new(wa::message::FutureProofMessage {
+                message: Some(Box::new(wa::Message {
+                    device_sent_message: Some(Box::new(wa::message::DeviceSentMessage {
+                        message: Some(Box::new(wa::Message {
+                            view_once_message_v2: Some(Box::new(wa::message::FutureProofMessage {
+                                message: Some(Box::new(wa::Message::default())),
+                            })),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+            })),
+            ..Default::default()
+        };
+        assert!(msg.is_view_once());
     }
 }

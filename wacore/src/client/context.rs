@@ -2,13 +2,14 @@ use crate::libsignal::protocol::PreKeyBundle;
 use crate::types::message::AddressingMode;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use wacore_binary::jid::Jid;
+use wacore_binary::CompactString;
+use wacore_binary::Jid;
 
-fn build_pn_to_lid_map(lid_to_pn_map: &HashMap<String, Jid>) -> HashMap<String, Jid> {
+fn build_pn_to_lid_map(lid_to_pn_map: &HashMap<CompactString, Jid>) -> HashMap<CompactString, Jid> {
     lid_to_pn_map
         .iter()
         .map(|(lid_user, phone_jid)| {
-            let lid_jid = Jid::lid(lid_user);
+            let lid_jid = Jid::lid(lid_user.clone());
             (phone_jid.user.clone(), lid_jid)
         })
         .collect()
@@ -21,10 +22,10 @@ pub struct GroupInfo {
     /// Maps a LID user identifier (the `user` part of the LID JID) to the
     /// corresponding phone-number JID. This is used for device queries since
     /// LID usync requests may not work reliably.
-    lid_to_pn_map: HashMap<String, Jid>,
+    lid_to_pn_map: HashMap<CompactString, Jid>,
     /// Reverse mapping: phone number (user part) to LID JID.
     /// This is used to convert device JIDs back to LID format after device resolution.
-    pn_to_lid_map: HashMap<String, Jid>,
+    pn_to_lid_map: HashMap<CompactString, Jid>,
 }
 
 impl GroupInfo {
@@ -46,7 +47,7 @@ impl GroupInfo {
     pub fn with_lid_to_pn_map(
         participants: Vec<Jid>,
         addressing_mode: AddressingMode,
-        lid_to_pn_map: HashMap<String, Jid>,
+        lid_to_pn_map: HashMap<CompactString, Jid>,
     ) -> Self {
         let pn_to_lid_map = build_pn_to_lid_map(&lid_to_pn_map);
 
@@ -59,13 +60,13 @@ impl GroupInfo {
     }
 
     /// Replace the current LID-to-phone mapping.
-    pub fn set_lid_to_pn_map(&mut self, lid_to_pn_map: HashMap<String, Jid>) {
+    pub fn set_lid_to_pn_map(&mut self, lid_to_pn_map: HashMap<CompactString, Jid>) {
         self.pn_to_lid_map = build_pn_to_lid_map(&lid_to_pn_map);
         self.lid_to_pn_map = lid_to_pn_map;
     }
 
     /// Access the LID-to-phone mapping.
-    pub fn lid_to_pn_map(&self) -> &HashMap<String, Jid> {
+    pub fn lid_to_pn_map(&self) -> &HashMap<CompactString, Jid> {
         &self.lid_to_pn_map
     }
 
@@ -85,7 +86,10 @@ impl GroupInfo {
     /// using the `phone_number` field from each participant.  Maps are updated
     /// even for already-present participants so that a later call with
     /// `Some(phone_number)` backfills a previous `None` entry.
-    pub fn add_participants(&mut self, new: &[(Jid, Option<Jid>)]) {
+    pub fn add_participants<'a, I>(&mut self, new: I)
+    where
+        I: IntoIterator<Item = (&'a Jid, Option<&'a Jid>)>,
+    {
         for (jid, phone_number) in new {
             // Always backfill LID maps — a re-add with phone_number fills a
             // previous None (e.g., client-initiated add followed by server
@@ -94,7 +98,7 @@ impl GroupInfo {
                 && let Some(pn) = phone_number
             {
                 self.pn_to_lid_map
-                    .insert(pn.user.clone(), Jid::lid(&jid.user));
+                    .insert(pn.user.clone(), Jid::lid(jid.user.clone()));
                 self.lid_to_pn_map.insert(jid.user.clone(), pn.clone());
             }
 
@@ -128,7 +132,7 @@ impl GroupInfo {
         if phone_device_jid.is_pn()
             && let Some(lid_base) = self.lid_jid_for_phone_user(&phone_device_jid.user)
         {
-            return Jid::lid_device(&lid_base.user, phone_device_jid.device);
+            return Jid::lid_device(lid_base.user.clone(), phone_device_jid.device);
         }
         phone_device_jid.clone()
     }
@@ -177,7 +181,9 @@ mod tests {
     #[test]
     fn add_participants_pn_mode() {
         let mut info = GroupInfo::new(vec![pn("alice")], AddressingMode::Pn);
-        info.add_participants(&[(pn("bob"), None), (pn("carol"), None)]);
+        let bob = pn("bob");
+        let carol = pn("carol");
+        info.add_participants([(&bob, None), (&carol, None)]);
         assert_eq!(info.participants.len(), 3);
         assert!(info.participants.iter().any(|p| p.user == "bob"));
     }
@@ -185,14 +191,18 @@ mod tests {
     #[test]
     fn add_participants_deduplicates() {
         let mut info = GroupInfo::new(vec![pn("alice"), pn("bob")], AddressingMode::Pn);
-        info.add_participants(&[(pn("bob"), None), (pn("carol"), None)]);
+        let bob = pn("bob");
+        let carol = pn("carol");
+        info.add_participants([(&bob, None), (&carol, None)]);
         assert_eq!(info.participants.len(), 3); // bob not duplicated
     }
 
     #[test]
     fn add_participants_lid_mode_updates_maps() {
         let mut info = GroupInfo::new(vec![lid("lid_alice")], AddressingMode::Lid);
-        info.add_participants(&[(lid("lid_bob"), Some(pn("bob_pn")))]);
+        let bob_lid = lid("lid_bob");
+        let bob_pn = pn("bob_pn");
+        info.add_participants([(&bob_lid, Some(&bob_pn))]);
 
         assert_eq!(info.participants.len(), 2);
         assert_eq!(
@@ -221,8 +231,8 @@ mod tests {
     #[test]
     fn remove_participants_cleans_lid_maps() {
         let lid_to_pn = HashMap::from([
-            ("lid_alice".to_string(), pn("alice_pn")),
-            ("lid_bob".to_string(), pn("bob_pn")),
+            (CompactString::from("lid_alice"), pn("alice_pn")),
+            (CompactString::from("lid_bob"), pn("bob_pn")),
         ]);
         let mut info = GroupInfo::with_lid_to_pn_map(
             vec![lid("lid_alice"), lid("lid_bob")],
@@ -252,11 +262,13 @@ mod tests {
     fn add_participants_backfills_lid_map_for_existing() {
         let mut info = GroupInfo::new(vec![lid("lid_bob")], AddressingMode::Lid);
         // First add without phone_number (simulates client-initiated add)
-        info.add_participants(&[(lid("lid_bob"), None)]);
+        let bob_lid = lid("lid_bob");
+        let bob_pn = pn("bob_pn");
+        info.add_participants([(&bob_lid, None)]);
         assert!(info.phone_jid_for_lid_user("lid_bob").is_none());
 
         // Second add with phone_number (simulates server notification backfill)
-        info.add_participants(&[(lid("lid_bob"), Some(pn("bob_pn")))]);
+        info.add_participants([(&bob_lid, Some(&bob_pn))]);
         assert_eq!(info.participants.len(), 1); // not duplicated
         assert_eq!(
             info.phone_jid_for_lid_user("lid_bob")

@@ -8,26 +8,68 @@ use crate::libsignal::protocol::{ProtocolAddress, SenderKeyRecord, SessionRecord
 use crate::libsignal::store::sender_key_name::SenderKeyName;
 use crate::store::traits::SignalStore;
 
-/// In-memory cache for Signal protocol state, matching WhatsApp Web's SignalStoreCache.
-///
-/// Sessions are cached as `SessionRecord` objects (not bytes), matching WA Web's pattern
-/// where the JS object IS the cache. Serialization only happens during `flush()`.
-///
-/// Identity and sender key stores use `Arc<[u8]>` byte caches with dedup checks.
-///
-/// Keys use `Arc<str>` so that cloning a key (needed for both cache and dirty/deleted sets)
-/// is an O(1) refcount bump instead of an O(n) heap allocation.
+/// Evict clean (non-dirty, non-deleted) entries from a cache HashMap.
+/// Negative entries (None values) are evicted first.
+fn evict_clean_entries<V>(
+    cache: &mut HashMap<Arc<str>, Option<V>>,
+    dirty: &HashSet<Arc<str>>,
+    deleted: Option<&HashSet<Arc<str>>>,
+    max_entries: usize,
+) {
+    let overflow = cache.len().saturating_sub(max_entries);
+    if overflow == 0 {
+        return;
+    }
+    let mut negative = Vec::with_capacity(overflow);
+    let mut positive = Vec::with_capacity(overflow);
+    for (k, v) in cache.iter() {
+        if dirty.contains(k.as_ref()) {
+            continue;
+        }
+        if let Some(del) = deleted
+            && del.contains(k.as_ref())
+        {
+            continue;
+        }
+        if v.is_none() {
+            negative.push(k.clone());
+        } else {
+            positive.push(k.clone());
+        }
+    }
+    for key in negative.into_iter().chain(positive).take(overflow) {
+        cache.remove(&key);
+    }
+}
+
+/// Default max entries per store before clean entry eviction triggers.
+const DEFAULT_MAX_CACHE_ENTRIES: usize = 2_000;
+
+/// In-memory write-back cache for Signal protocol state.
+/// Keys use `Arc<str>` for O(1) clone. Sessions cached as objects (serialized on flush).
+/// Capacity-bounded: evicts non-dirty entries when max_entries is exceeded.
 pub struct SignalStoreCache {
     sessions: Mutex<SessionStoreState>,
     identities: Mutex<ByteStoreState>,
     sender_keys: Mutex<SenderKeyStoreState>,
+    /// Avoids per-flush Vec allocation on the hot path (called after every message).
+    flush_encode_buf: Mutex<Vec<u8>>,
+    max_entries: usize,
 }
 
 // === Session object cache (no per-message serialize/deserialize) ===
 
+/// Cache entry tracking whether a session is present, absent, or checked out
+/// by an encrypt/decrypt operation.
+enum SessionEntry {
+    Present(Box<SessionRecord>),
+    Absent,
+    /// Taken by load_session; has_session treats as present, flush/eviction skip.
+    CheckedOut,
+}
+
 struct SessionStoreState {
-    /// Cached entries. `None` value = known-absent (negative cache).
-    cache: HashMap<Arc<str>, Option<SessionRecord>>,
+    cache: HashMap<Arc<str>, SessionEntry>,
     dirty: HashSet<Arc<str>>,
     deleted: HashSet<Arc<str>>,
 }
@@ -52,14 +94,15 @@ impl SessionStoreState {
 
     fn put(&mut self, address: &str, record: SessionRecord) {
         let addr = self.key_for(address);
-        self.cache.insert(addr.clone(), Some(record));
+        self.cache
+            .insert(addr.clone(), SessionEntry::Present(Box::new(record)));
         self.dirty.insert(addr.clone());
         self.deleted.remove(&addr);
     }
 
     fn delete(&mut self, address: &str) {
         let addr = self.key_for(address);
-        self.cache.insert(addr.clone(), None);
+        self.cache.insert(addr.clone(), SessionEntry::Absent);
         self.deleted.insert(addr.clone());
         self.dirty.remove(&addr);
     }
@@ -68,6 +111,28 @@ impl SessionStoreState {
         self.cache.clear();
         self.dirty.clear();
         self.deleted.clear();
+    }
+
+    fn evict_if_needed(&mut self, max_entries: usize) {
+        let overflow = self.cache.len().saturating_sub(max_entries);
+        if overflow == 0 {
+            return;
+        }
+        let mut negative = Vec::with_capacity(overflow);
+        let mut positive = Vec::with_capacity(overflow);
+        for (k, v) in self.cache.iter() {
+            if self.dirty.contains(k.as_ref()) || self.deleted.contains(k.as_ref()) {
+                continue;
+            }
+            match v {
+                SessionEntry::CheckedOut => continue, // never evict checked-out
+                SessionEntry::Absent => negative.push(k.clone()),
+                SessionEntry::Present(_) => positive.push(k.clone()),
+            }
+        }
+        for key in negative.into_iter().chain(positive).take(overflow) {
+            self.cache.remove(&key);
+        }
     }
 }
 
@@ -99,9 +164,19 @@ impl SenderKeyStoreState {
         self.dirty.insert(addr.clone());
     }
 
+    fn delete(&mut self, address: &str) {
+        let addr = self.key_for(address);
+        self.cache.insert(addr.clone(), None);
+        self.dirty.insert(addr);
+    }
+
     fn clear(&mut self) {
         self.cache.clear();
         self.dirty.clear();
+    }
+
+    fn evict_if_needed(&mut self, max_entries: usize) {
+        evict_clean_entries(&mut self.cache, &self.dirty, None, max_entries);
     }
 }
 
@@ -164,6 +239,15 @@ impl ByteStoreState {
         self.dirty.clear();
         self.deleted.clear();
     }
+
+    fn evict_if_needed(&mut self, max_entries: usize) {
+        evict_clean_entries(
+            &mut self.cache,
+            &self.dirty,
+            Some(&self.deleted),
+            max_entries,
+        );
+    }
 }
 
 impl Default for SignalStoreCache {
@@ -174,57 +258,148 @@ impl Default for SignalStoreCache {
 
 impl SignalStoreCache {
     pub fn new() -> Self {
+        Self::with_max_entries(DEFAULT_MAX_CACHE_ENTRIES)
+    }
+
+    pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
             sessions: Mutex::new(SessionStoreState::new()),
             identities: Mutex::new(ByteStoreState::new()),
             sender_keys: Mutex::new(SenderKeyStoreState::new()),
+            flush_encode_buf: Mutex::new(Vec::with_capacity(4096)),
+            max_entries,
         }
     }
 
     // === Sessions (object cache — serialize only during flush) ===
 
+    /// Takes ownership of the cached session, leaving a `CheckedOut` marker.
+    /// Callers must return the record with [`put_session`] after use.
     pub async fn get_session(
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
     ) -> Result<Option<SessionRecord>> {
         let key = address.as_str();
-        let mut state = self.sessions.lock().await;
-        if let Some(cached) = state.cache.get(key) {
-            return Ok(cached.clone());
+        {
+            let mut state = self.sessions.lock().await;
+            if let Some(entry) = state.cache.get_mut(key) {
+                if matches!(entry, SessionEntry::Present(_)) {
+                    let SessionEntry::Present(record) =
+                        std::mem::replace(entry, SessionEntry::CheckedOut)
+                    else {
+                        unreachable!()
+                    };
+                    return Ok(Some(*record));
+                }
+                return Ok(None);
+            }
         }
-        let record = match backend.get_session(key).await? {
-            Some(bytes) => Some(SessionRecord::deserialize(&bytes)?),
-            None => None,
-        };
-        state.cache.insert(Arc::from(key), record.clone());
-        Ok(record)
+        // Backend I/O outside the lock
+        let backend_result = backend.get_session(key).await?;
+        let mut state = self.sessions.lock().await;
+        match backend_result {
+            Some(bytes) => {
+                if state.cache.contains_key(key) {
+                    // Another task populated this slot while we were loading;
+                    // defer to whatever they wrote (Present, CheckedOut, etc).
+                    // Deserialize and return without caching to avoid conflict.
+                    return Ok(Some(SessionRecord::deserialize(&bytes)?));
+                }
+                let record = SessionRecord::deserialize(&bytes)?;
+                state.cache.insert(Arc::from(key), SessionEntry::CheckedOut);
+                state.evict_if_needed(self.max_entries);
+                Ok(Some(record))
+            }
+            None => {
+                if !state.cache.contains_key(key) {
+                    state.cache.insert(Arc::from(key), SessionEntry::Absent);
+                    state.evict_if_needed(self.max_entries);
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Non-destructive read. Clones the session without removing it from
+    /// cache. Use for inspection-only paths (retry, LID migration checks).
+    pub async fn peek_session(
+        &self,
+        address: &ProtocolAddress,
+        backend: &dyn SignalStore,
+    ) -> Result<Option<SessionRecord>> {
+        let key = address.as_str();
+        {
+            let state = self.sessions.lock().await;
+            if let Some(entry) = state.cache.get(key) {
+                return match entry {
+                    SessionEntry::Present(record) => Ok(Some((**record).clone())),
+                    _ => Ok(None),
+                };
+            }
+        }
+        // Backend I/O outside the lock
+        let backend_result = backend.get_session(key).await?;
+        let mut state = self.sessions.lock().await;
+        match backend_result {
+            Some(bytes) => {
+                let record = SessionRecord::deserialize(&bytes)?;
+                if !state.cache.contains_key(key) {
+                    state.cache.insert(
+                        Arc::from(key),
+                        SessionEntry::Present(Box::new(record.clone())),
+                    );
+                    state.evict_if_needed(self.max_entries);
+                }
+                Ok(Some(record))
+            }
+            None => {
+                if !state.cache.contains_key(key) {
+                    state.cache.insert(Arc::from(key), SessionEntry::Absent);
+                    state.evict_if_needed(self.max_entries);
+                }
+                Ok(None)
+            }
+        }
     }
 
     pub async fn put_session(&self, address: &ProtocolAddress, record: SessionRecord) {
-        self.sessions.lock().await.put(address.as_str(), record);
+        let mut state = self.sessions.lock().await;
+        state.put(address.as_str(), record);
+        state.evict_if_needed(self.max_entries);
     }
 
     pub async fn delete_session(&self, address: &ProtocolAddress) {
-        self.sessions.lock().await.delete(address.as_str());
+        let mut state = self.sessions.lock().await;
+        state.delete(address.as_str());
+        state.evict_if_needed(self.max_entries);
     }
 
+    /// Non-destructive existence check (`CheckedOut` counts as present).
+    /// Backend misses are negative-cached; hits are not cached to skip
+    /// deserialization (the subsequent `get_session` will cache on demand).
     pub async fn has_session(
         &self,
         address: &ProtocolAddress,
         backend: &dyn SignalStore,
     ) -> Result<bool> {
         let key = address.as_str();
-        let mut state = self.sessions.lock().await;
-        if let Some(cached) = state.cache.get(key) {
-            return Ok(cached.is_some());
+        {
+            let state = self.sessions.lock().await;
+            if let Some(entry) = state.cache.get(key) {
+                return Ok(!matches!(entry, SessionEntry::Absent));
+            }
         }
-        let record = match backend.get_session(key).await? {
-            Some(bytes) => Some(SessionRecord::deserialize(&bytes)?),
-            None => None,
-        };
-        let exists = record.is_some();
-        state.cache.insert(Arc::from(key), record);
+        // Backend I/O outside the lock
+        let exists = backend.has_session(key).await?;
+        if !exists {
+            let mut state = self.sessions.lock().await;
+            // Re-check: another task may have populated the cache
+            if !state.cache.contains_key(key) {
+                state.cache.insert(Arc::from(key), SessionEntry::Absent);
+                state.evict_if_needed(self.max_entries);
+            }
+        }
         Ok(exists)
     }
 
@@ -236,25 +411,37 @@ impl SignalStoreCache {
         backend: &dyn SignalStore,
     ) -> Result<Option<Arc<[u8]>>> {
         let key = address.as_str();
+        // Cache check inside scoped lock so concurrent callers don't queue on
+        // the mutex during the backend roundtrip. Mirrors get_session/has_session.
+        {
+            let state = self.identities.lock().await;
+            if let Some(cached) = state.cache.get(key) {
+                return Ok(cached.clone());
+            }
+        }
+        // Backend I/O outside the lock.
+        let data = backend.load_identity(key).await?;
+        let arc_data = data.map(Arc::from);
         let mut state = self.identities.lock().await;
+        // Re-check: another task may have populated the cache while we awaited.
         if let Some(cached) = state.cache.get(key) {
             return Ok(cached.clone());
         }
-        let data = backend.load_identity(key).await?;
-        let arc_data = data.map(Arc::from);
         state.cache.insert(Arc::from(key), arc_data.clone());
+        state.evict_if_needed(self.max_entries);
         Ok(arc_data)
     }
 
     pub async fn put_identity(&self, address: &ProtocolAddress, data: &[u8]) {
-        self.identities
-            .lock()
-            .await
-            .put_dedup(address.as_str(), data);
+        let mut state = self.identities.lock().await;
+        state.put_dedup(address.as_str(), data);
+        state.evict_if_needed(self.max_entries);
     }
 
     pub async fn delete_identity(&self, address: &ProtocolAddress) {
-        self.identities.lock().await.delete(address.as_str());
+        let mut state = self.identities.lock().await;
+        state.delete(address.as_str());
+        state.evict_if_needed(self.max_entries);
     }
 
     // === Sender Keys ===
@@ -274,75 +461,124 @@ impl SignalStoreCache {
             None => None,
         };
         state.cache.insert(Arc::from(key), record.clone());
+        state.evict_if_needed(self.max_entries);
         Ok(record)
     }
 
     pub async fn put_sender_key(&self, name: &SenderKeyName, record: SenderKeyRecord) {
-        self.sender_keys.lock().await.put(name.cache_key(), record);
+        let mut state = self.sender_keys.lock().await;
+        state.put(name.cache_key(), record);
+        state.evict_if_needed(self.max_entries);
+    }
+
+    pub async fn delete_sender_key(&self, cache_key: &str) {
+        let mut state = self.sender_keys.lock().await;
+        state.delete(cache_key);
+        state.evict_if_needed(self.max_entries);
     }
 
     // === Flush ===
 
-    /// Flush all dirty state to the backend in a single batch.
-    /// Acquires all 3 mutexes to ensure consistency (matches WhatsApp Web's pattern).
+    /// Flush all dirty state to the backend.
     ///
-    /// Sessions are serialized here (not on every store_session call).
-    /// Dirty sets are only cleared after ALL writes succeed.
+    /// Each store (sessions, identities, sender_keys) is flushed independently
+    /// under its own lock. This means:
+    /// - Only ONE store is locked during its I/O — the other two are free for
+    ///   concurrent encrypt/decrypt operations.
+    /// - No race between snapshot and clear — the lock is held throughout, so
+    ///   mutations to the same store are blocked until the flush completes.
+    /// - Dirty sets are cleared only after successful writes.
     pub async fn flush(&self, backend: &dyn SignalStore) -> Result<()> {
-        let mut sessions = self.sessions.lock().await;
-        let mut identities = self.identities.lock().await;
-        let mut sender_keys = self.sender_keys.lock().await;
+        // Flush sessions
+        {
+            let mut state = self.sessions.lock().await;
+            let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
+            let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
 
-        // Snapshot dirty/deleted sets WITHOUT draining — preserve on failure
-        let session_dirty: Vec<_> = sessions.dirty.iter().cloned().collect();
-        let session_deleted: Vec<_> = sessions.deleted.iter().cloned().collect();
-        let identity_dirty: Vec<_> = identities.dirty.iter().cloned().collect();
-        let identity_deleted: Vec<_> = identities.deleted.iter().cloned().collect();
-        let sender_key_dirty: Vec<_> = sender_keys.dirty.iter().cloned().collect();
-
-        // Persist dirty sessions — serialize only here, not on every store_session
-        for address in &session_dirty {
-            if let Some(Some(record)) = sessions.cache.get(address.as_ref()) {
-                let bytes = record
-                    .serialize()
-                    .map_err(|e| anyhow::anyhow!("session serialize for {address}: {e}"))?;
-                backend.put_session(address, &bytes).await?;
+            let mut encode_buf = self.flush_encode_buf.lock().await;
+            for address in &dirty_keys {
+                match state.cache.get(address.as_ref()) {
+                    Some(SessionEntry::Present(record)) => {
+                        record.serialize_into(&mut encode_buf);
+                        backend.put_session(address, &encode_buf).await?;
+                    }
+                    Some(SessionEntry::CheckedOut) => continue,
+                    _ => {}
+                }
             }
-        }
-        for address in &session_deleted {
-            backend.delete_session(address).await?;
-        }
-
-        for address in &identity_dirty {
-            if let Some(Some(data)) = identities.cache.get(address.as_ref()) {
-                let key: [u8; 32] = data.as_ref().try_into().map_err(|_| {
-                    anyhow::anyhow!(
-                        "Corrupted identity key for {address}: expected 32 bytes, got {}",
-                        data.len()
-                    )
-                })?;
-                backend.put_identity(address, key).await?;
+            for address in &deleted_keys {
+                backend.delete_session(address).await?;
             }
-        }
-        for address in &identity_deleted {
-            backend.delete_identity(address).await?;
-        }
 
-        for name in &sender_key_dirty {
-            if let Some(Some(record)) = sender_keys.cache.get(name.as_ref()) {
-                let bytes = record
-                    .serialize()
-                    .map_err(|e| anyhow::anyhow!("sender key serialize for {name}: {e}"))?;
-                backend.put_sender_key(name, &bytes).await?;
+            for key in &dirty_keys {
+                if !matches!(
+                    state.cache.get(key.as_ref()),
+                    Some(SessionEntry::CheckedOut)
+                ) {
+                    state.dirty.remove(key);
+                }
             }
+            for key in &deleted_keys {
+                state.deleted.remove(key);
+            }
+            state.evict_if_needed(self.max_entries);
         }
 
-        // All writes succeeded — clear dirty sets (matches WA Web's clearDirty())
-        sessions.dirty.clear();
-        sessions.deleted.clear();
-        identities.dirty.clear();
-        identities.deleted.clear();
-        sender_keys.dirty.clear();
+        // Flush identities
+        {
+            let mut state = self.identities.lock().await;
+            let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
+            let deleted_keys: Vec<_> = state.deleted.iter().cloned().collect();
+
+            for address in &dirty_keys {
+                if let Some(Some(data)) = state.cache.get(address.as_ref()) {
+                    let key: [u8; 32] = data.as_ref().try_into().map_err(|_| {
+                        anyhow::anyhow!(
+                            "Corrupted identity key for {address}: expected 32 bytes, got {}",
+                            data.len()
+                        )
+                    })?;
+                    backend.put_identity(address, key).await?;
+                }
+            }
+            for address in &deleted_keys {
+                backend.delete_identity(address).await?;
+            }
+
+            for key in &dirty_keys {
+                state.dirty.remove(key);
+            }
+            for key in &deleted_keys {
+                state.deleted.remove(key);
+            }
+            state.evict_if_needed(self.max_entries);
+        }
+
+        // Flush sender keys
+        {
+            let mut state = self.sender_keys.lock().await;
+            let dirty_keys: Vec<_> = state.dirty.iter().cloned().collect();
+
+            for name in &dirty_keys {
+                match state.cache.get(name.as_ref()) {
+                    Some(Some(record)) => {
+                        let bytes = record
+                            .serialize()
+                            .map_err(|e| anyhow::anyhow!("sender key serialize for {name}: {e}"))?;
+                        backend.put_sender_key(name, &bytes).await?;
+                    }
+                    Some(None) => {
+                        backend.delete_sender_key(name).await?;
+                    }
+                    None => {}
+                }
+            }
+
+            for key in &dirty_keys {
+                state.dirty.remove(key);
+            }
+            state.evict_if_needed(self.max_entries);
+        }
 
         Ok(())
     }

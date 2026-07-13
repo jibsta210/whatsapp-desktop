@@ -1,11 +1,11 @@
 use crate::client::Client;
 use log::{debug, warn};
 use thiserror::Error;
-use wacore::StringEnum;
+use wacore::WireEnum;
 use wacore::iq::tctoken::build_tc_token_node;
+use wacore_binary::Jid;
+use wacore_binary::Node;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::jid::Jid;
-use wacore_binary::node::Node;
 
 #[derive(Debug, Error)]
 pub enum PresenceError {
@@ -16,11 +16,12 @@ pub enum PresenceError {
 }
 
 /// Presence status for online/offline state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StringEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
+#[non_exhaustive]
 pub enum PresenceStatus {
-    #[str = "available"]
+    #[wire = "available"]
     Available,
-    #[str = "unavailable"]
+    #[wire = "unavailable"]
     Unavailable,
 }
 
@@ -46,7 +47,7 @@ impl<'a> Presence<'a> {
     async fn build_subscription_node(&self, jid: &Jid) -> Node {
         let mut builder = NodeBuilder::new("presence")
             .attr("type", "subscribe")
-            .attr("to", jid.clone());
+            .attr("to", jid);
 
         // Include tctoken if available (no t attribute, matching WhatsApp Web)
         if let Some(token) = self.client.lookup_tc_token_for_jid(jid).await {
@@ -59,7 +60,7 @@ impl<'a> Presence<'a> {
     fn build_unsubscription_node(&self, jid: &Jid) -> Node {
         NodeBuilder::new("presence")
             .attr("type", "unsubscribe")
-            .attr("to", jid.clone())
+            .attr("to", jid)
             .build()
     }
 
@@ -140,6 +141,27 @@ impl<'a> Presence<'a> {
         Ok(())
     }
 
+    /// Re-subscribe presence if the JID has an active subscription.
+    /// Does not modify the tracking set.
+    pub(crate) async fn re_subscribe_when_active(&self, jid: &Jid) -> Result<(), anyhow::Error> {
+        if !self
+            .client
+            .presence_subscriptions
+            .lock()
+            .await
+            .contains(jid)
+        {
+            return Ok(());
+        }
+
+        let node = self.build_subscription_node(jid).await;
+        self.client
+            .send_node(node)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(())
+    }
+
     /// Unsubscribe from a contact's presence updates.
     ///
     /// Sends a `<presence type="unsubscribe">` stanza to the target JID.
@@ -204,14 +226,7 @@ impl Client {
                 return;
             }
 
-            // Check membership before re-subscribing — a concurrent unsubscribe()
-            // call may have removed this JID while we were iterating.
-            if !self.presence_subscriptions.lock().await.contains(&jid) {
-                debug!("Skipping re-subscribe for {jid}: unsubscribed during iteration");
-                continue;
-            }
-
-            if let Err(err) = self.presence().subscribe(&jid).await {
+            if let Err(err) = self.presence().re_subscribe_when_active(&jid).await {
                 warn!("Failed to re-subscribe to presence for {jid}: {err:?}");
             }
         }

@@ -6,18 +6,15 @@
 //! - Read receipts (type="read") → blue checks ✓✓
 //! - Receipts are queued when the target is offline and delivered on reconnect.
 
-use e2e_tests::TestClient;
+use e2e_tests::{TestClient, text_msg};
 use log::info;
 use std::time::Duration;
 use wacore::types::events::Event;
 use wacore::types::presence::ReceiptType;
 use whatsapp_rust::features::{GroupCreateOptions, GroupParticipantOptions};
-use whatsapp_rust::waproto::whatsapp as wa;
+use whatsapp_rust::{NodeFilter, SendOptions};
 
-// ── Delivery Receipts (online) ──────────────────────────────────────────────
-
-/// Both clients online: A sends message to B, A should receive a delivery receipt
-/// after B processes the message.
+/// Both clients online: A sends message to B, A should receive a delivery receipt.
 #[tokio::test]
 async fn test_delivery_receipt_online() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -25,31 +22,20 @@ async fn test_delivery_receipt_online() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_rcpt_online_a").await?;
     let mut client_b = TestClient::connect("e2e_rcpt_online_b").await?;
 
-    let jid_b = client_b.client.get_pn().await.expect("B JID").to_non_ad();
+    let jid_b = client_b.jid().await;
 
     let msg_id = client_a
         .client
-        .send_message(
-            jid_b.clone(),
-            wa::Message {
-                conversation: Some("Hello B!".to_string()),
-                ..Default::default()
-            },
-        )
-        .await?;
+        .send_message(jid_b.clone(), text_msg("Hello B!"))
+        .await?
+        .message_id;
     info!("A sent message: {msg_id}");
 
-    // B should receive the message
-    client_b
-        .wait_for_event(
-            15,
-            |e| matches!(e, Event::Message(msg, _) if msg.conversation.as_deref() == Some("Hello B!")),
-        )
-        .await?;
+    client_b.wait_for_text("Hello B!", 15).await?;
     info!("B received message");
 
-    // A should receive the delivery receipt (B's client sends it automatically)
-    let event = client_a
+    // B's client sends delivery receipt automatically
+    client_a
         .wait_for_event(15, |e| {
             matches!(
                 e,
@@ -59,18 +45,12 @@ async fn test_delivery_receipt_online() -> anyhow::Result<()> {
             )
         })
         .await?;
-
-    if let Event::Receipt(r) = event {
-        info!("A received delivery receipt: {:?}", r.r#type);
-        assert!(r.message_ids.contains(&msg_id));
-    }
+    info!("A received delivery receipt");
 
     client_a.disconnect().await;
     client_b.disconnect().await;
     Ok(())
 }
-
-// ── Read Receipts (online) ──────────────────────────────────────────────────
 
 /// Both clients online: A sends message to B, B marks it as read, A gets read receipt.
 #[tokio::test]
@@ -80,38 +60,25 @@ async fn test_read_receipt_online() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_rcpt_read_a").await?;
     let mut client_b = TestClient::connect("e2e_rcpt_read_b").await?;
 
-    let jid_a = client_a.client.get_pn().await.expect("A JID").to_non_ad();
-    let jid_b = client_b.client.get_pn().await.expect("B JID").to_non_ad();
+    let jid_a = client_a.jid().await;
+    let jid_b = client_b.jid().await;
 
     let msg_id = client_a
         .client
-        .send_message(
-            jid_b.clone(),
-            wa::Message {
-                conversation: Some("Read me!".to_string()),
-                ..Default::default()
-            },
-        )
-        .await?;
+        .send_message(jid_b.clone(), text_msg("Read me!"))
+        .await?
+        .message_id;
     info!("A sent message: {msg_id}");
 
-    // B receives the message
-    client_b
-        .wait_for_event(
-            15,
-            |e| matches!(e, Event::Message(msg, _) if msg.conversation.as_deref() == Some("Read me!")),
-        )
-        .await?;
+    client_b.wait_for_text("Read me!", 15).await?;
 
-    // B sends read receipt
     client_b
         .client
         .mark_as_read(&jid_a, None, vec![msg_id.clone()])
         .await?;
     info!("B marked message as read");
 
-    // A should receive the read receipt
-    let event = client_a
+    client_a
         .wait_for_event(15, |e| {
             matches!(
                 e,
@@ -121,20 +88,14 @@ async fn test_read_receipt_online() -> anyhow::Result<()> {
             )
         })
         .await?;
-
-    if let Event::Receipt(r) = event {
-        info!("A received read receipt: {:?}", r.r#type);
-        assert_eq!(r.r#type, ReceiptType::Read);
-    }
+    info!("A received read receipt");
 
     client_a.disconnect().await;
     client_b.disconnect().await;
     Ok(())
 }
 
-// ── Delivery Receipts (offline → reconnect) ─────────────────────────────────
-
-/// B offline, A sends message, B reconnects → A gets deferred delivery receipt.
+/// B offline, A sends message, B reconnects -> A gets deferred delivery receipt.
 #[tokio::test]
 async fn test_delivery_receipt_offline_reconnect() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -142,53 +103,40 @@ async fn test_delivery_receipt_offline_reconnect() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_rcpt_off_a").await?;
     let mut client_b = TestClient::connect("e2e_rcpt_off_b").await?;
 
-    let jid_b = client_b.client.get_pn().await.expect("B JID").to_non_ad();
+    let jid_b = client_b.jid().await;
 
-    // B goes offline
     client_b.client.reconnect().await;
     info!("B disconnected (will auto-reconnect)");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let msg_id = client_a
         .client
-        .send_message(
-            jid_b.clone(),
-            wa::Message {
-                conversation: Some("Offline delivery test".to_string()),
-                ..Default::default()
-            },
-        )
-        .await?;
+        .send_message(jid_b.clone(), text_msg("Offline delivery test"))
+        .await?
+        .message_id;
     info!("A sent message to offline B: {msg_id}");
 
-    // A should NOT get delivery receipt while B is offline
-    let early = client_a
-        .wait_for_event(3, |e| {
-            matches!(
-                e,
-                Event::Receipt(r)
-                if r.message_ids.contains(&msg_id)
-                    && r.r#type == ReceiptType::Delivered
-            )
-        })
-        .await;
-    assert!(
-        early.is_err(),
-        "Should NOT receive delivery receipt while B is offline"
-    );
-    info!("Confirmed: no early delivery receipt");
-
-    // B reconnects and receives the message
-    client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(msg, _) if msg.conversation.as_deref() == Some("Offline delivery test")),
+    // No delivery receipt while B is offline
+    client_a
+        .assert_no_event(
+            3,
+            |e| {
+                matches!(
+                    e,
+                    Event::Receipt(r)
+                    if r.message_ids.contains(&msg_id)
+                        && r.r#type == ReceiptType::Delivered
+                )
+            },
+            "Should NOT receive delivery receipt while B is offline",
         )
         .await?;
+    info!("Confirmed: no early delivery receipt");
+
+    client_b.wait_for_text("Offline delivery test", 30).await?;
     info!("B received offline message after reconnect");
 
-    // A should now receive the delivery receipt
-    let event = client_a
+    client_a
         .wait_for_event(15, |e| {
             matches!(
                 e,
@@ -198,20 +146,14 @@ async fn test_delivery_receipt_offline_reconnect() -> anyhow::Result<()> {
             )
         })
         .await?;
-
-    if let Event::Receipt(r) = event {
-        info!("A received deferred delivery receipt: {:?}", r.r#type);
-        assert!(r.message_ids.contains(&msg_id));
-    }
+    info!("A received deferred delivery receipt");
 
     client_a.disconnect().await;
     client_b.disconnect().await;
     Ok(())
 }
 
-// ── Read Receipts (offline sender) ──────────────────────────────────────────
-
-/// A sends to B, A goes offline, B reads, A reconnects → A gets queued read receipt.
+/// A sends to B, A goes offline, B reads, A reconnects -> A gets queued read receipt.
 #[tokio::test]
 async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -219,32 +161,20 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_rcpt_read_off_a").await?;
     let mut client_b = TestClient::connect("e2e_rcpt_read_off_b").await?;
 
-    let jid_a = client_a.client.get_pn().await.expect("A JID").to_non_ad();
-    let jid_b = client_b.client.get_pn().await.expect("B JID").to_non_ad();
+    let jid_a = client_a.jid().await;
+    let jid_b = client_b.jid().await;
 
-    // A sends message to B (both online)
     let msg_id = client_a
         .client
-        .send_message(
-            jid_b.clone(),
-            wa::Message {
-                conversation: Some("Read while I'm away".to_string()),
-                ..Default::default()
-            },
-        )
-        .await?;
+        .send_message(jid_b.clone(), text_msg("Read while I'm away"))
+        .await?
+        .message_id;
     info!("A sent message: {msg_id}");
 
-    // B receives the message
-    client_b
-        .wait_for_event(
-            15,
-            |e| matches!(e, Event::Message(msg, _) if msg.conversation.as_deref() == Some("Read while I'm away")),
-        )
-        .await?;
+    client_b.wait_for_text("Read while I'm away", 15).await?;
     info!("B received message");
 
-    // Drain A's delivery receipt first
+    // Drain A's delivery receipt before going offline
     let _ = client_a
         .wait_for_event(10, |e| {
             matches!(
@@ -255,20 +185,18 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
         })
         .await;
 
-    // A goes offline
     client_a.client.reconnect().await;
     info!("A disconnected (will auto-reconnect)");
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // B sends read receipt while A is offline
     client_b
         .client
         .mark_as_read(&jid_a, None, vec![msg_id.clone()])
         .await?;
     info!("B marked message as read (A is offline)");
 
-    // A reconnects and should get the queued read receipt
-    let event = client_a
+    // A reconnects and gets the queued read receipt
+    client_a
         .wait_for_event(30, |e| {
             matches!(
                 e,
@@ -278,24 +206,15 @@ async fn test_read_receipt_queued_for_offline_sender() -> anyhow::Result<()> {
             )
         })
         .await?;
-
-    if let Event::Receipt(r) = event {
-        info!(
-            "A received queued read receipt after reconnect: {:?}",
-            r.r#type
-        );
-        assert_eq!(r.r#type, ReceiptType::Read);
-    }
+    info!("A received queued read receipt after reconnect");
 
     client_a.disconnect().await;
     client_b.disconnect().await;
     Ok(())
 }
 
-// ── Bidirectional offline ───────────────────────────────────────────────────
-
-/// Both go offline at different times: B offline → A sends → A offline → B reconnects →
-/// A reconnects → A gets delivery receipt.
+/// Both go offline at different times: B offline -> A sends -> A offline -> B reconnects ->
+/// A reconnects -> A gets delivery receipt.
 #[tokio::test]
 async fn test_delivery_receipt_bidirectional_offline() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
@@ -303,43 +222,29 @@ async fn test_delivery_receipt_bidirectional_offline() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_rcpt_bidir_a").await?;
     let mut client_b = TestClient::connect("e2e_rcpt_bidir_b").await?;
 
-    let jid_b = client_b.client.get_pn().await.expect("B JID").to_non_ad();
+    let jid_b = client_b.jid().await;
 
-    // B goes offline
     client_b.client.reconnect().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     info!("B offline");
 
-    // A sends message to offline B
     let msg_id = client_a
         .client
-        .send_message(
-            jid_b.clone(),
-            wa::Message {
-                conversation: Some("Bidirectional test".to_string()),
-                ..Default::default()
-            },
-        )
-        .await?;
+        .send_message(jid_b.clone(), text_msg("Bidirectional test"))
+        .await?
+        .message_id;
     info!("A sent to offline B: {msg_id}");
 
-    // A goes offline too
     client_a.client.reconnect().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     info!("A offline");
 
-    // B reconnects → receives message → sends delivery receipt → A is offline → queued
-    let msg_event = client_b
-        .wait_for_event(
-            30,
-            |e| matches!(e, Event::Message(msg, _) if msg.conversation.as_deref() == Some("Bidirectional test")),
-        )
-        .await?;
-    assert!(matches!(msg_event, Event::Message(..)));
+    // B reconnects, receives message, sends delivery receipt (queued since A is offline)
+    client_b.wait_for_text("Bidirectional test", 30).await?;
     info!("B received offline message");
 
-    // A reconnects → should get queued delivery receipt
-    let receipt = client_a
+    // A reconnects and gets queued delivery receipt
+    client_a
         .wait_for_event(30, |e| {
             matches!(
                 e,
@@ -349,18 +254,12 @@ async fn test_delivery_receipt_bidirectional_offline() -> anyhow::Result<()> {
             )
         })
         .await?;
-
-    if let Event::Receipt(r) = receipt {
-        info!("A received queued delivery receipt: {:?}", r.r#type);
-        assert!(r.message_ids.contains(&msg_id));
-    }
+    info!("A received queued delivery receipt");
 
     client_a.disconnect().await;
     client_b.disconnect().await;
     Ok(())
 }
-
-// ── No receipt when fully offline ───────────────────────────────────────────
 
 /// B disconnects fully (no reconnect). A should NOT get delivery receipt.
 #[tokio::test]
@@ -370,48 +269,38 @@ async fn test_no_delivery_receipt_for_fully_offline() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_rcpt_no_a").await?;
     let client_b = TestClient::connect("e2e_rcpt_no_b").await?;
 
-    let jid_b = client_b.client.get_pn().await.expect("B JID").to_non_ad();
+    let jid_b = client_b.jid().await;
 
-    // B disconnects fully (no reconnect)
     client_b.disconnect().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     info!("B fully disconnected");
 
     let msg_id = client_a
         .client
-        .send_message(
-            jid_b.clone(),
-            wa::Message {
-                conversation: Some("No receipt expected".to_string()),
-                ..Default::default()
-            },
-        )
-        .await?;
+        .send_message(jid_b.clone(), text_msg("No receipt expected"))
+        .await?
+        .message_id;
     info!("A sent to fully-offline B: {msg_id}");
 
-    // A should NOT receive delivery receipt
-    let result = client_a
-        .wait_for_event(5, |e| {
-            matches!(
-                e,
-                Event::Receipt(r)
-                if r.message_ids.contains(&msg_id)
-                    && r.r#type == ReceiptType::Delivered
-            )
-        })
-        .await;
-
-    assert!(
-        result.is_err(),
-        "Should NOT receive delivery receipt when B never reconnects"
-    );
+    client_a
+        .assert_no_event(
+            5,
+            |e| {
+                matches!(
+                    e,
+                    Event::Receipt(r)
+                    if r.message_ids.contains(&msg_id)
+                        && r.r#type == ReceiptType::Delivered
+                )
+            },
+            "Should NOT receive delivery receipt when B never reconnects",
+        )
+        .await?;
     info!("Confirmed: no delivery receipt for fully-offline recipient");
 
     client_a.disconnect().await;
     Ok(())
 }
-
-// ── Group delivery receipt ──────────────────────────────────────────────────
 
 /// Group message: A sends to group, B (participant) sends delivery receipt back to A.
 #[tokio::test]
@@ -421,9 +310,8 @@ async fn test_group_delivery_receipt() -> anyhow::Result<()> {
     let mut client_a = TestClient::connect("e2e_rcpt_grp_a").await?;
     let mut client_b = TestClient::connect("e2e_rcpt_grp_b").await?;
 
-    let jid_b = client_b.client.get_pn().await.expect("B JID").to_non_ad();
+    let jid_b = client_b.jid().await;
 
-    // Create group with A and B
     let group_jid = client_a
         .client
         .groups()
@@ -433,40 +321,25 @@ async fn test_group_delivery_receipt() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group created: {group_jid}");
 
-    // Wait for B to receive group create notification
-    client_b
-        .wait_for_event(10, |e| {
-            matches!(e, Event::Notification(node) if node.attrs.get("type").is_some_and(|v| v == "w:gp2"))
-        })
-        .await?;
+    client_b.wait_for_group_notification(10).await?;
 
-    // A sends group message
     let msg_id = client_a
         .client
-        .send_message(
-            group_jid.clone(),
-            wa::Message {
-                conversation: Some("Group receipt test".to_string()),
-                ..Default::default()
-            },
-        )
-        .await?;
+        .send_message(group_jid.clone(), text_msg("Group receipt test"))
+        .await?
+        .message_id;
     info!("A sent group message: {msg_id}");
 
-    // B receives the group message
     client_b
-        .wait_for_event(
-            15,
-            |e| matches!(e, Event::Message(msg, info) if msg.conversation.as_deref() == Some("Group receipt test") && info.source.chat == group_jid),
-        )
+        .wait_for_group_text(&group_jid, "Group receipt test", 15)
         .await?;
     info!("B received group message");
 
-    // A should receive delivery receipt from B
-    let event = client_a
+    client_a
         .wait_for_event(15, |e| {
             matches!(
                 e,
@@ -476,16 +349,156 @@ async fn test_group_delivery_receipt() -> anyhow::Result<()> {
             )
         })
         .await?;
-
-    if let Event::Receipt(r) = event {
-        info!(
-            "A received group delivery receipt: type={:?}, from={:?}",
-            r.r#type, r.source.chat
-        );
-        assert!(r.message_ids.contains(&msg_id));
-    }
+    info!("A received group delivery receipt");
 
     client_a.disconnect().await;
     client_b.disconnect().await;
+    Ok(())
+}
+
+/// Regression test for issue #571: disconnect must flush in-flight delivery
+/// receipts before teardown. The mock server can still race receipt routing
+/// with a close frame, so this verifies the client builds the receipt stanzas;
+/// the transport ordering is covered by the unit test in `client.rs`.
+#[tokio::test]
+async fn test_delivery_receipts_flushed_on_disconnect() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let client_a = TestClient::connect("e2e_rcpt_flush_a").await?;
+    let mut client_b = TestClient::connect("e2e_rcpt_flush_b").await?;
+
+    let jid_b = client_b.jid().await;
+
+    const N: usize = 5;
+    let mut msg_ids: Vec<String> = Vec::with_capacity(N);
+    let mut receipt_waiters = Vec::with_capacity(N);
+    for i in 0..N {
+        let id = client_a.client.generate_message_id().await;
+        let receipt_waiter = client_b
+            .client
+            .wait_for_sent_node(NodeFilter::tag("receipt").attr("id", id.clone()));
+        let text = format!("flush burst {i}");
+        let returned_id = client_a
+            .client
+            .send_message_with_options(
+                jid_b.clone(),
+                text_msg(&text),
+                SendOptions {
+                    message_id: Some(id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .message_id;
+        assert_eq!(returned_id, id);
+        receipt_waiters.push((id.clone(), receipt_waiter));
+        msg_ids.push(id);
+    }
+    info!("A sent {N} messages: {msg_ids:?}");
+
+    // Wait for every message event so later-arriving ones can't slip past the
+    // disconnect. Event::Message dispatches right after the receipt task is
+    // spawned, so by then the receipt may still be queued on the runtime.
+    let mut seen = std::collections::HashSet::<usize>::new();
+    while seen.len() < N {
+        let event = client_b
+            .wait_for_event(15, |e| {
+                matches!(e, Event::Message(m, _) if m
+                    .conversation
+                    .as_deref()
+                    .and_then(|c| c.strip_prefix("flush burst "))
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .is_some_and(|i| i < N))
+            })
+            .await?;
+        if let Event::Message(m, _) = &*event
+            && let Some(i) = m
+                .conversation
+                .as_deref()
+                .and_then(|c| c.strip_prefix("flush burst "))
+                .and_then(|s| s.parse::<usize>().ok())
+        {
+            seen.insert(i);
+        }
+    }
+    info!("B saw all {N} message events");
+
+    client_b.disconnect().await;
+    info!("B disconnected");
+
+    for (id, waiter) in receipt_waiters {
+        let node = tokio::time::timeout(Duration::from_secs(15), waiter)
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for sent receipt {id}"))?
+            .map_err(|_| anyhow::anyhow!("Sent receipt waiter canceled for {id}"))?;
+        assert_eq!(node.as_node_ref().tag.as_ref(), "receipt");
+    }
+    info!("B flushed all {N} delivery receipt stanzas");
+
+    client_a.disconnect().await;
+    Ok(())
+}
+
+/// Performance regression guard for issue #571 / PR #573: `disconnect()`
+/// must not pad latency when there are no pending receipt tasks. Cold
+/// disconnect (just connected, never received a message) should complete
+/// in milliseconds, not anywhere near the 5s drain cap.
+#[tokio::test]
+async fn test_disconnect_is_fast_with_no_pending_receipts() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let client = TestClient::connect("e2e_rcpt_cold_disconnect").await?;
+
+    let start = wacore::time::Instant::now();
+    client.client.disconnect().await;
+    let elapsed = start.elapsed();
+
+    info!("cold disconnect took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "disconnect with zero pending receipts took {elapsed:?}, expected well under 500ms — \
+         likely waiting on the receipt-drain cap"
+    );
+    Ok(())
+}
+
+/// Hot disconnect: B receives a burst of messages from A and disconnects
+/// immediately. The drain SHOULD complete fast (each receipt is a single
+/// `<receipt>` send) — significantly faster than the 5s cap. Padding here
+/// would compound across every test that creates+tears-down a client.
+#[tokio::test]
+async fn test_disconnect_is_fast_with_pending_receipts() -> anyhow::Result<()> {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let client_a = TestClient::connect("e2e_rcpt_hot_a").await?;
+    let mut client_b = TestClient::connect("e2e_rcpt_hot_b").await?;
+    let jid_b = client_b.jid().await;
+
+    const N: usize = 5;
+    for i in 0..N {
+        client_a
+            .client
+            .send_message(jid_b.clone(), text_msg(&format!("burst {i}")))
+            .await?;
+    }
+
+    // Wait until B observes the LAST message — receipt tasks are spawned
+    // by then but may still be in-flight on the runtime.
+    client_b
+        .wait_for_text(&format!("burst {}", N - 1), 15)
+        .await?;
+
+    let start = wacore::time::Instant::now();
+    client_b.client.disconnect().await;
+    let elapsed = start.elapsed();
+
+    info!("hot disconnect with {N} pending receipts took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "disconnect with {N} pending receipts took {elapsed:?}, expected <1s — \
+         drain is hitting the 5s cap on every call"
+    );
+
+    client_a.disconnect().await;
     Ok(())
 }

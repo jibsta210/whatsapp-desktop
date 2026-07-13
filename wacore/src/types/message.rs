@@ -1,31 +1,42 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use wacore_binary::jid::{Jid, JidExt, MessageId, MessageServerId};
+use wacore_binary::{Jid, JidExt, MessageId, MessageServerId};
 use waproto::whatsapp as wa;
 
-/// Unique identifier for a message stanza within a chat.
-/// Used for deduplication and retry tracking.
+use crate::WireEnum;
+
+/// Identifies a specific message within a chat.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct StanzaKey {
+pub struct ChatMessageId {
     pub chat: Jid,
     pub id: MessageId,
 }
 
-impl StanzaKey {
+impl ChatMessageId {
     pub fn new(chat: Jid, id: MessageId) -> Self {
         Self { chat, id }
     }
 }
 
 /// Addressing mode for a group (phone number vs LID).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, crate::StringEnum)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, crate::WireEnum)]
 pub enum AddressingMode {
-    #[string_default]
-    #[str = "pn"]
+    #[wire_default]
+    #[wire = "pn"]
     Pn,
-    #[str = "lid"]
+    #[wire = "lid"]
     Lid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, WireEnum)]
+pub enum MessageCategory {
+    #[wire_default]
+    #[wire = ""]
+    Empty,
+    #[wire = "peer"]
+    Peer,
+    #[wire_fallback]
+    Other(String),
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -53,22 +64,22 @@ pub struct DeviceSentMeta {
     pub phash: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, crate::StringEnum)]
+#[derive(Debug, Clone, PartialEq, Eq, crate::WireEnum)]
 pub enum EditAttribute {
-    #[string_default]
-    #[str = ""]
+    #[wire_default]
+    #[wire = ""]
     Empty,
-    #[str = "1"]
+    #[wire = "1"]
     MessageEdit,
-    #[str = "2"]
+    #[wire = "2"]
     PinInChat,
-    #[str = "3"]
+    #[wire = "3"]
     AdminEdit,
-    #[str = "7"]
+    #[wire = "7"]
     SenderRevoke,
-    #[str = "8"]
+    #[wire = "8"]
     AdminRevoke,
-    #[string_fallback]
+    #[wire_fallback]
     Unknown(String),
 }
 
@@ -117,7 +128,7 @@ pub struct MessageInfo {
     pub r#type: String,
     pub push_name: String,
     pub timestamp: DateTime<Utc>,
-    pub category: String,
+    pub category: MessageCategory,
     pub multicast: bool,
     pub media_type: String,
     pub edit: EditAttribute,
@@ -125,6 +136,13 @@ pub struct MessageInfo {
     pub meta_info: MsgMetaInfo,
     pub verified_name: Option<wa::VerifiedNameCertificate>,
     pub device_sent_meta: Option<DeviceSentMeta>,
+    /// Ephemeral duration in seconds, extracted from `contextInfo.expiration`.
+    pub ephemeral_expiration: Option<u32>,
+    /// Whether this message was delivered during offline sync.
+    pub is_offline: bool,
+    /// Set when this message was recovered via PDO rather than normal decryption.
+    /// Contains the PDO request message ID.
+    pub unavailable_request_id: Option<String>,
 }
 
 impl MessageInfo {

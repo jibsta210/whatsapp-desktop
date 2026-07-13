@@ -10,12 +10,12 @@ use log;
 
 use std::sync::atomic::Ordering;
 use wacore::iq::prekeys::{
-    DigestKeyBundleSpec, PreKeyCountSpec, PreKeyFetchSpec, PreKeyUploadSpec,
+    DigestKeyBundleSpec, PreKeyCountSpec, PreKeyFetchReason, PreKeyFetchSpec, PreKeyUploadSpec,
 };
 use wacore::libsignal::protocol::{KeyPair, PreKeyBundle, PublicKey};
 use wacore::libsignal::store::record_helpers::new_pre_key_record;
 use wacore::store::commands::DeviceCommand;
-use wacore_binary::jid::Jid;
+use wacore_binary::Jid;
 
 pub use wacore::prekeys::PreKeyUtils;
 
@@ -27,7 +27,7 @@ impl Client {
     pub(crate) async fn fetch_pre_keys(
         &self,
         jids: &[Jid],
-        reason: Option<&str>,
+        reason: Option<PreKeyFetchReason>,
     ) -> Result<std::collections::HashMap<Jid, PreKeyBundle>, anyhow::Error> {
         let spec = match reason {
             Some(r) => PreKeyFetchSpec::with_reason(jids.to_vec(), r),
@@ -49,26 +49,58 @@ impl Client {
         Ok(response.count)
     }
 
-    /// Ensure the server has at least MIN_PRE_KEY_COUNT pre-keys, and upload a batch of
-    /// WANTED_PRE_KEY_COUNT new pre-keys. Uses a persistent monotonic counter
-    /// (Device::next_pre_key_id) to avoid ID collisions — matching WhatsApp Web's
-    /// NEXT_PK_ID / FIRST_UNUPLOAD_PK_ID pattern from WAWebSignalStoreApi.
-    ///
-    /// When `force` is true, skips the count guard and always uploads. This is used
-    /// by the digest key repair path (WA Web's `_uploadPreKeys` does NOT check count).
-    pub(crate) async fn upload_pre_keys(&self, force: bool) -> Result<(), anyhow::Error> {
-        let server_count = match self.get_server_pre_key_count().await {
-            Ok(c) => c,
-            Err(e) => return Err(anyhow::anyhow!(e)),
-        };
+    /// Upload prekeys at login if the persisted flag indicates they're needed.
+    /// Matches WA Web's PassiveTasks.js:30 which checks `getServerHasPreKeys()`.
+    pub(crate) async fn upload_pre_keys_at_login(&self) -> Result<(), anyhow::Error> {
+        let has_prekeys = self
+            .persistence_manager
+            .get_device_snapshot()
+            .await
+            .server_has_prekeys;
 
-        if !force && server_count >= MIN_PRE_KEY_COUNT {
-            log::debug!("Server has {} pre-keys, no upload needed.", server_count);
+        if has_prekeys {
+            log::debug!("Server has prekeys (persisted flag), skipping login upload.");
             return Ok(());
         }
 
-        log::debug!("Server has {} pre-keys, uploading more.", server_count);
+        // Serialize with prekey-low/digest paths to avoid duplicate uploads
+        let _guard = self.prekey_upload_lock.lock().await;
 
+        // Re-check after acquiring lock (another task may have uploaded)
+        if self
+            .persistence_manager
+            .get_device_snapshot()
+            .await
+            .server_has_prekeys
+        {
+            return Ok(());
+        }
+
+        log::info!("Server missing prekeys (persisted flag), uploading.");
+        self.upload_pre_keys_inner().await
+    }
+
+    /// Ensure the server has enough pre-keys, uploading if below threshold.
+    /// When `force` is true, skips the count guard (used by digest key repair).
+    pub(crate) async fn upload_pre_keys(&self, force: bool) -> Result<(), anyhow::Error> {
+        let server_count = self
+            .get_server_pre_key_count()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        if !force && server_count >= MIN_PRE_KEY_COUNT {
+            log::debug!("Server has {server_count} pre-keys, no upload needed.");
+            return Ok(());
+        }
+
+        log::debug!("Server has {server_count} pre-keys, uploading.");
+        self.upload_pre_keys_inner().await
+    }
+
+    /// Generate and upload WANTED_PRE_KEY_COUNT pre-keys. Shared by
+    /// `upload_pre_keys` and `upload_pre_keys_at_login` to avoid
+    /// redundant server count queries.
+    async fn upload_pre_keys_inner(&self) -> Result<(), anyhow::Error> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
         let device_store = self.persistence_manager.get_device_arc().await;
 
@@ -77,23 +109,11 @@ impl Client {
             device_guard.backend.clone()
         };
 
-        // Pre-key IDs are 24-bit (max 16,777,215 per WA Web's NEXT_PK_ID).
-        // Determine the starting ID using both the persistent counter AND the store max.
-        const MAX_PRE_KEY_ID: u32 = 16_777_215;
+        // Use the persistent counter, falling back to max(store_id)+1 for migration.
+        // The counter is the source of truth after the first upload.
         let max_id = backend.get_max_prekey_id().await?;
-        // The persistent monotonic counter (next_pre_key_id, WA Web's NEXT_PK_ID)
-        // is AUTHORITATIVE. Do NOT clamp it up to the store's max.
-        // `get_max_prekey_id()` never decreases — old consumed/stale prekeys
-        // linger in the store forever — so `max(counter, store_max + 1)` pins
-        // start_id at the 24-bit ceiling permanently once the store has ever held
-        // a near-ceiling ID. That forced a wrap-to-1 on EVERY upload, which
-        // regenerated and OVERWROTE the live prekeys 1..=812 each launch — and
-        // silently broke every session a peer (including our own primary phone)
-        // had established with the previous batch (key mismatch → MAC failure →
-        // "session keeps dying after a day"). Trust the counter; only fall back
-        // to the store max to migrate an uninitialised counter.
-        let mut start_id = if device_snapshot.next_pre_key_id > 0 {
-            device_snapshot.next_pre_key_id
+        let raw_start = if device_snapshot.next_pre_key_id > 0 {
+            std::cmp::max(device_snapshot.next_pre_key_id, max_id + 1)
         } else {
             log::info!(
                 "Migrating pre-key counter: MAX(key_id) in store = {}, starting from {}",
@@ -103,29 +123,19 @@ impl Client {
             max_id + 1
         };
 
-        // Wrap only when the AUTHORITATIVE counter genuinely lacks room for a
-        // full batch below the 24-bit ceiling. Because start_id now advances from
-        // the counter (no longer re-pegged to the stale store max), after a wrap
-        // it climbs from 1 normally — so this fires at most once per ~16.7M IDs
-        // instead of on every launch.
-        if start_id > MAX_PRE_KEY_ID
-            || start_id.saturating_add(WANTED_PRE_KEY_COUNT as u32) > MAX_PRE_KEY_ID
-        {
-            log::warn!(
-                "Pre-key ID counter at {}, wrapping back to 1 (24-bit ceiling)",
-                start_id
-            );
-            start_id = 1;
-        }
+        // WA Web uses 24-bit PreKey IDs (max 2^24 - 1 = 16777215).
+        // Wrap into valid range so lingering high-ID rows don't pin start_id
+        // above the boundary and cause repeated overwrites of low IDs.
+        const MAX_PREKEY_ID: u32 = 16777215;
+        let start_id = ((raw_start as u64 - 1) % MAX_PREKEY_ID as u64) as u32 + 1;
 
         let mut keys_to_upload = Vec::with_capacity(WANTED_PRE_KEY_COUNT);
         let mut key_pairs_to_upload = Vec::with_capacity(WANTED_PRE_KEY_COUNT);
 
         for i in 0..WANTED_PRE_KEY_COUNT {
-            let pre_key_id = start_id + i as u32;
-            if pre_key_id > MAX_PRE_KEY_ID {
-                break;
-            }
+            let pre_key_id =
+                (((start_id as u64 - 1) + i as u64) % (MAX_PREKEY_ID as u64)) as u32 + 1;
+
             let key_pair = KeyPair::generate(&mut rand::make_rng::<rand::rngs::StdRng>());
             let pre_key_record = new_pre_key_record(pre_key_id, &key_pair);
 
@@ -133,17 +143,25 @@ impl Client {
             key_pairs_to_upload.push((pre_key_id, key_pair));
         }
 
-        if keys_to_upload.is_empty() {
-            log::warn!("No pre-keys available to upload");
-            return Ok(());
-        }
-
-        // Encode once — reused for both pre-upload store and post-upload mark.
-        let encoded_batch: Vec<(u32, Vec<u8>)> = {
+        // Encode all prekey records into a single contiguous buffer, then slice
+        // into Bytes sub-views. This replaces 812 individual encode_to_vec() allocs
+        // with one large allocation + zero-copy slicing.
+        let encoded_batch: Vec<(u32, bytes::Bytes)> = {
             use prost::Message;
-            keys_to_upload
-                .iter()
-                .map(|(id, record)| (*id, record.encode_to_vec()))
+            let total_len: usize = keys_to_upload.iter().map(|(_, r)| r.encoded_len()).sum();
+            let mut buf = Vec::with_capacity(total_len);
+            let mut offsets = Vec::with_capacity(keys_to_upload.len());
+            for (id, record) in &keys_to_upload {
+                let start = buf.len();
+                record
+                    .encode(&mut buf)
+                    .expect("prost encode into pre-sized Vec");
+                offsets.push((*id, start..buf.len()));
+            }
+            let shared = bytes::Bytes::from(buf);
+            offsets
+                .into_iter()
+                .map(|(id, range)| (id, shared.slice(range)))
                 .collect()
         };
 
@@ -175,13 +193,21 @@ impl Client {
             log::warn!("Failed to mark prekeys as uploaded: {:?}", e);
         }
 
-        // Update the persistent counter so future uploads never reuse these IDs.
-        let next_id = start_id + key_pairs_to_upload.len() as u32;
+        // IDs wrap modulo MAX_PREKEY_ID. If the counter wraps while unconsumed
+        // high-ID prekeys still exist, the upsert (.on_conflict.do_update)
+        // silently overwrites them. Acceptable: the server consumes keys well
+        // before a full 16M cycle completes.
+        let next_id = (((start_id as u64 - 1) + key_pairs_to_upload.len() as u64)
+            % (MAX_PREKEY_ID as u64)) as u32
+            + 1;
         self.persistence_manager
             .process_command(DeviceCommand::SetNextPreKeyId(next_id))
             .await;
 
-        self.server_has_prekeys.store(true, Ordering::Relaxed);
+        // Persist flag matching WA Web's setServerHasPreKeys(true) (PreKeysJob.js:79)
+        self.persistence_manager
+            .modify_device(|d| d.server_has_prekeys = true)
+            .await;
 
         log::debug!(
             "Successfully uploaded {} new pre-keys with sequential IDs starting from {}.",
@@ -235,6 +261,23 @@ impl Client {
         }
     }
 
+    /// Force-refresh the server's one-time pre-key pool with a fresh batch.
+    ///
+    /// Intended for callers that just restored a device from an external source
+    /// (e.g., migrating a Baileys session into an `InMemoryBackend`). The server
+    /// may still hold pre-key IDs whose private key material the caller cannot
+    /// reconstruct; any `pkmsg` referencing those IDs will fail forever with
+    /// `InvalidPreKeyId`. Uploading a fresh batch gives the server new IDs the
+    /// caller *does* have locally, and old unmatched IDs drain as peers consume
+    /// them.
+    ///
+    /// Acquires `prekey_upload_lock` for the duration so this force-upload
+    /// cannot race on `start_id` with the count-based and digest-repair paths.
+    pub async fn refresh_pre_keys(&self) -> Result<(), anyhow::Error> {
+        let _guard = self.prekey_upload_lock.lock().await;
+        self.upload_pre_keys_with_retry(true).await
+    }
+
     /// Validate server key bundle digest, re-uploading only when the server has no record.
     ///
     /// Matches WA Web's `WAWebDigestKeyJob.digestKey()`:
@@ -266,7 +309,9 @@ impl Client {
                 return Ok(());
             }
             Err(e) => {
-                log::warn!("digestKey: server error: {:?}", e);
+                if !self.is_shutting_down() {
+                    log::warn!("digestKey: server error: {:?}", e);
+                }
                 return Ok(());
             }
         };
@@ -296,51 +341,48 @@ impl Client {
             guard.backend.clone()
         };
 
-        // Load each prekey referenced by the server digest and extract its public key
+        // Batch-load all prekeys referenced by the server digest
+        let loaded = match backend.load_prekeys_batch(&response.prekey_ids).await {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("digestKey: failed to batch-load prekeys: {:?}, skipping", e);
+                return Ok(());
+            }
+        };
+
+        // Build a lookup so we preserve the server-requested order.
+        // Dedupe the expected count since the server may send duplicate IDs.
+        let loaded_map: std::collections::HashMap<u32, bytes::Bytes> = loaded.into_iter().collect();
+        let unique_requested: std::collections::HashSet<&u32> =
+            response.prekey_ids.iter().collect();
+
+        if loaded_map.len() < unique_requested.len() {
+            log::warn!(
+                "digestKey: missing {} local prekeys, skipping",
+                unique_requested.len() - loaded_map.len()
+            );
+            return Ok(());
+        }
+
+        // Extract public keys directly from stored protobuf bytes without full decode
         let mut prekey_pubkeys = Vec::with_capacity(response.prekey_ids.len());
         for prekey_id in &response.prekey_ids {
-            match backend.load_prekey(*prekey_id).await {
-                Ok(Some(record_bytes)) => {
-                    use prost::Message;
-                    match waproto::whatsapp::PreKeyRecordStructure::decode(record_bytes.as_slice())
-                    {
-                        Ok(record) => {
-                            if let Some(pk) = record.public_key {
-                                prekey_pubkeys.push(pk);
-                            } else {
-                                log::warn!(
-                                    "digestKey: prekey {} has no public key, skipping",
-                                    prekey_id
-                                );
-                                return Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "digestKey: failed to decode prekey {}: {}, skipping",
-                                prekey_id,
-                                e
-                            );
-                            return Ok(());
-                        }
-                    }
-                }
-                Ok(None) => {
-                    log::warn!("digestKey: missing local prekey {}, skipping", prekey_id);
-                    return Ok(());
-                }
-                Err(e) => {
+            let Some(record_bytes) = loaded_map.get(prekey_id) else {
+                log::warn!("digestKey: missing local prekey {}, skipping", prekey_id);
+                return Ok(());
+            };
+            match wacore::prekeys::extract_prekey_public_key(record_bytes) {
+                Some(pk) => prekey_pubkeys.push(pk),
+                None => {
                     log::warn!(
-                        "digestKey: failed to load prekey {}: {:?}, skipping",
-                        prekey_id,
-                        e
+                        "digestKey: prekey {} has no public key, skipping",
+                        prekey_id
                     );
                     return Ok(());
                 }
             }
         }
 
-        // Compute local SHA-1 digest matching WA Web's validateLocalKeyBundle
         let local_hash = wacore::prekeys::compute_key_bundle_digest(
             identity_bytes,
             skey_pub_bytes,

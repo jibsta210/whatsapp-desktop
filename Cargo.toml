@@ -1,7 +1,7 @@
 
 [package]
 name = "whatsapp-rust"
-version = "0.4.3"
+version = "0.6.0"
 edition = "2024"
 authors = ["João Lucas <jlucaso@hotmail.com>"]
 license = "MIT"
@@ -16,6 +16,7 @@ members = [
     "gmessages-rust",
     "http_clients/ureq-client",
     "storages/sqlite-storage",
+    "tests/bench-integration",
     "tests/e2e",
     "transports/tokio-transport",
     "wacore",
@@ -40,48 +41,58 @@ default-members = [
     "waproto",
 ]
 
+[workspace.lints.clippy]
+# Force the wacore::time abstraction so WASM/deterministic-test builds don't
+# regress. Exceptions carry `#[allow(clippy::disallowed_methods)]` inline.
+disallowed_methods = "deny"
+
 [workspace.dependencies]
 # Shared dependencies
-aes = "0.8.3"
-aes-gcm = { version = "0.10.2", default-features = false, features = ["aes", "alloc", "std"] }
+aes = "0.9.0"
+aes-gcm = { version = "0.11.0-rc.3", default-features = false, features = ["aes", "alloc", "bytes"] }
 anyhow = { version = "1.0", default-features = false }
 async-channel = { version = "2.5.0", default-features = false, features = ["std"] }
 async-lock = { version = "3", default-features = false }
 async-trait = "0.1.89"
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 bytemuck = { version = "1.22", default-features = false }
-bytes = { version = "1.5", default-features = false, features = ["serde"] }
+bytes = { version = "1.5", default-features = false }
 chrono = { version = "0.4", default-features = false }
-ctr = { version = "0.9", default-features = false }
+compact_str = { version = "0.9", default-features = false }
+ctr = { version = "0.10", default-features = false }
+env_logger = { version = "0.11", default-features = false }
 event-listener = { version = "5", default-features = false }
 flate2 = { version = "1.1.5", default-features = false, features = ["zlib-rs"] }
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 getrandom = { version = "0.4", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
-hkdf = { version = "0.12.3", default-features = false }
-hmac = { version = "0.12.1", default-features = false, features = ["reset"] }
+hkdf = { version = "0.13.0", default-features = false }
+hmac = { version = "0.13.0", default-features = false }
 iai-callgrind = "0.16"
+itoa = "1"
 log = "0.4"
+portable-atomic = { version = "1", default-features = false, features = ["fallback"] }
 prost = { version = "0.14.3", default-features = false, features = ["std"] }
 prost-build = { version = "0.14.3", default-features = false }
 rand = "0.10"
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde-big-array = "0.5"
 serde_json = { version = "1.0", default-features = false }
-sha1 = { version = "0.10.6", default-features = false }
-sha2 = { version = "0.10.6", default-features = false }
+sha1 = { version = "0.11.0", default-features = false }
+sha2 = { version = "0.11.0", default-features = false }
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", default-features = false }
 uuid = { version = "1", default-features = false }
 
 # Internal workspace crates
-wacore = { path = "./wacore", default-features = false, version = "0.4.3" }
-wacore-appstate = { path = "./wacore/appstate", default-features = false, version = "0.4.3" }
-wacore-binary = { path = "./wacore/binary", default-features = false, version = "0.4.3" }
-wacore-derive = { path = "./wacore/derive", version = "0.4.3" }
-wacore-libsignal = { path = "./wacore/libsignal", version = "0.4.3" }
-wacore-noise = { path = "./wacore/noise", version = "0.4.3" }
-waproto = { path = "./waproto", version = "0.4.3" }
+wacore = { path = "./wacore", default-features = false, version = "0.6.0" }
+wacore-appstate = { path = "./wacore/appstate", default-features = false, version = "0.6.0" }
+wacore-binary = { path = "./wacore/binary", default-features = false, version = "0.6.0" }
+wacore-derive = { path = "./wacore/derive", version = "0.6.0" }
+wacore-libsignal = { path = "./wacore/libsignal", version = "0.6.0" }
+wacore-noise = { path = "./wacore/noise", version = "0.6.0" }
+waproto = { path = "./waproto", version = "0.6.0" }
+yoke = { version = "0.8", features = ["derive"] }
 
 [features]
 debug-diagnostics = ["wacore/debug-diagnostics"]
@@ -113,13 +124,15 @@ async-lock = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
-chrono = { workspace = true, features = ["clock", "serde"] }
-env_logger = { version = "0.11", default-features = false }
+chrono = { workspace = true, features = ["clock"] }
+env_logger = { workspace = true }
 event-listener = { workspace = true }
 futures = { workspace = true, features = ["std"] }
 hex = { workspace = true }
+itoa = { workspace = true }
 log = { workspace = true }
 moka = { version = "0.12.12", features = ["future"], optional = true }
+portable-atomic = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
 scopeguard = "1.2"
@@ -130,12 +143,16 @@ tokio = { workspace = true, features = ["macros", "rt", "sync", "time"], optiona
 wacore = { workspace = true }
 wacore-binary = { workspace = true }
 waproto = { workspace = true }
-whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.4.3", optional = true }
-whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.4.3", optional = true }
-whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.4.3", optional = true }
+whatsapp-rust-sqlite-storage = { path = "./storages/sqlite-storage", version = "0.6.0", optional = true }
+whatsapp-rust-tokio-transport = { path = "./transports/tokio-transport", version = "0.6.0", optional = true }
+whatsapp-rust-ureq-http-client = { path = "./http_clients/ureq-client", version = "0.6.0", optional = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
+wacore-noise = { path = "./wacore/noise", features = ["test-util"] }
+
+[lints]
+workspace = true
 
 [[example]]
 name = "benchmark"
@@ -156,5 +173,11 @@ incremental = false
 [profile.bench]
 inherits = "release"
 lto = "thin"
+debug = 1
+strip = false
+
+# Profiling: optimized with debug symbols for DHAT / heaptrack / perf
+[profile.profiling]
+inherits = "release"
 debug = 1
 strip = false

@@ -3,7 +3,7 @@
 //! This module provides type-safe structures for blocklist operations following
 //! the `ProtocolNode` pattern defined in `wacore/src/protocol.rs`.
 
-use crate::StringEnum;
+use crate::WireEnum;
 use crate::iq::node::optional_child;
 use crate::iq::spec::IqSpec;
 use crate::protocol::ProtocolNode;
@@ -11,21 +11,20 @@ use crate::request::InfoQuery;
 use anyhow::Result;
 use log::warn;
 use wacore_binary::builder::NodeBuilder;
-use wacore_binary::jid::{Jid, SERVER_JID};
-use wacore_binary::node::{Node, NodeContent};
+use wacore_binary::{Jid, Server};
+use wacore_binary::{Node, NodeContent, NodeRef};
 /// IQ namespace for blocklist operations.
 pub const BLOCKLIST_IQ_NAMESPACE: &str = "blocklist";
 /// Action to perform on a blocklist entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, StringEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, WireEnum)]
 pub enum BlocklistAction {
-    #[str = "block"]
+    #[wire = "block"]
     Block,
-    #[str = "unblock"]
+    #[wire = "unblock"]
     Unblock,
 }
-/// Request node for updating blocklist.
-///
-/// Wire format: `<item action="block|unblock" jid="...@s.whatsapp.net"/>`
+/// Wire requires `jid` in LID and an additional `pn_jid` (PN) when blocking;
+/// servers reject PN-only blocks.
 #[derive(Debug, Clone, crate::ProtocolNode)]
 #[protocol(tag = "item")]
 pub struct BlocklistItemRequest {
@@ -33,6 +32,8 @@ pub struct BlocklistItemRequest {
     pub jid: Jid,
     #[attr(name = "action", string_enum)]
     pub action: BlocklistAction,
+    #[attr(name = "pn_jid", jid, optional)]
+    pub pn_jid: Option<Jid>,
 }
 
 impl BlocklistItemRequest {
@@ -40,6 +41,7 @@ impl BlocklistItemRequest {
         Self {
             jid: jid.clone(),
             action,
+            pn_jid: None,
         }
     }
 
@@ -49,6 +51,14 @@ impl BlocklistItemRequest {
 
     pub fn unblock(jid: &Jid) -> Self {
         Self::new(jid, BlocklistAction::Unblock)
+    }
+
+    /// Construct a block request with the LID and PN required on the wire.
+    pub fn block_with_pn(lid: &Jid, pn_jid: &Jid) -> Self {
+        Self {
+            pn_jid: Some(pn_jid.clone()),
+            ..Self::new(lid, BlocklistAction::Block)
+        }
     }
 }
 /// A single blocklist entry from the response.
@@ -81,7 +91,7 @@ impl ProtocolNode for BlocklistResponse {
         NodeBuilder::new("list").children(children).build()
     }
 
-    fn try_from_node(node: &Node) -> Result<Self> {
+    fn try_from_node_ref(node: &NodeRef<'_>) -> Result<Self> {
         // Response can be either:
         // 1. <list><item .../></list>
         // 2. Direct <item .../> children in the response node
@@ -90,13 +100,10 @@ impl ProtocolNode for BlocklistResponse {
         } else {
             node.get_children_by_tag("item")
         }
-        .filter_map(|item| match BlocklistEntry::try_from_node(item) {
+        .filter_map(|item| match BlocklistEntry::try_from_node_ref(item) {
             Ok(entry) => Some(entry),
             Err(e) => {
-                warn!(
-                    target: "blocklist",
-                    "Failed to parse blocklist entry: {e}"
-                );
+                warn!(target: "blocklist", "Failed to parse blocklist entry: {e}");
                 None
             }
         })
@@ -113,12 +120,25 @@ impl IqSpec for GetBlocklistSpec {
     type Response = Vec<BlocklistEntry>;
 
     fn build_iq(&self) -> InfoQuery<'static> {
-        InfoQuery::get(BLOCKLIST_IQ_NAMESPACE, Jid::new("", SERVER_JID), None)
+        InfoQuery::get(BLOCKLIST_IQ_NAMESPACE, Jid::new("", Server::Pn), None)
     }
 
-    fn parse_response(&self, response: &Node) -> Result<Self::Response> {
-        let blocklist = BlocklistResponse::try_from_node(response)?;
-        Ok(blocklist.entries)
+    fn parse_response(&self, response: &NodeRef<'_>) -> Result<Self::Response> {
+        // BlocklistResponse checks for a <list> child or direct <item> children
+        let entries = if let Some(list) = response.get_optional_child("list") {
+            list.get_children_by_tag("item")
+        } else {
+            response.get_children_by_tag("item")
+        }
+        .filter_map(|item| match BlocklistEntry::try_from_node_ref(item) {
+            Ok(entry) => Some(entry),
+            Err(e) => {
+                warn!(target: "blocklist", "Failed to parse blocklist entry: {e}");
+                None
+            }
+        })
+        .collect();
+        Ok(entries)
     }
 }
 
@@ -146,6 +166,13 @@ impl UpdateBlocklistSpec {
             request: BlocklistItemRequest::unblock(jid),
         }
     }
+
+    /// Construct a block spec with the LID and PN required on the wire.
+    pub fn block_with_pn(lid: &Jid, pn_jid: &Jid) -> Self {
+        Self {
+            request: BlocklistItemRequest::block_with_pn(lid, pn_jid),
+        }
+    }
 }
 
 impl IqSpec for UpdateBlocklistSpec {
@@ -154,12 +181,12 @@ impl IqSpec for UpdateBlocklistSpec {
     fn build_iq(&self) -> InfoQuery<'static> {
         InfoQuery::set(
             BLOCKLIST_IQ_NAMESPACE,
-            Jid::new("", SERVER_JID),
+            Jid::new("", Server::Pn),
             Some(NodeContent::Nodes(vec![self.request.clone().into_node()])),
         )
     }
 
-    fn parse_response(&self, _response: &Node) -> Result<Self::Response> {
+    fn parse_response(&self, _response: &NodeRef<'_>) -> Result<Self::Response> {
         Ok(())
     }
 }
@@ -272,5 +299,37 @@ mod tests {
 
         let unblock_spec = UpdateBlocklistSpec::unblock(&jid);
         assert_eq!(unblock_spec.request.action, BlocklistAction::Unblock);
+    }
+
+    #[test]
+    fn test_block_with_pn_emits_pn_jid_attr() {
+        let lid: Jid = "12345678901234@lid".parse().unwrap();
+        let pn: Jid = "5511999999999@s.whatsapp.net".parse().unwrap();
+        let request = BlocklistItemRequest::block_with_pn(&lid, &pn);
+        let node = request.into_node();
+
+        assert_eq!(node.tag, "item");
+        assert!(node.attrs.get("action").is_some_and(|v| v == "block"));
+        assert!(
+            node.attrs
+                .get("jid")
+                .is_some_and(|v| v == "12345678901234@lid")
+        );
+        assert!(
+            node.attrs
+                .get("pn_jid")
+                .is_some_and(|v| v == "5511999999999@s.whatsapp.net")
+        );
+    }
+
+    #[test]
+    fn test_unblock_omits_pn_jid_attr() {
+        let lid: Jid = "12345678901234@lid".parse().unwrap();
+        let request = BlocklistItemRequest::unblock(&lid);
+        let node = request.into_node();
+
+        assert_eq!(node.tag, "item");
+        assert!(node.attrs.get("action").is_some_and(|v| v == "unblock"));
+        assert!(node.attrs.get("pn_jid").is_none());
     }
 }

@@ -7,14 +7,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use async_lock::Mutex;
-use async_trait::async_trait;
-use wacore_binary::jid::Jid;
-
 use crate::appstate::hash::HashState;
 use crate::store::Device;
 use crate::store::error::Result;
 use crate::store::traits::*;
+use async_lock::Mutex;
+use async_trait::async_trait;
+use bytes::Bytes;
 use wacore_appstate::processor::AppStateMutationMAC;
 
 /// Key for the sent-message store: `(chat_jid, message_id)`.
@@ -28,23 +27,18 @@ struct SentMessageEntry {
 
 /// Key for pre-keys: `id`.
 struct PreKeyEntry {
-    record: Vec<u8>,
-    #[allow(dead_code)]
-    uploaded: bool,
+    record: Bytes,
 }
 
 /// Key for base-key collision detection: `(address, message_id)`.
 type BaseKeyKey = (String, String);
-
-/// Key for forget-sender-key marks: `group_jid` -> set of participants.
-type ForgetMarks = HashMap<String, Vec<String>>;
 
 /// Inner state protected by the mutex.
 #[derive(Default)]
 struct InMemoryState {
     // --- Signal ---
     identities: HashMap<String, [u8; 32]>,
-    sessions: HashMap<String, Vec<u8>>,
+    sessions: HashMap<String, Bytes>,
     prekeys: HashMap<u32, PreKeyEntry>,
     signed_prekeys: HashMap<u32, Vec<u8>>,
     sender_keys: HashMap<String, Vec<u8>>,
@@ -57,19 +51,29 @@ struct InMemoryState {
     mutation_macs: HashMap<(String, Vec<u8>), Vec<u8>>,
 
     // --- Protocol ---
-    skdm_recipients: HashMap<String, Vec<Jid>>,
+    /// Unified per-device sender key tracking: group_jid -> (device_jid -> has_key)
+    sender_key_devices: HashMap<String, HashMap<String, bool>>,
     lid_mappings: HashMap<String, LidPnMappingEntry>,
     /// Reverse index: phone_number -> lid
     pn_to_lid: HashMap<String, String>,
     base_keys: HashMap<BaseKeyKey, Vec<u8>>,
     device_lists: HashMap<String, DeviceListRecord>,
-    forget_marks: ForgetMarks,
     tc_tokens: HashMap<String, TcTokenEntry>,
     sent_messages: HashMap<SentMessageKey, SentMessageEntry>,
 
     // --- Device ---
     device: Option<Device>,
 }
+
+/// Default TTL for sent messages (seconds). Matches the client's
+/// `sent_message_ttl_secs` default of 300s.
+const DEFAULT_SENT_MESSAGE_TTL_SECS: i64 = 300;
+
+/// Eviction runs inline when the map exceeds this many entries.
+const SENT_MESSAGE_EVICT_THRESHOLD: usize = 64;
+
+/// Minimum interval between eviction scans (seconds).
+const SENT_MESSAGE_EVICT_INTERVAL_SECS: i64 = 30;
 
 /// In-memory implementation of the full [`Backend`] trait.
 ///
@@ -78,6 +82,8 @@ struct InMemoryState {
 pub struct InMemoryBackend {
     state: Mutex<InMemoryState>,
     next_device_id: AtomicI32,
+    sent_message_ttl_secs: i64,
+    last_eviction: std::sync::atomic::AtomicI64,
 }
 
 impl InMemoryBackend {
@@ -86,7 +92,17 @@ impl InMemoryBackend {
         Self {
             state: Mutex::new(InMemoryState::default()),
             next_device_id: AtomicI32::new(1),
+            sent_message_ttl_secs: DEFAULT_SENT_MESSAGE_TTL_SECS,
+            last_eviction: std::sync::atomic::AtomicI64::new(0),
         }
+    }
+
+    /// Create with a custom sent-message TTL. Values ≤ 0 are ignored.
+    pub fn with_sent_message_ttl(mut self, ttl_secs: i64) -> Self {
+        if ttl_secs > 0 {
+            self.sent_message_ttl_secs = ttl_secs;
+        }
+        self
     }
 }
 
@@ -112,14 +128,8 @@ impl SignalStore for InMemoryBackend {
         Ok(())
     }
 
-    async fn load_identity(&self, address: &str) -> Result<Option<Vec<u8>>> {
-        Ok(self
-            .state
-            .lock()
-            .await
-            .identities
-            .get(address)
-            .map(|k| k.to_vec()))
+    async fn load_identity(&self, address: &str) -> Result<Option<[u8; 32]>> {
+        Ok(self.state.lock().await.identities.get(address).copied())
     }
 
     async fn delete_identity(&self, address: &str) -> Result<()> {
@@ -127,7 +137,7 @@ impl SignalStore for InMemoryBackend {
         Ok(())
     }
 
-    async fn get_session(&self, address: &str) -> Result<Option<Vec<u8>>> {
+    async fn get_session(&self, address: &str) -> Result<Option<Bytes>> {
         Ok(self.state.lock().await.sessions.get(address).cloned())
     }
 
@@ -136,8 +146,12 @@ impl SignalStore for InMemoryBackend {
             .lock()
             .await
             .sessions
-            .insert(address.to_string(), session.to_vec());
+            .insert(address.to_string(), Bytes::copy_from_slice(session));
         Ok(())
+    }
+
+    async fn has_session(&self, address: &str) -> Result<bool> {
+        Ok(self.state.lock().await.sessions.contains_key(address))
     }
 
     async fn delete_session(&self, address: &str) -> Result<()> {
@@ -145,18 +159,30 @@ impl SignalStore for InMemoryBackend {
         Ok(())
     }
 
-    async fn store_prekey(&self, id: u32, record: &[u8], uploaded: bool) -> Result<()> {
+    async fn store_prekey(&self, id: u32, record: &[u8], _uploaded: bool) -> Result<()> {
         self.state.lock().await.prekeys.insert(
             id,
             PreKeyEntry {
-                record: record.to_vec(),
-                uploaded,
+                record: Bytes::copy_from_slice(record),
             },
         );
         Ok(())
     }
 
-    async fn load_prekey(&self, id: u32) -> Result<Option<Vec<u8>>> {
+    async fn store_prekeys_batch(&self, keys: &[(u32, Bytes)], _uploaded: bool) -> Result<()> {
+        let mut state = self.state.lock().await;
+        for (id, record) in keys {
+            state.prekeys.insert(
+                *id,
+                PreKeyEntry {
+                    record: record.clone(),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    async fn load_prekey(&self, id: u32) -> Result<Option<Bytes>> {
         Ok(self
             .state
             .lock()
@@ -164,6 +190,17 @@ impl SignalStore for InMemoryBackend {
             .prekeys
             .get(&id)
             .map(|e| e.record.clone()))
+    }
+
+    async fn load_prekeys_batch(&self, ids: &[u32]) -> Result<Vec<(u32, Bytes)>> {
+        let state = self.state.lock().await;
+        let mut result = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(entry) = state.prekeys.get(&id) {
+                result.push((id, entry.record.clone()));
+            }
+        }
+        Ok(result)
     }
 
     async fn remove_prekey(&self, id: u32) -> Result<()> {
@@ -313,32 +350,50 @@ impl AppSyncStore for InMemoryBackend {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl ProtocolStore for InMemoryBackend {
-    // --- SKDM Tracking ---
+    // --- Per-Device Sender Key Tracking ---
 
-    async fn get_skdm_recipients(&self, group_jid: &str) -> Result<Vec<Jid>> {
+    async fn get_sender_key_devices(&self, group_jid: &str) -> Result<Vec<(String, bool)>> {
         Ok(self
             .state
             .lock()
             .await
-            .skdm_recipients
+            .sender_key_devices
             .get(group_jid)
-            .cloned()
+            .map(|map| map.iter().map(|(k, v)| (k.clone(), *v)).collect())
             .unwrap_or_default())
     }
 
-    async fn add_skdm_recipients(&self, group_jid: &str, device_jids: &[Jid]) -> Result<()> {
+    async fn set_sender_key_status(&self, group_jid: &str, entries: &[(&str, bool)]) -> Result<()> {
         let mut s = self.state.lock().await;
-        let list = s.skdm_recipients.entry(group_jid.to_string()).or_default();
-        for jid in device_jids {
-            if !list.contains(jid) {
-                list.push(jid.clone());
-            }
+        let map = s
+            .sender_key_devices
+            .entry(group_jid.to_string())
+            .or_default();
+        for (device_jid, has_key) in entries {
+            map.insert(device_jid.to_string(), *has_key);
         }
         Ok(())
     }
 
-    async fn clear_skdm_recipients(&self, group_jid: &str) -> Result<()> {
-        self.state.lock().await.skdm_recipients.remove(group_jid);
+    async fn clear_sender_key_devices(&self, group_jid: &str) -> Result<()> {
+        self.state.lock().await.sender_key_devices.remove(group_jid);
+        Ok(())
+    }
+
+    async fn clear_all_sender_key_devices(&self) -> Result<()> {
+        self.state.lock().await.sender_key_devices.clear();
+        Ok(())
+    }
+
+    async fn delete_sender_key_device_rows(&self, device_jids: &[&str]) -> Result<()> {
+        if device_jids.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.state.lock().await;
+        let targets: std::collections::HashSet<&str> = device_jids.iter().copied().collect();
+        for group_map in state.sender_key_devices.values_mut() {
+            group_map.retain(|jid, _| !targets.contains(jid.as_str()));
+        }
         Ok(())
     }
 
@@ -434,25 +489,9 @@ impl ProtocolStore for InMemoryBackend {
         Ok(self.state.lock().await.device_lists.get(user).cloned())
     }
 
-    // --- Sender Key Status (Lazy Deletion) ---
-
-    async fn mark_forget_sender_key(&self, group_jid: &str, participant: &str) -> Result<()> {
-        let mut s = self.state.lock().await;
-        let list = s.forget_marks.entry(group_jid.to_string()).or_default();
-        if !list.contains(&participant.to_string()) {
-            list.push(participant.to_string());
-        }
+    async fn delete_devices(&self, user: &str) -> Result<()> {
+        self.state.lock().await.device_lists.remove(user);
         Ok(())
-    }
-
-    async fn consume_forget_marks(&self, group_jid: &str) -> Result<Vec<String>> {
-        Ok(self
-            .state
-            .lock()
-            .await
-            .forget_marks
-            .remove(group_jid)
-            .unwrap_or_default())
     }
 
     // --- TcToken Storage ---
@@ -496,7 +535,24 @@ impl ProtocolStore for InMemoryBackend {
         payload: &[u8],
     ) -> Result<()> {
         let now = crate::time::now_secs();
-        self.state.lock().await.sent_messages.insert(
+        let mut s = self.state.lock().await;
+
+        // Amortized eviction: only scan when the map is large AND enough time
+        // has passed since the last eviction to avoid O(n) work on every insert.
+        if s.sent_messages.len() >= SENT_MESSAGE_EVICT_THRESHOLD {
+            let last = self
+                .last_eviction
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let interval = SENT_MESSAGE_EVICT_INTERVAL_SECS.min(self.sent_message_ttl_secs);
+            if now - last >= interval {
+                let cutoff = now - self.sent_message_ttl_secs;
+                s.sent_messages.retain(|_, e| e.timestamp >= cutoff);
+                self.last_eviction
+                    .store(now, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        s.sent_messages.insert(
             (chat_jid.to_string(), message_id.to_string()),
             SentMessageEntry {
                 payload: payload.to_vec(),

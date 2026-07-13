@@ -220,9 +220,7 @@ impl IdentityKeyStore for Device {
                 })?,
             )
             .await
-            .map_err(|e| {
-                SignalProtocolError::InvalidState("backend put_identity", e.to_string())
-            })?;
+            .map_err(|e| SignalProtocolError::BackendError("backend put_identity", Box::new(e)))?;
 
         match existing_identity_opt {
             None => Ok(IdentityChange::NewOrUnchanged),
@@ -233,16 +231,14 @@ impl IdentityKeyStore for Device {
 
     async fn is_trusted_identity(
         &self,
-        address: &ProtocolAddress,
-        identity_key: &IdentityKey,
+        _address: &ProtocolAddress,
+        _identity_key: &IdentityKey,
         _direction: Direction,
     ) -> SignalResult<bool> {
-        // Trust on first use: if we don't have an identity stored, trust this one
-        // If we have one stored, it must match
-        match self.get_identity(address).await? {
-            None => Ok(true), // Trust on first use
-            Some(stored_identity) => Ok(&stored_identity == identity_key),
-        }
+        // WA Web: ProtocolStoreUnifiedApi.js — isTrustedIdentity always returns true.
+        // Identity changes are handled in save_identity (safety number change
+        // notification), not by rejecting messages.
+        Ok(true)
     }
 
     async fn get_identity(&self, address: &ProtocolAddress) -> SignalResult<Option<IdentityKey>> {
@@ -250,9 +246,7 @@ impl IdentityKeyStore for Device {
             .backend
             .load_identity(address.as_str())
             .await
-            .map_err(|e| {
-                SignalProtocolError::InvalidState("backend get_identity", e.to_string())
-            })?;
+            .map_err(|e| SignalProtocolError::BackendError("backend get_identity", Box::new(e)))?;
 
         match identity_bytes {
             Some(bytes) if !bytes.is_empty() => {
@@ -278,7 +272,7 @@ impl PreKeyStore for Device {
         match self.backend.load_prekey(prekey_id).await {
             Ok(Some(bytes)) => {
                 // Try new format first (protobuf-encoded PreKeyRecordStructure)
-                if let Ok(record) = PreKeyRecordStructure::decode(bytes.as_slice()) {
+                if let Ok(record) = PreKeyRecordStructure::decode(bytes.as_ref()) {
                     return Ok(Some(record));
                 }
 
@@ -481,18 +475,18 @@ impl SenderKeyStore for Device {
         self.backend
             .put_sender_key(sender_key_name.cache_key(), &serialized_record)
             .await
-            .map_err(|e| SignalProtocolError::InvalidState("store_sender_key", e.to_string()))
+            .map_err(|e| SignalProtocolError::BackendError("store_sender_key", Box::new(e)))
     }
 
     async fn load_sender_key(
-        &mut self,
+        &self,
         sender_key_name: &SenderKeyName,
     ) -> SignalResult<Option<SenderKeyRecord>> {
         match self
             .backend
             .get_sender_key(sender_key_name.cache_key())
             .await
-            .map_err(|e| SignalProtocolError::InvalidState("load_sender_key", e.to_string()))?
+            .map_err(|e| SignalProtocolError::BackendError("load_sender_key", Box::new(e)))?
         {
             Some(data) => {
                 let record = SenderKeyRecord::deserialize(&data)?;

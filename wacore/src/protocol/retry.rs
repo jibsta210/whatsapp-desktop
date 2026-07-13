@@ -5,7 +5,7 @@
 //! (session management, message resend, cache interaction) remains in
 //! `whatsapp-rust/src/retry.rs`.
 
-use wacore_binary::node::{Node, NodeContent};
+use wacore_binary::{Node, NodeContent};
 
 /// Maximum retry attempts we'll honor (matches WhatsApp Web's MAX_RETRY = 5).
 /// We refuse to resend if the requester has already retried this many times.
@@ -47,6 +47,14 @@ pub enum RetryReason {
     InvalidSession = 8,
     /// Invalid message key
     InvalidMsgKey = 9,
+    /// Bad broadcast ephemeral setting
+    BadBroadcastEphemeralSetting = 10,
+    /// Unknown companion device, not in our device list
+    UnknownCompanionNoPrekey = 11,
+    /// ADV signature or device identity failure
+    AdvFailure = 12,
+    /// Status revoke delay exceeded
+    StatusRevokeDelay = 13,
 }
 
 /// Helper to extract bytes content from a Node.
@@ -89,7 +97,8 @@ pub fn extract_registration_id_from_node(node: &Node) -> Option<u32> {
 /// keys are included on retry #1 for `NoSession` errors to reduce round-trips
 /// for skmsg-only message failures.
 pub fn should_include_keys(retry_count: u8, reason: RetryReason) -> bool {
-    let include_keys_early = reason == RetryReason::NoSession;
+    let include_keys_early =
+        reason == RetryReason::NoSession || reason == RetryReason::UnknownCompanionNoPrekey;
     retry_count >= MIN_RETRY_COUNT_FOR_KEYS || include_keys_early
 }
 
@@ -97,7 +106,7 @@ pub fn should_include_keys(retry_count: u8, reason: RetryReason) -> bool {
 mod tests {
     use super::*;
     use std::borrow::Cow;
-    use wacore_binary::node::Attrs;
+    use wacore_binary::Attrs;
 
     #[test]
     fn get_bytes_content_extracts_bytes() {
@@ -114,7 +123,7 @@ mod tests {
         let node = Node {
             tag: Cow::Borrowed("test"),
             attrs: Attrs::new(),
-            content: Some(NodeContent::String("hello".to_string())),
+            content: Some(NodeContent::String("hello".into())),
         };
         assert_eq!(get_bytes_content(&node), None);
     }
@@ -189,6 +198,14 @@ mod tests {
         assert!(
             should_include_keys(1, RetryReason::NoSession),
             "NoSession at retry#1 should include keys (optimization)"
+        );
+    }
+
+    #[test]
+    fn should_include_keys_unknown_companion_retry_1() {
+        assert!(
+            should_include_keys(1, RetryReason::UnknownCompanionNoPrekey),
+            "UnknownCompanionNoPrekey at retry#1 should include keys"
         );
     }
 

@@ -9,6 +9,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   PROTOC_VERSION: '3.25.3'
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 concurrency:
   group: release
@@ -30,11 +32,11 @@ jobs:
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-01-30
+          toolchain: nightly-2026-04-05
 
       - name: Install protoc
         uses: taiki-e/install-action@v2
@@ -42,9 +44,15 @@ jobs:
           tool: protoc@${{ env.PROTOC_VERSION }}
 
       - name: Install cargo-release
-        run: cargo install cargo-release --locked --version 0.25.20
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-release@0.25.20
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
 
       - name: Publish workspace crates
         env:
@@ -56,7 +64,7 @@ jobs:
     needs: publish
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 

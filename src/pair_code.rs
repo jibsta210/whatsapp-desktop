@@ -52,12 +52,25 @@ use log::{error, info, warn};
 
 use std::sync::Arc;
 use wacore::libsignal::protocol::KeyPair;
-use wacore::pair_code::{PairCodeError, PairCodeState, PairCodeUtils};
-use wacore_binary::jid::{Jid, SERVER_JID};
-use wacore_binary::node::{Node, NodeContent};
+use wacore::pair_code::{PairCodeState, PairCodeUtils, resolve_companion_platform};
+use wacore_binary::Jid;
+use wacore_binary::{NodeContent, NodeContentRef, NodeRef};
 
-// Re-export types for user convenience
-pub use wacore::pair_code::{PairCodeOptions, PlatformId};
+pub use wacore::companion_reg::CompanionWebClientType;
+pub use wacore::pair_code::{PairCodeError, PairCodeOptions};
+
+/// Errors raised by the high-level pair-code flow.
+///
+/// Wraps `wacore::pair_code::PairCodeError` (validation, key derivation, bundle
+/// building) and adds the IQ transport layer via `RequestFailed`.
+#[derive(Debug, thiserror::Error)]
+pub enum PairError {
+    #[error(transparent)]
+    PairCode(#[from] PairCodeError),
+
+    #[error("pair-code IQ request failed")]
+    RequestFailed(#[from] IqError),
+}
 
 impl Client {
     /// Initiates pair code authentication as an alternative to QR code pairing.
@@ -98,7 +111,7 @@ impl Client {
     pub async fn pair_with_code(
         self: &Arc<Self>,
         options: PairCodeOptions,
-    ) -> Result<String, PairCodeError> {
+    ) -> Result<String, PairError> {
         // Strip non-digit characters from phone number (allows "+1-555-123-4567" format)
         let phone_number: String = options
             .phone_number
@@ -108,20 +121,20 @@ impl Client {
 
         // Validate phone number
         if phone_number.is_empty() {
-            return Err(PairCodeError::PhoneNumberRequired);
+            return Err(PairCodeError::PhoneNumberRequired.into());
         }
         if phone_number.len() < 7 {
-            return Err(PairCodeError::PhoneNumberTooShort);
+            return Err(PairCodeError::PhoneNumberTooShort.into());
         }
         if phone_number.starts_with('0') {
-            return Err(PairCodeError::PhoneNumberNotInternational);
+            return Err(PairCodeError::PhoneNumberNotInternational.into());
         }
 
         // Generate or validate code
         let code = match &options.custom_code {
             Some(custom) => {
                 if !PairCodeUtils::validate_code(custom) {
-                    return Err(PairCodeError::InvalidCustomCode);
+                    return Err(PairCodeError::InvalidCustomCode.into());
                 }
                 custom.to_uppercase()
             }
@@ -160,14 +173,17 @@ impl Client {
         })
         .await;
 
-        // Build the stage 1 IQ node
+        let (platform_id, platform_display) =
+            resolve_companion_platform(&options, &device_snapshot.device_props);
+        let platform_id_str = platform_id.to_string();
+
         let req_id = self.generate_request_id();
         let iq_content = PairCodeUtils::build_companion_hello_iq(
             &phone_number,
             &noise_static_pub,
             &wrapped_ephemeral,
-            options.platform_id,
-            &options.platform_display,
+            &platform_id_str,
+            &platform_display,
             options.show_push_notification,
             req_id.clone(),
         );
@@ -176,7 +192,7 @@ impl Client {
         let query = InfoQuery {
             query_type: InfoQueryType::Set,
             namespace: "md",
-            to: Jid::new("", SERVER_JID),
+            to: Jid::new("", wacore_binary::Server::Pn),
             target: None,
             content: Some(NodeContent::Nodes(
                 iq_content
@@ -188,13 +204,9 @@ impl Client {
             timeout: Some(std::time::Duration::from_secs(30)),
         };
 
-        let response = self
-            .send_iq(query)
-            .await
-            .map_err(|e: IqError| PairCodeError::RequestFailed(e.to_string()))?;
+        let response = self.send_iq(query).await?;
 
-        // Extract pairing ref from response
-        let pairing_ref = PairCodeUtils::parse_companion_hello_response(&response)
+        let pairing_ref = PairCodeUtils::parse_companion_hello_response(response.get())
             .ok_or(PairCodeError::MissingPairingRef)?;
 
         info!(
@@ -212,7 +224,7 @@ impl Client {
         };
 
         // Dispatch event for user to display the code
-        self.core.event_bus.dispatch(&Event::PairingCode {
+        self.core.event_bus.dispatch(Event::PairingCode {
             code: code.clone(),
             timeout: PairCodeUtils::code_validity(),
         });
@@ -225,7 +237,10 @@ impl Client {
 ///
 /// This is called when the user enters the code on their phone. The notification
 /// contains the primary device's encrypted ephemeral public key and identity public key.
-pub(crate) async fn handle_pair_code_notification(client: &Arc<Client>, node: &Node) -> bool {
+pub(crate) async fn handle_pair_code_notification(
+    client: &Arc<Client>,
+    node: &NodeRef<'_>,
+) -> bool {
     // Check if this is a link_code_companion_reg notification
     let Some(reg_node) = node.get_optional_child_by_tag(&["link_code_companion_reg"]) else {
         return false;
@@ -234,10 +249,12 @@ pub(crate) async fn handle_pair_code_notification(client: &Arc<Client>, node: &N
     // Extract primary's wrapped ephemeral public key (80 bytes: salt + iv + encrypted key)
     let primary_wrapped_ephemeral = match reg_node
         .get_optional_child_by_tag(&["link_code_pairing_wrapped_primary_ephemeral_pub"])
-        .and_then(|n| n.content.as_ref())
-    {
-        Some(NodeContent::Bytes(b)) if b.len() == 80 => b.clone(),
-        _ => {
+        .and_then(|n| match n.content.as_deref() {
+            Some(NodeContentRef::Bytes(b)) if b.len() == 80 => Some(b.to_vec()),
+            _ => None,
+        }) {
+        Some(b) => b,
+        None => {
             warn!(
                 target: "Client/PairCode",
                 "Missing or invalid primary wrapped ephemeral pub in notification"
@@ -249,19 +266,12 @@ pub(crate) async fn handle_pair_code_notification(client: &Arc<Client>, node: &N
     // Extract primary's identity public key (32 bytes, unencrypted)
     let primary_identity_pub: [u8; 32] = match reg_node
         .get_optional_child_by_tag(&["primary_identity_pub"])
-        .and_then(|n| n.content.as_ref())
-    {
-        Some(NodeContent::Bytes(b)) if b.len() == 32 => match b.as_slice().try_into() {
-            Ok(arr) => arr,
-            Err(_) => {
-                warn!(
-                    target: "Client/PairCode",
-                    "Failed to convert primary identity pub to array"
-                );
-                return false;
-            }
-        },
-        _ => {
+        .and_then(|n| match n.content.as_deref() {
+            Some(NodeContentRef::Bytes(b)) if b.len() == 32 => b.as_ref().try_into().ok(),
+            _ => None,
+        }) {
+        Some(arr) => arr,
+        None => {
             warn!(
                 target: "Client/PairCode",
                 "Missing or invalid primary identity pub in notification"
@@ -370,4 +380,37 @@ pub(crate) async fn handle_pair_code_notification(client: &Arc<Client>, node: &N
     *client.pair_code_state.lock().await = PairCodeState::Completed;
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_error_request_failed_preserves_iq_source() {
+        let iq = IqError::ServerError {
+            code: 400,
+            text: "bad-request".into(),
+        };
+        let pe: PairError = iq.into();
+        let src = std::error::Error::source(&pe).expect("source preserved");
+        let downcast = src.downcast_ref::<IqError>().expect("downcasts to IqError");
+        assert!(matches!(downcast, IqError::ServerError { code: 400, .. }));
+    }
+
+    #[test]
+    fn pair_error_paircode_transparent_walks_to_curve_error() {
+        use wacore::libsignal::protocol::CurveError;
+        // Wrap a wacore PairCodeError that itself carries a CurveError source.
+        // Because PairError::PairCode is `transparent`, walking source() once
+        // skips the transparent layer and lands directly on the CurveError.
+        let pe: PairError =
+            PairCodeError::EphemeralKeyAgreement(CurveError::NoKeyTypeIdentifier).into();
+        assert_eq!(pe.to_string(), "ephemeral key agreement failed");
+        let src = std::error::Error::source(&pe).expect("source preserved");
+        let curve = src
+            .downcast_ref::<CurveError>()
+            .expect("downcasts to CurveError through transparent wrapper");
+        assert!(matches!(curve, CurveError::NoKeyTypeIdentifier));
+    }
 }

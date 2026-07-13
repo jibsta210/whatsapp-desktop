@@ -6,9 +6,10 @@
 //! `Backend` reference. That version should eventually be consolidated into this
 //! one once the `Device` wrapper is unified.
 
-use crate::runtime::Runtime;
+use crate::runtime::{AbortHandle, Runtime, ShutdownSignal, wait_for_shutdown};
+use crate::store::commands::{DeviceCommand, apply_command_to_device};
 use crate::store::device::Device;
-use crate::store::error::{StoreError, db_err};
+use crate::store::error::StoreError;
 use crate::store::traits::Backend;
 use async_lock::RwLock;
 use event_listener::Event;
@@ -17,9 +18,6 @@ use log::{debug, error};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use wacore_binary::jid::Jid;
-
-use crate::store::commands::{DeviceCommand, apply_command_to_device};
 
 /// Manages device state persistence with lazy, batched writes.
 ///
@@ -36,15 +34,15 @@ impl PersistenceManager {
     /// Create a PersistenceManager with a backend implementation.
     pub async fn new(backend: Arc<dyn Backend>) -> Result<Self, StoreError> {
         debug!("PersistenceManager: Ensuring device row exists.");
-        let exists = backend.exists().await.map_err(db_err)?;
+        let exists = backend.exists().await?;
         if !exists {
             debug!("PersistenceManager: No device row found. Creating new device row.");
-            let id = backend.create().await.map_err(db_err)?;
+            let id = backend.create().await?;
             debug!("PersistenceManager: Created device row with id={id}.");
         }
 
         debug!("PersistenceManager: Attempting to load device data via Backend.");
-        let device_data_opt = backend.load().await.map_err(db_err)?;
+        let device_data_opt = backend.load().await?;
 
         let device = if let Some(serializable_device) = device_data_opt {
             debug!(
@@ -105,7 +103,7 @@ impl PersistenceManager {
             if let Err(e) = self.backend.save(&serializable_device).await {
                 // Restore dirty flag so the next tick retries the save
                 self.dirty.store(true, Ordering::Release);
-                return Err(db_err(e));
+                return Err(e);
             }
             debug!("Device state saved successfully.");
         }
@@ -121,10 +119,7 @@ impl PersistenceManager {
         #[cfg(feature = "debug-snapshots")]
         {
             self.save_to_disk().await?;
-            self.backend
-                .snapshot_db(name, extra_content)
-                .await
-                .map_err(db_err)
+            self.backend.snapshot_db(name, extra_content).await
         }
         #[cfg(not(feature = "debug-snapshots"))]
         {
@@ -135,43 +130,59 @@ impl PersistenceManager {
         }
     }
 
-    // Known limitation: the background saver does not perform a final flush
-    // when the PersistenceManager is dropped. Any dirty state that hasn't been
-    // flushed by a periodic tick will be lost. A proper fix requires adding an
-    // explicit `shutdown()` method that callers invoke before dropping, which is
-    // a larger design change tracked separately.
-    pub fn run_background_saver(self: Arc<Self>, runtime: Arc<dyn Runtime>, interval: Duration) {
+    /// Spawn the background saver. Wakes on `save_notify`, the interval tick,
+    /// or the `shutdown` signal; runs a final flush before exiting on shutdown.
+    /// Caller must keep the returned [`AbortHandle`] to control the task's
+    /// lifetime (dropping it aborts). [`ShutdownSignal`] is sticky so a
+    /// notify that races the task's first listen is still observed.
+    pub fn run_background_saver(
+        self: Arc<Self>,
+        runtime: Arc<dyn Runtime>,
+        interval: Duration,
+        shutdown: ShutdownSignal,
+    ) -> AbortHandle {
         let rt = runtime.clone();
         let weak = Arc::downgrade(&self);
-        drop(self); // Release the strong reference; the caller's Arc keeps it alive
-        runtime
-            .spawn(Box::pin(async move {
-                loop {
-                    let Some(this) = weak.upgrade() else {
-                        debug!("PersistenceManager dropped, exiting background saver.");
-                        return;
-                    };
-                    let listener = this.save_notify.listen();
-                    drop(this); // Don't hold strong ref while sleeping
-
-                    futures::select! {
-                        _ = listener.fuse() => {
-                            debug!("Save notification received.");
-                        }
-                        _ = rt.sleep(interval).fuse() => {}
-                    }
-
-                    let Some(this) = weak.upgrade() else {
-                        debug!("PersistenceManager dropped, exiting background saver.");
-                        return;
-                    };
-                    if let Err(e) = this.save_to_disk().await {
-                        error!("Error saving device state in background: {e}");
-                    }
-                }
-            }))
-            .detach();
+        drop(self); // Release strong ref; caller's Arc keeps it alive
         debug!("Background saver task started with interval {interval:?}");
+        runtime.spawn(Box::pin(async move {
+            // Flush state dirtied during construction. save_notify is
+            // edge-triggered so pre-spawn writes rely on the dirty flag
+            // rather than a missed notification.
+            if let Some(this) = weak.upgrade()
+                && let Err(e) = this.save_to_disk().await
+            {
+                error!("Background saver: initial flush failed: {e}");
+            }
+
+            loop {
+                let Some(this) = weak.upgrade() else {
+                    debug!("PersistenceManager dropped, exiting background saver.");
+                    return;
+                };
+                let save_listener = this.save_notify.listen();
+                drop(this);
+
+                let should_exit = futures::select! {
+                    _ = save_listener.fuse() => false,
+                    _ = rt.sleep(interval).fuse() => false,
+                    _ = wait_for_shutdown(&shutdown).fuse() => true,
+                };
+
+                let Some(this) = weak.upgrade() else {
+                    debug!("PersistenceManager dropped, exiting background saver.");
+                    return;
+                };
+                if let Err(e) = this.save_to_disk().await {
+                    error!("Error saving device state in background: {e}");
+                }
+
+                if should_exit {
+                    debug!("Background saver received shutdown; final flush complete.");
+                    return;
+                }
+            }
+        }))
     }
 
     pub async fn process_command(&self, command: DeviceCommand) {
@@ -181,28 +192,31 @@ impl PersistenceManager {
         .await;
     }
 
-    pub async fn get_skdm_recipients(&self, group_jid: &str) -> Result<Vec<Jid>, StoreError> {
-        self.backend
-            .get_skdm_recipients(group_jid)
-            .await
-            .map_err(db_err)
-    }
-
-    pub async fn add_skdm_recipients(
+    pub async fn get_sender_key_devices(
         &self,
         group_jid: &str,
-        device_jids: &[Jid],
-    ) -> Result<(), StoreError> {
-        self.backend
-            .add_skdm_recipients(group_jid, device_jids)
-            .await
-            .map_err(db_err)
+    ) -> Result<Vec<(String, bool)>, StoreError> {
+        self.backend.get_sender_key_devices(group_jid).await
     }
 
-    pub async fn clear_skdm_recipients(&self, group_jid: &str) -> Result<(), StoreError> {
+    pub async fn set_sender_key_status(
+        &self,
+        group_jid: &str,
+        entries: &[(&str, bool)],
+    ) -> Result<(), StoreError> {
+        self.backend.set_sender_key_status(group_jid, entries).await
+    }
+
+    pub async fn clear_sender_key_devices(&self, group_jid: &str) -> Result<(), StoreError> {
+        self.backend.clear_sender_key_devices(group_jid).await
+    }
+
+    pub async fn delete_sender_key_device_rows(
+        &self,
+        device_jids: &[&str],
+    ) -> Result<(), StoreError> {
         self.backend
-            .clear_skdm_recipients(group_jid)
+            .delete_sender_key_device_rows(device_jids)
             .await
-            .map_err(db_err)
     }
 }

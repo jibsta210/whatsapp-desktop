@@ -78,14 +78,14 @@ impl CacheEntryConfig {
 /// Each field is an optional [`CacheStore`] for that specific cache. When
 /// `None`, the default in-process moka cache is used.
 ///
-/// # Example — only group and device on Redis
+/// # Example — group and device registry on Redis
 ///
 /// ```rust,ignore
 /// let redis = Arc::new(MyRedisCacheStore::new("redis://localhost:6379"));
 /// let config = CacheConfig {
 ///     cache_stores: CacheStores {
 ///         group_cache: Some(redis.clone()),
-///         device_cache: Some(redis.clone()),
+///         device_registry_cache: Some(redis.clone()),
 ///         ..Default::default()
 ///     },
 ///     ..Default::default()
@@ -95,8 +95,6 @@ impl CacheEntryConfig {
 pub struct CacheStores {
     /// Custom store for group metadata cache.
     pub group_cache: Option<Arc<dyn CacheStore>>,
-    /// Custom store for device list cache.
-    pub device_cache: Option<Arc<dyn CacheStore>>,
     /// Custom store for device registry cache.
     pub device_registry_cache: Option<Arc<dyn CacheStore>>,
     /// Custom store for LID-PN bidirectional mapping cache.
@@ -106,7 +104,7 @@ pub struct CacheStores {
 impl CacheStores {
     /// Set the same [`CacheStore`] for all pluggable caches at once.
     ///
-    /// Coordination caches (`session_locks`, `message_queues`, etc.) and the
+    /// Coordination caches (`session_locks`, `chat_lanes`, etc.) and the
     /// signal write-behind cache always remain in-process regardless of this
     /// setting.
     ///
@@ -118,7 +116,6 @@ impl CacheStores {
     pub fn all(store: Arc<dyn CacheStore>) -> Self {
         Self {
             group_cache: Some(store.clone()),
-            device_cache: Some(store.clone()),
             device_registry_cache: Some(store.clone()),
             lid_pn_cache: Some(store),
         }
@@ -142,7 +139,7 @@ impl CacheStores {
 /// };
 /// ```
 ///
-/// # Example — Redis for group and device caches only
+/// # Example — Redis for group and device registry caches
 ///
 /// ```rust,ignore
 /// use std::sync::Arc;
@@ -152,7 +149,7 @@ impl CacheStores {
 /// let config = CacheConfig {
 ///     cache_stores: CacheStores {
 ///         group_cache: Some(redis.clone()),
-///         device_cache: Some(redis.clone()),
+///         device_registry_cache: Some(redis.clone()),
 ///         ..Default::default()
 ///     },
 ///     ..Default::default()
@@ -162,30 +159,34 @@ impl CacheStores {
 pub struct CacheConfig {
     /// Group metadata cache (time_to_live). Default: 1h TTL, 250 entries.
     pub group_cache: CacheEntryConfig,
-    /// Device list cache (time_to_live). Default: 1h TTL, 5000 entries.
-    pub device_cache: CacheEntryConfig,
-    /// Device registry cache (time_to_live). Default: 1h TTL, 5000 entries.
+    /// Device registry cache (time_to_live). Default: 1h TTL, 1000 entries.
     pub device_registry_cache: CacheEntryConfig,
-    /// LID-to-phone cache (time_to_idle). Default: 1h timeout, 10000 entries.
+    /// LID-to-phone cache. WAWebLidPnCache uses plain Maps with no expiry
+    /// and no size cap; evicting a still-valid mapping silently downgrades
+    /// Signal addresses to `@c.us`. Default: no timeout, capacity u64::MAX
+    /// (effectively unbounded — moka doesn't expose an `unbounded()` builder).
     pub lid_pn_cache: CacheEntryConfig,
-    /// Retried group messages tracker (time_to_live). Default: 5m TTL, 2000 entries.
-    pub retried_group_messages: CacheEntryConfig,
     /// Optional L1 in-memory cache for sent messages (retry support).
     /// Default: capacity 0 (disabled — DB-only, matching WA Web).
     /// Set capacity > 0 to enable a fast in-memory cache in front of the DB.
     pub recent_messages: CacheEntryConfig,
-    /// Message retry counts (time_to_live). Default: 5m TTL, 1000 entries.
+    /// Message retry counts (time_to_live). Default: 5m TTL, 500 entries.
     pub message_retry_counts: CacheEntryConfig,
-    /// PDO pending requests (time_to_live). Default: 30s TTL, 500 entries.
+    /// Dedup key for `UndecryptableMessage` dispatch so a server resend of
+    /// the same id does not surface a second notification. Default: 5m TTL,
+    /// 1000 entries.
+    pub undecryptable_dispatched: CacheEntryConfig,
+    /// PDO pending requests (time_to_live). Default: 30s TTL, 200 entries.
     pub pdo_pending_requests: CacheEntryConfig,
+    /// Sender key device tracking cache (time_to_idle). Default: 1h TTI, 500 entries.
+    /// Caches per-group SKDM distribution state to avoid DB reads on every group send.
+    pub sender_key_devices_cache: CacheEntryConfig,
 
     // --- Coordination caches (capacity-only, no TTL) ---
-    /// Per-device Signal session lock capacity. Default: 2000.
+    /// Per-device Signal session lock capacity. Default: 10000.
     pub session_locks_capacity: u64,
-    /// Per-chat message processing queue capacity. Default: 2000.
-    pub message_queues_capacity: u64,
-    /// Per-chat message enqueue lock capacity. Default: 2000.
-    pub message_enqueue_locks_capacity: u64,
+    /// Per-chat lane capacity (combined lock + queue). Default: 5000.
+    pub chat_lanes_capacity: u64,
 
     // --- Sent message DB cleanup ---
     /// TTL in seconds for sent messages in DB before periodic cleanup.
@@ -199,9 +200,8 @@ pub struct CacheConfig {
     /// backend instead of the default in-process moka cache. Fields left as
     /// `None` keep the default moka behaviour.
     ///
-    /// Coordination caches (`session_locks`, `message_queues`,
-    /// `message_enqueue_locks`), the signal write-behind cache, and
-    /// `pdo_pending_requests` always stay in-process — they hold live Rust
+    /// Coordination caches (`session_locks`, `chat_lanes`), the signal write-behind
+    /// cache, and `pdo_pending_requests` always stay in-process — they hold live Rust
     /// objects (mutexes, channel senders, oneshot senders) that cannot be
     /// serialised to an external store.
     pub cache_stores: CacheStores,
@@ -211,27 +211,19 @@ impl std::fmt::Debug for CacheConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CacheConfig")
             .field("group_cache", &self.group_cache)
-            .field("device_cache", &self.device_cache)
             .field("device_registry_cache", &self.device_registry_cache)
             .field("lid_pn_cache", &self.lid_pn_cache)
-            .field("retried_group_messages", &self.retried_group_messages)
             .field("recent_messages", &self.recent_messages)
             .field("message_retry_counts", &self.message_retry_counts)
+            .field("undecryptable_dispatched", &self.undecryptable_dispatched)
             .field("pdo_pending_requests", &self.pdo_pending_requests)
+            .field("sender_key_devices_cache", &self.sender_key_devices_cache)
             .field("session_locks_capacity", &self.session_locks_capacity)
-            .field("message_queues_capacity", &self.message_queues_capacity)
-            .field(
-                "message_enqueue_locks_capacity",
-                &self.message_enqueue_locks_capacity,
-            )
+            .field("chat_lanes_capacity", &self.chat_lanes_capacity)
             .field("sent_message_ttl_secs", &self.sent_message_ttl_secs)
             .field(
                 "cache_stores.group_cache",
                 &self.cache_stores.group_cache.is_some(),
-            )
-            .field(
-                "cache_stores.device_cache",
-                &self.cache_stores.device_cache.is_some(),
             )
             .field(
                 "cache_stores.device_registry_cache",
@@ -252,18 +244,39 @@ impl Default for CacheConfig {
 
         Self {
             group_cache: CacheEntryConfig::new(one_hour, 250),
-            device_cache: CacheEntryConfig::new(one_hour, 5_000),
-            device_registry_cache: CacheEntryConfig::new(one_hour, 5_000),
-            lid_pn_cache: CacheEntryConfig::new(one_hour, 10_000),
-            retried_group_messages: CacheEntryConfig::new(five_min, 2_000),
+            device_registry_cache: CacheEntryConfig::new(one_hour, 1_000),
+            lid_pn_cache: CacheEntryConfig::new(None, u64::MAX),
             recent_messages: CacheEntryConfig::new(five_min, 0),
-            message_retry_counts: CacheEntryConfig::new(five_min, 1_000),
-            pdo_pending_requests: CacheEntryConfig::new(Some(Duration::from_secs(30)), 500),
-            session_locks_capacity: 2_000,
-            message_queues_capacity: 2_000,
-            message_enqueue_locks_capacity: 2_000,
+            message_retry_counts: CacheEntryConfig::new(five_min, 500),
+            undecryptable_dispatched: CacheEntryConfig::new(five_min, 1_000),
+            pdo_pending_requests: CacheEntryConfig::new(Some(Duration::from_secs(30)), 200),
+            sender_key_devices_cache: CacheEntryConfig::new(one_hour, 500),
+            // Coordination caches hold live mutexes/senders; capacity eviction
+            // while a reference is held creates a second lock for the same key,
+            // breaking serialization. Size generously to avoid eviction pressure.
+            session_locks_capacity: 10_000,
+            chat_lanes_capacity: 5_000,
             sent_message_ttl_secs: 300,
             cache_stores: CacheStores::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lid_pn_cache_default_is_effectively_unbounded() {
+        let cfg = CacheConfig::default();
+        assert_eq!(
+            cfg.lid_pn_cache.timeout, None,
+            "lid_pn_cache must not expire entries by time; WAWebLidPnCache uses plain Maps"
+        );
+        assert_eq!(
+            cfg.lid_pn_cache.capacity,
+            u64::MAX,
+            "lid_pn_cache must be effectively unbounded; capacity-LRU re-introduces the eviction bug at higher thresholds"
+        );
     }
 }

@@ -1,24 +1,7 @@
 //! Memory soak tests — aggressive stress tests to detect unbounded memory growth.
 //!
-//! These tests simulate sustained production load: high message volume, multiple
-//! groups, mixed operations (DMs, groups, presence, chatstate, reconnects),
-//! larger payloads, and many peers. They track both internal collection sizes
-//! AND process RSS to catch leaks that escape moka/HashMap tracking.
-//!
-//! Run with:
-//! ```sh
-//! MOCK_SERVER_URL="wss://127.0.0.1:8080/ws/chat" cargo test -p e2e-tests --test memory_soak -- --nocapture
-//! ```
-//!
-//! Run a single test:
-//! ```sh
-//! MOCK_SERVER_URL="wss://127.0.0.1:8080/ws/chat" cargo test -p e2e-tests --test memory_soak test_heavy_mixed_soak -- --nocapture
-//! ```
-//!
-//! For heap profiling with dhat:
-//! ```sh
-//! MOCK_SERVER_URL="wss://127.0.0.1:8080/ws/chat" cargo test -p e2e-tests --test memory_soak --features dhat-heap -- --nocapture --test-threads=1
-//! ```
+//! Track both internal collection sizes and process RSS to catch leaks that
+//! escape moka/HashMap tracking.
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -33,10 +16,6 @@ use whatsapp_rust::client::MemoryDiagnostics;
 use whatsapp_rust::features::{GroupCreateOptions, GroupParticipantOptions};
 use whatsapp_rust::waproto::whatsapp as wa;
 
-// ---------------------------------------------------------------------------
-// Configuration — override with env vars for longer runs
-// ---------------------------------------------------------------------------
-
 /// Read an env var as usize, falling back to the given default.
 fn env_or(var: &str, default: usize) -> usize {
     std::env::var(var)
@@ -44,10 +23,6 @@ fn env_or(var: &str, default: usize) -> usize {
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
 }
-
-// ---------------------------------------------------------------------------
-// RSS tracking via /proc/self/statm
-// ---------------------------------------------------------------------------
 
 /// Returns current RSS in KiB by parsing /proc/self/status (no page-size assumption).
 fn rss_kib() -> usize {
@@ -67,10 +42,6 @@ fn rss_kib() -> usize {
     0
 }
 
-// ---------------------------------------------------------------------------
-// Snapshot: internal diagnostics + RSS
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone)]
 struct Snapshot {
     round: usize,
@@ -87,11 +58,11 @@ async fn snapshot(label: &str, round: usize, client: &whatsapp_rust::client::Cli
     let heap_bytes = dhat::HeapStats::get().curr_bytes;
 
     info!(
-        "[round {round:>4}] {label} | RSS={rss}K | moka(recent_msg={},session_locks={},msg_queues={},device_cache={}) | unbounded(signal_sess={},signal_id={},signal_sk={},resp_waiters={},pending_retries={},presence_subs={},app_state_kr={},app_state_sync={})",
+        "[round {round:>4}] {label} | RSS={rss}K | moka(recent_msg={},session_locks={},chat_lanes={},device_reg={}) | unbounded(signal_sess={},signal_id={},signal_sk={},resp_waiters={},pending_retries={},presence_subs={},app_state_kr={},app_state_sync={})",
         diag.recent_messages,
         diag.session_locks,
-        diag.message_queues,
-        diag.device_cache,
+        diag.chat_lanes,
+        diag.device_registry_cache,
         diag.signal_cache_sessions,
         diag.signal_cache_identities,
         diag.signal_cache_sender_keys,
@@ -110,10 +81,6 @@ async fn snapshot(label: &str, round: usize, client: &whatsapp_rust::client::Cli
         heap_bytes,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Growth analysis
-// ---------------------------------------------------------------------------
 
 /// Analyze snapshot series: check both collection growth AND RSS growth.
 fn analyze_growth(label: &str, snapshots: &[Snapshot]) {
@@ -220,21 +187,7 @@ fn analyze_growth(label: &str, snapshots: &[Snapshot]) {
             first.diag.session_locks,
             last.diag.session_locks,
         ),
-        (
-            "message_queues",
-            first.diag.message_queues,
-            last.diag.message_queues,
-        ),
-        (
-            "message_enqueue_locks",
-            first.diag.message_enqueue_locks,
-            last.diag.message_enqueue_locks,
-        ),
-        (
-            "device_cache",
-            first.diag.device_cache,
-            last.diag.device_cache,
-        ),
+        ("chat_lanes", first.diag.chat_lanes, last.diag.chat_lanes),
         (
             "device_registry_cache",
             first.diag.device_registry_cache,
@@ -276,10 +229,6 @@ fn analyze_growth(label: &str, snapshots: &[Snapshot]) {
     }
     info!("  -> No growth issues detected.");
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 fn make_text_msg(text: &str) -> wa::Message {
     wa::Message {
@@ -348,11 +297,8 @@ async fn wait_for_group_msg(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Test 1: High-volume DM soak (200+ rounds, bidirectional, mixed sizes)
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
+#[ignore = "stress test — run manually with --ignored"]
 async fn test_heavy_dm_soak() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
     #[cfg(feature = "dhat-heap")]
@@ -412,11 +358,8 @@ async fn test_heavy_dm_soak() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Test 2: Multi-group + multi-peer soak
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
+#[ignore = "stress test — run manually with --ignored"]
 async fn test_heavy_group_soak() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
     #[cfg(feature = "dhat-heap")]
@@ -447,14 +390,15 @@ async fn test_heavy_group_soak() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group 1: {g1}");
 
     // Wait for notifications
     for client in [&mut client_b, &mut client_c] {
         client
             .wait_for_event(15, |e| {
-                matches!(e, Event::Notification(node) if node.attrs.get("type").is_some_and(|v| v == "w:gp2"))
+                matches!(e, Event::Notification(node) if node.get_attr("type").is_some_and(|v| v.as_str() == "w:gp2"))
             })
             .await?;
     }
@@ -469,12 +413,13 @@ async fn test_heavy_group_soak() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group 2: {g2}");
 
     client_b
         .wait_for_event(15, |e| {
-            matches!(e, Event::Notification(node) if node.attrs.get("type").is_some_and(|v| v == "w:gp2"))
+            matches!(e, Event::Notification(node) if node.get_attr("type").is_some_and(|v| v.as_str() == "w:gp2"))
         })
         .await?;
 
@@ -556,11 +501,8 @@ async fn test_heavy_group_soak() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Test 3: Mixed operations — DM + group + presence + chatstate + reconnects
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
+#[ignore = "stress test — run manually with --ignored"]
 async fn test_heavy_mixed_soak() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
     #[cfg(feature = "dhat-heap")]
@@ -593,13 +535,14 @@ async fn test_heavy_mixed_soak() -> anyhow::Result<()> {
             ..Default::default()
         })
         .await?
-        .gid;
+        .metadata
+        .id;
     info!("Group: {group_jid}");
 
     for client in [&mut client_b, &mut client_c] {
         client
             .wait_for_event(15, |e| {
-                matches!(e, Event::Notification(node) if node.attrs.get("type").is_some_and(|v| v == "w:gp2"))
+                matches!(e, Event::Notification(node) if node.get_attr("type").is_some_and(|v| v.as_str() == "w:gp2"))
             })
             .await?;
     }
@@ -701,11 +644,8 @@ async fn test_heavy_mixed_soak() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Test 4: Many-peer DM fan-out (stresses device_cache, session_locks, signal_cache)
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
+#[ignore = "stress test — run manually with --ignored"]
 async fn test_many_peers_soak() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
     #[cfg(feature = "dhat-heap")]
@@ -775,11 +715,8 @@ async fn test_many_peers_soak() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Test 5: Reconnect stress — many rapid reconnects with messaging between
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
+#[ignore = "stress test — run manually with --ignored"]
 async fn test_heavy_reconnect_soak() -> anyhow::Result<()> {
     let _ = env_logger::builder().is_test(true).try_init();
     #[cfg(feature = "dhat-heap")]

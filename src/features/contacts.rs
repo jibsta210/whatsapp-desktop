@@ -9,12 +9,30 @@ use anyhow::Result;
 use log::debug;
 use std::collections::HashMap;
 use wacore::iq::contacts::{ProfilePictureSpec, ProfilePictureType};
-use wacore::iq::usync::{ContactInfoSpec, IsOnWhatsAppSpec, UserInfoSpec};
-use wacore_binary::jid::{Jid, JidExt};
+use wacore::iq::usync::{IsOnWhatsAppQueryType, IsOnWhatsAppSpec, IsOnWhatsAppUser, UserInfoSpec};
+use wacore_binary::{Jid, JidExt};
 
 // Re-export types from wacore
 pub use wacore::iq::contacts::ProfilePicture;
-pub use wacore::iq::usync::{ContactInfo, IsOnWhatsAppResult, UserInfo};
+pub use wacore::iq::usync::{IsOnWhatsAppResult, UserInfo};
+
+// Use fn items rather than borrowing closures so futures containing these
+// iterators remain Send and can be spawned by embedding applications.
+fn forward_lid_pair(result: &IsOnWhatsAppResult) -> (&Jid, Option<&Jid>) {
+    (&result.jid, result.lid.as_ref())
+}
+
+fn reverse_lid_pair(result: &IsOnWhatsAppResult) -> Option<(&Jid, Option<&Jid>)> {
+    if result.jid.is_lid() {
+        result.pn_jid.as_ref().map(|pn| (pn, Some(&result.jid)))
+    } else {
+        None
+    }
+}
+
+fn user_info_lid_pair(entry: &UserInfo) -> (&Jid, Option<&Jid>) {
+    (&entry.jid, entry.lid.as_ref())
+}
 
 pub struct Contacts<'a> {
     client: &'a Client,
@@ -25,32 +43,86 @@ impl<'a> Contacts<'a> {
         Self { client }
     }
 
-    pub async fn is_on_whatsapp(&self, phones: &[&str]) -> Result<Vec<IsOnWhatsAppResult>> {
-        if phones.is_empty() {
-            return Ok(Vec::new());
+    async fn persist_lid_mappings<'b, I>(&self, entries: I)
+    where
+        I: IntoIterator<Item = (&'b Jid, Option<&'b Jid>)>,
+    {
+        for (jid, lid) in entries {
+            let Some(lid) = lid else {
+                continue;
+            };
+            if !jid.is_pn() || !lid.is_lid() {
+                continue;
+            }
+            if let Err(err) = self
+                .client
+                .add_lid_pn_mapping(
+                    &lid.user,
+                    &jid.user,
+                    crate::lid_pn_cache::LearningSource::Usync,
+                )
+                .await
+            {
+                log::warn!(
+                    "Failed to persist usync LID mapping {} -> {}: {err}",
+                    jid,
+                    lid
+                );
+            }
         }
-
-        debug!("is_on_whatsapp: checking {} numbers", phones.len());
-
-        let request_id = self.client.generate_request_id();
-        let phone_strings: Vec<String> = phones.iter().map(|s| s.to_string()).collect();
-        let spec = IsOnWhatsAppSpec::new(phone_strings, request_id);
-
-        Ok(self.client.execute(spec).await?)
     }
 
-    pub async fn get_info(&self, phones: &[&str]) -> Result<Vec<ContactInfo>> {
-        if phones.is_empty() {
+    /// Check if JIDs are registered on WhatsApp.
+    ///
+    /// Accepts both PN JIDs (`Jid::pn("1234567890")`) and LID JIDs (`Jid::lid("100000001")`).
+    /// PN and LID queries use different protocols (matching WA Web ExistsJob), so mixed
+    /// inputs are split into separate requests.
+    pub async fn is_on_whatsapp(&self, jids: &[Jid]) -> Result<Vec<IsOnWhatsAppResult>> {
+        if jids.is_empty() {
             return Ok(Vec::new());
         }
 
-        debug!("get_info: fetching info for {} numbers", phones.len());
+        debug!("is_on_whatsapp: checking {} JIDs", jids.len());
 
-        let request_id = self.client.generate_request_id();
-        let phone_strings: Vec<String> = phones.iter().map(|s| s.to_string()).collect();
-        let spec = ContactInfoSpec::new(phone_strings, request_id);
+        let mut pn_users = Vec::new();
+        let mut lid_users = Vec::new();
+        for jid in jids {
+            if jid.is_pn() {
+                let known_lid = self.client.lid_pn_cache.get_current_lid(&jid.user).await;
+                pn_users.push(IsOnWhatsAppUser {
+                    jid: jid.to_non_ad(),
+                    known_lid,
+                });
+            } else if jid.is_lid() {
+                lid_users.push(IsOnWhatsAppUser {
+                    jid: jid.to_non_ad(),
+                    known_lid: None,
+                });
+            } else {
+                log::warn!("is_on_whatsapp: skipping unsupported JID type: {jid}");
+            }
+        }
 
-        Ok(self.client.execute(spec).await?)
+        let mut results = Vec::new();
+
+        if !pn_users.is_empty() {
+            let sid = self.client.generate_request_id();
+            let spec = IsOnWhatsAppSpec::new(pn_users, sid, IsOnWhatsAppQueryType::Pn);
+            results.extend(self.client.execute(spec).await?);
+        }
+
+        if !lid_users.is_empty() {
+            let sid = self.client.generate_request_id();
+            let spec = IsOnWhatsAppSpec::new(lid_users, sid, IsOnWhatsAppQueryType::Lid);
+            results.extend(self.client.execute(spec).await?);
+        }
+
+        self.persist_lid_mappings(results.iter().map(forward_lid_pair))
+            .await;
+        self.persist_lid_mappings(results.iter().filter_map(reverse_lid_pair))
+            .await;
+
+        Ok(results)
     }
 
     pub async fn get_profile_picture(
@@ -71,9 +143,29 @@ impl<'a> Contacts<'a> {
         };
         let mut spec = ProfilePictureSpec::new(jid, picture_type);
 
-        // Include tctoken for user JIDs (skip groups, newsletters)
+        // Skip own JID: server never responds when tctoken is sent for self
+        let is_own_jid = {
+            let snap = self.client.persistence_manager.get_device_snapshot().await;
+            snap.pn.as_ref().is_some_and(|pn| pn.is_same_user_as(jid))
+                || snap
+                    .lid
+                    .as_ref()
+                    .is_some_and(|lid| lid.is_same_user_as(jid))
+        };
         if !jid.is_group()
             && !jid.is_newsletter()
+            && !jid.is_bot()
+            && !jid.is_broadcast_list()
+            && !jid.is_status_broadcast()
+            && !is_own_jid
+            && self
+                .client
+                .ab_props
+                .is_enabled_or(
+                    wacore::iq::props::config_codes::PROFILE_PIC_PRIVACY_TOKEN,
+                    true,
+                )
+                .await
             && let Some(token) = self.client.lookup_tc_token_for_jid(jid).await
         {
             spec = spec.with_tc_token(token);
@@ -98,7 +190,10 @@ impl<'a> Contacts<'a> {
         let request_id = self.client.generate_request_id();
         let spec = UserInfoSpec::new(jids.to_vec(), request_id);
 
-        Ok(self.client.execute(spec).await?)
+        let info = self.client.execute(spec).await?;
+        self.persist_lid_mappings(info.values().map(user_info_lid_pair))
+            .await;
+        Ok(info)
     }
 }
 
@@ -107,12 +202,9 @@ impl Client {
         Contacts::new(self)
     }
 
-    /// Resolve phone numbers to their LIDs via a ContactInfoSpec usync and
-    /// persist every discovered phone↔LID pair into the core LID-PN cache.
+    /// Resolve phone numbers to their LIDs through the stable PN existence
+    /// usync and persist every discovered phone↔LID pair into the core cache.
     ///
-    /// Unlike `get_user_devices` (DeviceListSpec), ContactInfoSpec requests the
-    /// `<lid/>` sidecar, so the server actually returns a `<lid val="…"/>` child
-    /// for each phone-keyed user — the only usync direction that yields a mapping.
     /// The desktop prewarm sweep calls this so an incoming LID resolves to the
     /// right saved contact instead of minting a phantom "+<lid digits>" chat.
     ///
@@ -123,62 +215,15 @@ impl Client {
             return Ok(0);
         }
 
-        let request_id = self.generate_request_id();
-        let spec = ContactInfoSpec::new(phones.to_vec(), request_id);
-        let infos = self.execute(spec).await?;
-
-        let mut learned = 0usize;
-        for info in infos {
-            // Only phone-keyed results carry a usable LID sidecar. `jid.user` is
-            // the phone digits; `lid.user` is the opaque LID user part.
-            if let Some(lid) = info.lid {
-                let phone_user = info.jid.user.as_str();
-                let lid_user = lid.user.as_str();
-                if phone_user.is_empty() || lid_user.is_empty() {
-                    continue;
-                }
-                // Reachable because this method lives inside the whatsapp-rust crate.
-                if let Err(e) = self
-                    .add_lid_pn_mapping(lid_user, phone_user, wacore::types::LearningSource::Usync)
-                    .await
-                {
-                    debug!("resolve_contact_lids: persist {lid_user}↔{phone_user} failed: {e:#}");
-                    continue;
-                }
-                learned += 1;
-            }
-        }
-
-        Ok(learned)
+        let jids: Vec<Jid> = phones.iter().map(|phone| Jid::pn(phone)).collect();
+        let results = self.contacts().is_on_whatsapp(&jids).await?;
+        Ok(results.iter().filter(|result| result.lid.is_some()).count())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_contact_info_struct() {
-        let jid: Jid = "1234567890@s.whatsapp.net"
-            .parse()
-            .expect("test JID should be valid");
-        let lid: Jid = "12345678@lid".parse().expect("test JID should be valid");
-
-        let info = ContactInfo {
-            jid: jid.clone(),
-            lid: Some(lid.clone()),
-            is_registered: true,
-            is_business: false,
-            status: Some("Hey there!".to_string()),
-            picture_id: Some(123456789),
-        };
-
-        assert!(info.is_registered);
-        assert!(!info.is_business);
-        assert_eq!(info.status, Some("Hey there!".to_string()));
-        assert_eq!(info.picture_id, Some(123456789));
-        assert!(info.lid.is_some());
-    }
 
     #[test]
     fn test_profile_picture_struct() {
@@ -192,18 +237,5 @@ mod tests {
         assert_eq!(pic.id, "123456789");
         assert_eq!(pic.url, "https://example.com/pic.jpg");
         assert!(pic.direct_path.is_some());
-    }
-
-    #[test]
-    fn test_is_on_whatsapp_result_struct() {
-        let jid: Jid = "1234567890@s.whatsapp.net"
-            .parse()
-            .expect("test JID should be valid");
-        let result = IsOnWhatsAppResult {
-            jid,
-            is_registered: true,
-        };
-
-        assert!(result.is_registered);
     }
 }

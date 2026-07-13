@@ -7,31 +7,38 @@ use crate::request::IqError;
 use serde_json::Value;
 use thiserror::Error;
 use wacore::iq::mex::MexQuerySpec;
+use wacore_binary::jid::JidError;
 
 // Re-export types from wacore
-pub use wacore::iq::mex::{MexErrorExtensions, MexGraphQLError, MexResponse};
+pub use wacore::iq::mex::{MexDoc, MexErrorExtensions, MexGraphQLError, MexResponse};
 
 /// Error types for MEX operations.
 #[derive(Debug, Error)]
 pub enum MexError {
+    /// Payload missing or otherwise malformed in a way that has no underlying
+    /// typed source (descriptive message only — e.g. "missing data").
     #[error("MEX payload parsing error: {0}")]
     PayloadParsing(String),
+
+    #[error("MEX payload contained an invalid JID")]
+    InvalidJid(#[from] JidError),
 
     #[error("MEX extension error: code={code}, message='{message}'")]
     ExtensionError { code: i32, message: String },
 
-    #[error("IQ request failed: {0}")]
+    #[error("IQ request failed")]
     Request(#[from] IqError),
 
-    #[error("JSON error: {0}")]
+    #[error("JSON error")]
     Json(#[from] serde_json::Error),
 }
 
-/// MEX request with document ID and variables.
+/// MEX request with persisted-query descriptor and variables.
 #[derive(Debug, Clone)]
-pub struct MexRequest<'a> {
-    /// GraphQL document ID.
-    pub doc_id: &'a str,
+pub struct MexRequest {
+    /// GraphQL persisted-query descriptor (name + id), from
+    /// [`wacore::iq::mex_ids`].
+    pub doc: MexDoc,
     /// Query variables.
     pub variables: Value,
 }
@@ -48,18 +55,18 @@ impl<'a> Mex<'a> {
 
     /// Execute a GraphQL query.
     #[inline]
-    pub async fn query(&self, request: MexRequest<'_>) -> Result<MexResponse, MexError> {
+    pub async fn query(&self, request: MexRequest) -> Result<MexResponse, MexError> {
         self.execute_request(request).await
     }
 
     /// Execute a GraphQL mutation.
     #[inline]
-    pub async fn mutate(&self, request: MexRequest<'_>) -> Result<MexResponse, MexError> {
+    pub async fn mutate(&self, request: MexRequest) -> Result<MexResponse, MexError> {
         self.execute_request(request).await
     }
 
-    async fn execute_request(&self, request: MexRequest<'_>) -> Result<MexResponse, MexError> {
-        let spec = MexQuerySpec::new(request.doc_id, request.variables);
+    async fn execute_request(&self, request: MexRequest) -> Result<MexResponse, MexError> {
+        let spec = MexQuerySpec::new(request.doc, request.variables);
 
         let response = self.client.execute(spec).await?;
 
@@ -89,14 +96,18 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_mex_request_borrows_doc_id() {
-        let doc_id = "29829202653362039";
+    fn test_mex_request_carries_doc() {
+        const DOC: MexDoc = MexDoc {
+            name: "WAWebMexTestQuery",
+            id: "29829202653362039",
+        };
         let request = MexRequest {
-            doc_id,
+            doc: DOC,
             variables: json!({}),
         };
 
-        assert_eq!(request.doc_id, "29829202653362039");
+        assert_eq!(request.doc.id, "29829202653362039");
+        assert_eq!(request.doc.name, "WAWebMexTestQuery");
     }
 
     #[test]
@@ -231,5 +242,29 @@ mod tests {
         assert!(ext.is_summary.is_none());
         assert!(ext.is_retryable.is_none());
         assert!(ext.severity.is_none());
+    }
+
+    #[test]
+    fn invalid_jid_preserves_jid_error_source() {
+        let raw: Result<wacore_binary::Jid, JidError> = "not-a-valid-jid".parse();
+        let jid_err = raw.unwrap_err();
+        let me: MexError = jid_err.into();
+        let src = std::error::Error::source(&me).expect("source preserved");
+        let inner = src
+            .downcast_ref::<JidError>()
+            .expect("downcasts to JidError");
+        assert!(matches!(inner, JidError::InvalidFormat(_)));
+    }
+
+    #[test]
+    fn request_preserves_iq_error_source() {
+        let iq = IqError::ServerError {
+            code: 404,
+            text: "not-found".into(),
+        };
+        let me: MexError = iq.into();
+        let src = std::error::Error::source(&me).expect("source preserved");
+        let inner = src.downcast_ref::<IqError>().expect("downcasts to IqError");
+        assert!(matches!(inner, IqError::ServerError { code: 404, .. }));
     }
 }

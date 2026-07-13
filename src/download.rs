@@ -227,6 +227,11 @@ where
 }
 
 impl Client {
+    /// Downloads and decrypts media from WhatsApp's CDN into memory.
+    ///
+    /// Only needed when you need the plaintext bytes (processing, transcoding,
+    /// re-upload). To forward existing media unchanged, reuse the original
+    /// message's CDN fields directly, no round-trip required.
     pub async fn download(&self, downloadable: &dyn Downloadable) -> Result<Vec<u8>> {
         download_media_with_retry(
             |force| self.prepare_requests(downloadable, force),
@@ -257,14 +262,14 @@ impl Client {
         file_length: u64,
         media_type: MediaType,
     ) -> Result<Vec<u8>> {
-        let params = DownloadParams {
-            direct_path: direct_path.to_string(),
-            media_key: Some(media_key.to_vec()),
-            file_sha256: file_sha256.to_vec(),
-            file_enc_sha256: Some(file_enc_sha256.to_vec()),
+        let params = Self::build_download_params(
+            direct_path,
+            media_key,
+            file_sha256,
+            file_enc_sha256,
             file_length,
             media_type,
-        };
+        );
         self.download(&params).await
     }
 
@@ -358,34 +363,55 @@ impl Client {
         media_type: MediaType,
         writer: W,
     ) -> Result<W> {
-        let params = DownloadParams {
+        let params = Self::build_download_params(
+            direct_path,
+            media_key,
+            file_sha256,
+            file_enc_sha256,
+            file_length,
+            media_type,
+        );
+        self.download_to_writer(&params, writer).await
+    }
+
+    fn build_download_params(
+        direct_path: &str,
+        media_key: &[u8],
+        file_sha256: &[u8],
+        file_enc_sha256: &[u8],
+        file_length: u64,
+        media_type: MediaType,
+    ) -> DownloadParams {
+        DownloadParams {
             direct_path: direct_path.to_string(),
             media_key: Some(media_key.to_vec()),
             file_sha256: file_sha256.to_vec(),
             file_enc_sha256: Some(file_enc_sha256.to_vec()),
             file_length,
             media_type,
-        };
-        self.download_to_writer(&params, writer).await
+        }
     }
 
-    /// Internal: stream download + decrypt to a writer in one blocking thread.
-    /// Always returns the writer (even on failure) so the caller can retry.
+    /// Download + decrypt to a writer. Uses streaming when available,
+    /// falls back to buffered otherwise. Returns writer for retry.
     async fn streaming_download_and_decrypt<W: Write + Seek + Send + 'static>(
         &self,
         request: &wacore::download::DownloadRequest,
         writer: W,
     ) -> Result<(W, std::result::Result<(), DownloadRequestError>)> {
+        if !self.http_client.supports_streaming() {
+            return self.buffered_download_and_decrypt(request, writer).await;
+        }
+
         let http_client = self.http_client.clone();
         let url = request.url.clone();
         let decryption = request.decryption.clone();
 
-        wacore::runtime::blocking(&*self.runtime, move || {
+        Ok(wacore::runtime::blocking(&*self.runtime, move || {
             let mut writer = writer;
 
-            // Seek to start before each attempt so retries start fresh
             if let Err(e) = writer.seek(SeekFrom::Start(0)) {
-                return Ok((writer, Err(DownloadRequestError::other(e))));
+                return (writer, Err(DownloadRequestError::other(e)));
             }
 
             let result = (|| -> std::result::Result<(), DownloadRequestError> {
@@ -435,9 +461,78 @@ impl Client {
                 Ok(())
             })();
 
-            Ok((writer, result))
+            (writer, result)
         })
-        .await
+        .await)
+    }
+
+    /// Buffered fallback when streaming is not available.
+    async fn buffered_download_and_decrypt<W: Write + Seek + Send + 'static>(
+        &self,
+        request: &wacore::download::DownloadRequest,
+        mut writer: W,
+    ) -> Result<(W, std::result::Result<(), DownloadRequestError>)> {
+        let http_request = crate::http::HttpRequest::get(request.url.clone());
+        let resp = match self.http_client.execute(http_request).await {
+            Ok(r) => r,
+            Err(e) => return Ok((writer, Err(DownloadRequestError::other(e)))),
+        };
+
+        if resp.status_code >= 300 {
+            let err = if is_media_auth_error(resp.status_code) {
+                DownloadRequestError::auth(resp.status_code)
+            } else if matches!(resp.status_code, 404 | 410) {
+                DownloadRequestError::not_found(resp.status_code)
+            } else {
+                DownloadRequestError::other(anyhow!(
+                    "Download failed with status: {}",
+                    resp.status_code
+                ))
+            };
+            return Ok((writer, Err(err)));
+        }
+
+        let decryption = request.decryption.clone();
+
+        // Offload blocking decrypt+write to avoid stalling the async executor
+        Ok(wacore::runtime::blocking(&*self.runtime, move || {
+            if let Err(e) = writer.seek(SeekFrom::Start(0)) {
+                return (writer, Err(DownloadRequestError::other(e)));
+            }
+
+            let result = (|| -> std::result::Result<(), DownloadRequestError> {
+                let reader = std::io::Cursor::new(resp.body);
+                match &decryption {
+                    MediaDecryption::Encrypted {
+                        media_key,
+                        media_type,
+                    } => {
+                        DownloadUtils::decrypt_stream_to_writer(
+                            reader,
+                            media_key,
+                            *media_type,
+                            &mut writer,
+                        )
+                        .map_err(DownloadRequestError::other)?;
+                    }
+                    MediaDecryption::Plaintext { file_sha256 } => {
+                        DownloadUtils::copy_and_validate_plaintext_to_writer(
+                            reader,
+                            file_sha256,
+                            &mut writer,
+                        )
+                        .map_err(DownloadRequestError::other)?;
+                    }
+                }
+                writer
+                    .seek(SeekFrom::Start(0))
+                    .map_err(DownloadRequestError::other)?;
+                Ok(())
+            })();
+
+            (writer, result)
+        })
+        .await)
     }
 }
 

@@ -2379,7 +2379,7 @@ async fn run_inner(
             let state = state_ev.clone();
             let lid_tx = lid_tx_ev.clone();
             async move {
-                handle_wa_event(&tx, &state, &client, &lid_tx, event).await;
+                handle_wa_event(&tx, &state, &client, &lid_tx, (*event).clone()).await;
             }
         })
         .build()
@@ -2512,6 +2512,24 @@ async fn run_inner(
 /// Send an unresolved LID to the background resolver. Deduplicates automatically.
 fn queue_lid_resolve(resolver_tx: &tokio::sync::mpsc::UnboundedSender<String>, lid: &str) {
     let _ = resolver_tx.send(lid.to_string());
+}
+
+fn receipt_status_for_type(receipt_type: &ReceiptType) -> Option<ReceiptStatus> {
+    match receipt_type {
+        ReceiptType::Read
+        | ReceiptType::ReadSelf
+        | ReceiptType::Played
+        | ReceiptType::PlayedSelf => Some(ReceiptStatus::Read),
+        ReceiptType::Delivered | ReceiptType::Sender | ReceiptType::PeerMsg => {
+            Some(ReceiptStatus::Delivered)
+        }
+        ReceiptType::ServerError => Some(ReceiptStatus::Failed),
+        ReceiptType::Retry
+        | ReceiptType::EncRekeyRetry
+        | ReceiptType::Inactive
+        | ReceiptType::HistorySync
+        | ReceiptType::Other(_) => None,
+    }
 }
 
 /// Resolve a batch of LID JIDs via usync, persist mappings, and notify UI.
@@ -3457,7 +3475,7 @@ async fn handle_wa_event(
             let edit_dbg = format!("{:?}", info.edit);
             let msg_id_dbg = info.id.to_string();
 
-            let mapped = map_message(*msg, info);
+            let mapped = map_message((*msg).clone(), (*info).clone());
             if mapped.is_none() {
                 log::warn!(
                     "DROPPED message: id={msg_id_dbg} chat={chat_id} raw_chat={raw_chat_dbg} \
@@ -3625,12 +3643,12 @@ async fn handle_wa_event(
                 r.r#type,
                 r.source.chat,
                 r.message_ids.len(),
-                r.message_sender
+                r.source.sender
             );
             // Detect "we read on another device":
             // - ReadSelf type (DMs)
             // - Read type where sender is OUR OWN LID/phone (groups)
-            let sender_raw = r.message_sender.to_string();
+            let sender_raw = r.source.sender.to_string();
             let sender_stripped =
                 if let (Some(c), Some(a)) = (sender_raw.find(':'), sender_raw.find('@')) {
                     if c < a {
@@ -3649,10 +3667,14 @@ async fn handle_wa_event(
                 false
             };
             let is_read_self = matches!(r.r#type, ReceiptType::ReadSelf) || is_own_read;
-            let status = match r.r#type {
-                ReceiptType::Read | ReceiptType::ReadSelf => ReceiptStatus::Read,
-                _ => ReceiptStatus::Delivered,
-            };
+            let status = receipt_status_for_type(&r.r#type);
+            if matches!(r.r#type, ReceiptType::ServerError) {
+                log::warn!(
+                    "WhatsApp rejected outgoing message receipt(s): chat={} ids={:?}",
+                    r.source.chat,
+                    r.message_ids
+                );
+            }
             // Use the receipt's source.chat directly — no scanning all history
             let chat_id = {
                 let raw = r.source.chat.to_string();
@@ -3674,7 +3696,8 @@ async fn handle_wa_event(
                 }
             };
 
-            if !is_read_self {
+            if !is_read_self && status.is_some() {
+                let status = status.clone().expect("checked above");
                 // Update sent message receipt status in cache (fast: only scan ONE chat)
                 let mut s = state.lock().unwrap();
                 if let Some(msgs) = s.history.get_mut(&chat_id) {
@@ -3768,21 +3791,24 @@ async fn handle_wa_event(
                         .await;
                 }
             }
-            for msg_id in r.message_ids {
-                let _ = tx
-                    .send(WaEvent::ReceiptUpdate {
-                        msg_id,
-                        status: status.clone(),
-                    })
-                    .await;
+            if let Some(status) = status {
+                for msg_id in r.message_ids {
+                    let _ = tx
+                        .send(WaEvent::ReceiptUpdate {
+                            msg_id,
+                            status: status.clone(),
+                        })
+                        .await;
+                }
             }
             return;
         }
 
         // Log ALL notifications for diagnostics
         Event::Notification(node) => {
-            if let Some(type_attr) = node.attrs.get("type") {
-                log::info!("Notification: type={} tag={}", type_attr.as_str(), node.tag);
+            let mut attrs = node.attrs();
+            if let Some(type_attr) = attrs.optional_string("type") {
+                log::info!("Notification: type={} tag={}", type_attr, node.tag());
             }
             return;
         }
@@ -3892,8 +3918,11 @@ async fn handle_wa_event(
             }
         }
 
-        Event::JoinedGroup(lazy_conv) => {
-            if let Some(conv) = lazy_conv.get_with_messages() {
+        Event::HistorySync(lazy_sync) => {
+            let Some(history_sync) = lazy_sync.get() else {
+                return;
+            };
+            for conv in &history_sync.conversations {
                 let raw_id = conv.id.clone();
 
                 // Skip status broadcasts and internal chats
@@ -4265,13 +4294,11 @@ async fn handle_wa_event(
                     }
                 }
 
-                match persisted {
-                    Some(s) => WaEvent::ChatAdded(s),
-                    None => return,
+                if let Some(s) = persisted {
+                    let _ = tx.send(WaEvent::ChatAdded(s)).await;
                 }
-            } else {
-                return;
             }
+            return;
         }
 
         Event::OfflineSyncPreview(preview) => {
@@ -4776,7 +4803,7 @@ async fn handle_wa_event(
                             crate::bridge::GroupMember {
                                 jid: pjid,
                                 name,
-                                is_admin: p.is_admin,
+                                is_admin: p.is_admin(),
                             }
                         })
                         .collect();
@@ -5378,6 +5405,7 @@ async fn handle_command(
             };
             match client.send_message(jid, msg).await {
                 Ok(real_id) => {
+                    let real_id = real_id.message_id;
                     // Persist sent message to cache so it survives chat switches
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -5504,6 +5532,7 @@ async fn handle_command(
             };
             match client.send_message(jid, msg).await {
                 Ok(real_id) => {
+                    let real_id = real_id.message_id;
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -5577,6 +5606,7 @@ async fn handle_command(
             };
             match client.send_message(jid, msg).await {
                 Ok(new_id) => {
+                    let new_id = new_id.message_id;
                     // Update the receipt on the existing bubble to Sent
                     let _ = tx
                         .send(WaEvent::ReceiptUpdate {
@@ -6756,7 +6786,9 @@ async fn handle_command(
                             }
                             _ => wacore::download::MediaType::Image,
                         };
-                        if let Ok(upload) = client.upload(data, upload_type).await {
+                        if let Ok(upload) =
+                            client.upload(data, upload_type, Default::default()).await
+                        {
                             let fwd_ctx = Box::new(wa::ContextInfo {
                                 is_forwarded: Some(true),
                                 forwarding_score: Some(orig.forwarding_score.saturating_add(1)),
@@ -6768,9 +6800,9 @@ async fn handle_command(
                                         mimetype: Some("image/webp".into()),
                                         url: Some(upload.url),
                                         direct_path: Some(upload.direct_path),
-                                        media_key: Some(upload.media_key),
-                                        file_enc_sha256: Some(upload.file_enc_sha256),
-                                        file_sha256: Some(upload.file_sha256),
+                                        media_key: Some(upload.media_key.to_vec()),
+                                        file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                                        file_sha256: Some(upload.file_sha256.to_vec()),
                                         file_length: Some(upload.file_length),
                                         context_info: Some(fwd_ctx),
                                         ..Default::default()
@@ -6782,9 +6814,9 @@ async fn handle_command(
                                         mimetype: Some("video/mp4".into()),
                                         url: Some(upload.url),
                                         direct_path: Some(upload.direct_path),
-                                        media_key: Some(upload.media_key),
-                                        file_enc_sha256: Some(upload.file_enc_sha256),
-                                        file_sha256: Some(upload.file_sha256),
+                                        media_key: Some(upload.media_key.to_vec()),
+                                        file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                                        file_sha256: Some(upload.file_sha256.to_vec()),
                                         file_length: Some(upload.file_length),
                                         context_info: Some(fwd_ctx),
                                         ..Default::default()
@@ -6797,9 +6829,9 @@ async fn handle_command(
                                         gif_playback: Some(true),
                                         url: Some(upload.url),
                                         direct_path: Some(upload.direct_path),
-                                        media_key: Some(upload.media_key),
-                                        file_enc_sha256: Some(upload.file_enc_sha256),
-                                        file_sha256: Some(upload.file_sha256),
+                                        media_key: Some(upload.media_key.to_vec()),
+                                        file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                                        file_sha256: Some(upload.file_sha256.to_vec()),
                                         file_length: Some(upload.file_length),
                                         context_info: Some(fwd_ctx),
                                         ..Default::default()
@@ -6826,9 +6858,11 @@ async fn handle_command(
                                                 file_name: orig.media_filename.clone(),
                                                 url: Some(upload.url),
                                                 direct_path: Some(upload.direct_path),
-                                                media_key: Some(upload.media_key),
-                                                file_enc_sha256: Some(upload.file_enc_sha256),
-                                                file_sha256: Some(upload.file_sha256),
+                                                media_key: Some(upload.media_key.to_vec()),
+                                                file_enc_sha256: Some(
+                                                    upload.file_enc_sha256.to_vec(),
+                                                ),
+                                                file_sha256: Some(upload.file_sha256.to_vec()),
                                                 file_length: Some(upload.file_length),
                                                 context_info: Some(fwd_ctx),
                                                 ..Default::default()
@@ -6842,9 +6876,9 @@ async fn handle_command(
                                         mimetype: Some("audio/ogg".into()),
                                         url: Some(upload.url),
                                         direct_path: Some(upload.direct_path),
-                                        media_key: Some(upload.media_key),
-                                        file_enc_sha256: Some(upload.file_enc_sha256),
-                                        file_sha256: Some(upload.file_sha256),
+                                        media_key: Some(upload.media_key.to_vec()),
+                                        file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                                        file_sha256: Some(upload.file_sha256.to_vec()),
                                         file_length: Some(upload.file_length),
                                         context_info: Some(fwd_ctx),
                                         ..Default::default()
@@ -6856,9 +6890,9 @@ async fn handle_command(
                                         mimetype: Some("image/jpeg".into()),
                                         url: Some(upload.url),
                                         direct_path: Some(upload.direct_path),
-                                        media_key: Some(upload.media_key),
-                                        file_enc_sha256: Some(upload.file_enc_sha256),
-                                        file_sha256: Some(upload.file_sha256),
+                                        media_key: Some(upload.media_key.to_vec()),
+                                        file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                                        file_sha256: Some(upload.file_sha256.to_vec()),
                                         file_length: Some(upload.file_length),
                                         context_info: Some(fwd_ctx),
                                         ..Default::default()
@@ -6867,6 +6901,7 @@ async fn handle_command(
                                 },
                             };
                             if let Ok(real_id) = client.send_message(to_jid.clone(), msg).await {
+                                let real_id = real_id.message_id;
                                 count += 1;
                                 let now = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
@@ -6896,6 +6931,7 @@ async fn handle_command(
                         ..Default::default()
                     };
                     if let Ok(real_id) = client.send_message(to_jid.clone(), msg).await {
+                        let real_id = real_id.message_id;
                         count += 1;
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -6927,6 +6963,7 @@ async fn handle_command(
                     };
                     match client.send_message(to_jid.clone(), fwd_msg).await {
                         Ok(real_id) => {
+                            let real_id = real_id.message_id;
                             count += 1;
                             // Create optimistic local message so it appears immediately
                             let now = std::time::SystemTime::now()
@@ -7046,7 +7083,7 @@ async fn handle_command(
             };
             match client.groups().create_group(opts).await {
                 Ok(result) => {
-                    let chat_id = result.gid.to_string();
+                    let chat_id = result.metadata.id.to_string();
                     let summary = ChatSummary {
                         id: chat_id.clone(),
                         name: subject,
@@ -7102,7 +7139,7 @@ async fn handle_command(
                             crate::bridge::GroupMember {
                                 jid: pjid,
                                 name,
-                                is_admin: p.is_admin,
+                                is_admin: p.is_admin(),
                             }
                         })
                         .collect();
@@ -7169,6 +7206,7 @@ async fn handle_command(
                 .await
             {
                 Ok((msg_id, secret)) => {
+                    let msg_id = msg_id.message_id;
                     log::info!(
                         "Poll created: {msg_id} in {chat_id} secret_len={}",
                         secret.len()
@@ -7496,7 +7534,7 @@ async fn handle_command(
                             crate::bridge::GroupMember {
                                 jid: display_jid,
                                 name,
-                                is_admin: p.is_admin,
+                                is_admin: p.is_admin(),
                             }
                         })
                         .collect();
@@ -7520,7 +7558,7 @@ async fn handle_command(
                     // Also extract just the phone number for flexible matching
                     let own_number = own_pn.split('@').next().unwrap_or("").to_string();
                     let i_am_admin = meta.participants.iter().any(|p| {
-                        if !p.is_admin {
+                        if !p.is_admin() {
                             return false;
                         }
                         let pstr = p.jid.to_string();
@@ -7587,7 +7625,11 @@ async fn handle_command(
             // Normalize: strip +, spaces, dashes for the API
             let normalized = phone.replace(['+', ' ', '-', '(', ')'], "");
             log::info!("CheckOnWhatsApp: input='{phone}' normalized='{normalized}'");
-            match client.contacts().is_on_whatsapp(&[&normalized]).await {
+            match client
+                .contacts()
+                .is_on_whatsapp(&[Jid::pn(normalized)])
+                .await
+            {
                 Ok(results) => {
                     log::info!("CheckOnWhatsApp result: {} results", results.len());
                     for r in &results {
@@ -7752,7 +7794,10 @@ async fn handle_command(
                 .unwrap_or("file")
                 .to_string();
 
-            match client.upload(file_data, upload_type).await {
+            match client
+                .upload(file_data, upload_type, Default::default())
+                .await
+            {
                 Ok(upload) => {
                     let file_len = upload.file_length;
                     let msg = if is_image {
@@ -7762,9 +7807,9 @@ async fn handle_command(
                                 caption: caption.clone(),
                                 url: Some(upload.url),
                                 direct_path: Some(upload.direct_path),
-                                media_key: Some(upload.media_key),
-                                file_enc_sha256: Some(upload.file_enc_sha256),
-                                file_sha256: Some(upload.file_sha256),
+                                media_key: Some(upload.media_key.to_vec()),
+                                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                                file_sha256: Some(upload.file_sha256.to_vec()),
                                 file_length: Some(file_len),
                                 ..Default::default()
                             })),
@@ -7777,9 +7822,9 @@ async fn handle_command(
                                 caption: caption.clone(),
                                 url: Some(upload.url),
                                 direct_path: Some(upload.direct_path),
-                                media_key: Some(upload.media_key),
-                                file_enc_sha256: Some(upload.file_enc_sha256),
-                                file_sha256: Some(upload.file_sha256),
+                                media_key: Some(upload.media_key.to_vec()),
+                                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                                file_sha256: Some(upload.file_sha256.to_vec()),
                                 file_length: Some(file_len),
                                 ..Default::default()
                             })),
@@ -7793,9 +7838,9 @@ async fn handle_command(
                                 file_name: Some(filename.clone()),
                                 url: Some(upload.url),
                                 direct_path: Some(upload.direct_path),
-                                media_key: Some(upload.media_key),
-                                file_enc_sha256: Some(upload.file_enc_sha256),
-                                file_sha256: Some(upload.file_sha256),
+                                media_key: Some(upload.media_key.to_vec()),
+                                file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                                file_sha256: Some(upload.file_sha256.to_vec()),
                                 file_length: Some(file_len),
                                 ..Default::default()
                             })),
@@ -7811,6 +7856,7 @@ async fn handle_command(
                     };
                     match client.send_message(jid, msg).await {
                         Ok(real_id) => {
+                            let real_id = real_id.message_id;
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
@@ -7935,7 +7981,7 @@ async fn handle_command(
 
             // Upload as video
             match client
-                .upload(data, wacore::download::MediaType::Video)
+                .upload(data, wacore::download::MediaType::Video, Default::default())
                 .await
             {
                 Ok(upload) => {
@@ -7944,9 +7990,9 @@ async fn handle_command(
                             mimetype: Some("video/mp4".to_string()),
                             url: Some(upload.url),
                             direct_path: Some(upload.direct_path),
-                            media_key: Some(upload.media_key),
-                            file_enc_sha256: Some(upload.file_enc_sha256),
-                            file_sha256: Some(upload.file_sha256),
+                            media_key: Some(upload.media_key.to_vec()),
+                            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                            file_sha256: Some(upload.file_sha256.to_vec()),
                             file_length: Some(upload.file_length),
                             gif_playback: Some(true),
                             ..Default::default()
@@ -7955,6 +8001,7 @@ async fn handle_command(
                     };
                     match client.send_message(jid, msg).await {
                         Ok(real_id) => {
+                            let real_id = real_id.message_id;
                             log::info!("GIF sent: {real_id}");
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -8116,6 +8163,7 @@ async fn handle_command(
             };
             match client.send_message(jid, msg).await {
                 Ok(real_id) => {
+                    let real_id = real_id.message_id;
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -8280,7 +8328,7 @@ async fn handle_command(
             };
 
             match client
-                .upload(data, wacore::download::MediaType::Image)
+                .upload(data, wacore::download::MediaType::Image, Default::default())
                 .await
             {
                 Ok(upload) => {
@@ -8289,9 +8337,9 @@ async fn handle_command(
                             mimetype: Some("image/webp".to_string()),
                             url: Some(upload.url),
                             direct_path: Some(upload.direct_path),
-                            media_key: Some(upload.media_key),
-                            file_enc_sha256: Some(upload.file_enc_sha256),
-                            file_sha256: Some(upload.file_sha256),
+                            media_key: Some(upload.media_key.to_vec()),
+                            file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
+                            file_sha256: Some(upload.file_sha256.to_vec()),
                             file_length: Some(upload.file_length),
                             ..Default::default()
                         })),
@@ -8299,6 +8347,7 @@ async fn handle_command(
                     };
                     match client.send_message(jid, msg).await {
                         Ok(real_id) => {
+                            let real_id = real_id.message_id;
                             log::info!("Sticker sent: {real_id}");
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -8504,7 +8553,7 @@ async fn handle_command(
                                 crate::bridge::GroupMember {
                                     jid: pjid,
                                     name,
-                                    is_admin: p.is_admin,
+                                    is_admin: p.is_admin(),
                                 }
                             })
                             .collect();
@@ -8557,7 +8606,7 @@ async fn handle_command(
                                 crate::bridge::GroupMember {
                                     jid: pjid,
                                     name,
-                                    is_admin: p.is_admin,
+                                    is_admin: p.is_admin(),
                                 }
                             })
                             .collect();
@@ -8737,7 +8786,7 @@ async fn handle_command(
                     } else {
                         wacore::download::MediaType::Audio
                     };
-                    match client.upload(data, upload_type).await {
+                    match client.upload(data, upload_type, Default::default()).await {
                         Ok(upload) => {
                             let now_ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -8747,9 +8796,9 @@ async fn handle_command(
                                 audio_message: Some(Box::new(wa::message::AudioMessage {
                                     url: Some(upload.url),
                                     direct_path: Some(upload.direct_path),
-                                    media_key: Some(upload.media_key),
-                                    file_sha256: Some(upload.file_sha256),
-                                    file_enc_sha256: Some(upload.file_enc_sha256),
+                                    media_key: Some(upload.media_key.to_vec()),
+                                    file_sha256: Some(upload.file_sha256.to_vec()),
+                                    file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
                                     file_length: Some(upload.file_length),
                                     mimetype: Some(mimetype.to_string()),
                                     ptt: Some(is_voice_note),
@@ -8762,6 +8811,7 @@ async fn handle_command(
                             };
                             match client.send_message(jid, msg).await {
                                 Ok(real_id) => {
+                                    let real_id = real_id.message_id;
                                     // Build a sent voice-note message and route it
                                     // through the choke point (mirror SendImage):
                                     // persists the summary (→ ChatRowChanged) AND
@@ -8900,6 +8950,7 @@ async fn handle_command(
                 };
                 match client.send_message(jid, msg).await {
                     Ok(real_id) => {
+                        let real_id = real_id.message_id;
                         sent += 1;
                         log::info!("MultiSend to {cid} OK → {real_id}");
                         // Emit self-message event so it appears in the target chat locally
@@ -9001,6 +9052,7 @@ async fn handle_command(
                     };
                     match client.send_message(jid, msg).await {
                         Ok(real_id) => {
+                            let real_id = real_id.message_id;
                             sent += 1;
                             // Emit self-message so it appears locally in target chat
                             let now_ts = std::time::SystemTime::now()
@@ -10675,6 +10727,25 @@ fn uuid_v4_simple() -> String {
         .unwrap_or_default()
         .subsec_nanos();
     format!("{:08x}", nanos)
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn server_error_is_never_shown_as_delivered() {
+        assert_eq!(
+            receipt_status_for_type(&ReceiptType::ServerError),
+            Some(ReceiptStatus::Failed)
+        );
+    }
+
+    #[test]
+    fn retry_receipts_do_not_claim_delivery() {
+        assert_eq!(receipt_status_for_type(&ReceiptType::Retry), None);
+        assert_eq!(receipt_status_for_type(&ReceiptType::EncRekeyRetry), None);
+    }
 }
 
 #[cfg(test)]

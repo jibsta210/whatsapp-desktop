@@ -9,14 +9,65 @@
 //! - Resolving JIDs to their LID equivalents
 //! - Bidirectional lookup (LID to PN and PN to LID)
 
+use std::sync::Arc;
+
 use anyhow::Result;
-use log::{debug, warn};
-use wacore_binary::jid::Jid;
+use log::debug;
+use wacore::store::traits::LidPnMappingEntry;
+use wacore_binary::Jid;
 
 use super::Client;
 use crate::lid_pn_cache::{LearningSource, LidPnEntry};
 
+/// Backend `LidPnMappingEntry` → in-memory `LidPnEntry`.
+fn mapping_to_entry(m: LidPnMappingEntry) -> LidPnEntry {
+    LidPnEntry::with_timestamp(
+        m.lid,
+        m.phone_number,
+        m.created_at,
+        LearningSource::parse(&m.learning_source),
+    )
+}
+
 impl Client {
+    /// Feed a LID↔phone mapping learned by an embedding application into the
+    /// protocol cache and durable store.
+    pub async fn learn_lid_pn(&self, lid_user: &str, phone_user: &str) {
+        let strip = |s: &str| -> String {
+            s.split('@')
+                .next()
+                .unwrap_or(s)
+                .split([':', '.'])
+                .next()
+                .unwrap_or(s)
+                .trim_start_matches('+')
+                .to_string()
+        };
+        let lid = strip(lid_user);
+        let phone = strip(phone_user);
+        if let Err(error) = self
+            .add_lid_pn_mapping(&lid, &phone, LearningSource::MigrationSyncLatest)
+            .await
+        {
+            log::warn!("learn_lid_pn: failed to persist {lid}↔{phone}: {error:#}");
+        }
+    }
+
+    /// Resolve a LID JID to the corresponding phone JID from the warmed cache.
+    pub async fn resolve_lid_to_phone_jid(&self, lid_jid: &str) -> Option<String> {
+        let jid: Jid = lid_jid.parse().ok()?;
+        if !jid.is_lid() {
+            return None;
+        }
+        let phone = self.lid_pn_cache.get_phone_number(&jid.user).await?;
+        Some(format!("{phone}@s.whatsapp.net"))
+    }
+
+    /// Return the current cached LID user part for a phone number.
+    pub async fn get_lid_for_phone(&self, phone_digits: &str) -> Option<String> {
+        self.lid_pn_cache.get_current_lid(phone_digits).await
+    }
+
     /// Warm up the LID-PN cache from persistent storage.
     /// This is called during client initialization to populate the in-memory cache
     /// with previously learned LID-PN mappings.
@@ -29,47 +80,155 @@ impl Client {
             return Ok(());
         }
 
-        let cache_entries: Vec<LidPnEntry> = entries
-            .into_iter()
-            .map(|e| {
-                LidPnEntry::with_timestamp(
-                    e.lid,
-                    e.phone_number,
-                    e.created_at,
-                    LearningSource::parse(&e.learning_source),
-                )
-            })
-            .collect();
-
-        self.lid_pn_cache.warm_up(cache_entries).await;
+        self.lid_pn_cache
+            .warm_up(entries.into_iter().map(mapping_to_entry))
+            .await;
         Ok(())
     }
 
-    /// Add a LID-PN mapping to both the in-memory cache and persistent storage.
-    /// This is called when we learn about a mapping from messages, usync, etc.
-    /// Also migrates any existing PN-keyed device registry entries to LID.
+    /// Awaits the persist + any device/session migrations. Hot paths should
+    /// prefer [`learn_lid_pn_mapping_fast`].
     pub(crate) async fn add_lid_pn_mapping(
         &self,
         lid: &str,
         phone_number: &str,
         source: LearningSource,
     ) -> Result<()> {
-        use anyhow::anyhow;
-        use wacore::store::traits::LidPnMappingEntry;
+        let (entry, is_new_mapping) = self
+            .record_lid_pn_in_memory(lid, phone_number, source)
+            .await;
+        self.persist_and_migrate_lid_pn(entry, is_new_mapping).await
+    }
 
-        // Check if this is a new mapping (not just an update)
+    /// Hot-path variant: cache is updated synchronously (so a subsequent
+    /// `resolve_encryption_jid` sees the mapping), DB write + migrations run
+    /// in a detached task. Matches WA Web's `warmUpLidPnMapping` + the
+    /// deferred `lidPnCacheDirtySet` flush in `WAWebDBCreateLidPnMappings`.
+    ///
+    /// `is_offline` mirrors WA Web's `flushImmediately = msgInfo.offline == null`:
+    /// offline replays only warm the in-memory cache, so a burst of queued
+    /// messages on reconnect doesn't fan out one persist task per message.
+    /// Offline mappings are re-learned from the next live message or usync.
+    ///
+    /// Durability: if the spawned persist task fails (DB error, shutdown
+    /// mid-write), the mapping is only in-memory and will be lost on restart.
+    /// Use [`add_lid_pn_mapping`] when the caller needs a durable guarantee.
+    ///
+    /// Concurrent calls for the same phone number may both observe
+    /// `is_new_mapping = true` and each spawn a persist task. The downstream
+    /// work tolerates this:
+    /// - `put_lid_mapping` is an upsert
+    /// - `migrate_device_registry_on_lid_discovery` no-ops after the PN-keyed
+    ///   record is gone
+    /// - `migrate_signal_sessions_on_lid_discovery` no-ops after the sessions
+    ///   are migrated
+    pub(crate) async fn learn_lid_pn_mapping_fast(
+        self: &Arc<Self>,
+        lid: &str,
+        phone_number: &str,
+        source: LearningSource,
+        is_offline: bool,
+    ) {
+        let (entry, is_new_mapping) = self
+            .record_lid_pn_in_memory(lid, phone_number, source)
+            .await;
+        if is_offline {
+            return;
+        }
+        let client = Arc::clone(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                if let Err(err) = client
+                    .persist_and_migrate_lid_pn(entry, is_new_mapping)
+                    .await
+                {
+                    log::warn!("Background LID-PN persist failed: {err}");
+                }
+            }))
+            .detach();
+    }
+
+    /// Batched variant of [`learn_lid_pn_mapping_fast`]. Updates the in-memory
+    /// cache synchronously for every entry, then fires one detached task that
+    /// persists the whole batch in a single backend transaction and runs the
+    /// device/session migrations for newly discovered PN↔LID pairs.
+    ///
+    /// Mirrors WA Web's `createLidPnMappings({ mappings, flushImmediately, learningSource })`
+    /// call shape: one backend write for N participants instead of N detached
+    /// tasks racing each other. The savings are linear in batch size and
+    /// matter most on first `query_info` of large groups.
+    ///
+    /// `is_offline` mirrors the single-entry path: skip the persist task for
+    /// offline replays; mappings are re-learned from the next live event.
+    ///
+    /// Takes owned `(lid, phone_number)` pairs; each `String` moves directly
+    /// into the `LidPnEntry` stored in the cache, then (via `into_iter`) into
+    /// the `LidPnMappingEntry` that's persisted — no clones on either step.
+    /// The `Vec` itself is consumed, so no copy of the outer container either.
+    pub(crate) async fn learn_lid_pn_mappings_batch(
+        self: &Arc<Self>,
+        mappings: Vec<(String, String)>,
+        source: LearningSource,
+        is_offline: bool,
+    ) {
+        if mappings.is_empty() {
+            return;
+        }
+        let cap = mappings.len();
+        let mut entries: Vec<LidPnEntry> = Vec::with_capacity(cap);
+        let mut is_new_flags: Vec<bool> = Vec::with_capacity(cap);
+        for (lid, phone_number) in mappings {
+            let is_new = self
+                .lid_pn_cache
+                .get_current_lid(&phone_number)
+                .await
+                .is_none();
+            let entry = LidPnEntry::new(lid, phone_number, source);
+            self.lid_pn_cache.add(&entry).await;
+            entries.push(entry);
+            is_new_flags.push(is_new);
+        }
+
+        if is_offline {
+            return;
+        }
+
+        let client = Arc::clone(self);
+        self.runtime
+            .spawn(Box::pin(async move {
+                if let Err(err) = client
+                    .persist_and_migrate_lid_pn_batch(entries, is_new_flags)
+                    .await
+                {
+                    log::warn!("Background LID-PN batch persist failed: {err}");
+                }
+            }))
+            .detach();
+    }
+
+    async fn record_lid_pn_in_memory(
+        &self,
+        lid: &str,
+        phone_number: &str,
+        source: LearningSource,
+    ) -> (LidPnEntry, bool) {
         let is_new_mapping = self
             .lid_pn_cache
             .get_current_lid(phone_number)
             .await
             .is_none();
-
-        // Add to in-memory cache
         let entry = LidPnEntry::new(lid.to_string(), phone_number.to_string(), source);
-        self.lid_pn_cache.add(entry.clone()).await;
+        self.lid_pn_cache.add(&entry).await;
+        (entry, is_new_mapping)
+    }
 
-        // Persist to storage
-        let backend = self.persistence_manager.backend();
+    async fn persist_and_migrate_lid_pn(
+        &self,
+        entry: LidPnEntry,
+        is_new_mapping: bool,
+    ) -> Result<()> {
+        use anyhow::anyhow;
+
         let storage_entry = LidPnMappingEntry {
             lid: entry.lid,
             phone_number: entry.phone_number,
@@ -78,66 +237,65 @@ impl Client {
             learning_source: entry.learning_source.as_str().to_string(),
         };
 
-        backend
+        self.persistence_manager
+            .backend()
             .put_lid_mapping(&storage_entry)
             .await
             .map_err(|e| anyhow!("persisting LID-PN mapping: {e}"))?;
 
-        // If this is a new LID mapping, migrate any existing PN-keyed device registry entries
         if is_new_mapping {
-            self.migrate_device_registry_on_lid_discovery(phone_number, lid)
-                .await;
+            self.migrate_device_registry_on_lid_discovery(
+                &storage_entry.phone_number,
+                &storage_entry.lid,
+            )
+            .await;
+            self.migrate_signal_sessions_on_lid_discovery(
+                &storage_entry.phone_number,
+                &storage_entry.lid,
+            )
+            .await;
         }
 
         Ok(())
     }
 
-    /// Learn a LID<->PN mapping from a bulk source (app-state contacts, history
-    /// sync mapping tables). Public API consumed by the desktop layer.
-    ///
-    /// Inputs may be full JIDs, user parts, or user parts carrying a device
-    /// suffix (e.g. "12345:2"); we defensively reduce to the bare user part so
-    /// the cache is keyed consistently regardless of caller hygiene.
-    pub async fn learn_lid_pn(&self, lid_user: &str, phone_user: &str) {
-        // Strip any "@server" and ":device" / ".device" suffix, keeping only the
-        // user digits. add_lid_pn_mapping keys the cache on the bare user part,
-        // so a stray device suffix would create a phantom mapping that never hits.
-        let strip = |s: &str| -> String {
-            let no_server = s.split('@').next().unwrap_or(s);
-            no_server
-                .split([':', '.'])
-                .next()
-                .unwrap_or(no_server)
-                .to_string()
-        };
-        let lid = strip(lid_user);
-        let phone = strip(phone_user);
+    async fn persist_and_migrate_lid_pn_batch(
+        &self,
+        entries: Vec<LidPnEntry>,
+        is_new_flags: Vec<bool>,
+    ) -> Result<()> {
+        use anyhow::anyhow;
 
-        if let Err(e) = self
-            .add_lid_pn_mapping(&lid, &phone, LearningSource::MigrationSyncLatest)
+        // Consume entries so `lid`/`phone_number` move into storage rather
+        // than being cloned. Only `learning_source` is allocated, and only
+        // because `LidPnMappingEntry.learning_source` is a `String` field.
+        let storage: Vec<LidPnMappingEntry> = entries
+            .into_iter()
+            .map(|entry| LidPnMappingEntry {
+                lid: entry.lid,
+                phone_number: entry.phone_number,
+                created_at: entry.created_at,
+                updated_at: entry.created_at,
+                learning_source: entry.learning_source.as_str().to_string(),
+            })
+            .collect();
+
+        self.persistence_manager
+            .backend()
+            .put_lid_mappings(&storage)
             .await
-        {
-            warn!("learn_lid_pn: failed to persist mapping {lid}<->{phone}: {e:?}");
-        }
-    }
+            .map_err(|e| anyhow!("persisting LID-PN mapping batch: {e}"))?;
 
-    /// Resolve a @lid JID string to its corresponding @s.whatsapp.net JID string.
-    /// Returns None if the mapping is not in the local cache.
-    pub async fn resolve_lid_to_phone_jid(&self, lid_jid_str: &str) -> Option<String> {
-        let jid: Jid = lid_jid_str.parse().ok()?;
-        if !jid.is_lid() {
-            return None;
+        for (entry, is_new) in storage.iter().zip(is_new_flags.iter()) {
+            if *is_new {
+                self.migrate_device_registry_on_lid_discovery(&entry.phone_number, &entry.lid)
+                    .await;
+                self.migrate_signal_sessions_on_lid_discovery(&entry.phone_number, &entry.lid)
+                    .await;
+            }
         }
-        let phone = self.lid_pn_cache.get_phone_number(&jid.user).await?;
-        Some(format!("{}@s.whatsapp.net", phone))
-    }
 
-    /// Cached current LID (user part) for a phone number (digits only), or None if
-    /// no mapping is known. Public wrapper over the lid_pn_cache so the desktop's
-    /// proactive phone→LID prewarm can skip already-mapped contacts and read back
-    /// the LID a usync just learned.
-    pub async fn get_lid_for_phone(&self, phone_digits: &str) -> Option<String> {
-        self.lid_pn_cache.get_current_lid(phone_digits).await
+        Ok(())
     }
 
     /// Ensure phone-to-LID mappings are resolved for the given JIDs.
@@ -175,63 +333,194 @@ impl Client {
         resolved
     }
 
-    /// Resolve the encryption JID for a given target JID.
-    /// This uses the same logic as the receiving path to ensure consistent
-    /// lock keys between sending and receiving.
-    ///
-    /// For PN JIDs, this checks if a LID mapping exists and returns the LID.
-    /// This ensures that sending and receiving use the same session lock.
+    /// Mirrors WA Web `SignalAddress.toString()` (`WAWeb/Signal/Address.js`):
+    /// upgrade Pn → Lid and Hosted → HostedLid when a mapping is known, else
+    /// preserve the input.
     pub(crate) async fn resolve_encryption_jid(&self, target: &Jid) -> Jid {
-        let pn_server = wacore_binary::jid::DEFAULT_USER_SERVER;
-        let lid_server = wacore_binary::jid::HIDDEN_USER_SERVER;
-
-        if target.server == lid_server {
-            // Already a LID - use it directly
-            target.clone()
-        } else if target.server == pn_server {
-            // PN JID - check if we have a LID mapping
-            if let Some(lid_user) = self.lid_pn_cache.get_current_lid(&target.user).await {
-                let lid_jid = Jid {
-                    user: lid_user,
-                    server: wacore_binary::jid::cow_server_from_str(lid_server),
-                    device: target.device,
-                    agent: target.agent,
-                    integrator: target.integrator,
-                };
-                debug!(
-                    "[SEND-LOCK] Resolved {} to LID {} for session lock",
-                    target, lid_jid
-                );
-                lid_jid
-            } else {
-                // No LID mapping - use PN as-is
-                debug!("[SEND-LOCK] No LID mapping for {}, using PN", target);
-                target.clone()
-            }
-        } else {
-            // Other server type - use as-is
-            target.clone()
+        use wacore_binary::Server;
+        let lid_server = match target.server {
+            Server::Pn => Server::Lid,
+            Server::Hosted => Server::HostedLid,
+            _ => return target.clone(),
+        };
+        match self.lid_pn_cache.get_current_lid(&target.user).await {
+            Some(lid_user) => Jid {
+                user: lid_user.into(),
+                server: lid_server,
+                device: target.device,
+                agent: target.agent,
+                integrator: target.integrator,
+            },
+            None => target.clone(),
         }
     }
 
-    /// Get the phone number (user part) for a given LID.
-    /// Looks up the LID-PN mapping from the in-memory cache.
-    ///
-    /// # Arguments
-    ///
-    /// * `lid` - The LID user part (e.g., "100000012345678") or full JID (e.g., "100000012345678@lid")
-    ///
-    /// # Returns
-    ///
-    /// The phone number user part if a mapping exists, None otherwise.
-    pub async fn get_phone_number_from_lid(&self, lid: &str) -> Option<String> {
-        // Handle both full JID (e.g., "100000012345678@lid") and user part only
-        let lid_user = if lid.contains('@') {
-            lid.split('@').next().unwrap_or(lid)
+    /// Swap a JID's namespace between PN and LID, preserving device/agent/integrator.
+    /// Returns `None` if no mapping exists or the JID is neither PN nor LID.
+    pub(crate) async fn swap_pn_lid_namespace(&self, jid: &Jid) -> Option<Jid> {
+        if jid.is_lid() {
+            let pn_user = self.lid_pn_cache.get_phone_number(&jid.user).await?;
+            Some(Jid {
+                user: pn_user.into(),
+                server: wacore_binary::Server::Pn,
+                device: jid.device,
+                agent: jid.agent,
+                integrator: jid.integrator,
+            })
+        } else if jid.is_pn() {
+            let lid_user = self.lid_pn_cache.get_current_lid(&jid.user).await?;
+            Some(Jid {
+                user: lid_user.into(),
+                server: wacore_binary::Server::Lid,
+                device: jid.device,
+                agent: jid.agent,
+                integrator: jid.integrator,
+            })
         } else {
-            lid
+            None
+        }
+    }
+
+    /// Migrate Signal sessions and identity keys from PN to LID address.
+    ///
+    /// All reads/writes go through `signal_cache` to avoid reading stale data
+    /// from the backend when the cache has unflushed mutations (e.g., after
+    /// SKDM encryption ratcheted the session).
+    pub(crate) async fn migrate_signal_sessions_on_lid_discovery(&self, pn: &str, lid: &str) {
+        use log::{info, warn};
+        use wacore::types::jid::JidExt;
+
+        let backend = self.persistence_manager.backend();
+
+        for device_id in 0..=99u16 {
+            let pn_jid = Jid::pn_device(pn.to_string(), device_id);
+            let lid_jid = Jid::lid_device(lid.to_string(), device_id);
+
+            let pn_proto = pn_jid.to_protocol_address();
+            let lid_proto = lid_jid.to_protocol_address();
+
+            // Migrate session: take from cache (authoritative), write to cache
+            if let Ok(Some(session)) = self
+                .signal_cache
+                .get_session(&pn_proto, backend.as_ref())
+                .await
+            {
+                match self
+                    .signal_cache
+                    .has_session(&lid_proto, backend.as_ref())
+                    .await
+                {
+                    Ok(true) => {
+                        self.signal_cache.delete_session(&pn_proto).await;
+                        info!("Deleted stale PN session {} (LID exists)", pn_proto);
+                    }
+                    Ok(false) => {
+                        self.signal_cache.put_session(&lid_proto, session).await;
+                        self.signal_cache.delete_session(&pn_proto).await;
+                        info!("Migrated session {} -> {}", pn_proto, lid_proto);
+                    }
+                    Err(e) => {
+                        // Restore the taken PN session to avoid losing it
+                        self.signal_cache.put_session(&pn_proto, session).await;
+                        log::warn!(
+                            "Skipping session migration {} -> {}: {e}",
+                            pn_proto,
+                            lid_proto
+                        );
+                    }
+                }
+            }
+
+            // Migrate identity: same cache-first pattern
+            if let Ok(Some(identity_data)) = self
+                .signal_cache
+                .get_identity(&pn_proto, backend.as_ref())
+                .await
+            {
+                if self
+                    .signal_cache
+                    .get_identity(&lid_proto, backend.as_ref())
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    self.signal_cache
+                        .put_identity(&lid_proto, &identity_data)
+                        .await;
+                    info!("Migrated identity {} -> {}", pn_proto, lid_proto);
+                }
+                self.signal_cache.delete_identity(&pn_proto).await;
+            }
+        }
+
+        // Flush migrated state to backend so it survives restarts
+        if let Err(e) = self.signal_cache.flush(backend.as_ref()).await {
+            warn!("Failed to flush signal cache after migration: {e:?}");
+        }
+    }
+
+    /// Look up the LID↔phone mapping for a JID. Cache-aside: falls back to
+    /// the backend on cache miss so mappings survive cache eviction and any
+    /// backend implementation gets the fallback without warm-up.
+    ///
+    /// Backend errors are propagated — callers can distinguish "no mapping"
+    /// (`Ok(None)`) from "lookup failed" (`Err(_)`).
+    pub async fn get_lid_pn_entry(&self, jid: &Jid) -> Result<Option<LidPnEntry>> {
+        let (hit, is_lid) = if jid.is_lid() {
+            (self.lid_pn_cache.get_entry_by_lid(&jid.user).await, true)
+        } else if jid.is_pn() {
+            (self.lid_pn_cache.get_entry_by_phone(&jid.user).await, false)
+        } else {
+            return Ok(None);
         };
-        self.lid_pn_cache.get_phone_number(lid_user).await
+
+        if let Some(entry) = hit {
+            return Ok(Some(entry));
+        }
+
+        let backend = self.persistence_manager.backend();
+        let mapping = if is_lid {
+            backend.get_lid_mapping(&jid.user).await?
+        } else {
+            backend.get_pn_mapping(&jid.user).await?
+        };
+
+        let Some(mapping) = mapping else {
+            return Ok(None);
+        };
+
+        let entry = mapping_to_entry(mapping);
+        self.lid_pn_cache.add(&entry).await;
+        Ok(Some(entry))
+    }
+
+    /// Resolve any user JID to its bare LID form, or `None` when no LID is
+    /// available. Mirrors WA Web's `WAWebLidMigrationUtils.toUserLid`: LID
+    /// passes through, PN goes through the cache-aside mapping, anything
+    /// else and any lookup failure returns `None`.
+    ///
+    /// Used by `send_status_message` to replicate WA Web's
+    /// `compactMap(list, toUserLid)` skip-on-unresolvable semantics.
+    pub(crate) async fn resolve_recipient_to_lid(&self, jid: &Jid) -> Option<Jid> {
+        if jid.is_lid() {
+            return Some(jid.to_non_ad());
+        }
+        if !jid.is_pn() {
+            return None;
+        }
+        match self.get_lid_pn_entry(jid).await {
+            Ok(Some(entry)) => Some(Jid::new(entry.lid, wacore_binary::Server::Lid)),
+            Ok(None) => None,
+            Err(e) => {
+                log::warn!(
+                    "resolve_recipient_to_lid: LID lookup for {} failed: {:?}",
+                    jid,
+                    e
+                );
+                None
+            }
+        }
     }
 }
 
@@ -241,7 +530,7 @@ mod tests {
     use crate::lid_pn_cache::LearningSource;
     use crate::test_utils::create_test_client;
     use std::sync::Arc;
-    use wacore_binary::jid::HIDDEN_USER_SERVER;
+    use wacore_binary::Server;
 
     #[tokio::test]
     async fn test_resolve_encryption_jid_pn_to_lid() {
@@ -259,7 +548,7 @@ mod tests {
         let resolved = client.resolve_encryption_jid(&pn_jid).await;
 
         assert_eq!(resolved.user, lid);
-        assert_eq!(resolved.server, HIDDEN_USER_SERVER);
+        assert_eq!(resolved.server, Server::Lid);
     }
 
     #[tokio::test]
@@ -282,5 +571,317 @@ mod tests {
         let resolved = client.resolve_encryption_jid(&pn_jid).await;
 
         assert_eq!(resolved, pn_jid);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_encryption_jid_hosted_with_lid_upgrades_to_hosted_lid() {
+        let client: Arc<Client> = create_test_client().await;
+        let user = "55999999999";
+        let lid = "100000012345678";
+
+        client
+            .add_lid_pn_mapping(lid, user, LearningSource::PeerPnMessage)
+            .await
+            .unwrap();
+
+        for device in [99u16, 7] {
+            let mut hosted = Jid::new(user, Server::Hosted);
+            hosted.device = device;
+            hosted.agent = 0xAB;
+            hosted.integrator = 0xBEEF;
+            let resolved = client.resolve_encryption_jid(&hosted).await;
+
+            assert_eq!(resolved.user, lid);
+            assert_eq!(resolved.server, Server::HostedLid);
+            assert_eq!(
+                resolved.device, device,
+                "device must round-trip, not be coerced to 99"
+            );
+            assert_eq!(resolved.agent, hosted.agent);
+            assert_eq!(resolved.integrator, hosted.integrator);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_encryption_jid_hosted_no_mapping_keeps_hosted() {
+        let client: Arc<Client> = create_test_client().await;
+        let mut hosted = Jid::new("55999999999", Server::Hosted);
+        hosted.device = 99;
+
+        let resolved = client.resolve_encryption_jid(&hosted).await;
+
+        assert_eq!(resolved, hosted);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_encryption_jid_preserves_hosted_lid() {
+        let client: Arc<Client> = create_test_client().await;
+        let mut hosted_lid = Jid::new("100000012345678", Server::HostedLid);
+        hosted_lid.device = 99;
+
+        let resolved = client.resolve_encryption_jid(&hosted_lid).await;
+
+        assert_eq!(resolved, hosted_lid);
+    }
+
+    #[tokio::test]
+    async fn test_get_lid_pn_entry_from_pn() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "55999999999";
+        let lid = "100000012345678";
+
+        assert!(
+            client
+                .get_lid_pn_entry(&Jid::pn(pn))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let entry = client
+            .get_lid_pn_entry(&Jid::pn(pn))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.lid, lid);
+        assert_eq!(entry.phone_number, pn);
+    }
+
+    #[tokio::test]
+    async fn test_get_lid_pn_entry_from_lid() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "55999999999";
+        let lid = "100000012345678";
+
+        assert!(
+            client
+                .get_lid_pn_entry(&Jid::lid(lid))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        client
+            .add_lid_pn_mapping(lid, pn, LearningSource::Usync)
+            .await
+            .unwrap();
+
+        let entry = client
+            .get_lid_pn_entry(&Jid::lid(lid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.lid, lid);
+        assert_eq!(entry.phone_number, pn);
+    }
+
+    /// Cache-aside fallback: if the in-memory cache is missing an entry the
+    /// backend has, the lookup should still succeed and re-populate the cache.
+    #[tokio::test]
+    async fn test_get_lid_pn_entry_falls_back_to_backend() {
+        use wacore::store::traits::LidPnMappingEntry;
+
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "15555550123";
+        let lid = "100000000000123";
+
+        let backend = client.persistence_manager.backend();
+        backend
+            .put_lid_mapping(&LidPnMappingEntry {
+                lid: lid.into(),
+                phone_number: pn.into(),
+                created_at: 1,
+                updated_at: 1,
+                learning_source: "usync".into(),
+            })
+            .await
+            .unwrap();
+
+        // Cache was never warmed from this backend write → cache miss path.
+        let entry = client
+            .get_lid_pn_entry(&Jid::lid(lid))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.lid, lid);
+        assert_eq!(entry.phone_number, pn);
+
+        // Subsequent lookup served from cache.
+        let entry = client
+            .get_lid_pn_entry(&Jid::pn(pn))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.lid, lid);
+    }
+
+    /// `learn_lid_pn_mapping_fast` must leave the in-memory cache populated
+    /// by the time it returns — `resolve_encryption_jid` runs immediately
+    /// after on the decrypt hot path and needs to find the LID.
+    #[tokio::test]
+    async fn test_learn_lid_pn_mapping_fast_populates_cache_synchronously() {
+        let client: Arc<Client> = create_test_client().await;
+        let pn = "5511999998877";
+        let lid = "200000000007788";
+
+        client
+            .learn_lid_pn_mapping_fast(lid, pn, LearningSource::PeerPnMessage, false)
+            .await;
+
+        let resolved = client.resolve_encryption_jid(&Jid::pn(pn)).await;
+        assert_eq!(resolved.user, lid, "cache must have the mapping on return");
+        assert_eq!(resolved.server, Server::Lid);
+    }
+
+    /// Batched variant must populate the in-memory cache synchronously for
+    /// every entry before returning; WA Web parity for `createLidPnMappings`.
+    #[tokio::test]
+    async fn test_learn_lid_pn_mappings_batch_populates_cache_synchronously() {
+        let client: Arc<Client> = create_test_client().await;
+        let pairs = [
+            ("200000000000001", "5511911111111"),
+            ("200000000000002", "5511922222222"),
+            ("200000000000003", "5511933333333"),
+        ];
+
+        let batch: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(lid, pn)| ((*lid).to_string(), (*pn).to_string()))
+            .collect();
+        client
+            .learn_lid_pn_mappings_batch(batch, LearningSource::Other, false)
+            .await;
+
+        for (lid, pn) in &pairs {
+            let resolved = client.resolve_encryption_jid(&Jid::pn(*pn)).await;
+            assert_eq!(resolved.user, *lid, "batch entry {pn} missing from cache");
+            assert_eq!(resolved.server, Server::Lid);
+        }
+    }
+
+    /// Empty batch is a no-op (no detached task, no panic).
+    #[tokio::test]
+    async fn test_learn_lid_pn_mappings_batch_empty_is_noop() {
+        let client: Arc<Client> = create_test_client().await;
+        client
+            .learn_lid_pn_mappings_batch(Vec::new(), LearningSource::Other, false)
+            .await;
+        assert_eq!(client.lid_pn_cache.lid_count().await, 0);
+    }
+
+    /// Online (`is_offline = false`) batch must persist the mapping to the
+    /// backend AND run `migrate_device_registry_on_lid_discovery` for each
+    /// newly learned PN. Polls until the detached task completes.
+    #[tokio::test]
+    async fn test_learn_lid_pn_mappings_batch_online_persists_and_migrates() {
+        use wacore::store::traits::{DeviceInfo, DeviceListRecord};
+        use wacore_binary::Jid;
+
+        let client: Arc<Client> = create_test_client().await;
+        let lid = "200000000077777";
+        let pn = "5511955550000";
+        let backend = client.persistence_manager.backend();
+
+        // Seed a PN-keyed device registry row so the migration has something
+        // to move when the mapping is learned. Without this, the migration
+        // helper is a no-op and the test can't distinguish "migration ran"
+        // from "migration never called".
+        backend
+            .update_device_list(DeviceListRecord {
+                user: pn.to_string(),
+                devices: vec![DeviceInfo {
+                    device_id: 3,
+                    key_index: None,
+                }],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .unwrap();
+
+        client
+            .learn_lid_pn_mappings_batch(
+                vec![(lid.to_string(), pn.to_string())],
+                LearningSource::Other,
+                false,
+            )
+            .await;
+
+        // Poll for the end-of-chain migration effect (device row moved to
+        // LID key). That strictly happens after both `put_lid_mappings` and
+        // `migrate_device_registry_on_lid_discovery`, so observing it
+        // guarantees both steps ran.
+        let start = wacore::time::Instant::now();
+        let deadline = std::time::Duration::from_secs(5);
+        loop {
+            if backend.get_devices(lid).await.unwrap().is_some() {
+                break;
+            }
+            assert!(
+                start.elapsed() < deadline,
+                "timed out waiting for batch persist + migration"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert!(
+            backend.get_lid_mapping(lid).await.unwrap().is_some(),
+            "mapping must be persisted"
+        );
+        assert!(
+            backend.get_devices(pn).await.unwrap().is_none(),
+            "migration must delete the old PN-keyed device row"
+        );
+        let lid_row = backend.get_devices(lid).await.unwrap().unwrap();
+        assert_eq!(lid_row.devices[0].device_id, 3);
+        // And the mapping resolves from both directions.
+        assert_eq!(
+            client
+                .get_lid_pn_entry(&Jid::pn(pn))
+                .await
+                .unwrap()
+                .unwrap()
+                .lid,
+            lid
+        );
+    }
+
+    /// Offline batch only warms the in-memory cache; the persist task never
+    /// fires. Mirrors WA Web's `flushImmediately = false` semantics.
+    #[tokio::test]
+    async fn test_learn_lid_pn_mappings_batch_offline_skips_persist() {
+        use wacore_binary::Jid;
+
+        let client: Arc<Client> = create_test_client().await;
+        let lid = "200000000009999";
+        let pn = "5511900009999";
+
+        client
+            .learn_lid_pn_mappings_batch(
+                vec![(lid.to_string(), pn.to_string())],
+                LearningSource::Other,
+                true,
+            )
+            .await;
+
+        let resolved = client.resolve_encryption_jid(&Jid::pn(pn)).await;
+        assert_eq!(resolved.user, lid);
+
+        assert!(
+            client
+                .persistence_manager
+                .backend()
+                .get_lid_mapping(lid)
+                .await
+                .unwrap()
+                .is_none(),
+            "offline batch must not persist to DB"
+        );
     }
 }

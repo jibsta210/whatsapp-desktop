@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 use wacore::libsignal::store::SessionStore;
 use wacore::types::jid::JidExt;
-use wacore_binary::jid::Jid;
+use wacore_binary::Jid;
 
 use super::Client;
 use crate::types::events::{Event, OfflineSyncCompleted};
@@ -25,25 +25,28 @@ impl Client {
 
         // Signal that offline sync is complete - post-login tasks are waiting for this.
         // This mimics WhatsApp Web's offlineDeliveryEnd event.
-        //
-        // The CAS (run-once guard; add_permits is NOT idempotent) and the widen
-        // (1 → 64 permits) are performed together under the semaphore mutex by
-        // `try_complete_offline_sync_widen`. Doing both under one lock closes the
-        // race where a concurrent `cleanup_connection_state` → `swap_message_semaphore(1)`
-        // interleaves between the CAS and the widen, which would otherwise leak the
-        // 63 extra permits onto the NEXT connection's fresh semaphore and break
-        // ordering for its offline sync.
-        //
-        // WIDEN the existing semaphore rather than swapping the Arc: swapping bumps
-        // the generation, and any offline-message worker still draining the backlog
-        // would then see a generation mismatch. Growing the same semaphore keeps those
-        // in-flight permits valid so the workers finish decoding without a re-acquire.
-        if self.try_complete_offline_sync_widen(63) {
+        // Use compare_exchange to ensure we only run this once (add_permits is NOT idempotent).
+        // Readers that observe offline_sync_completed=true short-circuit without touching
+        // the semaphore (wait_for_offline_delivery_end returns early), so the ordering of
+        // flag flip vs. semaphore swap below is not observable: any in-flight worker keeps
+        // using its old 1-permit Arc and drains normally; newly-spawned workers pick up the
+        // 64-permit semaphore via read_message_semaphore().
+        if self
+            .offline_sync_completed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            // Allow parallel message processing now that offline sync is done.
+            // During offline sync, permits=1 serialized all message processing.
+            // Replace with a new semaphore with 64 permits for concurrent processing.
+            // Old workers holding the previous semaphore Arc will finish normally.
+            self.swap_message_semaphore(64);
+
             self.offline_sync_notifier.notify(usize::MAX);
 
             self.core
                 .event_bus
-                .dispatch(&Event::OfflineSyncCompleted(OfflineSyncCompleted { count }));
+                .dispatch(Event::OfflineSyncCompleted(OfflineSyncCompleted { count }));
         }
     }
 
@@ -143,22 +146,36 @@ impl Client {
 
     /// Ensure E2E sessions exist for the given device JIDs.
     /// Waits for offline delivery, resolves LID mappings, then batches prekey fetches.
-    pub(crate) async fn ensure_e2e_sessions(&self, device_jids: Vec<Jid>) -> Result<()> {
-        use wacore::types::jid::JidExt;
-
+    pub(crate) async fn ensure_e2e_sessions(&self, device_jids: &[Jid]) -> Result<()> {
         if device_jids.is_empty() {
             return Ok(());
         }
-
         self.wait_for_offline_delivery_end().await;
-        let resolved_jids = self.resolve_lid_mappings(&device_jids).await;
+        let resolved_jids = self.resolve_lid_mappings(device_jids).await;
+        self.ensure_sessions_inner(resolved_jids).await
+    }
+
+    /// Like `ensure_e2e_sessions` but skips `resolve_lid_mappings`. Use when the
+    /// caller already resolved JIDs to the correct namespace (e.g., after
+    /// alternate PN/LID key normalization in retry handling).
+    pub(crate) async fn ensure_e2e_sessions_resolved(&self, jids: &[Jid]) -> Result<()> {
+        if jids.is_empty() {
+            return Ok(());
+        }
+        self.wait_for_offline_delivery_end().await;
+        self.ensure_sessions_inner(jids.to_vec()).await
+    }
+
+    /// Core session-check + prekey-fetch logic shared by both entry points.
+    async fn ensure_sessions_inner(&self, jids: Vec<Jid>) -> Result<()> {
+        use wacore::types::jid::JidExt;
 
         let device_store = self.persistence_manager.get_device_arc().await;
-        let mut jids_needing_sessions = Vec::with_capacity(resolved_jids.len());
+        let mut jids_needing_sessions = Vec::with_capacity(jids.len());
 
         {
             let device_guard = device_store.read().await;
-            for jid in resolved_jids {
+            for jid in jids {
                 let signal_addr = jid.to_protocol_address();
                 // Check cache first (includes unflushed sessions), fall back to backend
                 match self
@@ -194,13 +211,11 @@ impl Client {
             return Ok(0);
         }
 
-        let prekey_bundles = self.fetch_pre_keys(jids, Some("identity")).await?;
+        let prekey_bundles = self
+            .fetch_pre_keys(jids, Some(wacore::iq::prekeys::PreKeyFetchReason::Identity))
+            .await?;
 
-        let device_store = self.persistence_manager.get_device_arc().await;
-        let mut adapter = crate::store::signal_adapter::SignalProtocolStoreAdapter::new(
-            device_store,
-            self.signal_cache.clone(),
-        );
+        let mut adapter = self.signal_adapter().await;
 
         let mut success_count = 0;
         let mut missing_count = 0;
@@ -211,12 +226,7 @@ impl Client {
                 let signal_addr = jid.to_protocol_address();
 
                 // Acquire per-sender session lock to prevent race with concurrent message decryption.
-                let session_mutex = self
-                    .session_locks
-                    .get_with_by_ref(signal_addr.as_str(), async {
-                        std::sync::Arc::new(async_lock::Mutex::new(()))
-                    })
-                    .await;
+                let session_mutex = self.session_lock_for(signal_addr.as_str()).await;
                 let _session_guard = session_mutex.lock().await;
 
                 match process_prekey_bundle(
@@ -266,15 +276,8 @@ impl Client {
         Ok(success_count)
     }
 
-    /// Establish session with primary phone (device 0) immediately for PDO.
-    ///
-    /// Called during login BEFORE offline messages arrive. Checks both PN and LID
-    /// sessions but does NOT establish PN sessions proactively. The primary phone's
-    /// PN session will be established via LID pkmsg when needed, which prevents
-    /// dual-session conflicts where both PN and LID sessions exist for the same user.
-    /// This matches WhatsApp Web's `prekey_fetch_iq_pnh_lid_enabled: false` behavior.
-    ///
-    /// Returns error if session check fails (fail-safe to prevent replacing existing sessions).
+    /// Log primary phone (device 0) session state at login.
+    /// Migration is lazy via try_pn_to_lid_migration_decrypt on first message.
     pub(crate) async fn establish_primary_phone_session_immediate(&self) -> Result<()> {
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
 
@@ -283,46 +286,30 @@ impl Client {
             .clone()
             .ok_or_else(|| anyhow::Error::from(crate::client::ClientError::NotLoggedIn))?;
 
+        let Some(ref own_lid) = device_snapshot.lid else {
+            log::debug!("No own LID yet, skipping primary phone session check");
+            return Ok(());
+        };
+
+        let primary_phone_lid = own_lid.with_device(0);
         let primary_phone_pn = own_pn.with_device(0);
-        let primary_phone_lid = device_snapshot.lid.as_ref().map(|lid| lid.with_device(0));
 
-        let pn_session_exists =
-            self.check_session_exists(&primary_phone_pn)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Cannot verify PN session existence for primary phone {}: {}. \
-                     Refusing to establish session to prevent potential MAC failures.",
-                        primary_phone_pn,
-                        e
-                    )
-                })?;
+        let lid_exists = self
+            .check_session_exists(&primary_phone_lid)
+            .await
+            .unwrap_or(false);
+        let pn_exists = self
+            .check_session_exists(&primary_phone_pn)
+            .await
+            .unwrap_or(false);
 
-        // Don't proactively establish PN session - matches WhatsApp Web's
-        // prekey_fetch_iq_pnh_lid_enabled: false behavior. The primary phone will
-        // establish the session via pkmsg from LID address, which prevents dual-session
-        // conflicts where both PN and LID sessions exist for the same user.
-        if pn_session_exists {
-            log::debug!(
-                "PN session with primary phone {} already exists",
-                primary_phone_pn
-            );
-        } else {
-            log::debug!(
-                "No PN session with primary phone {} - will be established via LID pkmsg",
-                primary_phone_pn
-            );
-        }
-
-        // Check LID session existence (don't establish - primary phone does that via pkmsg)
-        if let Some(ref lid_jid) = primary_phone_lid {
-            match self.check_session_exists(lid_jid).await {
-                Ok(true) => log::debug!("LID session with {} already exists", lid_jid),
-                Ok(false) => log::debug!(
-                    "No LID session with {} - established on first message",
-                    lid_jid
-                ),
-                Err(e) => log::debug!("Could not check LID session for {}: {}", lid_jid, e),
+        match (lid_exists, pn_exists) {
+            (true, _) => log::debug!("LID session with {} exists", primary_phone_lid),
+            (false, true) => {
+                log::debug!("PN-only session for own device 0 — will migrate on first message")
+            }
+            (false, false) => {
+                log::debug!("No session with own device 0 — will establish on first message")
             }
         }
 
@@ -345,7 +332,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wacore_binary::jid::{DEFAULT_USER_SERVER, HIDDEN_USER_SERVER, JidExt};
+    use wacore_binary::{JidExt, Server};
 
     #[test]
     fn test_primary_phone_jid_creation_from_pn() {
@@ -353,7 +340,7 @@ mod tests {
         let primary_phone_jid = own_pn.with_device(0);
 
         assert_eq!(primary_phone_jid.user, "559999999999");
-        assert_eq!(primary_phone_jid.server, DEFAULT_USER_SERVER);
+        assert_eq!(primary_phone_jid.server, Server::Pn);
         assert_eq!(primary_phone_jid.device, 0);
         assert_eq!(primary_phone_jid.agent, 0);
         assert_eq!(primary_phone_jid.to_string(), "559999999999@s.whatsapp.net");
@@ -366,7 +353,7 @@ mod tests {
         let primary_phone_jid = own_pn.with_device(0);
 
         assert_eq!(primary_phone_jid.user, "559999999999");
-        assert_eq!(primary_phone_jid.server, DEFAULT_USER_SERVER);
+        assert_eq!(primary_phone_jid.server, Server::Pn);
         assert_eq!(primary_phone_jid.device, 0);
     }
 
@@ -388,7 +375,7 @@ mod tests {
         let primary_phone_jid = own_lid.with_device(0);
 
         assert_eq!(primary_phone_jid.user, "100000000000001");
-        assert_eq!(primary_phone_jid.server, HIDDEN_USER_SERVER);
+        assert_eq!(primary_phone_jid.server, Server::Lid);
         assert_eq!(primary_phone_jid.device, 0);
         assert!(!primary_phone_jid.is_ad());
     }
@@ -403,7 +390,7 @@ mod tests {
 
         let parsed: Jid = jid_string.parse().expect("JID should be parseable");
         assert_eq!(parsed.user, "559999999999");
-        assert_eq!(parsed.server, DEFAULT_USER_SERVER);
+        assert_eq!(parsed.server, Server::Pn);
         assert_eq!(parsed.device, 0);
     }
 
@@ -621,7 +608,7 @@ mod tests {
     #[test]
     fn test_session_establishment_lookup_normalization() {
         use std::collections::HashMap;
-        use wacore_binary::jid::Jid;
+        use wacore_binary::Jid;
 
         // Represents the bundle map returned by fetch_pre_keys
         // (keys are normalized by parsing logic as verified in wacore/src/prekeys.rs)
