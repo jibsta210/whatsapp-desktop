@@ -551,7 +551,12 @@ impl WhatsAppApp {
                             break;
                         }
                         match event_rx.try_recv() {
-                            Ok(ev) => win_clone.handle_event(ev),
+                            Ok(ev) => {
+                                if matches!(&ev, WaEvent::Connected { .. }) {
+                                    crate::updater::mark_healthy();
+                                }
+                                win_clone.handle_event(ev);
+                            }
                             Err(_) => break,
                         }
                     }
