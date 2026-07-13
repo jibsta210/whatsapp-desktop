@@ -5240,6 +5240,7 @@ async fn handle_command(
             mentioned_jids,
         } => {
             let jid: Jid = chat_id.parse()?;
+            log::info!("SendText started: tmp_id={tmp_id}");
 
             // Check if text contains a URL — fetch OpenGraph preview
             let link_url = text
@@ -5405,6 +5406,7 @@ async fn handle_command(
             };
             match client.send_message(jid, msg).await {
                 Ok(real_id) => {
+                    log::info!("SendText submitted: tmp_id={tmp_id}");
                     let real_id = real_id.message_id;
                     // Persist sent message to cache so it survives chat switches
                     let now = std::time::SystemTime::now()

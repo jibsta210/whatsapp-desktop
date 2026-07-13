@@ -1179,6 +1179,12 @@ impl Client {
             // WAWebSendUserMsgJob reads local device table only on the send
             // path; WAWebDBDeviceListFanout excludes hosted devices.
             let recipient_bare = self.resolve_encryption_jid(&to).await.to_non_ad();
+            let recipient_is_lid = recipient_bare.is_lid();
+            let stanza_to = if recipient_is_lid {
+                recipient_bare.clone()
+            } else {
+                to.clone()
+            };
 
             // Local registry first; network warm only on miss to avoid
             // unnecessary LID-migration side effects from get_user_devices
@@ -1232,6 +1238,18 @@ impl Client {
                 !is_sender
             });
 
+            // WhatsApp rejects fanout stanzas that mix PN and LID participants.
+            if recipient_is_lid {
+                let lid = own_lid.ok_or_else(|| {
+                    anyhow!("Cannot send a LID-addressed DM before the device LID is known")
+                })?;
+                for jid in &mut all_dm_jids {
+                    if jid.is_pn() && jid.is_same_user_as(own_jid) {
+                        *jid = Jid::lid_device(lid.user.clone(), jid.device);
+                    }
+                }
+            }
+
             // Same-namespace dedup only; cross-namespace overlap is avoided
             // upstream via `is_self_dm_recipient`.
             wacore::types::jid::sort_dedup_by_device(&mut all_dm_jids);
@@ -1272,7 +1290,7 @@ impl Client {
                 own_jid,
                 device_snapshot.lid.as_ref(),
                 device_snapshot.account.as_ref(),
-                to,
+                stanza_to,
                 message,
                 request_id,
                 edit,
@@ -1798,6 +1816,152 @@ pub(crate) fn is_self_dm_recipient(
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[tokio::test]
+    async fn dm_to_lid_mapped_peer_uses_lid_for_the_entire_stanza() {
+        use crate::store::commands::DeviceCommand;
+        use wacore::libsignal::protocol::{
+            IdentityKeyPair, KeyPair, PreKeyBundle, SignalProtocolError, UsePQRatchet,
+            process_prekey_bundle,
+        };
+
+        let client = crate::test_utils::create_test_client_with_name("lid_dm_stanza").await;
+        let own_pn: Jid = "111111111111@s.whatsapp.net".parse().unwrap();
+        let own_lid: Jid = "222222222222@lid".parse().unwrap();
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetId(Some(own_pn.clone())))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetLid(Some(own_lid)))
+            .await;
+        client
+            .persistence_manager
+            .process_command(DeviceCommand::SetAccount(Some(
+                wa::AdvSignedDeviceIdentity {
+                    details: Some(vec![0; 32]),
+                    account_signature_key: Some(vec![0; 32]),
+                    account_signature: Some(vec![0; 64]),
+                    device_signature: Some(vec![0; 64]),
+                },
+            )))
+            .await;
+
+        let peer_pn: Jid = "100000000000777@s.whatsapp.net".parse().unwrap();
+        let peer_lid: Jid = "555000000000777@lid".parse().unwrap();
+        client
+            .add_lid_pn_mapping(
+                peer_lid.user.as_str(),
+                peer_pn.user.as_str(),
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .expect("seed LID mapping");
+
+        for user in [peer_lid.user.to_string(), own_pn.user.to_string()] {
+            client
+                .update_device_list(wacore::store::traits::DeviceListRecord {
+                    user,
+                    devices: vec![wacore::store::traits::DeviceInfo {
+                        device_id: 0,
+                        key_index: None,
+                    }],
+                    timestamp: wacore::time::now_secs(),
+                    phash: None,
+                    raw_id: None,
+                })
+                .await
+                .expect("seed device registry");
+        }
+        client.complete_offline_sync(0);
+
+        let peer_address = peer_lid.to_non_ad();
+        let bundle =
+            tokio::task::spawn_blocking(|| -> Result<PreKeyBundle, SignalProtocolError> {
+                let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+                let receiver = IdentityKeyPair::generate(&mut rng);
+                let signed_pre_key = KeyPair::generate(&mut rng);
+                let one_time_pre_key = KeyPair::generate(&mut rng);
+                let signature = receiver
+                    .private_key()
+                    .calculate_signature(&signed_pre_key.public_key.serialize(), &mut rng)?;
+                PreKeyBundle::new(
+                    1,
+                    1u32.into(),
+                    Some((1u32.into(), one_time_pre_key.public_key)),
+                    1u32.into(),
+                    signed_pre_key.public_key,
+                    signature.to_vec(),
+                    *receiver.identity_key(),
+                )
+            })
+            .await
+            .expect("prekey task")
+            .expect("prekey bundle");
+        {
+            let mut adapter = client.signal_adapter().await;
+            let mut rng = rand::make_rng::<rand::rngs::StdRng>();
+            process_prekey_bundle(
+                &peer_address.to_protocol_address(),
+                &mut adapter.session_store,
+                &mut adapter.identity_store,
+                &bundle,
+                &mut rng,
+                UsePQRatchet::No,
+            )
+            .await
+            .expect("peer LID session");
+        }
+
+        let request_id = "LID_DM_STANZA_1";
+        let waiter = client
+            .wait_for_sent_node(crate::client::NodeFilter::tag("message").attr("id", request_id));
+        let message = wa::Message {
+            conversation: Some("test".into()),
+            ..Default::default()
+        };
+        let result = client
+            .send_message_impl(
+                peer_pn,
+                &message,
+                Some(request_id.into()),
+                false,
+                false,
+                None,
+                vec![],
+            )
+            .await;
+        assert!(result.is_err(), "the test client has no network socket");
+
+        let node = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("stanza capture timeout")
+            .expect("stanza capture canceled");
+        let outer_to: Jid = node
+            .attrs()
+            .optional_string("to")
+            .expect("outer to")
+            .parse()
+            .expect("outer to parses");
+        assert_eq!(outer_to.server, Server::Lid);
+        assert_eq!(outer_to.user, peer_lid.user);
+
+        let participants = node
+            .get_optional_child("participants")
+            .expect("participants");
+        let entries = participants.children().expect("participant entries");
+        assert!(!entries.is_empty());
+        for entry in entries {
+            let participant: Jid = entry
+                .attrs()
+                .optional_string("jid")
+                .expect("participant jid")
+                .parse()
+                .expect("participant jid parses");
+            assert_eq!(participant.server, Server::Lid);
+        }
+    }
 
     #[tokio::test]
     async fn send_message_to_status_without_reaction_errors() {

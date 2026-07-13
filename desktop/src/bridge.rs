@@ -980,7 +980,9 @@ pub struct Bridge {
 
 impl Bridge {
     pub fn send_command(&self, cmd: WaCommand) {
-        let _ = self.cmd_tx.send(cmd);
+        if self.cmd_tx.send(cmd).is_err() {
+            log::error!("WhatsApp command channel is closed");
+        }
     }
 }
 
