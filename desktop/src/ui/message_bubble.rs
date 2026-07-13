@@ -9,6 +9,34 @@ use gtk4::{Align, Box, Button, GestureClick, Label, Orientation};
 // gtk4::Box shadows std::boxed::Box, so alias the closure box type explicitly.
 type ClickHandler = std::boxed::Box<dyn Fn()>;
 
+/// Give a gesture-backed widget equivalent keyboard and assistive-technology
+/// behaviour. GTK boxes/pictures are not focusable controls by default, so a
+/// pointer-only media affordance otherwise disappears from the tab order.
+fn install_keyboard_activation(
+    widget: &gtk4::Widget,
+    accessible_label: &str,
+    action: Rc<dyn Fn()>,
+) {
+    widget.set_focusable(true);
+    widget.set_accessible_role(gtk4::AccessibleRole::Button);
+    widget.update_property(&[gtk4::accessible::Property::Label(accessible_label)]);
+    widget.set_tooltip_text(Some(accessible_label));
+
+    let key = gtk4::EventControllerKey::new();
+    key.connect_key_pressed(move |_, key, _, _| {
+        if matches!(
+            key,
+            gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter | gtk4::gdk::Key::space
+        ) {
+            action();
+            gtk4::glib::Propagation::Stop
+        } else {
+            gtk4::glib::Propagation::Proceed
+        }
+    });
+    widget.add_controller(key);
+}
+
 use crate::bridge::{IncomingMessage, MediaType, ReceiptStatus};
 
 /// Per-option widget refs stored on MessageBubble for live vote updates.
@@ -201,6 +229,7 @@ impl MessageBubble {
         let mut stored_text_label: Option<Label> = None;
         let mut stored_edited_label: Option<Label> = None;
         let mut stored_sender_label: Option<Label> = None;
+        let mut stored_contact_msg_btn: Option<Button> = None;
 
         content_wrapper.append(&content);
 
@@ -280,7 +309,7 @@ impl MessageBubble {
             let mut thumb_loaded = false;
             // Source 1: direct quoted_media_path (set by our reply flow)
             if let Some(ref path) = msg.quoted_media_path {
-                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path) {
+                if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(path, 96) {
                     let thumb = gtk4::Picture::new();
                     thumb.set_paintable(Some(&tex));
                     thumb.set_size_request(72, 72);
@@ -306,7 +335,7 @@ impl MessageBubble {
                             let candidate = media_dir.join(format!("{qid}.{ext}"));
                             if candidate.exists() {
                                 if let Some(tex) =
-                                    crate::ui::texture_cache::texture_from_filename(&candidate)
+                                    crate::ui::texture_cache::texture_thumbnail(&candidate, 96)
                                 {
                                     let thumb = gtk4::Picture::new();
                                     thumb.set_paintable(Some(&tex));
@@ -330,13 +359,20 @@ impl MessageBubble {
             let reply_gesture = GestureClick::new();
             reply_gesture.set_button(1);
             let quoted_cb = on_quoted_click.clone();
-            reply_gesture.connect_released(move |_, _, _, _| {
+            let activate_quote: Rc<dyn Fn()> = Rc::new(move || {
                 let borrow = quoted_cb.borrow();
                 if let Some(f) = borrow.as_ref() {
                     f();
                 }
             });
+            let activate_click = activate_quote.clone();
+            reply_gesture.connect_released(move |_, _, _, _| activate_click());
             reply_box.add_controller(reply_gesture);
+            install_keyboard_activation(
+                reply_box.upcast_ref(),
+                "Jump to quoted message",
+                activate_quote,
+            );
 
             content.append(&reply_box);
         }
@@ -761,6 +797,7 @@ impl MessageBubble {
             }) {
                 msg_btn.set_widget_name(jid);
             }
+            stored_contact_msg_btn = Some(msg_btn.clone());
             card.append(&msg_btn);
 
             content.append(&card);
@@ -845,13 +882,18 @@ impl MessageBubble {
             // URL is sender-controlled, so `open_url` allowlists http/https only
             // and rejects any other scheme before spawning xdg-open (mb-12).
             let url_owned = url.clone();
+            let activate_link: Rc<dyn Fn()> = Rc::new(move || open_url(&url_owned));
             let gesture = GestureClick::new();
             gesture.set_button(1);
-            gesture.connect_released(move |_, _, _, _| {
-                open_url(&url_owned);
-            });
+            let activate_click = activate_link.clone();
+            gesture.connect_released(move |_, _, _, _| activate_click());
             preview_box.add_controller(gesture);
             preview_box.set_cursor_from_name(Some("pointer"));
+            install_keyboard_activation(
+                preview_box.upcast_ref(),
+                "Open link preview",
+                activate_link,
+            );
 
             content.append(&preview_box);
         }
@@ -1018,7 +1060,7 @@ impl MessageBubble {
                     .and_then(|s| s.split(&[':', ';'][..]).next())
                     .map(|waid| format!("{waid}@s.whatsapp.net"))
             }),
-            contact_msg_btn: None, // Wired by chat_view after creation
+            contact_msg_btn: stored_contact_msg_btn,
             text_label: RefCell::new(stored_text_label),
             edited_label: RefCell::new(stored_edited_label),
             content_box: Some(content),
@@ -1229,7 +1271,7 @@ impl MessageBubble {
     }
 
     pub fn set_avatar_image(&self, path: &str) {
-        if let Some(texture) = crate::ui::texture_cache::texture_from_filename(path) {
+        if let Some(texture) = crate::ui::texture_cache::texture_thumbnail(path, 96) {
             self.avatar.set_custom_image(Some(&texture));
         }
     }
@@ -1371,9 +1413,8 @@ fn build_media_content(
 
 /// Render an image with a click-to-expand gesture.
 ///
-/// The `css_class` is applied to the Picture to cap its size via CSS max-width/max-height.
-/// This is the correct GTK4 approach — `set_size_request` only sets the minimum, not the
-/// maximum. CSS max-width/max-height affect the natural size reported during measure.
+/// The requested preview texture is decoded near its display size, so the widget
+/// never retains the camera-resolution source just to draw a chat thumbnail.
 fn build_image_widget(
     container: &Box,
     path: &str,
@@ -1387,7 +1428,7 @@ fn build_image_widget(
 
     // Probe the texture from file to compute display size. We keep the loaded
     // texture (not just its dimensions) so we can show it immediately below.
-    let probe = crate::ui::texture_cache::texture_from_filename(path);
+    let probe = crate::ui::texture_cache::texture_thumbnail(path, max_h.max(max_w));
     let (display_w, display_h) = probe
         .as_ref()
         .map(|t| {
@@ -1434,7 +1475,9 @@ fn build_image_widget(
         if p.paintable().is_some() {
             return;
         }
-        if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&path_owned) {
+        if let Some(tex) =
+            crate::ui::texture_cache::texture_thumbnail(&path_owned, max_h.max(max_w))
+        {
             p.set_paintable(Some(&tex));
         }
     });
@@ -1452,21 +1495,26 @@ fn build_image_widget(
     let gesture = GestureClick::new();
     gesture.set_button(1);
     let cb = on_click.clone();
-    gesture.connect_released(move |_, _, _, _| {
+    let activate_image: Rc<dyn Fn()> = Rc::new(move || {
         let borrow = cb.borrow();
         if let Some(f) = borrow.as_ref() {
             f();
         }
     });
+    let activate_click = activate_image.clone();
+    gesture.connect_released(move |_, _, _, _| activate_click());
     frame.add_controller(gesture);
+    install_keyboard_activation(frame.upcast_ref(), "Open image viewer", activate_image);
 
     container.append(&frame);
 }
 
 /// Render a video: thumbnail placeholder + play-in-player button.
 fn build_video_widget(container: &Box, path: &str) {
-    // Video widget with lazy loading: the gtk4::Video is only populated when
-    // the widget is mapped (visible). When unmapped the media stream is cleared.
+    // The gtk4::Video stays empty until the user explicitly presses play.
+    // Merely setting its file creates a GStreamer pipeline and several driver
+    // threads; message-list children remain mapped even when scrolled away, so
+    // map-based loading retained one pipeline per video in the open history.
     let video = gtk4::Video::new();
     video.set_size_request(380, 250);
     video.set_autoplay(false);
@@ -1506,20 +1554,7 @@ fn build_video_widget(container: &Box, path: &str) {
 
     wrapper.append(&overlay);
 
-    // Lazy load: set video file when mapped, fully tear down on unmap.
-    // Use weak refs to avoid widget → closure → widget reference cycles.
-    let path_map = path.to_string();
-    let video_weak_map = video.downgrade();
-    wrapper.connect_map(move |_| {
-        let Some(v) = video_weak_map.upgrade() else {
-            return;
-        };
-        if v.media_stream().is_some() {
-            return;
-        }
-        let file = gtk4::gio::File::for_path(&path_map);
-        v.set_file(Some(&file));
-    });
+    // Fully tear down the pipeline when the bubble leaves the widget tree.
     let video_weak_unmap = video.downgrade();
     let play_weak_unmap = play_btn.downgrade();
     wrapper.connect_unmap(move |_| {
@@ -1542,9 +1577,7 @@ fn build_video_widget(container: &Box, path: &str) {
     let path_owned = path.to_string();
     let play_weak = play_btn.downgrade();
     let video_weak = video.downgrade();
-    let gesture = GestureClick::new();
-    gesture.set_button(1);
-    gesture.connect_released(move |_, _, _, _| {
+    let activate_video: Rc<dyn Fn()> = Rc::new(move || {
         let Some(video_ref) = video_weak.upgrade() else {
             return;
         };
@@ -1568,8 +1601,13 @@ fn build_video_widget(container: &Box, path: &str) {
             play_ref.set_visible(false);
         }
     });
+    let gesture = GestureClick::new();
+    gesture.set_button(1);
+    let activate_click = activate_video.clone();
+    gesture.connect_released(move |_, _, _, _| activate_click());
     wrapper.add_controller(gesture);
     wrapper.set_cursor_from_name(Some("pointer"));
+    install_keyboard_activation(wrapper.upcast_ref(), "Play or pause video", activate_video);
 
     container.append(&wrapper);
 }
@@ -1581,6 +1619,36 @@ struct GifAnimation {
     timer_id: Option<glib::SourceId>,
 }
 
+const MAX_ACTIVE_GIF_ANIMATIONS: usize = 4;
+
+thread_local! {
+    /// Message rows are not virtualized, so every GIF in the 50-message
+    /// history may be mapped at once. Retain full frame sets for only the four
+    /// newest animations; older GIFs remain visible on their current frame.
+    static ACTIVE_GIF_ANIMATIONS: RefCell<Vec<std::rc::Weak<RefCell<Option<GifAnimation>>>>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+fn register_gif_animation(anim: &Rc<RefCell<Option<GifAnimation>>>) {
+    ACTIVE_GIF_ANIMATIONS.with(|active| {
+        let mut active = active.borrow_mut();
+        active.retain(|weak| weak.upgrade().is_some_and(|state| state.borrow().is_some()));
+        active.push(Rc::downgrade(anim));
+
+        while active.len() > MAX_ACTIVE_GIF_ANIMATIONS {
+            let Some(old) = active.remove(0).upgrade() else {
+                continue;
+            };
+            if let Some(mut animation) = old.borrow_mut().take() {
+                if let Some(id) = animation.timer_id.take() {
+                    id.remove();
+                }
+                animation.frames.clear();
+            }
+        }
+    });
+}
+
 /// Extract frames from an MP4 using ffmpeg into a cache dir.
 /// Returns the cache directory path. Frames are named frame_001.png, frame_002.png, etc.
 fn extract_gif_frames(mp4_path: &str) -> Option<PathBuf> {
@@ -1589,14 +1657,22 @@ fn extract_gif_frames(mp4_path: &str) -> Option<PathBuf> {
         ^ mp4_path
             .bytes()
             .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-    let cache_dir = std::env::temp_dir().join(format!("wa_gif_{hash:016x}"));
+    let cache_dir = std::env::temp_dir().join(format!("wa_gif_v2_{hash:016x}"));
     // If we already extracted, skip ffmpeg
     if cache_dir.join("frame_001.png").exists() {
         return Some(cache_dir);
     }
     std::fs::create_dir_all(&cache_dir).ok()?;
     let status = std::process::Command::new("ffmpeg")
-        .args(["-i", mp4_path, "-vf", "fps=15,scale=280:-1", "-y"])
+        .args([
+            "-i",
+            mp4_path,
+            "-vf",
+            "fps=8,scale=180:-1",
+            "-frames:v",
+            "48",
+            "-y",
+        ])
         .arg(cache_dir.join("frame_%03d.png").to_str()?)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -1612,7 +1688,8 @@ fn extract_gif_frames(mp4_path: &str) -> Option<PathBuf> {
 
 /// Render a GIF (short MP4 with gif_playback flag).
 /// Autoplay using extracted PNG frames cycled on a timer — no GStreamer pipeline.
-/// ~15MB per GIF instead of ~400MB with MediaFile.
+/// At most 48 180px frames (~6MB worst-case) are held per visible GIF instead
+/// of a full GStreamer pipeline or an unbounded full-resolution frame set.
 fn build_gif_widget(container: &Box, path: &str) {
     let pic = gtk4::Picture::new();
     pic.set_size_request(380, 340);
@@ -1657,12 +1734,12 @@ fn build_gif_widget(container: &Box, path: &str) {
             };
             // Load frame textures
             let mut frames = Vec::new();
-            for i in 1.. {
+            for i in 1..=48 {
                 let frame_path = cache_dir.join(format!("frame_{i:03}.png"));
                 if !frame_path.exists() {
                     break;
                 }
-                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&frame_path) {
+                if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&frame_path, 200) {
                     frames.push(tex);
                 }
             }
@@ -1673,12 +1750,12 @@ fn build_gif_widget(container: &Box, path: &str) {
             if let Some(p) = pic_weak_inner.upgrade() {
                 p.set_paintable(Some(&frames[0]));
             }
-            // Start cycling at ~15fps (67ms per frame).
+            // Match the 8fps extraction rate so playback duration stays correct.
             // Timer closure uses weak ref to pic — returns Break if widget is gone.
             let pic_weak_timer = pic_weak_inner.clone();
             let anim_timer = anim_c.clone();
             let timer_id =
-                glib::timeout_add_local(std::time::Duration::from_millis(67), move || {
+                glib::timeout_add_local(std::time::Duration::from_millis(125), move || {
                     let Some(p) = pic_weak_timer.upgrade() else {
                         return glib::ControlFlow::Break;
                     };
@@ -1696,6 +1773,7 @@ fn build_gif_widget(container: &Box, path: &str) {
                 index: 0,
                 timer_id: Some(timer_id),
             });
+            register_gif_animation(&anim_c);
         });
     });
 
@@ -1750,69 +1828,15 @@ fn build_document_widget(container: &Box, path: &str) {
     let decoded = urldecode(display);
     let is_pdf = path.to_lowercase().ends_with(".pdf");
 
-    // For PDFs: show thumbnail + filename in a fixed-width wrapper so text never exceeds image
-    let mut pdf_wrapper_width: Option<i32> = None;
-    if is_pdf {
-        let thumb_path = format!("{path}.thumb.png");
-        if !std::path::Path::new(&thumb_path).exists() {
-            let path_c = path.to_string();
-            let _ = std::process::Command::new("pdftocairo")
-                .args([
-                    "-png",
-                    "-f",
-                    "1",
-                    "-l",
-                    "1",
-                    "-scale-to",
-                    "380",
-                    "-singlefile",
-                    &path_c,
-                    &format!("{path_c}.thumb"),
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-        if std::path::Path::new(&thumb_path).exists() {
-            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&thumb_path) {
-                let scale = (380.0 / tex.width() as f64)
-                    .min(480.0 / tex.height() as f64)
-                    .min(1.0);
-                let w = (tex.width() as f64 * scale).round() as i32;
-                let h = (tex.height() as f64 * scale).round() as i32;
-                pdf_wrapper_width = Some(w);
+    // One focusable control wraps thumbnail + filename. This avoids exposing
+    // duplicate tab stops for two pieces that perform the same action.
+    let document = Box::new(Orientation::Vertical, 4);
+    document.set_cursor_from_name(Some("pointer"));
 
-                let pic = gtk4::Picture::new();
-                pic.set_can_shrink(true);
-                pic.set_content_fit(gtk4::ContentFit::Contain);
-                pic.set_size_request(w, h);
-                pic.set_paintable(Some(&tex));
-
-                let frame = Box::new(Orientation::Vertical, 0);
-                frame.set_overflow(gtk4::Overflow::Hidden);
-                frame.set_cursor_from_name(Some("pointer"));
-                frame.append(&pic);
-
-                let path_c = path.to_string();
-                let gesture = GestureClick::new();
-                gesture.set_button(1);
-                gesture.connect_released(move |_, _, _, _| open_with_xdg(&path_c));
-                frame.add_controller(gesture);
-
-                container.append(&frame);
-            }
-        }
-    }
-
-    // File info row: icon + filename — width matched to PDF thumbnail if present
+    // File info row: icon + filename. Its width is matched once an async PDF
+    // thumbnail is ready.
     let hbox = Box::new(Orientation::Horizontal, 8);
-    hbox.set_cursor_from_name(Some("pointer"));
     hbox.set_hexpand(false);
-    // If PDF thumbnail exists, hard-cap the filename row to the thumbnail width
-    if let Some(w) = pdf_wrapper_width {
-        hbox.set_size_request(w, -1);
-        hbox.set_overflow(gtk4::Overflow::Hidden);
-    }
 
     let icon = Label::new(Some(file_type_icon(path)));
     let name_label = Label::new(Some(&decoded));
@@ -1827,15 +1851,136 @@ fn build_document_widget(container: &Box, path: &str) {
     hbox.append(&icon);
     hbox.append(&name_label);
 
+    if is_pdf {
+        let pic = gtk4::Picture::new();
+        pic.set_can_shrink(true);
+        pic.set_content_fit(gtk4::ContentFit::Contain);
+
+        let frame = Box::new(Orientation::Vertical, 0);
+        frame.set_overflow(gtk4::Overflow::Hidden);
+        frame.append(&pic);
+        document.append(&frame);
+
+        let pic_w = pic.downgrade();
+        let frame_w = frame.downgrade();
+        let hbox_w = hbox.downgrade();
+        render_pdf_thumbnail_async(path, move |thumb_path| {
+            let (Some(pic), Some(frame), Some(hbox), Some(thumb_path)) = (
+                pic_w.upgrade(),
+                frame_w.upgrade(),
+                hbox_w.upgrade(),
+                thumb_path,
+            ) else {
+                return;
+            };
+            let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&thumb_path, 480) else {
+                return;
+            };
+            let scale = (380.0 / tex.width() as f64)
+                .min(480.0 / tex.height() as f64)
+                .min(1.0);
+            let w = (tex.width() as f64 * scale).round() as i32;
+            let h = (tex.height() as f64 * scale).round() as i32;
+            pic.set_size_request(w, h);
+            frame.set_size_request(w, h);
+            hbox.set_size_request(w, -1);
+            hbox.set_overflow(gtk4::Overflow::Hidden);
+            pic.set_paintable(Some(&tex));
+        });
+    }
+
+    document.append(&hbox);
+
     let path_owned = path.to_string();
+    let activate_document: Rc<dyn Fn()> = Rc::new(move || open_with_xdg(&path_owned));
     let gesture = GestureClick::new();
     gesture.set_button(1);
-    gesture.connect_released(move |_, _, _, _| open_with_xdg(&path_owned));
-    hbox.add_controller(gesture);
+    let activate_click = activate_document.clone();
+    gesture.connect_released(move |_, _, _, _| activate_click());
+    document.add_controller(gesture);
+    install_keyboard_activation(document.upcast_ref(), "Open document", activate_document);
 
-    // Filename is inside the content box which is inside the bubble Clamp (380px).
-    // No extra limiter needed — the Clamp handles max width.
-    container.append(&hbox);
+    container.append(&document);
+}
+
+/// Render the first PDF page without blocking GTK. The callback always runs on
+/// the GTK main context and receives `None` if pdftocairo is unavailable or the
+/// render fails. Existing cached thumbnails take the same asynchronous path so
+/// callers never have re-entrancy surprises.
+pub(crate) fn render_pdf_thumbnail_async(
+    pdf_path: &str,
+    on_complete: impl FnOnce(Option<PathBuf>) + 'static,
+) {
+    let pdf_path = pdf_path.to_string();
+    let thumb_path = PathBuf::from(format!("{pdf_path}.thumb.png"));
+    let (tx, rx) = async_channel::bounded::<Option<PathBuf>>(1);
+
+    glib::MainContext::default().spawn_local(async move {
+        let result = rx.recv().await.unwrap_or(None);
+        on_complete(result);
+    });
+
+    struct PdfJob {
+        pdf_path: String,
+        thumb_path: PathBuf,
+        reply: async_channel::Sender<Option<PathBuf>>,
+    }
+    static PDF_WORKER: std::sync::OnceLock<std::sync::mpsc::Sender<PdfJob>> =
+        std::sync::OnceLock::new();
+    let worker = PDF_WORKER.get_or_init(|| {
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<PdfJob>();
+        if let Err(error) = std::thread::Builder::new()
+            .name("pdf-thumbnail-worker".to_string())
+            .spawn(move || {
+                for job in job_rx {
+                    let result = if job.thumb_path.exists() {
+                        Some(job.thumb_path)
+                    } else {
+                        let output_prefix = format!("{}.thumb", job.pdf_path);
+                        let rendered = std::process::Command::new("pdftocairo")
+                            .args([
+                                "-png",
+                                "-f",
+                                "1",
+                                "-l",
+                                "1",
+                                "-scale-to",
+                                "380",
+                                "-singlefile",
+                                &job.pdf_path,
+                                &output_prefix,
+                            ])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .map(|status| status.success())
+                            .unwrap_or(false);
+                        if rendered && job.thumb_path.exists() {
+                            Some(job.thumb_path)
+                        } else {
+                            None
+                        }
+                    };
+                    let _ = job.reply.send_blocking(result);
+                }
+            })
+        {
+            log::warn!("Failed to start PDF thumbnail worker: {error}");
+        }
+        job_tx
+    });
+
+    if worker
+        .send(PdfJob {
+            pdf_path,
+            thumb_path,
+            reply: tx.clone(),
+        })
+        .is_err()
+    {
+        // Wake the awaiting main-context task even if the worker exited.
+        let _ = tx.try_send(None);
+    }
 }
 
 /// Placeholder shown while media is still downloading.
@@ -1850,7 +1995,10 @@ fn build_reaction_row(reactions: &[(String, String)], is_from_me: bool) -> Optio
     let mut grouped: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
     for (sender, emoji) in reactions {
-        grouped.entry(emoji.clone()).or_default().push(sender.clone());
+        grouped
+            .entry(emoji.clone())
+            .or_default()
+            .push(sender.clone());
     }
 
     let reaction_row = Box::new(Orientation::Horizontal, 4);
@@ -1958,12 +2106,11 @@ fn build_downloadable_placeholder(
     row.set_cursor_from_name(Some("pointer"));
 
     let clicked = Rc::new(std::cell::Cell::new(false));
-    let gesture = GestureClick::new();
     let bridge_c = bridge.clone();
     let chat_id = msg.chat_id.clone();
     let msg_id = msg.id.clone();
     let hint_c = hint.clone();
-    gesture.connect_pressed(move |_, _, _, _| {
+    let activate_download: Rc<dyn Fn()> = Rc::new(move || {
         if clicked.replace(true) {
             return; // already requested — ignore repeat taps
         }
@@ -1973,18 +2120,18 @@ fn build_downloadable_placeholder(
         });
         hint_c.set_text("⏳ Downloading…");
     });
+    let gesture = GestureClick::new();
+    let activate_click = activate_download.clone();
+    gesture.connect_pressed(move |_, _, _, _| activate_click());
     row.add_controller(gesture);
+    install_keyboard_activation(row.upcast_ref(), "Download attachment", activate_download);
     row
 }
 
 /// Simple percent-decode (%XX → char) for display purposes.
 /// Return an emoji icon based on the file extension.
 pub fn file_type_icon(filename: &str) -> &'static str {
-    let ext = filename
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
     match ext.as_str() {
         // Archives
         "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "tgz" => "🗜️",
@@ -2003,8 +2150,8 @@ pub fn file_type_icon(filename: &str) -> &'static str {
         // Video
         "mp4" | "mov" | "avi" | "mkv" | "webm" | "wmv" => "🎬",
         // Code
-        "py" | "js" | "ts" | "rs" | "go" | "java" | "c" | "cpp" | "h" | "html" | "css"
-        | "json" | "xml" | "yaml" | "yml" | "toml" | "sh" | "sql" => "💻",
+        "py" | "js" | "ts" | "rs" | "go" | "java" | "c" | "cpp" | "h" | "html" | "css" | "json"
+        | "xml" | "yaml" | "yml" | "toml" | "sh" | "sql" => "💻",
         // Executables / installers
         "exe" | "msi" | "dmg" | "deb" | "rpm" | "appimage" | "apk" => "⚙️",
         // Fonts
@@ -2292,22 +2439,41 @@ fn open_video_window(path: &str) {
     close_btn.set_valign(Align::Start);
     close_btn.set_margin_top(12);
     close_btn.set_margin_end(12);
-    let win_c = window.clone();
-    close_btn.connect_clicked(move |_| win_c.close());
+    let win_c = window.downgrade();
+    close_btn.connect_clicked(move |_| {
+        if let Some(window) = win_c.upgrade() {
+            window.close();
+        }
+    });
     overlay.add_overlay(&close_btn);
 
     // Escape to close
     let key_ctrl = gtk4::EventControllerKey::new();
-    let win_c = window.clone();
+    let win_c = window.downgrade();
     key_ctrl.connect_key_pressed(move |_, key, _, _| {
         if key == gtk4::gdk::Key::Escape {
-            win_c.close();
+            if let Some(window) = win_c.upgrade() {
+                window.close();
+            }
             gtk4::glib::Propagation::Stop
         } else {
             gtk4::glib::Propagation::Proceed
         }
     });
     window.add_controller(key_ctrl);
+
+    let video_cleanup = video.clone();
+    window.connect_close_request(move |_| {
+        if let Some(stream) = video_cleanup.media_stream() {
+            stream.pause();
+            if let Ok(file) = stream.downcast::<gtk4::MediaFile>() {
+                file.clear();
+            }
+        }
+        video_cleanup.set_media_stream(None::<&gtk4::MediaStream>);
+        video_cleanup.set_file(None::<&gtk4::gio::File>);
+        gtk4::glib::Propagation::Proceed
+    });
 
     window.set_child(Some(&overlay));
     window.fullscreen();
@@ -2396,9 +2562,7 @@ fn save_to_downloads(src: &std::path::Path) -> Option<std::path::PathBuf> {
     let src_len = std::fs::metadata(src).ok()?.len();
 
     let preferred = dir.join(&clean);
-    if preferred.exists()
-        && std::fs::metadata(&preferred).ok().map(|m| m.len()) == Some(src_len)
-    {
+    if preferred.exists() && std::fs::metadata(&preferred).ok().map(|m| m.len()) == Some(src_len) {
         return Some(preferred); // already downloaded, identical — reuse
     }
     let dest = if preferred.exists() {

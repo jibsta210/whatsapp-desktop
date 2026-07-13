@@ -1,6 +1,24 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+// The default jemalloc profile creates many CPU-scaled arenas and retains
+// dirty pages for throughput-heavy server workloads. This desktop app has four
+// Tokio workers and is much more sensitive to steady-state RSS. The measured
+// profile below cut a fully synced session's RSS from ~434 MiB to ~253 MiB
+// without changing UI or protocol behavior.
+union JemallocConfigPtr {
+    byte: &'static u8,
+    c_char: &'static libc::c_char,
+}
+
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static JEMALLOC_CONFIG: Option<&'static libc::c_char> = Some(unsafe {
+    JemallocConfigPtr {
+        byte: &b"abort_conf:true,narenas:4,background_thread:true,tcache_max:4096,dirty_decay_ms:5000,muzzy_decay_ms:0\0"[0],
+    }
+    .c_char
+});
+
 mod app;
 mod bridge;
 mod contacts;
@@ -81,7 +99,10 @@ fn apply_prescale(data_dir: &std::path::Path) {
         let scale_str = format!("{:.4}", scale);
         // SAFETY: called in main() before any threads or GTK init — single-threaded.
         unsafe { std::env::set_var("GDK_DPI_SCALE", &scale_str) };
-        eprintln!("WhatsApp: applied UI scale {:.0}% (GDK_DPI_SCALE={scale_str})", scale * 100.0);
+        eprintln!(
+            "WhatsApp: applied UI scale {:.0}% (GDK_DPI_SCALE={scale_str})",
+            scale * 100.0
+        );
     }
 }
 
@@ -150,7 +171,7 @@ fn main() {
         unsafe {
             std::env::set_var(
                 "RUST_LOG",
-                "info,gmessages_rust=debug,whatsapp_desktop=info,whatsapp_rust=warn,whatsapp_rust::pdo=info,whatsapp_rust::client::sessions=info",
+                "info,gmessages_rust=info,whatsapp_desktop=info,whatsapp_rust=warn,whatsapp_rust::pdo=info,whatsapp_rust::client::sessions=info",
             );
         }
     }

@@ -4,8 +4,8 @@
 //! AUTH_PATH=./gmessages-auth.json cargo run -p gmessages-rust --example listen
 //! ```
 
-use gmessages_rust::{AuthData, Client, Event};
 use gmessages_rust::gmproto::conversations::{Message, message_info};
+use gmessages_rust::{AuthData, Client, Event};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,10 +39,17 @@ async fn main() -> anyhow::Result<()> {
     while let Some(event) = events.recv().await {
         match event {
             Event::Ready => println!("[ready]"),
-            Event::Messages { messages, timestamp: _ } => {
+            Event::Messages {
+                messages,
+                timestamp: _,
+            } => {
                 for m in &messages {
                     let body = extract_body(m);
-                    let from = if m.participant_id.is_empty() { "<self>" } else { &m.participant_id };
+                    let from = if m.participant_id.is_empty() {
+                        "<self>"
+                    } else {
+                        &m.participant_id
+                    };
                     let kind = match m.r#type {
                         1 => "sms",
                         2 => "mms",
@@ -50,11 +57,7 @@ async fn main() -> anyhow::Result<()> {
                         4 => "rcs",
                         n => return Err(anyhow::anyhow!("unknown msg type {n}")),
                     };
-                    let status = m
-                        .message_status
-                        .as_ref()
-                        .map(|s| s.status)
-                        .unwrap_or(0);
+                    let status = m.message_status.as_ref().map(|s| s.status).unwrap_or(0);
                     println!(
                         "[{kind} status={status}] {from} → conv={} : {body}",
                         m.conversation_id,

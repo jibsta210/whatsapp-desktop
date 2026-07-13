@@ -142,7 +142,9 @@ name = "benchmark"
 required-features = ["danger-skip-tls-verify"]
 
 [profile.release]
-opt-level = "z"
+# This is a desktop application and the stripped binary is already small.
+# Optimize hot protocol, crypto, database, and media paths for runtime speed.
+opt-level = 3
 debug = false
 lto = true
 codegen-units = 1

@@ -2,6 +2,7 @@ pub mod autocorrect;
 pub mod chat_list;
 pub mod chat_picker;
 pub mod chat_view;
+pub mod emoji_picker;
 pub mod login;
 pub mod message_bubble;
 pub mod new_chat_panel;

@@ -50,7 +50,9 @@ async fn main() -> anyhow::Result<()> {
                 if !p.full_name.is_empty() {
                     p.full_name.clone()
                 } else {
-                    p.id.as_ref().map(|id| id.participant_id.clone()).unwrap_or_default()
+                    p.id.as_ref()
+                        .map(|id| id.participant_id.clone())
+                        .unwrap_or_default()
                 }
             })
             .collect();
@@ -59,7 +61,11 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .map(|lm| {
                 let s = lm.display_content.replace('\n', " ");
-                if s.len() > 80 { format!("{}…", &s[..80]) } else { s }
+                if s.len() > 80 {
+                    format!("{}…", &s[..80])
+                } else {
+                    s
+                }
             })
             .unwrap_or_default();
         println!(

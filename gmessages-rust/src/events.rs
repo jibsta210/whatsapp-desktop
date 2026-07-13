@@ -2,7 +2,7 @@
 
 use std::time::SystemTime;
 
-use crate::gmproto::conversations::Message;
+use crate::gmproto::conversations::{Conversation, Message};
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -43,8 +43,10 @@ pub enum Event {
         messages: Vec<Message>,
     },
 
-    /// A conversation was added or updated.
-    ConversationUpdate { conversation_id: String },
+    /// A conversation was added or updated. Keep the full payload: it carries
+    /// the other participant's saved-contact name and phone number, which may
+    /// not be present on an outgoing message sent from the paired phone.
+    ConversationUpdate { conversation: Conversation },
 
     /// Typing indicator changed.
     Typing {

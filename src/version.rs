@@ -8,8 +8,7 @@ use std::sync::Arc;
 pub use wacore::version::parse_sw_js;
 
 const SW_URL: &str = "https://web.whatsapp.com/sw.js";
-const CHROME_VERSION_URL: &str =
-    "https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/stable/versions?pageSize=1";
+const CHROME_VERSION_URL: &str = "https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/stable/versions?pageSize=1";
 
 /// Fetch the current stable Chrome version for Linux from Google's
 /// versionhistory API. Returns (primary, secondary, tertiary).

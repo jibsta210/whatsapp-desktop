@@ -2,8 +2,8 @@
 //! This provides a persistent tray icon on GNOME/KDE/XFCE that lets the user
 //! show/hide the window or quit the application.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Shared state between the tray icon (background thread) and GTK (main thread).
 pub struct TrayHandle {
@@ -92,9 +92,7 @@ pub fn spawn_tray_icon() -> TrayHandle {
             }
             Err(e) => {
                 log::warn!("System tray icon failed: {e}");
-                log::warn!(
-                    "Install gnome-shell-extension-appindicator for tray support on GNOME."
-                );
+                log::warn!("Install gnome-shell-extension-appindicator for tray support on GNOME.");
             }
         }
     });

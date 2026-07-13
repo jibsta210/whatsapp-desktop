@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use std::time::Duration;
 use wacore::net::{HttpClient, HttpRequest, HttpResponse, StreamingHttpResponse};
 
 /// HTTP client implementation using `ureq` for synchronous HTTP requests.
@@ -27,19 +28,34 @@ impl Default for UreqHttpClient {
 }
 
 fn build_agent() -> ureq::Agent {
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+    const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+    const BODY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+    const OVERALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
     #[cfg(feature = "danger-skip-tls-verify")]
     {
         use ureq::config::Config;
         use ureq::tls::TlsConfig;
         Config::builder()
             .tls_config(TlsConfig::builder().disable_verification(true).build())
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_recv_response(Some(RESPONSE_TIMEOUT))
+            .timeout_recv_body(Some(BODY_TIMEOUT))
+            .timeout_global(Some(OVERALL_TIMEOUT))
             .build()
             .into()
     }
 
     #[cfg(not(feature = "danger-skip-tls-verify"))]
     {
-        ureq::Agent::new_with_defaults()
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(CONNECT_TIMEOUT))
+            .timeout_recv_response(Some(RESPONSE_TIMEOUT))
+            .timeout_recv_body(Some(BODY_TIMEOUT))
+            .timeout_global(Some(OVERALL_TIMEOUT))
+            .build()
+            .into()
     }
 }
 
@@ -80,12 +96,11 @@ impl HttpClient for UreqHttpClient {
             // which silently failed large WhatsApp media — e.g. architectural-
             // drawing PDFs over 10 MB never downloaded and showed a dead-end
             // placeholder. WhatsApp documents go well beyond that; lift the cap
-            // to 512 MB, still bounded so a malicious huge response can't OOM us.
+            // Generic responses are protocol metadata and should stay small.
+            // Large WhatsApp media uses `execute_streaming`, below, so keeping
+            // this limit tight prevents a bad endpoint from causing an RSS spike.
             let mut body = response.into_body();
-            let body_bytes = body
-                .with_config()
-                .limit(512 * 1024 * 1024)
-                .read_to_vec()?;
+            let body_bytes = body.with_config().limit(32 * 1024 * 1024).read_to_vec()?;
 
             Ok(HttpResponse {
                 status_code,

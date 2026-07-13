@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -10,6 +10,16 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::bridge::{Bridge, ChatSummary, WaCommand};
+
+const MAX_RENDERED_CONTACTS: usize = 100;
+
+struct ContactData {
+    jid: String,
+    name: String,
+    /// Existing direct chats sort first, with newest activity first. Contacts
+    /// without a chat follow alphabetically.
+    recent_rank: usize,
+}
 
 #[derive(Clone)]
 pub struct NewChatPanel {
@@ -30,6 +40,12 @@ struct NewChatInner {
     on_chat_selected: Rc<dyn Fn(String, String)>,
     on_back: RefCell<Option<std::boxed::Box<dyn Fn()>>>,
     found_jid: RefCell<Option<String>>,
+    /// Normalized number for the only lookup result the UI may currently accept.
+    pending_phone: RefCell<Option<String>>,
+    lookup_generation: Cell<u64>,
+    /// Lightweight backing store. GTK rows and avatar textures are created
+    /// only for the small, currently visible result window.
+    contacts: RefCell<Vec<ContactData>>,
 }
 
 impl NewChatPanel {
@@ -142,14 +158,22 @@ impl NewChatPanel {
             on_chat_selected: Rc::new(on_chat_selected),
             on_back: RefCell::new(None),
             found_jid: RefCell::new(None),
+            pending_phone: RefCell::new(None),
+            lookup_generation: Cell::new(0),
+            contacts: RefCell::new(Vec::new()),
         });
 
         // Search: filter contacts + auto phone lookup
         {
-            let inner_c = inner.clone();
+            let inner_weak = Rc::downgrade(&inner);
             inner.search_entry.connect_search_changed(move |entry| {
+                let Some(inner_c) = inner_weak.upgrade() else {
+                    return;
+                };
                 let query = entry.text().to_string();
-                inner_c.contacts_list.invalidate_filter();
+                let generation = inner_c.lookup_generation.get().wrapping_add(1);
+                inner_c.lookup_generation.set(generation);
+                *inner_c.found_jid.borrow_mut() = None;
 
                 // Check if query looks like a phone number
                 let trimmed = query.trim().replace([' ', '-', '(', ')'], "");
@@ -157,67 +181,67 @@ impl NewChatPanel {
                     trimmed.len() >= 4 && trimmed.chars().all(|c| c.is_ascii_digit() || c == '+');
 
                 if is_phone {
+                    *inner_c.pending_phone.borrow_mut() = Some(normalize_phone(&trimmed));
                     inner_c
                         .phone_lookup_label
                         .set_text(&format!("Search WhatsApp for {trimmed}"));
                     inner_c.phone_lookup_row.set_visible(true);
                     inner_c.phone_result_row.set_visible(false);
 
-                    // Auto-lookup after 800ms debounce.
-                    // Use a generation counter so stale timers are no-ops (avoids SourceId::remove panic).
-                    static LOOKUP_GEN: std::sync::atomic::AtomicU64 =
-                        std::sync::atomic::AtomicU64::new(0);
-                    let generation =
-                        LOOKUP_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    let bridge = inner_c.bridge.clone();
+                    // Auto-lookup after 800ms debounce. The per-panel generation
+                    // also advances when the text stops being a phone number,
+                    // so an old timer cannot issue a request for stale input.
+                    let inner_weak = Rc::downgrade(&inner_c);
                     let phone = trimmed.clone();
                     glib::timeout_add_local_once(
                         std::time::Duration::from_millis(800),
                         move || {
-                            if LOOKUP_GEN.load(std::sync::atomic::Ordering::Relaxed) == generation {
-                                bridge.send_command(WaCommand::CheckOnWhatsApp { phone });
+                            if let Some(inner) = inner_weak.upgrade() {
+                                if inner.lookup_generation.get() == generation {
+                                    inner
+                                        .bridge
+                                        .send_command(WaCommand::CheckOnWhatsApp { phone });
+                                }
                             }
                         },
                     );
                 } else {
+                    *inner_c.pending_phone.borrow_mut() = None;
                     inner_c.phone_lookup_row.set_visible(false);
                     inner_c.phone_result_row.set_visible(false);
                 }
+
+                render_contacts(&inner_c, &query);
             });
         }
 
-        // Contact list filter
+        // Stack pages are mapped only while shown. Drop all contact widgets
+        // (and their avatar paintables) as soon as this page is left, then
+        // rebuild its bounded result window when reopened.
         {
-            let search_ref = inner.search_entry.clone();
-            inner.contacts_list.set_filter_func(move |row| {
-                let name = row.widget_name();
-                // Always show special rows
-                if name == "phone-lookup" || name == "phone-result" {
-                    return row.is_visible();
+            let inner_weak = Rc::downgrade(&inner);
+            inner.root.connect_map(move |_| {
+                if let Some(inner) = inner_weak.upgrade() {
+                    render_contacts(&inner, inner.search_entry.text().as_str());
                 }
-                let query = search_ref.text().to_lowercase();
-                let query_digits: String = query.chars().filter(|c| c.is_ascii_digit()).collect();
-                if query.is_empty() {
-                    return true;
+            });
+        }
+        {
+            let inner_weak = Rc::downgrade(&inner);
+            inner.root.connect_unmap(move |_| {
+                if let Some(inner) = inner_weak.upgrade() {
+                    clear_rendered_contacts(&inner.contacts_list);
                 }
-                // Match by name OR by phone number in the JID (widget_name)
-                let jid = row.widget_name().to_lowercase();
-                if !query_digits.is_empty() && jid.contains(&query_digits) {
-                    return true;
-                }
-                // Check the label text (name)
-                row.child()
-                    .and_then(|c| c.last_child())
-                    .and_then(|c| c.downcast::<Label>().ok())
-                    .map(|l| l.text().to_lowercase().contains(&query))
-                    .unwrap_or(true)
             });
         }
 
         // Row activation — handle contacts and phone result row
         {
-            let inner_c = inner.clone();
+            let inner_weak = Rc::downgrade(&inner);
             inner.contacts_list.connect_row_activated(move |_, row| {
+                let Some(inner_c) = inner_weak.upgrade() else {
+                    return;
+                };
                 let name = row.widget_name().to_string();
                 if name == "phone-result" {
                     // Start chat with found phone JID
@@ -235,6 +259,7 @@ impl NewChatPanel {
                     // Manual trigger of phone search
                     let query = inner_c.search_entry.text().to_string();
                     let trimmed = query.trim().replace([' ', '-', '(', ')'], "");
+                    *inner_c.pending_phone.borrow_mut() = Some(normalize_phone(&trimmed));
                     inner_c
                         .bridge
                         .send_command(WaCommand::CheckOnWhatsApp { phone: trimmed });
@@ -257,19 +282,23 @@ impl NewChatPanel {
 
         // Back button
         {
-            let inner_c = inner.clone();
+            let inner_weak = Rc::downgrade(&inner);
             back_btn.connect_clicked(move |_| {
-                if let Some(back) = inner_c.on_back.borrow().as_ref() {
-                    back();
+                if let Some(inner) = inner_weak.upgrade() {
+                    if let Some(back) = inner.on_back.borrow().as_ref() {
+                        back();
+                    }
                 }
             });
         }
 
         // New group button
         {
-            let inner_c = inner.clone();
+            let inner_weak = Rc::downgrade(&inner);
             group_btn.connect_clicked(move |_| {
-                show_create_group_dialog(&inner_c);
+                if let Some(inner) = inner_weak.upgrade() {
+                    show_create_group_dialog(&inner);
+                }
             });
         }
 
@@ -291,55 +320,23 @@ impl NewChatPanel {
         chats: &[ChatSummary],
         all_contacts: &std::collections::HashMap<String, String>,
     ) {
-        let list = &self.inner.contacts_list;
-        // Remove all rows except the phone lookup/result rows
-        let mut child = list.first_child();
-        while let Some(c) = child {
-            let next = c.next_sibling();
-            if let Ok(row) = c.downcast::<ListBoxRow>() {
-                let name = row.widget_name();
-                if name != "phone-lookup" && name != "phone-result" {
-                    list.remove(&row);
-                }
-            }
-            child = next;
-        }
+        let mut direct_chats: Vec<_> = chats.iter().filter(|chat| !chat.is_group).collect();
+        direct_chats.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
-        for chat in chats {
-            if chat.is_group {
+        let mut contacts = Vec::with_capacity(direct_chats.len() + all_contacts.len());
+        let mut existing_ids = std::collections::HashSet::with_capacity(direct_chats.len());
+        for (recent_rank, chat) in direct_chats.into_iter().enumerate() {
+            if !existing_ids.insert(chat.id.as_str()) {
                 continue;
             }
-            let row = ListBoxRow::new();
-            let hbox = Box::new(Orientation::Horizontal, 8);
-            hbox.set_margin_start(8);
-            hbox.set_margin_end(8);
-            hbox.set_margin_top(6);
-            hbox.set_margin_bottom(6);
-
-            let av = adw::Avatar::new(36, Some(&chat.name), true);
-            let safe = chat.id.replace(['/', '\\', '@', ':'], "_");
-            let avatar_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
-            if avatar_path.exists() {
-                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&avatar_path) {
-                    av.set_custom_image(Some(&tex));
-                }
-            }
-
-            let name = Label::new(Some(&chat.name));
-            name.set_hexpand(true);
-            name.set_halign(Align::Start);
-            name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-
-            hbox.append(&av);
-            hbox.append(&name);
-            row.set_child(Some(&hbox));
-            row.set_widget_name(&chat.id);
-            list.append(&row);
+            contacts.push(ContactData {
+                jid: chat.id.clone(),
+                name: chat.name.clone(),
+                recent_rank,
+            });
         }
 
-        // Also add contacts that don't have an existing chat
-        let existing_ids: std::collections::HashSet<&str> =
-            chats.iter().map(|c| c.id.as_str()).collect();
+        // Contacts without an existing direct chat follow the recent chats.
         let mut contact_entries: Vec<(&String, &String)> = all_contacts
             .iter()
             .filter(|(jid, _)| {
@@ -348,41 +345,35 @@ impl NewChatPanel {
             .collect();
         contact_entries.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
 
-        for (jid, name) in contact_entries {
+        let contact_rank_start = contacts.len();
+        for (index, (jid, name)) in contact_entries.into_iter().enumerate() {
             if name.is_empty() {
                 continue;
             }
-            let row = ListBoxRow::new();
-            let hbox = Box::new(Orientation::Horizontal, 8);
-            hbox.set_margin_start(8);
-            hbox.set_margin_end(8);
-            hbox.set_margin_top(6);
-            hbox.set_margin_bottom(6);
+            contacts.push(ContactData {
+                jid: jid.clone(),
+                name: name.clone(),
+                recent_rank: contact_rank_start + index,
+            });
+        }
 
-            let av = adw::Avatar::new(36, Some(name), true);
-            let safe = jid.replace(['/', '\\', '@', ':'], "_");
-            let avatar_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
-            if avatar_path.exists() {
-                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&avatar_path) {
-                    av.set_custom_image(Some(&tex));
-                }
-            }
-
-            let name_lbl = Label::new(Some(name));
-            name_lbl.set_hexpand(true);
-            name_lbl.set_halign(Align::Start);
-            name_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-
-            hbox.append(&av);
-            hbox.append(&name_lbl);
-            row.set_child(Some(&hbox));
-            row.set_widget_name(jid);
-            list.append(&row);
+        *self.inner.contacts.borrow_mut() = contacts;
+        if self.inner.root.is_mapped() {
+            render_contacts(&self.inner, self.inner.search_entry.text().as_str());
+        } else {
+            clear_rendered_contacts(&self.inner.contacts_list);
         }
     }
 
     /// Handle phone lookup result from runtime.
     pub fn set_phone_result(&self, phone: &str, jid: Option<&str>, is_registered: bool) {
+        let response_phone = normalize_phone(phone);
+        let current_phone = normalize_phone(self.inner.search_entry.text().as_str());
+        if self.inner.pending_phone.borrow().as_deref() != Some(response_phone.as_str())
+            || current_phone != response_phone
+        {
+            return;
+        }
         self.inner.phone_lookup_row.set_visible(false);
         if is_registered {
             if let Some(jid) = jid {
@@ -400,6 +391,107 @@ impl NewChatPanel {
             *self.inner.found_jid.borrow_mut() = None;
         }
     }
+}
+
+fn clear_rendered_contacts(list: &ListBox) {
+    let mut child = list.first_child();
+    while let Some(widget) = child {
+        let next = widget.next_sibling();
+        if let Ok(row) = widget.downcast::<ListBoxRow>() {
+            let name = row.widget_name();
+            if name != "phone-lookup" && name != "phone-result" {
+                list.remove(&row);
+            }
+        }
+        child = next;
+    }
+}
+
+fn render_contacts(inner: &NewChatInner, query: &str) {
+    clear_rendered_contacts(&inner.contacts_list);
+
+    let query = query.trim().to_lowercase();
+    let query_digits: String = query.chars().filter(char::is_ascii_digit).collect();
+    let contacts = inner.contacts.borrow();
+
+    // The backing store is already ordered for the empty state, so reopening
+    // the panel remains O(the 100 rows we actually materialize).
+    if query.is_empty() {
+        for contact in contacts.iter().take(MAX_RENDERED_CONTACTS) {
+            inner.contacts_list.append(&build_contact_row(contact));
+        }
+        return;
+    }
+
+    let mut matches: Vec<(&ContactData, u8)> = contacts
+        .iter()
+        .filter_map(|contact| {
+            let name = contact.name.to_lowercase();
+            let jid = contact.jid.to_lowercase();
+            let jid_digits: String = jid.chars().filter(char::is_ascii_digit).collect();
+            let score = if name == query {
+                0
+            } else if name.starts_with(&query) {
+                1
+            } else if name.split_whitespace().any(|word| word.starts_with(&query)) {
+                2
+            } else if name.contains(&query) {
+                3
+            } else if !query_digits.is_empty() && jid_digits.starts_with(&query_digits) {
+                4
+            } else if !query_digits.is_empty() && jid_digits.contains(&query_digits) {
+                5
+            } else if jid.contains(&query) {
+                6
+            } else {
+                return None;
+            };
+            Some((contact, score))
+        })
+        .collect();
+
+    matches.sort_by(|(a, score_a), (b, score_b)| {
+        score_a
+            .cmp(score_b)
+            .then_with(|| a.recent_rank.cmp(&b.recent_rank))
+    });
+
+    for (contact, _) in matches.into_iter().take(MAX_RENDERED_CONTACTS) {
+        inner.contacts_list.append(&build_contact_row(contact));
+    }
+}
+
+fn build_contact_row(contact: &ContactData) -> ListBoxRow {
+    let row = ListBoxRow::new();
+    let hbox = Box::new(Orientation::Horizontal, 8);
+    hbox.set_margin_start(8);
+    hbox.set_margin_end(8);
+    hbox.set_margin_top(6);
+    hbox.set_margin_bottom(6);
+
+    let avatar = adw::Avatar::new(36, Some(&contact.name), true);
+    let safe = contact.jid.replace(['/', '\\', '@', ':'], "_");
+    let avatar_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
+    if avatar_path.exists() {
+        if let Some(texture) = crate::ui::texture_cache::texture_thumbnail(&avatar_path, 96) {
+            avatar.set_custom_image(Some(&texture));
+        }
+    }
+
+    let name = Label::new(Some(&contact.name));
+    name.set_hexpand(true);
+    name.set_halign(Align::Start);
+    name.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
+    hbox.append(&avatar);
+    hbox.append(&name);
+    row.set_child(Some(&hbox));
+    row.set_widget_name(&contact.jid);
+    row
+}
+
+fn normalize_phone(phone: &str) -> String {
+    phone.chars().filter(char::is_ascii_digit).collect()
 }
 
 fn show_create_group_dialog(panel: &Rc<NewChatInner>) {

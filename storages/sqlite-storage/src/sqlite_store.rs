@@ -140,33 +140,35 @@ fn parse_database_path(database_url: &str) -> Result<String> {
 
 impl SqliteStore {
     pub async fn new(database_url: &str) -> std::result::Result<Self, StoreError> {
-        let manager = ConnectionManager::<SqliteConnection>::new(database_url);
+        // r2d2 establishes and customizes connections while building the pool.
+        // Keep that work, the WAL pragma, and migrations together on the
+        // blocking pool so startup cannot stall a Tokio worker thread.
+        let connection_url = database_url.to_owned();
+        let pool =
+            tokio::task::spawn_blocking(move || -> std::result::Result<SqlitePool, StoreError> {
+                let manager = ConnectionManager::<SqliteConnection>::new(&connection_url);
+                let pool = Pool::builder()
+                    .max_size(2)
+                    .connection_customizer(Box::new(ConnectionOptions))
+                    .build(manager)
+                    .map_err(|e| StoreError::Connection(e.to_string()))?;
 
-        let pool_size = 2;
+                let mut conn = pool
+                    .get()
+                    .map_err(|e| StoreError::Connection(e.to_string()))?;
 
-        let pool = Pool::builder()
-            .max_size(pool_size)
-            .connection_customizer(Box::new(ConnectionOptions))
-            .build(manager)
-            .map_err(|e| StoreError::Connection(e.to_string()))?;
+                diesel::sql_query("PRAGMA journal_mode = WAL;")
+                    .execute(&mut conn)
+                    .map_err(|e| StoreError::Database(e.to_string()))?;
 
-        let pool_clone = pool.clone();
-        tokio::task::spawn_blocking(move || -> std::result::Result<(), StoreError> {
-            let mut conn = pool_clone
-                .get()
-                .map_err(|e| StoreError::Connection(e.to_string()))?;
+                conn.run_pending_migrations(MIGRATIONS)
+                    .map_err(|e| StoreError::Migration(e.to_string()))?;
 
-            diesel::sql_query("PRAGMA journal_mode = WAL;")
-                .execute(&mut conn)
-                .map_err(|e| StoreError::Database(e.to_string()))?;
-
-            conn.run_pending_migrations(MIGRATIONS)
-                .map_err(|e| StoreError::Migration(e.to_string()))?;
-
-            Ok(())
-        })
-        .await
-        .map_err(|e| StoreError::Database(e.to_string()))??;
+                drop(conn);
+                Ok(pool)
+            })
+            .await
+            .map_err(|e| StoreError::Database(e.to_string()))??;
 
         let database_path = parse_database_path(database_url)?;
 
@@ -856,13 +858,13 @@ impl SqliteStore {
                 .get()
                 .map_err(|e| StoreError::Connection(e.to_string()))?;
             // Exact match only. Sender_key records for OUTGOING sends contain
-                // the private signing key; records for incoming sends from another
-                // device do not. Returning the wrong device's record makes
-                // encryption fail with "missing private key bytes". The proper
-                // device-suffix normalization happens at the call site
-                // (src/message.rs uses to_non_ad before building the address) —
-                // so by the time we hit the store, the address is already
-                // canonical and an exact match is correct.
+            // the private signing key; records for incoming sends from another
+            // device do not. Returning the wrong device's record makes
+            // encryption fail with "missing private key bytes". The proper
+            // device-suffix normalization happens at the call site
+            // (src/message.rs uses to_non_ad before building the address) —
+            // so by the time we hit the store, the address is already
+            // canonical and an exact match is correct.
             let res: Option<Vec<u8>> = sender_keys::table
                 .select(sender_keys::record)
                 .filter(sender_keys::address.eq(&address))

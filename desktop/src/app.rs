@@ -5,27 +5,22 @@ use gtk4::gio;
 use gtk4::glib;
 use gtk4::prelude::*;
 use libadwaita as adw;
-use libadwaita::prelude::*;
 use tokio::sync::mpsc;
 
 const APP_CSS: &str = "
 /* Panel backgrounds */
-box.chat-list-bg { background-color: rgba(0, 0, 0, 0.55); }
+box.chat-list-bg { background-color: alpha(@window_bg_color, 0.96); }
 /* chat list header removed — search is inline now */
 headerbar.message-pane-hdr { background: transparent; border: none; box-shadow: none; min-height: 72px; }
 /* system titlebar — default GTK size */
-box.message-pane-bg { background-color: rgba(0, 0, 0, 0.45); }
+box.message-pane-bg { background-color: alpha(@window_bg_color, 0.90); }
 
 box.message-bubble-out {
     background-color: #005c4b;
     border-radius: 8px 8px 2px 8px;
-    /* max-width is set dynamically per-display by chat_view.rs as a
-     * percentage of the message pane width — bubbles grow / shrink as
-     * the window is resized, with a hard cap so ultrawide displays
-     * don't produce hard-to-scan long lines. */
 }
 box.message-bubble-in {
-    background-color: #202c33;
+    background-color: @card_bg_color;
     border-radius: 8px 8px 8px 2px;
 }
 /* Send-mode toggle in the chat header tints itself by current protocol. */
@@ -42,16 +37,17 @@ box.message-bubble-in.message-bubble-sms {
     background-color: #3a506b;
 }
 box.message-bubble-out label,
-box.message-bubble-in label {
+box.message-bubble-in.message-bubble-sms label {
     color: #e9edef;
 }
+box.message-bubble-in label { color: @window_fg_color; }
 box.message-bubble-out .dim-label,
 box.message-bubble-in .dim-label {
-    color: #8696a0;
+    color: #c3d0cd;
 }
 box.message-bubble-out .accent,
 box.message-bubble-in .accent {
-    color: #53bdeb;
+    color: #8fdcff;
 }
 box.reply-context {
     border-left: 3px solid #53bdeb;
@@ -80,10 +76,15 @@ button.filter-chip:disabled {
     outline-width: 0;
     outline-offset: 0;
     box-shadow: none;
-    -gtk-outline-radius: 0;
     -gtk-icon-shadow: none;
     text-shadow: none;
-    color: #e9edef;
+    color: @window_fg_color;
+}
+button.filter-chip:focus-visible {
+    outline-color: @accent_color;
+    outline-style: solid;
+    outline-width: 2px;
+    outline-offset: 2px;
 }
 button.filter-chip:hover {
     background-color: rgba(255, 255, 255, 0.05);
@@ -99,8 +100,9 @@ button.filter-chip:checked:focus-visible {
     border: 1px solid #00a884;
     box-shadow: none;
     color: #00a884;
-    outline: none;
-    outline-width: 0;
+    outline-color: @accent_color;
+    outline-style: solid;
+    outline-width: 2px;
 }
 button.filter-chip:checked:hover {
     background-color: rgba(0, 168, 132, 0.08);
@@ -135,17 +137,17 @@ entry.search-rounded {
 }
 textview.message-input {
     background-color: transparent;
-    color: #e9edef;
+    color: @window_fg_color;
 }
 box.message-bubble-out .error,
 box.message-bubble-in .error {
-    color: #ef5350;
+    color: #ffaba5;
 }
 
 /* Typing indicator — bouncing dots */
 @keyframes typing-bounce {
-    0%, 60%, 100% { opacity: 0.2; margin-bottom: 0px; }
-    30%           { opacity: 1.0; margin-bottom: 4px; }
+    0%, 60%, 100% { opacity: 0.2; }
+    30%           { opacity: 1.0; }
 }
 .typing-dot {
     color: #00a884;
@@ -158,8 +160,8 @@ box.message-bubble-in .error {
 
 /* Icon rail (left nav panel) */
 box.icon-rail {
-    background-color: rgba(0, 0, 0, 0.65);
-    border-right: 1px solid rgba(255, 255, 255, 0.08);
+    background-color: alpha(@window_bg_color, 0.98);
+    border-right: 1px solid alpha(@window_fg_color, 0.10);
 }
 
 /* Poll widget */
@@ -176,12 +178,12 @@ box.poll-widget button.flat:hover {
 
 /* Poll voter avatar stack — overlap via negative margins */
 box.poll-voters > .avatar {
-    margin-start: -4px;
+    margin-left: -4px;
     border: 1px solid rgba(0, 0, 0, 0.3);
     border-radius: 9999px;
 }
 box.poll-voters > .avatar:first-child {
-    margin-start: 0;
+    margin-left: 0;
 }
 
 /* Poll vote bars */
@@ -304,7 +306,6 @@ popover.stealth-popover contents {
     border-radius: 12px;
     padding: 8px 0;
     min-width: 320px;
-    max-height: 400px;
 }
 box.stealth-message {
     padding: 6px 12px;
@@ -350,26 +351,15 @@ progressbar.sync-progress progress {
     border-radius: 2px;
 }
 
-/* ── New-bubble slide-in animation ─────────────────────────────────── */
-/* Outgoing (right-aligned) bubbles slide in from the right via animated
- * margin-right (starts large negative, settles to baseline). Incoming
- * bubbles slide in from the left via margin-start. Both use a spring
- * cubic-bezier to land with a small overshoot bounce. The class is
- * added by Rust on bubble creation and removed after ~360ms.
- *
- * Note: GTK4 CSS animations on margin work but reflow layout each
- * frame, which is fine for a single bubble on send/receive. The 50-
- * bubble bulk render in load_history all animates at once on chat
- * switch — that is intentional, gives the chat a reveal feel. */
+/* New live bubbles fade in without animating margins. Margin animation
+ * re-laid out the whole message list every frame and caused visible jank. */
 @keyframes bubble-slide-in-right {
-    0%   { opacity: 0; margin-right: -180px; }
-    70%  { opacity: 1; margin-right:    4px; }
-    100% { opacity: 1; margin-right:    8px; }
+    0%   { opacity: 0; }
+    100% { opacity: 1; }
 }
 @keyframes bubble-slide-in-left {
-    0%   { opacity: 0; margin-left: -180px; }
-    70%  { opacity: 1; margin-left:    4px; }
-    100% { opacity: 1; margin-left:    8px; }
+    0%   { opacity: 0; }
+    100% { opacity: 1; }
 }
 box.bubble-enter.bubble-row-out {
     animation: bubble-slide-in-right 0.48s cubic-bezier(0.34, 1.56, 0.64, 1);
@@ -380,8 +370,8 @@ box.bubble-enter.bubble-row-in {
 /* System / centered bubbles (no left/right anchor) — fall back to a
  * gentle vertical fade-in. */
 @keyframes bubble-fade-in {
-    0%   { opacity: 0; margin-top: -20px; }
-    100% { opacity: 1; margin-top:   3px; }
+    0%   { opacity: 0; }
+    100% { opacity: 1; }
 }
 box.bubble-enter:not(.bubble-row-out):not(.bubble-row-in) {
     animation: bubble-fade-in 0.36s cubic-bezier(0.16, 1, 0.3, 1);
@@ -403,6 +393,34 @@ popover.fade-popover contents {
     animation: window-fade-in 0.24s cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 ";
+
+#[cfg(test)]
+mod css_tests {
+    use super::APP_CSS;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[test]
+    fn app_stylesheet_has_no_parser_errors() {
+        if gtk4::init().is_err() {
+            // Headless CI cannot create GTK objects; runtime startup performs
+            // the same parse when a display is available.
+            return;
+        }
+        let errors = Rc::new(RefCell::new(Vec::new()));
+        let provider = gtk4::CssProvider::new();
+        let captured = errors.clone();
+        provider.connect_parsing_error(move |_, section, error| {
+            captured.borrow_mut().push(format!(
+                "line {}: {}",
+                section.start_location().lines() + 1,
+                error
+            ));
+        });
+        provider.load_from_string(APP_CSS);
+        assert!(errors.borrow().is_empty(), "{}", errors.borrow().join("\n"));
+    }
+}
 
 use crate::bridge::{Bridge, WaCommand, WaEvent};
 use crate::ui::window::MainWindow;
@@ -431,8 +449,7 @@ impl WhatsAppApp {
         // tries to launch), we just re-show the existing window.
         let initialized = std::cell::Cell::new(false);
         // Store the window so re-activation can show it
-        let saved_window: std::cell::RefCell<Option<gtk4::Window>> =
-            std::cell::RefCell::new(None);
+        let saved_window: std::cell::RefCell<Option<gtk4::Window>> = std::cell::RefCell::new(None);
 
         self.gtk_app.connect_activate(move |gtk_app| {
             // Re-activation: just show the existing window
@@ -474,7 +491,13 @@ impl WhatsAppApp {
             thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
-                    .thread_stack_size(8 * 1024 * 1024) // 8MB stack for media uploads
+                    // Network-heavy desktop work does not benefit from one
+                    // worker per CPU (18 on the audited machine). Media bytes
+                    // live on the heap, so huge worker stacks only inflate the
+                    // process. Blocking media/disk work is separately capped.
+                    .worker_threads(4)
+                    .max_blocking_threads(32)
+                    .thread_stack_size(2 * 1024 * 1024)
                     .build()
                     .expect("Failed to build Tokio runtime");
 
@@ -491,10 +514,12 @@ impl WhatsAppApp {
             *saved_window.borrow_mut() = window.gtk_window();
 
             // Receive events on the GTK main context.
-            // Process up to BATCH_SIZE events per iteration, then yield back
-            // to the GTK event loop so it can paint frames and respond to
-            // window-manager pings (prevents "Not Responding" during sync).
-            const BATCH_SIZE: usize = 8;
+            // Drain cheap bursts aggressively, but stop after one frame budget
+            // even when fewer than MAX_BATCH events were handled. A fixed count
+            // made eight expensive history events freeze the UI, while eight
+            // tiny receipt events per iteration let the unbounded bridge grow.
+            const MAX_BATCH: usize = 64;
+            const BATCH_BUDGET: std::time::Duration = std::time::Duration::from_millis(8);
             let win_clone = window.clone();
             glib::MainContext::default().spawn_local(async move {
                 loop {
@@ -503,10 +528,14 @@ impl WhatsAppApp {
                         Ok(ev) => ev,
                         Err(_) => break,
                     };
+                    let batch_started = std::time::Instant::now();
                     win_clone.handle_event(first);
 
-                    // Drain any queued events (up to BATCH_SIZE-1 more)
-                    for _ in 1..BATCH_SIZE {
+                    // Drain queued cheap events until the count or time budget.
+                    for _ in 1..MAX_BATCH {
+                        if batch_started.elapsed() >= BATCH_BUDGET {
+                            break;
+                        }
                         match event_rx.try_recv() {
                             Ok(ev) => win_clone.handle_event(ev),
                             Err(_) => break,

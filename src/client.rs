@@ -256,6 +256,8 @@ pub struct Client {
     pub(crate) is_logged_in: Arc<AtomicBool>,
     pub(crate) is_connecting: Arc<AtomicBool>,
     pub(crate) is_running: Arc<AtomicBool>,
+    /// Per-client guard for the periodic version refresh task.
+    version_refresh_started: AtomicBool,
     /// Whether the noise socket is established (connected to WhatsApp servers).
     /// Uses an AtomicBool instead of probing the noise_socket mutex to avoid
     /// TOCTOU races where `try_lock()` fails due to contention, not disconnection.
@@ -540,32 +542,36 @@ impl Client {
     /// and if we don't, long-running desktop sessions eventually hit the
     /// "older version" warning. Runs every 2 hours; best-effort.
     fn start_version_refresh_loop(self: &Arc<Self>) {
-        static STARTED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        if self.version_refresh_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        let client = self.clone();
-        self.runtime.spawn(Box::pin(async move {
-            const REFRESH_INTERVAL: std::time::Duration =
-                std::time::Duration::from_secs(2 * 60 * 60); // 2 hours
-            loop {
-                client.runtime.sleep(REFRESH_INTERVAL).await;
-                log::info!("Periodic version refresh: fetching WA Web + Chrome versions");
-                // WA Web version (client_revision) — writes to device store
-                if let Err(e) = crate::version::resolve_and_update_version(
-                    &client.persistence_manager,
-                    &client.http_client,
-                    client.override_version,
-                )
-                .await
-                {
-                    log::warn!("Periodic WA version refresh failed: {e:#}");
+        let weak_client = Arc::downgrade(self);
+        let runtime = self.runtime.clone();
+        self.runtime
+            .spawn(Box::pin(async move {
+                const REFRESH_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(2 * 60 * 60); // 2 hours
+                loop {
+                    runtime.sleep(REFRESH_INTERVAL).await;
+                    let Some(client) = weak_client.upgrade() else {
+                        break;
+                    };
+                    log::info!("Periodic version refresh: fetching WA Web + Chrome versions");
+                    // WA Web version (client_revision) — writes to device store
+                    if let Err(e) = crate::version::resolve_and_update_version(
+                        &client.persistence_manager,
+                        &client.http_client,
+                        client.override_version,
+                    )
+                    .await
+                    {
+                        log::warn!("Periodic WA version refresh failed: {e:#}");
+                    }
+                    // Chrome version — writes to wacore atomics, affects next login payload
+                    crate::version::refresh_chrome_version(&client.http_client).await;
                 }
-                // Chrome version — writes to wacore atomics, affects next login payload
-                crate::version::refresh_chrome_version(&client.http_client).await;
-            }
-        })).detach();
+            }))
+            .detach();
     }
 
     /// Enable or disable skipping of history sync notifications at runtime.
@@ -651,6 +657,7 @@ impl Client {
             is_logged_in: Arc::new(AtomicBool::new(false)),
             is_connecting: Arc::new(AtomicBool::new(false)),
             is_running: Arc::new(AtomicBool::new(false)),
+            version_refresh_started: AtomicBool::new(false),
             is_connected: Arc::new(AtomicBool::new(false)),
             shutdown_notifier: Arc::new(event_listener::Event::new()),
             last_data_received_ms: Arc::new(AtomicU64::new(0)),
@@ -756,14 +763,6 @@ impl Client {
                 if let Err(e) = warm_up_arc.warm_up_lid_pn_cache().await {
                     warn!("Failed to warm up LID-PN cache: {e}");
                 }
-            }))
-            .detach();
-
-        // Start background task to clean up stale device registry entries
-        let cleanup_arc = arc.clone();
-        arc.runtime
-            .spawn(Box::pin(async move {
-                cleanup_arc.device_registry_cleanup_loop().await;
             }))
             .detach();
 
@@ -3581,10 +3580,10 @@ fn is_encrypt_identity_notification(node: &Node) -> bool {
         && node.get_optional_child("identity").is_some()
 }
 
-/// Computes a reconnect delay matching WhatsApp Web's Fibonacci backoff:
-/// `{ algo: { type: "fibonacci", first: 1000, second: 1000 }, jitter: 0.1, max: 9e5 }`
+/// Computes a reconnect delay based on WhatsApp Web's Fibonacci backoff,
+/// capped at 60 seconds for an interactive desktop client.
 ///
-/// Sequence: 1s, 1s, 2s, 3s, 5s, 8s, 13s, 21s, 34s, 55s, 89s, 144s, ... capped at 900s.
+/// Sequence: 1s, 1s, 2s, 3s, 5s, 8s, 13s, 21s, 34s, 55s, 60s, 60s, ...
 /// Each value gets ±10% random jitter.
 fn fibonacci_backoff(attempt: u32) -> Duration {
     // Capped at 60s so a laptop coming back from an offline window
@@ -5373,17 +5372,17 @@ mod tests {
     }
 
     #[test]
-    fn test_fibonacci_backoff_max_900s() {
-        // After many attempts, should cap at 900s (±10%)
+    fn test_fibonacci_backoff_max_60s() {
+        // After many attempts, desktop reconnects should cap at 60s (±10%).
         let delay = fibonacci_backoff(100);
         let ms = delay.as_millis() as u64;
         assert!(
-            ms <= 990_000,
-            "should never exceed 900s + 10% jitter, got {ms}ms"
+            ms <= 66_000,
+            "should never exceed 60s + 10% jitter, got {ms}ms"
         );
         assert!(
-            ms >= 810_000,
-            "should be at least 900s - 10% jitter, got {ms}ms"
+            ms >= 54_000,
+            "should be at least 60s - 10% jitter, got {ms}ms"
         );
     }
 
@@ -5643,9 +5642,7 @@ mod tests {
         // A disconnect happens mid-flight: cleanup swaps the semaphore (bumps gen G -> G+1).
         client.swap_message_semaphore(1);
         assert_eq!(
-            client
-                .message_semaphore_generation
-                .load(Ordering::SeqCst),
+            client.message_semaphore_generation.load(Ordering::SeqCst),
             gen_at_start + 1,
             "swap must bump the generation exactly once"
         );
@@ -5714,7 +5711,10 @@ mod tests {
             }
             guards.len()
         };
-        assert_eq!(permits, 64, "widen must land on the current semaphore (1 + 63)");
+        assert_eq!(
+            permits, 64,
+            "widen must land on the current semaphore (1 + 63)"
+        );
 
         // A second call (idempotency guard) must NOT win the CAS and must NOT widen again.
         assert!(

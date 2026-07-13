@@ -79,10 +79,8 @@ pub(crate) fn dispatch_chat_mutation(
                 if let Ok(jid) = jid_str.parse::<Jid>() {
                     event_bus.dispatch(&Event::ContactUpdate(ContactUpdate {
                         jid,
-                        timestamp: DateTime::from_timestamp_millis(
-                            val.timestamp.unwrap_or(0),
-                        )
-                        .unwrap_or_else(wacore::time::now_utc),
+                        timestamp: DateTime::from_timestamp_millis(val.timestamp.unwrap_or(0))
+                            .unwrap_or_else(wacore::time::now_utc),
                         action: Box::new(wa::sync_action_value::ContactAction {
                             full_name: act.full_name.clone(),
                             first_name: act.first_name.clone(),

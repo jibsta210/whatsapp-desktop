@@ -1293,9 +1293,7 @@ pub fn start_ai_corrector() {
     let (tx, rx) = std::sync::mpsc::channel::<AiCorrectionRequest>();
     let _ = AI_TX.set(tx);
 
-    log::info!(
-        "AI autocorrect enabled (provider read live from settings; currently '{provider}')"
-    );
+    log::info!("AI autocorrect enabled (provider read live from settings; currently '{provider}')");
     std::thread::Builder::new()
         .name("ai-autocorrect".into())
         .spawn(move || {
@@ -1396,7 +1394,11 @@ fn ai_corrector_loop(rx: std::sync::mpsc::Receiver<AiCorrectionRequest>) {
                 if !MISSING_KEY_WARNED.swap(true, Ordering::Relaxed) {
                     log::warn!(
                         "AI autocorrect: provider '{provider}' is selected but its API key is empty — corrections are a no-op. Paste the {} key in Settings → AI Autocorrect.",
-                        if provider == "deepseek" { "DeepSeek" } else { "Gemini" }
+                        if provider == "deepseek" {
+                            "DeepSeek"
+                        } else {
+                            "Gemini"
+                        }
                     );
                 }
             } else {
@@ -1620,8 +1622,7 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                 bs_flag.set(true);
             }
             // Ctrl+Z: skip next AI pass
-            if key == gtk4::gdk::Key::z
-                && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+            if key == gtk4::gdk::Key::z && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
             {
                 bs_flag.set(true); // treat Ctrl+Z like backspace for revert purposes
             }

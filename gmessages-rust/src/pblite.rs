@@ -63,11 +63,7 @@ fn msg_to_dynamic<M: ReflectMessage + prost::Message>(msg: &M) -> Result<Dynamic
 
 fn serialize_message(msg: &DynamicMessage) -> Result<Vec<Json>> {
     let descriptor = msg.descriptor();
-    let max_field = descriptor
-        .fields()
-        .map(|f| f.number())
-        .max()
-        .unwrap_or(0) as usize;
+    let max_field = descriptor.fields().map(|f| f.number()).max().unwrap_or(0) as usize;
     let mut out = vec![Json::Null; max_field];
 
     for field in descriptor.fields() {
@@ -116,12 +112,8 @@ fn serialize_scalar(field: &FieldDescriptor, value: &Value) -> Result<Json> {
             }
         }
         (Kind::Bool, Value::Bool(b)) => Json::Bool(*b),
-        (Kind::Int32 | Kind::Sint32 | Kind::Sfixed32, Value::I32(n)) => {
-            Json::Number((*n).into())
-        }
-        (Kind::Int64 | Kind::Sint64 | Kind::Sfixed64, Value::I64(n)) => {
-            Json::Number((*n).into())
-        }
+        (Kind::Int32 | Kind::Sint32 | Kind::Sfixed32, Value::I32(n)) => Json::Number((*n).into()),
+        (Kind::Int64 | Kind::Sint64 | Kind::Sfixed64, Value::I64(n)) => Json::Number((*n).into()),
         (Kind::Uint32 | Kind::Fixed32, Value::U32(n)) => Json::Number((*n).into()),
         (Kind::Uint64 | Kind::Fixed64, Value::U64(n)) => Json::Number((*n).into()),
         (Kind::Float, Value::F32(n)) => serde_json::Number::from_f64(*n as f64)
@@ -231,9 +223,7 @@ fn deserialize_scalar(field: &FieldDescriptor, raw: &Json) -> Result<Value> {
                 )));
             }
         },
-        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => {
-            Value::I32(expect_i64(raw, field)? as i32)
-        }
+        Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => Value::I32(expect_i64(raw, field)? as i32),
         Kind::Int64 | Kind::Sint64 | Kind::Sfixed64 => Value::I64(expect_i64(raw, field)?),
         Kind::Uint32 | Kind::Fixed32 => Value::U32(expect_u64(raw, field)? as u32),
         Kind::Uint64 | Kind::Fixed64 => Value::U64(expect_u64(raw, field)?),
@@ -262,12 +252,9 @@ fn expect_i64(raw: &Json, field: &FieldDescriptor) -> Result<i64> {
                 field.full_name()
             ))
         }),
-        Json::String(s) => s.parse::<i64>().map_err(|e| {
-            Error::PBLite(format!(
-                "parse i64 for {}: {e}",
-                field.full_name()
-            ))
-        }),
+        Json::String(s) => s
+            .parse::<i64>()
+            .map_err(|e| Error::PBLite(format!("parse i64 for {}: {e}", field.full_name()))),
         other => Err(Error::PBLite(format!(
             "expected number/string for {}, got {}",
             field.full_name(),
@@ -284,12 +271,9 @@ fn expect_u64(raw: &Json, field: &FieldDescriptor) -> Result<u64> {
                 field.full_name()
             ))
         }),
-        Json::String(s) => s.parse::<u64>().map_err(|e| {
-            Error::PBLite(format!(
-                "parse u64 for {}: {e}",
-                field.full_name()
-            ))
-        }),
+        Json::String(s) => s
+            .parse::<u64>()
+            .map_err(|e| Error::PBLite(format!("parse u64 for {}: {e}", field.full_name()))),
         other => Err(Error::PBLite(format!(
             "expected number/string for {}, got {}",
             field.full_name(),

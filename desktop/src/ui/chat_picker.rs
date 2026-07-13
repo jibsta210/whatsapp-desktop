@@ -212,7 +212,7 @@ pub fn show_chat_picker_with_chats(
         let safe = chat.id.replace(['/', '\\', '@', ':'], "_");
         let av_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
         if av_path.exists() {
-            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&av_path) {
+            if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&av_path, 96) {
                 av.set_custom_image(Some(&tex));
             }
         }
@@ -230,9 +230,12 @@ pub fn show_chat_picker_with_chats(
     }
 
     // Search filter
-    let search_ref = search.clone();
+    let search_weak = search.downgrade();
     list.set_filter_func(move |row| {
-        let q = search_ref.text().to_lowercase();
+        let Some(search) = search_weak.upgrade() else {
+            return true;
+        };
+        let q = search.text().to_lowercase();
         if q.is_empty() {
             return true;
         }
@@ -248,18 +251,24 @@ pub fn show_chat_picker_with_chats(
             .unwrap_or(true)
     });
     search.connect_search_changed({
-        let list_ref = list.clone();
-        move |_| list_ref.invalidate_filter()
+        let list_weak = list.downgrade();
+        move |_| {
+            if let Some(list) = list_weak.upgrade() {
+                list.invalidate_filter();
+            }
+        }
     });
 
     // Row click for single-select: select and close
     if !multi_select {
         let cb = Rc::new(callback);
-        let win_c = win.clone();
+        let win_weak = win.downgrade();
         list.connect_row_activated(move |_, row| {
             let id = row.widget_name().to_string();
             cb(vec![id]);
-            win_c.close();
+            if let Some(win) = win_weak.upgrade() {
+                win.close();
+            }
         });
     } else {
         // Row click toggles checkbox
@@ -276,11 +285,13 @@ pub fn show_chat_picker_with_chats(
         // OK button for multi-select
         let cb = Rc::new(callback);
         let sel_ref = selected.clone();
-        let win_c = win.clone();
+        let win_weak = win.downgrade();
         send_btn.connect_clicked(move |_| {
             let ids = sel_ref.borrow().clone();
             cb(ids);
-            win_c.close();
+            if let Some(win) = win_weak.upgrade() {
+                win.close();
+            }
         });
     }
 

@@ -1,11 +1,10 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
-use gtk4::{
-    Box, Button, Orientation, Paned, Revealer, RevealerTransitionType, Spinner, Stack, TextView,
-};
+use gtk4::{Box, Button, Orientation, Revealer, RevealerTransitionType, Stack};
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
@@ -17,7 +16,183 @@ use crate::ui::new_chat_panel::NewChatPanel;
 use crate::ui::profile_panel::ProfilePanel;
 use crate::ui::settings::SettingsHandle;
 
-const SIDEBAR_WIDTH: i32 = 360;
+/// Matches the comfortable width reached by adjusting the live layout: wide
+/// enough for the 52px avatars and row metadata without stealing space from
+/// message bubbles on the user's scaled desktop.
+const DEFAULT_SIDEBAR_WIDTH: i32 = 400;
+const MIN_SIDEBAR_WIDTH: i32 = 320;
+const MAX_SIDEBAR_WIDTH: i32 = 640;
+/// Preserve a useful message surface when a previously-wide window is made
+/// narrow. The preferred sidebar width itself is retained and restored when
+/// room returns.
+const MIN_CHAT_WIDTH: i32 = 360;
+
+fn sanitize_sidebar_width(saved: Option<i32>) -> i32 {
+    match saved {
+        Some(width) if (MIN_SIDEBAR_WIDTH..=MAX_SIDEBAR_WIDTH).contains(&width) => width,
+        _ => DEFAULT_SIDEBAR_WIDTH,
+    }
+}
+
+fn effective_sidebar_width(preferred: i32, available_width: i32) -> i32 {
+    let preferred = preferred.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+    if available_width <= 0 {
+        return preferred;
+    }
+
+    // On very small windows the sidebar's minimum wins, preventing GTK from
+    // shrinking it below the point where row avatars are visibly clipped.
+    let responsive_max = (available_width - MIN_CHAT_WIDTH).max(MIN_SIDEBAR_WIDTH);
+    preferred.min(responsive_max)
+}
+
+fn queue_sidebar_width_save(
+    settings: &SettingsHandle,
+    pending: &Rc<RefCell<Option<gtk4::glib::SourceId>>>,
+    width: i32,
+) {
+    if let Some(source) = pending.borrow_mut().take() {
+        source.remove();
+    }
+
+    let settings = settings.clone();
+    let pending_done = pending.clone();
+    let source = gtk4::glib::timeout_add_local_once(Duration::from_millis(180), move || {
+        pending_done.borrow_mut().take();
+        settings.set_sidebar_width(width);
+    });
+    *pending.borrow_mut() = Some(source);
+}
+
+fn configure_sidebar_pane(paned: &gtk4::Paned, settings: &SettingsHandle) {
+    let preferred = Rc::new(Cell::new(sanitize_sidebar_width(
+        settings.get().sidebar_width,
+    )));
+    let applying_layout = Rc::new(Cell::new(false));
+    let pointer_adjusting = Rc::new(Cell::new(false));
+    let pending_save: Rc<RefCell<Option<gtk4::glib::SourceId>>> = Rc::new(RefCell::new(None));
+
+    paned.set_position(preferred.get());
+
+    // Only a real divider interaction updates the preference. Layout-driven
+    // position changes (for example when a window is temporarily narrowed)
+    // must not overwrite the width the user chose on a roomy window.
+    // Observe raw button events instead of adding a second gesture recognizer:
+    // a competing GestureClick can steal the sequence from Paned's own drag.
+    let pointer = gtk4::EventControllerLegacy::new();
+    pointer.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    {
+        let paned = paned.clone();
+        let pointer_adjusting = pointer_adjusting.clone();
+        let preferred = preferred.clone();
+        let settings = settings.clone();
+        let pending_save = pending_save.clone();
+        pointer.connect_event(move |_, event| {
+            let Some(button) = event.downcast_ref::<gtk4::gdk::ButtonEvent>() else {
+                return gtk4::glib::Propagation::Proceed;
+            };
+            if button.button() != 1 {
+                return gtk4::glib::Propagation::Proceed;
+            }
+
+            match event.event_type() {
+                gtk4::gdk::EventType::ButtonPress => {
+                    // GDK reports surface coordinates, while Paned::position
+                    // is local to the Paned (which starts after the icon rail).
+                    let on_separator = event
+                        .position()
+                        .and_then(|(x, y)| {
+                            let root = paned.root()?;
+                            root.compute_point(
+                                &paned,
+                                &gtk4::graphene::Point::new(x as f32, y as f32),
+                            )
+                        })
+                        .map(|point| {
+                            (f64::from(point.x()) - f64::from(paned.position())).abs() <= 18.0
+                        })
+                        .unwrap_or(false);
+                    pointer_adjusting.set(on_separator);
+                }
+                gtk4::gdk::EventType::ButtonRelease => {
+                    if pointer_adjusting.replace(false) {
+                        let width = paned.position().clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+                        preferred.set(width);
+                        if let Some(source) = pending_save.borrow_mut().take() {
+                            source.remove();
+                        }
+                        settings.set_sidebar_width(width);
+                    }
+                }
+                _ => {}
+            }
+
+            // Passive observation only; Paned remains the sole gesture owner.
+            gtk4::glib::Propagation::Proceed
+        });
+    }
+    paned.add_controller(pointer);
+
+    {
+        let preferred = preferred.clone();
+        let applying_layout = applying_layout.clone();
+        let pointer_adjusting = pointer_adjusting.clone();
+        let settings = settings.clone();
+        let pending_save = pending_save.clone();
+        paned.connect_position_notify(move |paned| {
+            if applying_layout.get() || !pointer_adjusting.get() {
+                return;
+            }
+            let width = paned.position().clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+            preferred.set(width);
+            queue_sidebar_width_save(&settings, &pending_save, width);
+        });
+    }
+
+    // Keyboard divider movement goes through this action signal. Read the
+    // resulting value on the next main-loop turn, after GTK's default handler.
+    {
+        let paned_weak = paned.downgrade();
+        let preferred = preferred.clone();
+        let settings = settings.clone();
+        let pending_save = pending_save.clone();
+        paned.connect_move_handle(move |_, _| {
+            let paned_weak = paned_weak.clone();
+            let preferred = preferred.clone();
+            let settings = settings.clone();
+            let pending_save = pending_save.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                let Some(paned) = paned_weak.upgrade() else {
+                    return;
+                };
+                let width = paned.position().clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+                preferred.set(width);
+                queue_sidebar_width_save(&settings, &pending_save, width);
+            });
+            false
+        });
+    }
+
+    // `max-position` changes whenever the Paned allocation changes. Apply a
+    // temporary effective width that leaves room for messages; because the
+    // preferred value lives separately, growing the window restores it.
+    {
+        let preferred = preferred.clone();
+        let applying_layout = applying_layout.clone();
+        let pointer_adjusting = pointer_adjusting.clone();
+        paned.connect_max_position_notify(move |paned| {
+            if pointer_adjusting.get() {
+                return;
+            }
+            let target = effective_sidebar_width(preferred.get(), paned.width());
+            if paned.position() != target {
+                applying_layout.set(true);
+                paned.set_position(target);
+                applying_layout.set(false);
+            }
+        });
+    }
+}
 
 #[derive(Clone)]
 pub struct MainWindow {
@@ -55,10 +230,9 @@ struct MainWindowInner {
     cached_chats: RefCell<Vec<crate::bridge::ChatSummary>>,
     /// App-wide toast overlay for surfacing errors + confirmations.
     toast_overlay: adw::ToastOverlay,
-    /// Title of the last toast shown, to suppress consecutive duplicates
-    /// (a reconnect loop otherwise stacks an unbounded backlog of identical
-    /// "Reconnecting…" / error toasts).
-    last_toast_title: RefCell<String>,
+    /// Most recent toast and display time. Reconnect loops are deduplicated,
+    /// but the same useful error may be shown again after a short quiet period.
+    last_toast: RefCell<Option<(String, Instant)>>,
 }
 
 #[derive(Clone)]
@@ -99,32 +273,24 @@ impl MainWindow {
         profile_revealer.set_reveal_child(false);
         profile_revealer.set_hexpand(false);
 
-        // Chat view takes all space, revealer only appears when opened
-        let chat_area = Box::new(Orientation::Horizontal, 0);
+        // Present profile info as an end-aligned side sheet. Keeping it in an
+        // overlay prevents opening a 360px panel from collapsing the message
+        // view on split-screen/narrow windows.
+        let chat_area = gtk4::Overlay::new();
         chat_view.widget().set_hexpand(true);
-        chat_area.append(chat_view.widget());
-        chat_area.append(&profile_revealer);
+        chat_area.set_child(Some(chat_view.widget()));
+        profile_revealer.set_halign(gtk4::Align::End);
+        profile_revealer.set_valign(gtk4::Align::Fill);
+        profile_revealer.set_vexpand(true);
+        chat_area.add_overlay(&profile_revealer);
+        chat_area.set_measure_overlay(&profile_revealer, false);
 
         let chat_view_for_list = chat_view.clone();
         let bridge_for_list = bridge.clone();
         let profile_rev_for_list = profile_revealer.clone();
         let app_for_list = app.clone();
         let chat_list = ChatListPanel::new(bridge.clone(), move |chat_id, chat_name| {
-            let needs_load = chat_view_for_list.open_chat(chat_id.clone(), &chat_name);
-            if needs_load {
-                bridge_for_list.send_command(crate::bridge::WaCommand::LoadChat {
-                    chat_id: chat_id.clone(),
-                    chat_name,
-                });
-            }
-            bridge_for_list.send_command(crate::bridge::WaCommand::MarkRead {
-                chat_id: chat_id.clone(),
-            });
-            // Tell the runtime this chat is now active so it doesn't count
-            // incoming messages for it as unread.
-            bridge_for_list.send_command(crate::bridge::WaCommand::SetActiveChat {
-                chat_id: Some(chat_id.clone()),
-            });
+            activate_chat(&chat_view_for_list, &bridge_for_list, &chat_id, &chat_name);
             // Dismiss any notifications for this chat
             withdraw_chat_notification(&app_for_list, &chat_id);
             // Close profile panel when switching chats
@@ -140,20 +306,16 @@ impl MainWindow {
         let sidebar_stack_for_new = sidebar_stack.clone();
         let chat_view_for_new = chat_view.clone();
         let bridge_for_new = bridge.clone();
+        let chat_list_for_new = chat_list.clone();
+        let profile_rev_for_new = profile_revealer.clone();
+        let app_for_new = app.clone();
         let new_chat_panel = NewChatPanel::new(bridge.clone(), move |jid, name| {
             // Switch back to chat list and open the selected chat
             sidebar_stack_for_new.set_visible_child_name("chats");
-            let needs_load = chat_view_for_new.open_chat(jid.clone(), &name);
-            if needs_load {
-                bridge_for_new.send_command(crate::bridge::WaCommand::LoadChat {
-                    chat_id: jid.clone(),
-                    chat_name: name,
-                });
-            }
-            bridge_for_new.send_command(crate::bridge::WaCommand::SetActiveChat {
-                chat_id: Some(jid.clone()),
-            });
-            bridge_for_new.send_command(crate::bridge::WaCommand::MarkRead { chat_id: jid });
+            activate_chat(&chat_view_for_new, &bridge_for_new, &jid, &name);
+            chat_list_for_new.select_chat(&jid);
+            profile_rev_for_new.set_reveal_child(false);
+            withdraw_chat_notification(&app_for_new, &jid);
         });
         sidebar_stack.add_named(new_chat_panel.widget(), Some("new-chat"));
 
@@ -162,17 +324,19 @@ impl MainWindow {
             bridge.clone(),
             &sidebar_stack,
             chat_view.clone(),
+            &profile_revealer,
         );
         sidebar_stack.add_named(&send_groups_panel, Some("send-groups"));
 
         sidebar_stack.set_visible_child_name("chats");
 
+        let settings = SettingsHandle::new();
+
         let paned = gtk4::Paned::new(Orientation::Horizontal);
         paned.set_start_child(Some(&sidebar_stack));
         paned.set_end_child(Some(&chat_area));
-        paned.set_position(SIDEBAR_WIDTH);
-        paned.set_shrink_start_child(false);
-        paned.set_shrink_end_child(false);
+        paned.set_shrink_start_child(true);
+        paned.set_shrink_end_child(true);
         // When the WINDOW is resized (drag corner / maximize), the sidebar
         // stays at whatever width the user dragged it to via the internal
         // divider — only the message panel grows. Without this, both panes
@@ -181,6 +345,7 @@ impl MainWindow {
         // The user can still resize the sidebar by dragging the divider.
         paned.set_resize_start_child(false);
         paned.set_resize_end_child(true);
+        configure_sidebar_pane(&paned, &settings);
 
         // Sync banner — pulsing progress bar shown while history syncs.
         // A progress bar pulses smoothly via the GTK animation framework,
@@ -247,7 +412,12 @@ impl MainWindow {
         // Wire after inner is created (need inner for profile data)
         // Done below after inner is constructed
 
-        rail_bottom.append(&own_avatar);
+        let own_avatar_btn = Button::new();
+        own_avatar_btn.add_css_class("flat");
+        own_avatar_btn.add_css_class("circular");
+        own_avatar_btn.set_tooltip_text(Some("Your profile"));
+        own_avatar_btn.set_child(Some(&own_avatar));
+        rail_bottom.append(&own_avatar_btn);
 
         icon_rail.append(&rail_top);
         icon_rail.append(&rail_bottom);
@@ -283,7 +453,29 @@ impl MainWindow {
 
         window.set_content(Some(&toolbar_view));
 
-        let settings = SettingsHandle::new();
+        // Compact breakpoints retain all primary actions while reclaiming
+        // horizontal room: favourites collapse first, then the sidebar/profile
+        // settle at smaller but still usable widths.
+        let compact = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            900.0,
+            adw::LengthUnit::Sp,
+        ));
+        compact.add_setter(&rail_top, "visible", Some(&false.to_value()));
+        compact.add_setter(&icon_rail, "width-request", Some(&52i32.to_value()));
+        window.add_breakpoint(compact);
+
+        let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+            adw::BreakpointConditionLengthType::MaxWidth,
+            700.0,
+            adw::LengthUnit::Sp,
+        ));
+        narrow.add_setter(
+            profile_panel.widget(),
+            "width-request",
+            Some(&300i32.to_value()),
+        );
+        window.add_breakpoint(narrow);
 
         let inner = Rc::new(MainWindowInner {
             window,
@@ -309,15 +501,13 @@ impl MainWindow {
             own_profile_data: RefCell::new(None),
             cached_chats: RefCell::new(Vec::new()),
             toast_overlay,
-            last_toast_title: RefCell::new(String::new()),
+            last_toast: RefCell::new(None),
         });
 
         // Wire own avatar click → open profile window with cached data
         {
             let inner_c = inner.clone();
-            let avatar_click = gtk4::GestureClick::new();
-            avatar_click.set_button(1);
-            avatar_click.connect_released(move |_, _, _, _| {
+            own_avatar_btn.connect_clicked(move |_| {
                 let name = inner_c
                     .own_avatar
                     .text()
@@ -328,7 +518,6 @@ impl MainWindow {
                 let parent = inner_c.window.upcast_ref::<gtk4::Window>();
                 open_own_profile_window(Some(parent), &inner_c.bridge, &name, data.as_ref(), &jid);
             });
-            inner.own_avatar.add_controller(avatar_click);
         }
 
         // Wire settings button
@@ -397,6 +586,11 @@ impl MainWindow {
             }
         });
 
+        inner.profile_panel.connect_close_requested({
+            let profile_rev = inner.profile_revealer.clone();
+            move || profile_rev.set_reveal_child(false)
+        });
+
         // Escape dismisses the profile side panel. Previously the only close
         // paths were re-clicking the chat header or switching chats — a keyboard
         // user couldn't dismiss it at all. Capture phase so it fires even when a
@@ -420,17 +614,16 @@ impl MainWindow {
         inner.profile_panel.connect_chat_selected({
             let chat_view = inner.chat_view.clone();
             let bridge_ref = inner.bridge.clone();
+            let chat_list = inner.chat_list.clone();
+            let sidebar_stack = inner.sidebar_stack.clone();
             let profile_rev = inner.profile_revealer.clone();
+            let app = inner.gtk_app.clone();
             move |chat_id, chat_name| {
-                let needs_load = chat_view.open_chat(chat_id.clone(), &chat_name);
-                if needs_load {
-                    bridge_ref.send_command(crate::bridge::WaCommand::LoadChat {
-                        chat_id: chat_id.clone(),
-                        chat_name,
-                    });
-                }
-                bridge_ref.send_command(crate::bridge::WaCommand::MarkRead { chat_id });
+                activate_chat(&chat_view, &bridge_ref, &chat_id, &chat_name);
+                sidebar_stack.set_visible_child_name("chats");
+                chat_list.select_chat(&chat_id);
                 profile_rev.set_reveal_child(false);
+                withdraw_chat_notification(&app, &chat_id);
             }
         });
 
@@ -466,11 +659,17 @@ impl MainWindow {
                         gtk4::glib::timeout_add_local(
                             std::time::Duration::from_millis(250),
                             move || {
-                                if tray_handle.show_requested.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                if tray_handle
+                                    .show_requested
+                                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                                {
                                     win_poll.set_visible(true);
                                     win_poll.present();
                                 }
-                                if tray_handle.quit_requested.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                                if tray_handle
+                                    .quit_requested
+                                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                                {
                                     app_poll.quit();
                                     return gtk4::glib::ControlFlow::Break;
                                 }
@@ -499,11 +698,11 @@ impl MainWindow {
                 if win.is_active()
                     && let Some(chat_id) = inner_active.chat_view.current_chat_id()
                 {
-                    inner_active.bridge.send_command(
-                        crate::bridge::WaCommand::SetActiveChat {
+                    inner_active
+                        .bridge
+                        .send_command(crate::bridge::WaCommand::SetActiveChat {
                             chat_id: Some(chat_id),
-                        },
-                    );
+                        });
                 }
             });
         }
@@ -523,10 +722,8 @@ impl MainWindow {
         // window AND opens the originating chat (previously the click did nothing).
         {
             let inner_c = inner.clone();
-            let action = gtk4::gio::SimpleAction::new(
-                "open-chat",
-                Some(gtk4::glib::VariantTy::STRING),
-            );
+            let action =
+                gtk4::gio::SimpleAction::new("open-chat", Some(gtk4::glib::VariantTy::STRING));
             action.connect_activate(move |_, param| {
                 let Some(chat_id) = param.and_then(|p| p.get::<String>()) else {
                     return;
@@ -537,28 +734,13 @@ impl MainWindow {
                     .chat_list
                     .chat_name(&chat_id)
                     .unwrap_or_else(|| chat_id.clone());
-                let needs_load = inner_c.chat_view.open_chat(chat_id.clone(), &chat_name);
-                if needs_load {
-                    inner_c.bridge.send_command(crate::bridge::WaCommand::LoadChat {
-                        chat_id: chat_id.clone(),
-                        chat_name,
-                    });
-                }
+                activate_chat(&inner_c.chat_view, &inner_c.bridge, &chat_id, &chat_name);
                 // Make the sidebar selection follow: force the chat-list page
                 // and highlight the opened row so the sidebar isn't out of sync
                 // with the message panel after a notification click.
                 inner_c.sidebar_stack.set_visible_child_name("chats");
                 inner_c.chat_list.select_chat(&chat_id);
-                inner_c
-                    .bridge
-                    .send_command(crate::bridge::WaCommand::MarkRead {
-                        chat_id: chat_id.clone(),
-                    });
-                inner_c
-                    .bridge
-                    .send_command(crate::bridge::WaCommand::SetActiveChat {
-                        chat_id: Some(chat_id.clone()),
-                    });
+                inner_c.profile_revealer.set_reveal_child(false);
                 withdraw_chat_notification(&inner_c.gtk_app, &chat_id);
             });
             inner.gtk_app.add_action(&action);
@@ -694,7 +876,7 @@ impl MainWindow {
                     let safe = phone.replace(['/', '\\', '@', ':'], "_");
                     let path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
                     if path.exists() {
-                        if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&path) {
+                        if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&path, 128) {
                             inner.own_avatar.set_custom_image(Some(&tex));
                         }
                     }
@@ -753,7 +935,9 @@ impl MainWindow {
                     {
                         log::debug!(
                             "ChatsLoaded: resolved {} → {} via LID→phone map ({})",
-                            c.id, name, phone_jid
+                            c.id,
+                            name,
+                            phone_jid
                         );
                         c.name = name.clone();
                         continue;
@@ -762,7 +946,8 @@ impl MainWindow {
                     if let Some(name) = crate::contacts::global().lookup(&c.id) {
                         log::debug!(
                             "ChatsLoaded: resolved {} → {} via global directory",
-                            c.id, name
+                            c.id,
+                            name
                         );
                         c.name = name;
                         continue;
@@ -774,7 +959,8 @@ impl MainWindow {
                     {
                         log::debug!(
                             "ChatsLoaded: resolved {} → {} via LID→phone→global",
-                            c.id, name
+                            c.id,
+                            name
                         );
                         c.name = name;
                     }
@@ -815,21 +1001,33 @@ impl MainWindow {
                         let local = c.id.split('@').next().unwrap_or("");
                         let has_device = local.contains(':');
                         match best_idx.get(&phone).copied() {
-                            None => { best_idx.insert(phone, i); }
+                            None => {
+                                best_idx.insert(phone, i);
+                            }
                             Some(prev) => {
                                 let prev_local = chats[prev].id.split('@').next().unwrap_or("");
                                 let prev_has_device = prev_local.contains(':');
                                 // Prefer clean JID (no device suffix)
                                 if prev_has_device && !has_device {
-                                    log::info!("Dedup: replacing {} with {} for phone {}", chats[prev].id, c.id, phone);
+                                    log::info!(
+                                        "Dedup: replacing {} with {} for phone {}",
+                                        chats[prev].id,
+                                        c.id,
+                                        phone
+                                    );
                                     best_idx.insert(phone, i);
                                 } else if !prev_has_device && has_device {
-                                    log::info!("Dedup: dropping {} — clean {} already kept", c.id, chats[prev].id);
+                                    log::info!(
+                                        "Dedup: dropping {} — clean {} already kept",
+                                        c.id,
+                                        chats[prev].id
+                                    );
                                 }
                             }
                         }
                     }
-                    let keep: std::collections::HashSet<usize> = best_idx.values().copied().collect();
+                    let keep: std::collections::HashSet<usize> =
+                        best_idx.values().copied().collect();
                     let mut idx = 0;
                     chats.retain(|_| {
                         let kept = keep.contains(&idx);
@@ -843,31 +1041,24 @@ impl MainWindow {
 
                 // Cache chat list for multi-send
                 *inner.cached_chats.borrow_mut() = chats.clone();
+                for chat in &chats {
+                    inner
+                        .chat_view
+                        .set_chat_favorite(&chat.id, chat.is_favorite);
+                }
 
-                // Progressive loading: load first INITIAL_BATCH immediately so the
-                // user sees content fast, then add remaining chats in idle callbacks
-                // so the GTK event loop can paint and answer WM pings in between.
-                const INITIAL_BATCH: usize = 30;
-                const CHUNK_SIZE: usize = 20;
-
-                // Remove stale rows that aren't in the new data
-                let incoming_ids: std::collections::HashSet<&str> =
-                    chats.iter().map(|c| c.id.as_str()).collect();
-                inner.chat_list.remove_stale(&incoming_ids);
-
-                // Load the first visible batch synchronously
-                let (first, rest) = if chats.len() > INITIAL_BATCH {
-                    let rest = chats.split_off(INITIAL_BATCH);
-                    (chats, rest)
-                } else {
-                    (chats, Vec::new())
-                };
+                // ListBox is not virtualized. Keep every lightweight summary
+                // searchable, but let ChatListPanel materialize only its bounded
+                // recent working set (plus pinned/favourite/search rows).
+                inner.chat_list.load_catalog(&chats);
 
                 // Re-fetch group names for any @g.us chat with a person-like name (max 5)
                 {
                     let mut refetch_count = 0u32;
-                    for c in first.iter().chain(rest.iter()) {
-                        if refetch_count >= 5 { break; }
+                    for c in &chats {
+                        if refetch_count >= 5 {
+                            break;
+                        }
                         if c.id.ends_with("@g.us") {
                             let words: Vec<&str> = c.name.split_whitespace().collect();
                             let looks_like_person = words.len() <= 3
@@ -877,69 +1068,28 @@ impl MainWindow {
                                         && w.len() < 20
                                 });
                             if looks_like_person {
-                                inner.bridge.send_command(
-                                    crate::bridge::WaCommand::GetGroupInfo {
+                                inner
+                                    .bridge
+                                    .send_command(crate::bridge::WaCommand::GetGroupInfo {
                                         chat_id: c.id.clone(),
-                                    },
-                                );
+                                    });
                                 refetch_count += 1;
                             }
                         }
                     }
                 }
 
-                for chat in &first {
-                    // Remove @lid duplicate when a phone JID version arrives
-                    if chat.id.ends_with("@s.whatsapp.net") {
-                        inner.chat_list.remove_lid_duplicate(&chat.name);
-                    }
-                    // Bulk load: apply_summary creates missing rows AND refreshes
-                    // existing ones verbatim (add_chat is now create-only, meant
-                    // for ChatAdded's non-monotonic payloads).
-                    inner.chat_list.apply_summary(chat);
-                }
-                inner.chat_list.invalidate();
-
-                // Populate rail favourites + new chat panel from the first batch
-                // (will be refreshed once all chats are loaded)
-                let all_chats_for_rail: Vec<_> = first.iter().chain(rest.iter()).cloned().collect();
                 populate_rail_favourites(
                     &inner.rail_favourites,
-                    &all_chats_for_rail,
+                    &chats,
                     &inner.chat_view,
                     &inner.bridge,
+                    &inner.chat_list,
+                    &inner.sidebar_stack,
+                    &inner.profile_revealer,
+                    &inner.gtk_app,
                 );
-                inner
-                    .new_chat_panel
-                    .load_contacts(&all_chats_for_rail, &contacts);
-
-                // Schedule remaining chats in idle chunks
-                if !rest.is_empty() {
-                    let chat_list = inner.chat_list.clone();
-                    let chunks: Vec<Vec<_>> = rest.chunks(CHUNK_SIZE).map(|c| c.to_vec()).collect();
-                    let chunk_idx = std::rc::Rc::new(std::cell::Cell::new(0usize));
-
-                    gtk4::glib::idle_add_local(move || {
-                        let idx = chunk_idx.get();
-                        if idx >= chunks.len() {
-                            chat_list.invalidate();
-                            return gtk4::glib::ControlFlow::Break;
-                        }
-                        for chat in &chunks[idx] {
-                            if chat.id.ends_with("@s.whatsapp.net") {
-                                chat_list.remove_lid_duplicate(&chat.name);
-                            }
-                            // Bulk load: create-or-refresh verbatim (see above).
-                            chat_list.apply_summary(chat);
-                        }
-                        chunk_idx.set(idx + 1);
-                        // If this is the last chunk, do a final invalidate
-                        if idx + 1 >= chunks.len() {
-                            chat_list.invalidate();
-                        }
-                        gtk4::glib::ControlFlow::Continue
-                    });
-                }
+                inner.new_chat_panel.load_contacts(&chats, &contacts);
             }
             WaEvent::ChatAdded(chat) => {
                 // When a phone JID chat arrives, remove any @lid duplicate for
@@ -951,16 +1101,25 @@ impl MainWindow {
                 // to pick it up. A debounced refresh handles bursts of adds
                 // during initial sync without hammering load_chats().
                 let needs_rail_refresh = chat.is_pinned || chat.is_favorite;
+                inner
+                    .chat_view
+                    .set_chat_favorite(&chat.id, chat.is_favorite);
                 inner.chat_list.add_chat(chat);
                 if needs_rail_refresh {
                     let rail = inner.rail_favourites.clone();
                     let cv = inner.chat_view.clone();
                     let br = inner.bridge.clone();
+                    let list = inner.chat_list.clone();
+                    let stack = inner.sidebar_stack.clone();
+                    let profile = inner.profile_revealer.clone();
+                    let app = inner.gtk_app.clone();
                     glib::timeout_add_local_once(
                         std::time::Duration::from_millis(800),
                         move || {
                             let chats = crate::ui::runtime::load_chats();
-                            populate_rail_favourites(&rail, &chats, &cv, &br);
+                            populate_rail_favourites(
+                                &rail, &chats, &cv, &br, &list, &stack, &profile, &app,
+                            );
                         },
                     );
                 }
@@ -971,6 +1130,9 @@ impl MainWindow {
                 // deliberately NO remove_lid_duplicate / rail refresh here (that's
                 // why ChatAdded is not reused — its handler has per-chat side
                 // effects that must not fire on every message).
+                inner
+                    .chat_view
+                    .set_chat_favorite(&chat.id, chat.is_favorite);
                 inner.chat_list.apply_summary(&chat);
             }
             WaEvent::MessageReceived(msg) => {
@@ -989,17 +1151,17 @@ impl MainWindow {
                 // so they're no longer typing. Do this BEFORE appending so the
                 // dots disappear at the same time the message appears.
                 if !msg.is_from_me {
-                    inner.chat_view.set_typing_indicator(
-                        &msg.chat_id, &msg.sender_name, false,
-                    );
-                    inner.chat_list.set_typing(
-                        &msg.chat_id, &msg.sender_name, false,
-                    );
+                    inner
+                        .chat_view
+                        .set_typing_indicator(&msg.chat_id, &msg.sender_name, false);
+                    inner
+                        .chat_list
+                        .set_typing(&msg.chat_id, &msg.sender_name, false);
                 }
 
                 // Append to chat view FIRST so the message body appears before
                 // the chat list preview updates (fixes visual race condition).
-                inner.chat_view.append_message(msg.clone());
+                inner.chat_view.append_message((*msg).clone());
 
                 // Feed the stealth-peek cache and clear any typing overlay. The
                 // row's preview/time/unread/sort are NOT touched here — the
@@ -1049,7 +1211,9 @@ impl MainWindow {
                     now_secs,
                     is_recent,
                     is_gm,
-                    msg.text.as_deref().map(|t| t.chars().take(40).collect::<String>()),
+                    msg.text
+                        .as_deref()
+                        .map(|t| t.chars().take(40).collect::<String>()),
                 );
                 // Auto-detect 2FA codes in incoming SMS/RCS messages and pop
                 // them into the clipboard with an OSD-style notification. Gated on
@@ -1273,19 +1437,32 @@ impl MainWindow {
                 let rail = inner.rail_favourites.clone();
                 let cv = inner.chat_view.clone();
                 let br = inner.bridge.clone();
+                let list = inner.chat_list.clone();
+                let stack = inner.sidebar_stack.clone();
+                let profile = inner.profile_revealer.clone();
+                let app = inner.gtk_app.clone();
                 glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
                     let chats = crate::ui::runtime::load_chats();
-                    populate_rail_favourites(&rail, &chats, &cv, &br);
+                    populate_rail_favourites(
+                        &rail, &chats, &cv, &br, &list, &stack, &profile, &app,
+                    );
                 });
             }
             WaEvent::ChatFavorited { chat_id, favorite } => {
                 inner.chat_list.set_chat_favorite(&chat_id, favorite);
+                inner.chat_view.set_chat_favorite(&chat_id, favorite);
                 let rail = inner.rail_favourites.clone();
                 let cv = inner.chat_view.clone();
                 let br = inner.bridge.clone();
+                let list = inner.chat_list.clone();
+                let stack = inner.sidebar_stack.clone();
+                let profile = inner.profile_revealer.clone();
+                let app = inner.gtk_app.clone();
                 glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
                     let chats = crate::ui::runtime::load_chats();
-                    populate_rail_favourites(&rail, &chats, &cv, &br);
+                    populate_rail_favourites(
+                        &rail, &chats, &cv, &br, &list, &stack, &profile, &app,
+                    );
                 });
             }
             WaEvent::ChatDeleted { chat_id } => {
@@ -1389,14 +1566,20 @@ impl MainWindow {
                 inner.chat_view.set_quick_replies(replies);
             }
             WaEvent::ContactProfile {
-                about, avatar_path, ..
+                chat_id,
+                phone,
+                about,
+                avatar_path,
             } => {
-                inner
-                    .profile_panel
-                    .set_contact_profile(about.as_deref(), avatar_path.as_deref());
+                inner.profile_panel.set_contact_profile(
+                    &chat_id,
+                    &phone,
+                    about.as_deref(),
+                    avatar_path.as_deref(),
+                );
             }
-            WaEvent::GroupsInCommon { groups, .. } => {
-                inner.profile_panel.set_groups_in_common(&groups);
+            WaEvent::GroupsInCommon { chat_id, groups } => {
+                inner.profile_panel.set_groups_in_common(&chat_id, &groups);
             }
             WaEvent::GroupProfile {
                 chat_id,
@@ -1407,6 +1590,7 @@ impl MainWindow {
                 ..
             } => {
                 inner.profile_panel.set_group_profile(
+                    &chat_id,
                     &subject,
                     description.as_deref(),
                     &participants,
@@ -1417,14 +1601,31 @@ impl MainWindow {
                     .chat_view
                     .set_group_members(&chat_id, participants.clone());
             }
-            WaEvent::GroupInviteLink { link, .. } => {
-                inner.profile_panel.set_invite_link(&link);
+            WaEvent::GroupInviteLink { chat_id, link } => {
+                inner.profile_panel.set_invite_link(&chat_id, &link);
             }
-            WaEvent::GifResults { gifs } => {
-                inner.chat_view.show_gif_results(gifs);
+            WaEvent::GifResults {
+                request_id,
+                query,
+                gifs,
+                error,
+            } => {
+                inner
+                    .chat_view
+                    .show_gif_results(request_id, &query, gifs, error.as_deref());
             }
-            WaEvent::StickerResults { stickers } => {
-                inner.chat_view.show_sticker_results(stickers);
+            WaEvent::StickerResults {
+                request_id,
+                query,
+                stickers,
+                error,
+            } => {
+                inner.chat_view.show_sticker_results(
+                    request_id,
+                    &query,
+                    stickers,
+                    error.as_deref(),
+                );
             }
             WaEvent::OwnProfile {
                 name,
@@ -1474,7 +1675,17 @@ impl MainWindow {
             }
             // ── Global search results ────────────────────────────────────
             WaEvent::GlobalSearchResults { query, results } => {
-                show_global_search_results(&inner.window, &inner.bridge, &inner.chat_view, &query, results);
+                show_global_search_results(
+                    &inner.window,
+                    &inner.bridge,
+                    &inner.chat_view,
+                    &inner.chat_list,
+                    &inner.sidebar_stack,
+                    &inner.profile_revealer,
+                    &inner.gtk_app,
+                    &query,
+                    results,
+                );
             }
             // ── Calls ────────────────────────────────────────────────────
             WaEvent::IncomingCall {
@@ -1483,7 +1694,13 @@ impl MainWindow {
                 is_video,
             } => {
                 let kind = if is_video { "video" } else { "voice" };
-                show_incoming_call_dialog(&inner.window, &inner.bridge, &chat_id, &caller_name, is_video);
+                show_incoming_call_dialog(
+                    &inner.window,
+                    &inner.bridge,
+                    &chat_id,
+                    &caller_name,
+                    is_video,
+                );
                 log::info!("Incoming {kind} call from {caller_name} ({chat_id})");
             }
             WaEvent::CallEnded { chat_id, reason } => {
@@ -1515,16 +1732,45 @@ impl MainWindow {
     }
 }
 
-/// Add a toast, skipping it if its text is identical to the last toast shown
-/// consecutively. A reconnect loop emits the same "Reconnecting…"/error text
-/// repeatedly; without this guard those stack into an unbounded backlog that
-/// blocks the UI for minutes.
+const TOAST_DEDUP_WINDOW: Duration = Duration::from_secs(5);
+
+/// Add a toast, suppressing a rapid duplicate without permanently silencing a
+/// recurring error. A reconnect loop can emit the same text many times per
+/// second, while a later occurrence is still useful feedback.
 fn show_toast_deduped(inner: &MainWindowInner, msg: &str) {
-    if inner.last_toast_title.borrow().as_str() == msg {
+    let now = Instant::now();
+    if !toast_should_show(inner.last_toast.borrow().as_ref(), msg, now) {
         return;
     }
-    *inner.last_toast_title.borrow_mut() = msg.to_string();
+    *inner.last_toast.borrow_mut() = Some((msg.to_string(), now));
     inner.toast_overlay.add_toast(adw::Toast::new(msg));
+}
+
+fn toast_should_show(last: Option<&(String, Instant)>, msg: &str, now: Instant) -> bool {
+    !matches!(
+        last,
+        Some((last_msg, shown_at))
+            if last_msg == msg && now.saturating_duration_since(*shown_at) < TOAST_DEDUP_WINDOW
+    )
+}
+
+/// Single navigation path used by the sidebar, search, notification actions,
+/// profile links and favourites rail. Keeping these commands together avoids
+/// a visually-open chat remaining inactive in the runtime.
+fn activate_chat(chat_view: &ChatViewPanel, bridge: &Arc<Bridge>, chat_id: &str, chat_name: &str) {
+    let needs_load = chat_view.open_chat(chat_id.to_string(), chat_name);
+    if needs_load {
+        bridge.send_command(WaCommand::LoadChat {
+            chat_id: chat_id.to_string(),
+            chat_name: chat_name.to_string(),
+        });
+    }
+    bridge.send_command(WaCommand::SetActiveChat {
+        chat_id: Some(chat_id.to_string()),
+    });
+    bridge.send_command(WaCommand::MarkRead {
+        chat_id: chat_id.to_string(),
+    });
 }
 
 /// Extract just the phone number from a JID for dedup comparison.
@@ -1563,6 +1809,10 @@ fn populate_rail_favourites(
     chats: &[crate::bridge::ChatSummary],
     chat_view: &crate::ui::chat_view::ChatViewPanel,
     bridge: &Arc<crate::bridge::Bridge>,
+    chat_list: &ChatListPanel,
+    sidebar_stack: &Stack,
+    profile_revealer: &Revealer,
+    app: &adw::Application,
 ) {
     // Clear existing
     while let Some(child) = container.first_child() {
@@ -1611,12 +1861,17 @@ fn populate_rail_favourites(
         let safe = chat.id.replace(['/', '\\', '@', ':'], "_");
         let avatar_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
         if avatar_path.exists() {
-            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&avatar_path) {
+            if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&avatar_path, 96) {
                 av.set_custom_image(Some(&tex));
             }
         }
 
-        overlay.set_child(Some(&av));
+        let open_btn = Button::new();
+        open_btn.add_css_class("flat");
+        open_btn.add_css_class("circular");
+        open_btn.set_tooltip_text(Some(&format!("Open {}", chat.name)));
+        open_btn.set_child(Some(&av));
+        overlay.set_child(Some(&open_btn));
 
         // Unread badge
         if chat.unread_count > 0 {
@@ -1633,21 +1888,17 @@ fn populate_rail_favourites(
         let chat_name = chat.name.clone();
         let cv = chat_view.clone();
         let br = bridge.clone();
-        let gesture = gtk4::GestureClick::new();
-        gesture.set_button(1);
-        gesture.connect_released(move |_, _, _, _| {
-            let needs_load = cv.open_chat(chat_id.clone(), &chat_name);
-            if needs_load {
-                br.send_command(crate::bridge::WaCommand::LoadChat {
-                    chat_id: chat_id.clone(),
-                    chat_name: chat_name.clone(),
-                });
-            }
-            br.send_command(crate::bridge::WaCommand::MarkRead {
-                chat_id: chat_id.clone(),
-            });
+        let list = chat_list.clone();
+        let stack = sidebar_stack.clone();
+        let profile = profile_revealer.clone();
+        let app = app.clone();
+        open_btn.connect_clicked(move |_| {
+            activate_chat(&cv, &br, &chat_id, &chat_name);
+            stack.set_visible_child_name("chats");
+            list.select_chat(&chat_id);
+            profile.set_reveal_child(false);
+            withdraw_chat_notification(&app, &chat_id);
         });
-        overlay.add_controller(gesture);
 
         // Drag source — provides the chat_id as string content
         let drag_source = gtk4::DragSource::new();
@@ -1738,10 +1989,12 @@ fn open_own_profile_window(
 
     // Escape closes, matching the app's other dialogs (chat_view.rs).
     let key = gtk4::EventControllerKey::new();
-    let win_key = window.clone();
+    let win_weak = window.downgrade();
     key.connect_key_pressed(move |_, keyval, _, _| {
         if keyval == gtk4::gdk::Key::Escape {
-            win_key.close();
+            if let Some(window) = win_weak.upgrade() {
+                window.close();
+            }
             gtk4::glib::Propagation::Stop
         } else {
             gtk4::glib::Propagation::Proceed
@@ -1778,7 +2031,7 @@ fn open_own_profile_window(
         {
             let fname = entry.file_name().to_string_lossy().to_string();
             if fname.starts_with(own_phone) && fname.ends_with(".jpg") {
-                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(entry.path()) {
+                if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(entry.path(), 192) {
                     avatar.set_custom_image(Some(&tex));
                 }
                 break;
@@ -1795,8 +2048,11 @@ fn open_own_profile_window(
     {
         let br = bridge.clone();
         let av = avatar.clone();
-        let win = window.clone();
+        let window_weak = window.downgrade();
         change_photo_btn.connect_clicked(move |_| {
+            let Some(window) = window_weak.upgrade() else {
+                return;
+            };
             let dialog = gtk4::FileDialog::builder()
                 .title("Choose Profile Photo")
                 .build();
@@ -1810,7 +2066,7 @@ fn open_own_profile_window(
             dialog.set_filters(Some(&filters));
             let br2 = br.clone();
             let av2 = av.clone();
-            dialog.open(Some(&win), gtk4::gio::Cancellable::NONE, move |result| {
+            dialog.open(Some(&window), gtk4::gio::Cancellable::NONE, move |result| {
                 if let Ok(file) = result {
                     if let Some(path) = file.path() {
                         let path_str = path.to_string_lossy().to_string();
@@ -1820,13 +2076,11 @@ fn open_own_profile_window(
                         // this path's mtime in the cache. invalidate() ensures
                         // the next call from elsewhere reloads too.
                         crate::ui::texture_cache::invalidate(&path);
-                        if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&path) {
+                        if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&path, 192) {
                             av2.set_custom_image(Some(&tex));
                         }
                         // Send to WhatsApp
-                        br2.send_command(WaCommand::SetProfilePicture {
-                            path: path_str,
-                        });
+                        br2.send_command(WaCommand::SetProfilePicture { path: path_str });
                     }
                 }
             });
@@ -1967,13 +2221,17 @@ fn open_own_profile_window(
 
     let cancel_btn = Button::with_label("Cancel");
     cancel_btn.add_css_class("flat");
-    let win_cancel = window.clone();
-    cancel_btn.connect_clicked(move |_| win_cancel.close());
+    let window_weak = window.downgrade();
+    cancel_btn.connect_clicked(move |_| {
+        if let Some(window) = window_weak.upgrade() {
+            window.close();
+        }
+    });
 
     let bridge_c = bridge.clone();
     let name_c = name_entry.clone();
     let about_c = about_entry.clone();
-    let win_save = window.clone();
+    let window_weak = window.downgrade();
     save_btn.connect_clicked(move |_| {
         let new_name = name_c.text().to_string();
         let new_about = about_c.text().to_string();
@@ -1984,7 +2242,9 @@ fn open_own_profile_window(
             bridge_c.send_command(crate::bridge::WaCommand::SetStatus { text: new_about });
         }
         // TODO: save business-specific fields (description, hours, etc.)
-        win_save.close();
+        if let Some(window) = window_weak.upgrade() {
+            window.close();
+        }
     });
 
     btn_row.append(&cancel_btn);
@@ -2131,7 +2391,10 @@ mod twofa_tests {
     #[test]
     fn ignores_friend_texts() {
         assert_eq!(detect_two_factor_code("call me at 1234"), None);
-        assert_eq!(detect_two_factor_code("see you at 4pm, bring 5 beers"), None);
+        assert_eq!(
+            detect_two_factor_code("see you at 4pm, bring 5 beers"),
+            None
+        );
     }
     #[test]
     fn ignores_long_runs() {
@@ -2191,13 +2454,21 @@ fn show_global_search_results(
     parent: &adw::ApplicationWindow,
     bridge: &Arc<crate::bridge::Bridge>,
     chat_view: &crate::ui::chat_view::ChatViewPanel,
+    chat_list: &ChatListPanel,
+    sidebar_stack: &Stack,
+    profile_revealer: &Revealer,
+    app: &adw::Application,
     query: &str,
     results: Vec<crate::bridge::SearchHit>,
 ) {
     use gtk4::{Label, ListBox, Orientation, ScrolledWindow, SelectionMode};
 
     let dialog = gtk4::Window::builder()
-        .title(&format!("Search: \"{}\" — {} results", query, results.len()))
+        .title(&format!(
+            "Search: \"{}\" — {} results",
+            query,
+            results.len()
+        ))
         .default_width(600)
         .default_height(500)
         .modal(true)
@@ -2221,7 +2492,11 @@ fn show_global_search_results(
                 .title(&hit.text.chars().take(120).collect::<String>())
                 .subtitle(&format!(
                     "{} — {}",
-                    if hit.sender_name.is_empty() { "You" } else { &hit.sender_name },
+                    if hit.sender_name.is_empty() {
+                        "You"
+                    } else {
+                        &hit.sender_name
+                    },
                     format_timestamp(hit.timestamp),
                 ))
                 .activatable(true)
@@ -2229,18 +2504,24 @@ fn show_global_search_results(
 
             let chat_id = hit.chat_id.clone();
             let chat_name = hit.chat_name.clone();
+            let msg_id = hit.msg_id.clone();
             let cv = chat_view.clone();
             let br = bridge.clone();
-            let dlg = dialog.clone();
+            let chat_list = chat_list.clone();
+            let sidebar_stack = sidebar_stack.clone();
+            let profile_revealer = profile_revealer.clone();
+            let app = app.clone();
+            let dialog_weak = dialog.downgrade();
             row.connect_activated(move |_| {
-                let needs_load = cv.open_chat(chat_id.clone(), &chat_name);
-                if needs_load {
-                    br.send_command(crate::bridge::WaCommand::LoadChat {
-                        chat_id: chat_id.clone(),
-                        chat_name: chat_name.clone(),
-                    });
+                activate_chat(&cv, &br, &chat_id, &chat_name);
+                cv.jump_to_message(&msg_id);
+                sidebar_stack.set_visible_child_name("chats");
+                chat_list.select_chat(&chat_id);
+                profile_revealer.set_reveal_child(false);
+                withdraw_chat_notification(&app, &chat_id);
+                if let Some(dialog) = dialog_weak.upgrade() {
+                    dialog.close();
                 }
-                dlg.close();
             });
             list.append(&row);
         }
@@ -2255,10 +2536,12 @@ fn show_global_search_results(
 
     // Escape closes, matching the app's other dialogs.
     let key = gtk4::EventControllerKey::new();
-    let dlg_key = dialog.clone();
+    let dialog_weak = dialog.downgrade();
     key.connect_key_pressed(move |_, keyval, _, _| {
         if keyval == gtk4::gdk::Key::Escape {
-            dlg_key.close();
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.close();
+            }
             gtk4::glib::Propagation::Stop
         } else {
             gtk4::glib::Propagation::Proceed
@@ -2299,15 +2582,13 @@ fn show_incoming_call_dialog(
 
     let br = bridge.clone();
     let cid = chat_id.to_string();
-    dialog.connect_response(None, move |_, response| {
-        match response {
-            "accept" => br.send_command(WaCommand::AcceptCall {
-                chat_id: cid.clone(),
-            }),
-            _ => br.send_command(WaCommand::RejectCall {
-                chat_id: cid.clone(),
-            }),
-        }
+    dialog.connect_response(None, move |_, response| match response {
+        "accept" => br.send_command(WaCommand::AcceptCall {
+            chat_id: cid.clone(),
+        }),
+        _ => br.send_command(WaCommand::RejectCall {
+            chat_id: cid.clone(),
+        }),
     });
     dialog.present(Some(parent));
 }
@@ -2356,7 +2637,8 @@ pub fn show_multi_send_window(
     list.set_selection_mode(SelectionMode::None);
     list.add_css_class("boxed-list");
 
-    let checks: Rc<RefCell<Vec<(String, CheckButton)>>> = Rc::new(RefCell::new(Vec::new()));
+    let checks: Rc<RefCell<Vec<(String, gtk4::glib::WeakRef<CheckButton>)>>> =
+        Rc::new(RefCell::new(Vec::new()));
 
     for chat in chats {
         let row = Box::new(Orientation::Horizontal, 8);
@@ -2378,7 +2660,9 @@ pub fn show_multi_send_window(
         row.append(&type_lbl);
         list.append(&row);
 
-        checks.borrow_mut().push((chat.id.clone(), check.clone()));
+        checks
+            .borrow_mut()
+            .push((chat.id.clone(), check.downgrade()));
 
         // Enforce 8-chat limit
         let checks_c = checks.clone();
@@ -2387,12 +2671,14 @@ pub fn show_multi_send_window(
             let count = checks_c
                 .borrow()
                 .iter()
-                .filter(|(_, cb)| cb.is_active())
+                .filter(|(_, cb)| cb.upgrade().is_some_and(|cb| cb.is_active()))
                 .count();
             counter_c.set_text(&format!("{} / 8 selected", count));
             // Disable unchecked boxes when at limit
             for (_, cb) in checks_c.borrow().iter() {
-                if !cb.is_active() {
+                if let Some(cb) = cb.upgrade()
+                    && !cb.is_active()
+                {
                     cb.set_sensitive(count < 8);
                 }
             }
@@ -2417,7 +2703,7 @@ pub fn show_multi_send_window(
 
     let br = bridge.clone();
     let checks_c = checks.clone();
-    let win_c = window.clone();
+    let window_weak = window.downgrade();
     send_btn.connect_clicked(move |_| {
         let text = msg_entry.text().to_string();
         if text.trim().is_empty() {
@@ -2426,7 +2712,7 @@ pub fn show_multi_send_window(
         let selected: Vec<String> = checks_c
             .borrow()
             .iter()
-            .filter(|(_, cb)| cb.is_active())
+            .filter(|(_, cb)| cb.upgrade().is_some_and(|cb| cb.is_active()))
             .map(|(id, _)| id.clone())
             .collect();
         if selected.is_empty() {
@@ -2436,7 +2722,9 @@ pub fn show_multi_send_window(
             chat_ids: selected,
             text,
         });
-        win_c.close();
+        if let Some(window) = window_weak.upgrade() {
+            window.close();
+        }
     });
     vbox.append(&send_btn);
 
@@ -2471,6 +2759,7 @@ fn build_send_groups_panel(
     bridge: Arc<crate::bridge::Bridge>,
     sidebar_stack: &gtk4::Stack,
     chat_view: crate::ui::chat_view::ChatViewPanel,
+    profile_revealer: &Revealer,
 ) -> Box {
     use gtk4::{Label, ListBox, Orientation, ScrolledWindow, SelectionMode};
 
@@ -2538,6 +2827,7 @@ fn build_send_groups_panel(
         let bridge_c = bridge.clone();
         let sidebar_stack_c = sidebar_stack.clone();
         let chat_view_c = chat_view.clone();
+        let profile_revealer_c = profile_revealer.clone();
         Rc::new(move || {
             while let Some(child) = list_c.first_child() {
                 list_c.remove(&child);
@@ -2571,9 +2861,13 @@ fn build_send_groups_panel(
                 let sg_name = sg.name.clone();
                 let cv = chat_view_c.clone();
                 let stack_send = sidebar_stack_c.clone();
+                let bridge_send = bridge_c.clone();
+                let profile_send = profile_revealer_c.clone();
                 send_btn.connect_clicked(move |_| {
                     cv.open_send_group(&sg_name, chat_ids.clone());
+                    bridge_send.send_command(WaCommand::SetActiveChat { chat_id: None });
                     stack_send.set_visible_child_name("chats");
+                    profile_send.set_reveal_child(false);
                 });
 
                 // Edit members button
@@ -2732,3 +3026,58 @@ fn build_send_groups_panel(
 
 // show_send_group_compose removed — send groups now use the main ChatViewPanel
 // via chat_view.open_send_group()
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_CHAT_WIDTH, MIN_SIDEBAR_WIDTH,
+        TOAST_DEDUP_WINDOW, effective_sidebar_width, sanitize_sidebar_width, toast_should_show,
+    };
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn toast_dedup_only_suppresses_recent_identical_text() {
+        let shown_at = Instant::now();
+        let last = ("Reconnecting…".to_string(), shown_at);
+
+        assert!(!toast_should_show(
+            Some(&last),
+            "Reconnecting…",
+            shown_at + Duration::from_secs(1)
+        ));
+        assert!(toast_should_show(
+            Some(&last),
+            "Connected",
+            shown_at + Duration::from_secs(1)
+        ));
+        assert!(toast_should_show(
+            Some(&last),
+            "Reconnecting…",
+            shown_at + TOAST_DEDUP_WINDOW
+        ));
+    }
+
+    #[test]
+    fn sidebar_width_uses_a_safe_default_for_missing_or_bad_state() {
+        assert_eq!(sanitize_sidebar_width(None), DEFAULT_SIDEBAR_WIDTH);
+        assert_eq!(
+            sanitize_sidebar_width(Some(MIN_SIDEBAR_WIDTH - 1)),
+            DEFAULT_SIDEBAR_WIDTH
+        );
+        assert_eq!(
+            sanitize_sidebar_width(Some(MAX_SIDEBAR_WIDTH + 1)),
+            DEFAULT_SIDEBAR_WIDTH
+        );
+        assert_eq!(sanitize_sidebar_width(Some(475)), 475);
+    }
+
+    #[test]
+    fn sidebar_width_is_temporarily_clamped_on_narrow_windows() {
+        assert_eq!(effective_sidebar_width(475, 1200), 475);
+        assert_eq!(effective_sidebar_width(475, MIN_CHAT_WIDTH + 420), 420);
+        assert_eq!(
+            effective_sidebar_width(475, MIN_CHAT_WIDTH + 200),
+            MIN_SIDEBAR_WIDTH
+        );
+    }
+}
