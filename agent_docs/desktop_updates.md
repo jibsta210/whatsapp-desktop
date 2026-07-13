@@ -12,6 +12,8 @@ declared size, and SHA-256 hash have all been verified.
   workflow run with the `stable` input.
 - Both releases retain fixed asset names so clients can follow a channel
   without discovering version-specific URLs.
+- Each fixed channel tag is moved to the exact commit used for its current
+  assets, preserving useful release and rollback metadata.
 
 The app defaults to Stable. The Updates settings page can switch to Canary or
 Manual, start a check immediately, and restart into a staged update.

@@ -99,12 +99,17 @@ jobs:
               --notes "Managed ${CHANNEL} channel. Assets are replaced only after the full test suite passes." \
               "${EXTRA[@]}"
           fi
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG}" \
+            -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          gh release edit "$TAG" --target "$GITHUB_SHA" \
+            --notes "Managed ${CHANNEL} channel. Assets are replaced only after the full test suite passes."
           gh release upload "$TAG" --clobber \
             whatsapp-desktop-linux-x86_64 \
             whatsapp-desktop-linux-x86_64.json
 
       - name: Retain exact build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: whatsapp-desktop-${{ env.CHANNEL }}-${{ github.run_number }}
           path: |
