@@ -484,6 +484,17 @@ impl WhatsAppApp {
             // sync data and caused self-messages to be dropped at the protocol level)
             let (event_tx, event_rx) = async_channel::unbounded::<WaEvent>();
 
+            // Check for a signed whole-app update after startup settles. The
+            // download runs off the GTK thread and is only staged; applying it
+            // waits for restart, with the current binary retained for rollback.
+            if startup_settings.auto_update && startup_settings.update_channel != "manual" {
+                let update_channel = startup_settings.update_channel.clone();
+                let update_events = event_tx.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_secs(12), move || {
+                    crate::updater::check_for_updates(update_channel, false, Some(update_events));
+                });
+            }
+
             let bridge = Arc::new(Bridge { cmd_tx });
 
             // Spawn Tokio runtime in background thread
@@ -529,6 +540,9 @@ impl WhatsAppApp {
                         Err(_) => break,
                     };
                     let batch_started = std::time::Instant::now();
+                    if matches!(&first, WaEvent::Connected { .. }) {
+                        crate::updater::mark_healthy();
+                    }
                     win_clone.handle_event(first);
 
                     // Drain queued cheap events until the count or time budget.

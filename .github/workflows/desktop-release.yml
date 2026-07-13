@@ -1,0 +1,113 @@
+name: Desktop auto-update release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'desktop/**'
+      - 'src/**'
+      - 'wacore/**'
+      - 'waproto/**'
+      - 'storages/**'
+      - 'transports/**'
+      - 'http_clients/**'
+      - 'gmessages-rust/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/desktop-release.yml'
+      - 'scripts/make_update_manifest.sh'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Release channel to publish
+        required: true
+        type: choice
+        default: stable
+        options: [stable, canary]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: desktop-release-${{ github.event_name == 'workflow_dispatch' && inputs.channel || 'canary' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PROTOC_VERSION: '3.25.3'
+
+jobs:
+  build-test-publish:
+    name: Build, verify, and publish signed desktop update
+    runs-on: ubuntu-24.04
+    env:
+      CHANNEL: ${{ github.event_name == 'workflow_dispatch' && inputs.channel || 'canary' }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libssl-dev libdbus-1-dev jq
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-04-05
+
+      - name: Install protoc
+        uses: taiki-e/install-action@v2
+        with:
+          tool: protoc@${{ env.PROTOC_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test protocol and desktop
+        run: cargo test -p whatsapp-rust -p whatsapp-desktop -p gmessages-rust
+
+      - name: Build release binary
+        env:
+          WHATSAPP_BUILD_ID: ${{ github.run_number }}
+        run: cargo build --release -p whatsapp-desktop
+
+      - name: Create signed update assets
+        env:
+          UPDATE_SIGNING_KEY_PEM: ${{ secrets.WHATSAPP_UPDATE_SIGNING_KEY_PEM }}
+        run: |
+          test -n "$UPDATE_SIGNING_KEY_PEM"
+          umask 077
+          printf '%s' "$UPDATE_SIGNING_KEY_PEM" > update-signing-key.pem
+          chmod +x scripts/make_update_manifest.sh
+          TARGET_DIR=$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)
+          cp "$TARGET_DIR/release/whatsapp-desktop" whatsapp-desktop-linux-x86_64
+          VERSION=$(sed -n '/^\[package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' desktop/Cargo.toml | head -1)
+          TAG="desktop-${CHANNEL}"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/whatsapp-desktop-linux-x86_64"
+          scripts/make_update_manifest.sh \
+            whatsapp-desktop-linux-x86_64 "$CHANNEL" "$VERSION" "${GITHUB_RUN_NUMBER}" \
+            "$URL" update-signing-key.pem whatsapp-desktop-linux-x86_64.json
+          rm -f update-signing-key.pem
+
+      - name: Publish fixed-channel release assets
+        run: |
+          TAG="desktop-${CHANNEL}"
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            EXTRA=()
+            if [[ "$CHANNEL" == canary ]]; then EXTRA+=(--prerelease); fi
+            gh release create "$TAG" --target "$GITHUB_SHA" \
+              --title "WhatsApp Desktop ${CHANNEL^}" \
+              --notes "Managed ${CHANNEL} channel. Assets are replaced only after the full test suite passes." \
+              "${EXTRA[@]}"
+          fi
+          gh release upload "$TAG" --clobber \
+            whatsapp-desktop-linux-x86_64 \
+            whatsapp-desktop-linux-x86_64.json
+
+      - name: Retain exact build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: whatsapp-desktop-${{ env.CHANNEL }}-${{ github.run_number }}
+          path: |
+            whatsapp-desktop-linux-x86_64
+            whatsapp-desktop-linux-x86_64.json
+          retention-days: 30

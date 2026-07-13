@@ -25,6 +25,7 @@ mod contacts;
 mod gm_qr_state;
 mod gmessages_runtime;
 mod ui;
+mod updater;
 
 use app::WhatsAppApp;
 
@@ -124,6 +125,14 @@ fn main() {
     // path in the app (whatsapp.db, wa_avatars/, wa_messages/, …)
     // lands in ~/.local/share/whatsapp-desktop/ instead of $HOME.
     let data_dir = ensure_data_dir();
+
+    // Apply a previously downloaded update before GTK or any worker thread
+    // starts. The updater replaces the on-disk executable atomically and then
+    // execs it in-place, preserving the service PID. If the replacement failed
+    // to reach a healthy WhatsApp connection on its previous run, this call
+    // restores the retained known-good executable instead.
+    updater::handle_startup_update(&data_dir);
+
     std::env::set_current_dir(&data_dir)
         .unwrap_or_else(|e| panic!("failed to chdir to {}: {}", data_dir.display(), e));
 

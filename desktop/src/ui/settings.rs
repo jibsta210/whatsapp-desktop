@@ -60,6 +60,13 @@ pub struct AppSettings {
     /// Close to tray instead of quitting
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
+    // ── Application updates ──
+    /// Download signed application updates in the background.
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
+    /// Update channel: "stable", "canary", or "manual".
+    #[serde(default = "default_update_channel")]
+    pub update_channel: String,
     // ── Audio ──
     /// PulseAudio/PipeWire source name for voice recording (empty = "default")
     #[serde(default)]
@@ -72,6 +79,10 @@ fn default_ai_model() -> String {
 
 fn default_theme() -> String {
     "dark".to_string()
+}
+
+fn default_update_channel() -> String {
+    "stable".to_string()
 }
 
 fn default_true() -> bool {
@@ -94,6 +105,8 @@ impl Default for AppSettings {
             zoom_level: 0.0, // 0.0 = auto-detect
             sidebar_width: None,
             close_to_tray: true,
+            auto_update: true,
+            update_channel: "stable".to_string(),
             audio_input: String::new(),
         }
     }
@@ -644,6 +657,116 @@ pub fn show_settings_window(
     behave_page.add(&account_group);
 
     window.add(&behave_page);
+
+    // ── Application updates page ───────────────────────────────────────
+    let updates_page = adw::PreferencesPage::new();
+    updates_page.set_title("Updates");
+    updates_page.set_icon_name(Some("software-update-available-symbolic"));
+
+    let updates_group = adw::PreferencesGroup::new();
+    updates_group.set_title("Automatic Updates");
+    updates_group.set_description(Some(
+        "Signed releases download in the background, install on restart, and retain the previous build for automatic rollback.",
+    ));
+
+    let version_row = adw::ActionRow::new();
+    version_row.set_title("Installed Version");
+    version_row.set_subtitle(&crate::updater::current_version_label());
+    updates_group.add(&version_row);
+
+    let auto_row = adw::SwitchRow::new();
+    auto_row.set_title("Automatic Downloads");
+    auto_row.set_subtitle("Check silently and stage verified updates for the next restart");
+    auto_row.set_active(settings.get().auto_update);
+    let sh = settings.clone();
+    auto_row.connect_active_notify(move |row| {
+        sh.update(|s| s.auto_update = row.is_active());
+    });
+    updates_group.add(&auto_row);
+
+    let channel_row = adw::ComboRow::new();
+    channel_row.set_title("Update Channel");
+    channel_row.set_subtitle("Stable is recommended; Canary receives protocol fixes earlier");
+    let channels = gtk4::StringList::new(&["Stable", "Canary", "Manual"]);
+    channel_row.set_model(Some(&channels));
+    channel_row.set_selected(match settings.get().update_channel.as_str() {
+        "canary" => 1,
+        "manual" => 2,
+        _ => 0,
+    });
+    let sh = settings.clone();
+    channel_row.connect_selected_notify(move |row| {
+        let channel = match row.selected() {
+            1 => "canary",
+            2 => "manual",
+            _ => "stable",
+        };
+        sh.update(|s| s.update_channel = channel.to_string());
+    });
+    updates_group.add(&channel_row);
+
+    let status_row = adw::ActionRow::new();
+    status_row.set_title("Update Status");
+    status_row.set_subtitle(&crate::updater::status().message);
+
+    let check_btn = gtk4::Button::with_label("Check Now");
+    check_btn.set_valign(gtk4::Align::Center);
+    {
+        let settings = settings.clone();
+        let status_weak = status_row.downgrade();
+        check_btn.connect_clicked(move |_| {
+            let channel = match settings.get().update_channel.as_str() {
+                "canary" => "canary",
+                _ => "stable",
+            };
+            crate::updater::check_for_updates(channel.to_string(), true, None);
+            if let Some(row) = status_weak.upgrade() {
+                row.set_subtitle("Checking for updates…");
+            }
+        });
+    }
+    status_row.add_suffix(&check_btn);
+
+    let restart_update_btn = gtk4::Button::with_label("Restart & Install");
+    restart_update_btn.set_valign(gtk4::Align::Center);
+    restart_update_btn.add_css_class("suggested-action");
+    restart_update_btn.set_visible(crate::updater::status().ready);
+    {
+        let status_weak = status_row.downgrade();
+        restart_update_btn.connect_clicked(move |_| {
+            if let Err(error) = crate::updater::restart_to_apply()
+                && let Some(row) = status_weak.upgrade()
+            {
+                row.set_subtitle(&format!("Could not restart: {error}"));
+            }
+        });
+    }
+    status_row.add_suffix(&restart_update_btn);
+    updates_group.add(&status_row);
+    updates_page.add(&updates_group);
+    window.add(&updates_page);
+
+    // Refresh status while the preferences window exists. Update work runs on
+    // a worker thread; this polling keeps GTK ownership on the main thread.
+    {
+        let status_weak = status_row.downgrade();
+        let check_weak = check_btn.downgrade();
+        let restart_weak = restart_update_btn.downgrade();
+        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+            let (Some(row), Some(check), Some(restart)) = (
+                status_weak.upgrade(),
+                check_weak.upgrade(),
+                restart_weak.upgrade(),
+            ) else {
+                return gtk4::glib::ControlFlow::Break;
+            };
+            let status = crate::updater::status();
+            row.set_subtitle(&status.message);
+            check.set_sensitive(!status.checking);
+            restart.set_visible(status.ready);
+            gtk4::glib::ControlFlow::Continue
+        });
+    }
 
     // ── Google Messages page (optional) ─────────────────────────────────
     // Hidden unless the user has set GMESSAGES_ENABLE=1 (during the
