@@ -1547,7 +1547,17 @@ fn build_video_widget(container: &Box, path: &str) {
     popout_btn.set_margin_end(4);
     popout_btn.set_tooltip_text(Some("Open fullscreen"));
     let path_popout = path.to_string();
+    let video_weak_popout = video.downgrade();
+    let play_weak_popout = play_btn.downgrade();
     popout_btn.connect_clicked(move |_| {
+        if let Some(video) = video_weak_popout.upgrade()
+            && let Some(stream) = video.media_stream()
+        {
+            stream.pause();
+        }
+        if let Some(play) = play_weak_popout.upgrade() {
+            play.set_visible(true);
+        }
         open_video_window(&path_popout);
     });
     overlay.add_overlay(&popout_btn);
