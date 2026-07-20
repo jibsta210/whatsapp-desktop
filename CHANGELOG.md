@@ -10,6 +10,19 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## Autocorrect: @mentions are untouchable
+
+The inline autocorrector was overwriting `@name` while the user was mid-mention (the AI
+pass fires after a 400 ms typing pause — exactly the pause of reading the mention popup —
+and the local word-corrector treated `@An` as a typo). Four layers of protection:
+- **desktop/src/ui/autocorrect.rs**: (1) the local word-corrector skips any token
+  containing `@` (mentions + emails); (2) the AI pass doesn't even fire while the token at
+  the cursor starts with `@` (mention in progress — re-arms on next keystroke); (3) HARD
+  guarantee at apply time: if the corrected text does not preserve every `@token` from the
+  live buffer verbatim, the entire correction is discarded; (4) the system prompt now
+  instructs the model to reproduce `@mentions` character-for-character.
+- Revert: `git revert <commit>`.
+
 ## Preview single-source-of-truth refactor (`FIXPLAN-PREVIEW-SSOT.md`)
 
 The sidebar row was patched by 16 independent UI-side writers using 4 different clocks —

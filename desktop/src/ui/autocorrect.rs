@@ -1293,9 +1293,7 @@ pub fn start_ai_corrector() {
     let (tx, rx) = std::sync::mpsc::channel::<AiCorrectionRequest>();
     let _ = AI_TX.set(tx);
 
-    log::info!(
-        "AI autocorrect enabled (provider read live from settings; currently '{provider}')"
-    );
+    log::info!("AI autocorrect enabled (provider read live from settings; currently '{provider}')");
     std::thread::Builder::new()
         .name("ai-autocorrect".into())
         .spawn(move || {
@@ -1358,6 +1356,7 @@ fn clean_ai_response(raw: &str) -> String {
 const AC_SYSTEM_PROMPT: &str = "Act as a savvy editor for a WhatsApp message input. Fix the user's bad typing and poor spelling so they look professional. \
 \nMANDATORY: always capitalize the first letter of every sentence and the pronoun 'I'. Do this even for short, casual, or entirely lowercase messages — correct capitalization is REQUIRED and takes priority over preserving a casual lowercase look. \
 \nDO NOT modify any nouns, hard numbers, URLs, acronyms, or slang when you are able to contextually identify them. \
+\nNEVER touch @mentions: any token starting with '@' (like '@Anna') must be reproduced character-for-character exactly where it appears. \
 \nDo not expand contractions or short forms (e.g. leave 'don't' as 'don't', leave 'u' as 'u', leave 'rn' as 'rn'). \
 \nDo not correct internet slang (e.g. 'finna', 'no cap', 'slay', 'fr', 'tbh', 'lmk'). \
 \nOnly fix unintentional typos and missing essential punctuation. You may improve sentence structure. Keep the writer's original voice and vibe — EXCEPT that capitalization and spelling must ALWAYS be corrected. \
@@ -1396,7 +1395,11 @@ fn ai_corrector_loop(rx: std::sync::mpsc::Receiver<AiCorrectionRequest>) {
                 if !MISSING_KEY_WARNED.swap(true, Ordering::Relaxed) {
                     log::warn!(
                         "AI autocorrect: provider '{provider}' is selected but its API key is empty — corrections are a no-op. Paste the {} key in Settings → AI Autocorrect.",
-                        if provider == "deepseek" { "DeepSeek" } else { "Gemini" }
+                        if provider == "deepseek" {
+                            "DeepSeek"
+                        } else {
+                            "Gemini"
+                        }
                     );
                 }
             } else {
@@ -1620,8 +1623,7 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                 bs_flag.set(true);
             }
             // Ctrl+Z: skip next AI pass
-            if key == gtk4::gdk::Key::z
-                && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+            if key == gtk4::gdk::Key::z && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
             {
                 bs_flag.set(true); // treat Ctrl+Z like backspace for revert purposes
             }
@@ -1772,7 +1774,12 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                 }
                 let word = buf.text(&word_start, &trigger_iter, false).to_string();
                 log::debug!("autocorrect: local trigger word='{word}'");
-                if !word.is_empty() && !ignored_local.borrow().contains(&word.to_lowercase()) {
+                // Never correct @mentions (or emails) — the token is a name/handle,
+                // not a word, and rewriting it mid-type destroys the mention flow.
+                if !word.is_empty()
+                    && !word.contains('@')
+                    && !ignored_local.borrow().contains(&word.to_lowercase())
+                {
                     if let Some(corrected) = correct_word(&word) {
                         log::info!("autocorrect: local correction '{word}' → '{corrected}'");
                         let offset_start = word_start.offset();
@@ -1840,6 +1847,31 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                     .to_string();
                 if full_text.trim().len() < 3 {
                     return;
+                }
+
+                // A mention is being typed at the cursor ("@An…"): the 400ms pause
+                // that triggered this pass is the user reading the mention popup —
+                // rewriting the buffer now would clobber the mention mid-flight.
+                // Skip the pass entirely; it re-arms on the next keystroke.
+                {
+                    let cursor = buf_ref.cursor_position();
+                    let cursor_iter = buf_ref.iter_at_offset(cursor);
+                    let mut tok_start = cursor_iter.clone();
+                    loop {
+                        if !tok_start.backward_char() {
+                            break;
+                        }
+                        let c = tok_start.char();
+                        if c.is_whitespace() || c == '\n' {
+                            tok_start.forward_char();
+                            break;
+                        }
+                    }
+                    let tok = buf_ref.text(&tok_start, &cursor_iter, false).to_string();
+                    if tok.starts_with('@') {
+                        log::debug!("AI autocorrect: skipping — mention in progress at cursor");
+                        return;
+                    }
                 }
 
                 if let Some(tx) = AI_TX.get() {
@@ -1931,6 +1963,27 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                                     };
 
                                     if apply_text == current {
+                                        AI_IN_FLIGHT
+                                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                                        return gtk4::glib::ControlFlow::Break;
+                                    }
+
+                                    // HARD GUARANTEE for @mentions: every @token in the
+                                    // live buffer must survive the correction verbatim
+                                    // (the prompt asks the model to preserve them, but the
+                                    // client enforces it). If any would be altered or
+                                    // dropped, discard the entire correction — a lost
+                                    // autocorrect pass is cheap, a mangled mention is not.
+                                    let mentions_preserved = current
+                                        .split_whitespace()
+                                        .filter(|w| w.starts_with('@') && w.len() > 1)
+                                        .all(|m| {
+                                            apply_text.split_whitespace().any(|w| w == m)
+                                        });
+                                    if !mentions_preserved {
+                                        log::info!(
+                                            "AI autocorrect: discarding correction (would alter an @mention)"
+                                        );
                                         AI_IN_FLIGHT
                                             .store(false, std::sync::atomic::Ordering::Relaxed);
                                         return gtk4::glib::ControlFlow::Break;
