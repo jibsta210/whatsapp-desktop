@@ -85,8 +85,7 @@ pub fn get() -> Option<String> {
 /// Cross-thread signal: settings page → gm runtime to drop the current
 /// connection and re-run pairing. Set true from the UI; the runtime
 /// observes via `take_repair_request` and resets the flag.
-static REPAIR_REQUESTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static REPAIR_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Settings UI calls this when the user clicks "Re-pair…".
 pub fn request_repair() {
@@ -101,8 +100,7 @@ pub fn take_repair_request() -> bool {
 
 /// Cross-thread signal: settings page → gm runtime to attempt Gaia
 /// (Firefox-cookie based) pairing. Read + cleared by the runtime.
-static GAIA_REQUESTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static GAIA_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub fn request_gaia_pair() {
     GAIA_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -145,7 +143,10 @@ pub fn answer_gaia_confirmation(confirmed: bool) {
 
 /// Runtime polls this to consume the user's answer.
 pub fn take_gaia_confirmation() -> Option<bool> {
-    state().write().ok().and_then(|mut s| s.gaia_confirmation.take())
+    state()
+        .write()
+        .ok()
+        .and_then(|mut s| s.gaia_confirmation.take())
 }
 
 /// Runtime publishes status updates here; settings reads them via `get_gaia_status`.
@@ -156,21 +157,25 @@ pub fn set_gaia_status(status: GaiaStatus) {
 }
 
 pub fn get_gaia_status() -> GaiaStatus {
-    state().read().map(|s| s.gaia_status.clone()).unwrap_or(GaiaStatus::Idle)
+    state()
+        .read()
+        .map(|s| s.gaia_status.clone())
+        .unwrap_or(GaiaStatus::Idle)
 }
 
 /// Runtime publishes the list of Google accounts; settings shows them as
 /// a dropdown. Pass `None` to clear.
-pub fn set_available_accounts(
-    accounts: Option<Vec<gmessages_rust::accounts::GoogleAccount>>,
-) {
+pub fn set_available_accounts(accounts: Option<Vec<gmessages_rust::accounts::GoogleAccount>>) {
     if let Ok(mut s) = state().write() {
         s.available_accounts = accounts;
     }
 }
 
 pub fn get_available_accounts() -> Option<Vec<gmessages_rust::accounts::GoogleAccount>> {
-    state().read().ok().and_then(|s| s.available_accounts.clone())
+    state()
+        .read()
+        .ok()
+        .and_then(|s| s.available_accounts.clone())
 }
 
 /// Settings UI calls this when the user picks an account from the dropdown.
@@ -182,5 +187,8 @@ pub fn answer_chosen_authuser(authuser: u32) {
 
 /// Runtime polls + consumes.
 pub fn take_chosen_authuser() -> Option<u32> {
-    state().write().ok().and_then(|mut s| s.chosen_authuser.take())
+    state()
+        .write()
+        .ok()
+        .and_then(|mut s| s.chosen_authuser.take())
 }

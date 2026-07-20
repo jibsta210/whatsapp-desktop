@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -46,6 +46,8 @@ struct ProfileInner {
     invite_label: Label,
     disappearing_section: Box,
     disappearing_dropdown: gtk4::DropDown,
+    updating_disappearing_dropdown: Cell<bool>,
+    disappearing_by_chat: RefCell<std::collections::HashMap<String, u32>>,
     bridge: Arc<Bridge>,
     share_btn: Button,
     current_chat_id: RefCell<Option<String>>,
@@ -57,13 +59,15 @@ struct ProfileInner {
         std::collections::HashMap<String, (String, Option<String>, Vec<GroupMember>, bool)>,
     >,
     on_chat_selected: RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>,
+    on_close_requested: RefCell<Option<std::boxed::Box<dyn Fn()>>>,
 }
 
 impl ProfilePanel {
     pub fn new(bridge: Arc<Bridge>) -> Self {
         let root = Box::new(Orientation::Vertical, 0);
-        root.set_width_request(425);
+        root.set_width_request(360);
         root.set_vexpand(true);
+        root.add_css_class("background");
 
         // Header with close button
         let header = adw::HeaderBar::new();
@@ -72,6 +76,11 @@ impl ProfilePanel {
         let header_title = Label::new(Some("Profile"));
         header_title.add_css_class("title");
         header.set_title_widget(Some(&header_title));
+
+        let close_btn = Button::from_icon_name("window-close-symbolic");
+        close_btn.add_css_class("flat");
+        close_btn.set_tooltip_text(Some("Close profile"));
+        header.pack_start(&close_btn);
 
         let scroll = ScrolledWindow::new();
         scroll.set_vexpand(true);
@@ -369,13 +378,26 @@ impl ProfilePanel {
             invite_label,
             disappearing_section,
             disappearing_dropdown,
+            updating_disappearing_dropdown: Cell::new(false),
+            disappearing_by_chat: RefCell::new(std::collections::HashMap::new()),
             bridge,
             share_btn,
             current_chat_id: RefCell::new(None),
             loaded_group_subject: RefCell::new(String::new()),
             cached_group_profiles: RefCell::new(std::collections::HashMap::new()),
             on_chat_selected: RefCell::new(None),
+            on_close_requested: RefCell::new(None),
         });
+
+        // A visible, keyboard-focusable close affordance complements Escape.
+        {
+            let inner_c = inner.clone();
+            close_btn.connect_clicked(move |_| {
+                if let Some(cb) = inner_c.on_close_requested.borrow().as_ref() {
+                    cb();
+                }
+            });
+        }
 
         // Auto-save group name when the user presses Enter or leaves the field.
         // Uses a shared closure so both paths run the same logic.
@@ -419,14 +441,20 @@ impl ProfilePanel {
             inner
                 .disappearing_dropdown
                 .connect_selected_notify(move |dd| {
-                    let duration = match dd.selected() {
-                        0 => 0u32,    // Off
-                        1 => 86400,   // 24 hours
-                        2 => 604800,  // 7 days
-                        3 => 7776000, // 90 days
-                        _ => 0,
-                    };
+                    if inner_c.updating_disappearing_dropdown.get() {
+                        return;
+                    }
+                    let duration = disappearing_duration(dd.selected());
                     if let Some(chat_id) = inner_c.current_chat_id.borrow().clone() {
+                        // The current backend command uses the group API, so do
+                        // not expose/send it for direct chats yet.
+                        if !chat_id.ends_with("@g.us") {
+                            return;
+                        }
+                        inner_c
+                            .disappearing_by_chat
+                            .borrow_mut()
+                            .insert(chat_id.clone(), duration);
                         inner_c.bridge.send_command(WaCommand::SetDisappearing {
                             chat_id,
                             duration_secs: duration,
@@ -578,6 +606,11 @@ impl ProfilePanel {
         *self.inner.on_chat_selected.borrow_mut() = Some(std::boxed::Box::new(cb));
     }
 
+    /// Set the callback used by the explicit close button in the panel header.
+    pub fn connect_close_requested(&self, cb: impl Fn() + 'static) {
+        *self.inner.on_close_requested.borrow_mut() = Some(std::boxed::Box::new(cb));
+    }
+
     /// Update the displayed name if this chat is currently open in the panel.
     /// Populate own profile fields with data from the server.
     pub fn set_own_profile(
@@ -659,11 +692,18 @@ impl ProfilePanel {
         inner.avatar.set_text(Some(chat_name));
         inner.members_search.set_text("");
 
+        // Clear response-owned fields before issuing async requests so the
+        // previous profile cannot remain visible while this one is loading.
+        inner.about_label.set_text("");
+        inner.about_section.set_visible(false);
+        inner.invite_label.set_text("");
+        inner.invite_section.set_visible(false);
+
         // Load cached avatar
         let safe = chat_id.replace(['/', '\\', '@', ':'], "_");
         let path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
         if path.exists() {
-            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&path) {
+            if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&path, 192) {
                 inner.avatar.set_custom_image(Some(&tex));
             }
         } else {
@@ -713,6 +753,7 @@ impl ProfilePanel {
             inner.about_section.set_visible(false);
             inner.invite_section.set_visible(false); // shown when link arrives
             inner.disappearing_section.set_visible(true);
+            self.select_disappearing_for_chat(chat_id);
             // Request invite link
             inner.bridge.send_command(WaCommand::GetGroupInviteLink {
                 chat_id: chat_id.to_string(),
@@ -720,7 +761,7 @@ impl ProfilePanel {
             // Use cache if available, otherwise fetch
             let cached = inner.cached_group_profiles.borrow().get(chat_id).cloned();
             if let Some((subject, desc, participants, is_admin)) = cached {
-                self.set_group_profile(&subject, desc.as_deref(), &participants, is_admin);
+                self.set_group_profile(chat_id, &subject, desc.as_deref(), &participants, is_admin);
             } else {
                 inner.bridge.send_command(WaCommand::GetGroupInfo {
                     chat_id: chat_id.to_string(),
@@ -733,8 +774,7 @@ impl ProfilePanel {
             inner.share_btn.set_visible(true);
             inner.members_section.set_visible(false);
             inner.groups_section.set_visible(true);
-            inner.about_section.set_visible(true);
-            inner.disappearing_section.set_visible(true);
+            inner.about_section.set_visible(false);
             // If chat_id is a LID, resolve to the real phone number first
             // so the profile shows a proper +1... phone, not a raw LID like
             // "156753471783022:8@lid".
@@ -745,7 +785,13 @@ impl ProfilePanel {
                     let base = chat_id
                         .split(':')
                         .next()
-                        .map(|b| if b.ends_with("@lid") { b.to_string() } else { format!("{b}@lid") })
+                        .map(|b| {
+                            if b.ends_with("@lid") {
+                                b.to_string()
+                            } else {
+                                format!("{b}@lid")
+                            }
+                        })
                         .unwrap_or_else(|| chat_id.to_string());
                     if let Some(pn) = lid_map.get(&base).cloned() {
                         crate::ui::runtime::display_name_from_jid(&pn)
@@ -763,6 +809,21 @@ impl ProfilePanel {
         }
     }
 
+    fn select_disappearing_for_chat(&self, chat_id: &str) {
+        let duration = self
+            .inner
+            .disappearing_by_chat
+            .borrow()
+            .get(chat_id)
+            .copied()
+            .unwrap_or(0);
+        self.inner.updating_disappearing_dropdown.set(true);
+        self.inner
+            .disappearing_dropdown
+            .set_selected(disappearing_selection(duration));
+        self.inner.updating_disappearing_dropdown.set(false);
+    }
+
     fn load_media_grid(&self, chat_id: &str) {
         let grid = &self.inner.media_grid;
         grid.remove_all();
@@ -775,15 +836,33 @@ impl ProfilePanel {
             self.inner.docs_list.remove(&child);
         }
 
-        // Load messages for this chat
-        let safe = chat_id.replace(['/', '\\', '@', ':'], "_");
-        let msg_path = std::path::PathBuf::from("wa_messages").join(format!("{safe}.json"));
-        let msgs: Vec<crate::bridge::IncomingMessage> =
-            if let Ok(data) = std::fs::read_to_string(&msg_path) {
-                serde_json::from_str(&data).unwrap_or_default()
-            } else {
-                vec![]
+        self.inner.media_count_label.set_text("Loading…");
+
+        // Current history is bincode and can be large. Read/decode it away
+        // from GTK's main thread, then discard stale results if the profile
+        // changed while the read was in flight.
+        let requested_chat_id = chat_id.to_string();
+        let thread_chat_id = requested_chat_id.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let messages = crate::ui::runtime::load_messages(&thread_chat_id);
+            let _ = tx.send_blocking(messages);
+        });
+
+        let panel = self.clone();
+        gtk4::glib::MainContext::default().spawn_local(async move {
+            let Ok(messages) = rx.recv().await else {
+                return;
             };
+            if panel.inner.current_chat_id.borrow().as_deref() != Some(requested_chat_id.as_str()) {
+                return;
+            }
+            panel.render_media_grid(&messages);
+        });
+    }
+
+    fn render_media_grid(&self, msgs: &[crate::bridge::IncomingMessage]) {
+        let grid = &self.inner.media_grid;
 
         // Separate into media (images/videos), links, and documents
         let mut media_count = 0u32;
@@ -802,7 +881,7 @@ impl ProfilePanel {
                     lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".gif");
 
                 if (is_image || is_video) && media_count < 9 {
-                    if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path) {
+                    if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(path, 128) {
                         let pic = Picture::for_paintable(&tex);
                         pic.set_size_request(90, 90);
                         pic.set_content_fit(gtk4::ContentFit::Cover);
@@ -867,31 +946,53 @@ impl ProfilePanel {
         }
 
         let total = media_count + link_count + doc_count;
-        self.inner
-            .media_count_label
-            .set_text(&format!("{total} items"));
+        let count_text = match total {
+            0 => "No media, links or documents".to_string(),
+            1 => "1 item".to_string(),
+            _ => format!("{total} items"),
+        };
+        self.inner.media_count_label.set_text(&count_text);
     }
 
-    pub fn set_contact_profile(&self, about: Option<&str>, avatar_path: Option<&str>) {
-        if let Some(text) = about {
+    pub fn set_contact_profile(
+        &self,
+        chat_id: &str,
+        phone: &str,
+        about: Option<&str>,
+        avatar_path: Option<&str>,
+    ) {
+        if !self.is_current_chat(chat_id) {
+            return;
+        }
+        self.inner.subtitle_label.set_text(phone);
+        if let Some(text) = about.filter(|text| !text.is_empty()) {
             self.inner.about_label.set_text(text);
             self.inner.about_section.set_visible(true);
+        } else {
+            self.inner.about_label.set_text("");
+            self.inner.about_section.set_visible(false);
         }
         if let Some(path) = avatar_path {
-            if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path) {
+            if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(path, 192) {
                 self.inner.avatar.set_custom_image(Some(&tex));
             }
         }
     }
 
     /// Display the group invite link
-    pub fn set_invite_link(&self, link: &str) {
+    pub fn set_invite_link(&self, chat_id: &str, link: &str) {
+        if !self.is_current_chat(chat_id) {
+            return;
+        }
         self.inner.invite_label.set_text(link);
-        self.inner.invite_section.set_visible(true);
+        self.inner.invite_section.set_visible(!link.is_empty());
     }
 
     /// Set groups in common for a contact profile
-    pub fn set_groups_in_common(&self, groups: &[ChatSummary]) {
+    pub fn set_groups_in_common(&self, chat_id: &str, groups: &[ChatSummary]) {
+        if !self.is_current_chat(chat_id) {
+            return;
+        }
         let list = &self.inner.groups_list;
         while let Some(child) = list.first_child() {
             list.remove(&child);
@@ -932,7 +1033,7 @@ impl ProfilePanel {
             let safe = g.id.replace(['/', '\\', '@', ':'], "_");
             let av_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
             if av_path.exists() {
-                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&av_path) {
+                if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&av_path, 96) {
                     av.set_custom_image(Some(&tex));
                 }
             }
@@ -953,22 +1054,24 @@ impl ProfilePanel {
 
     pub fn set_group_profile(
         &self,
+        chat_id: &str,
         subject: &str,
         description: Option<&str>,
         participants: &[GroupMember],
         i_am_admin: bool,
     ) {
         // Cache for fast reopen
-        if let Some(chat_id) = self.inner.current_chat_id.borrow().clone() {
-            self.inner.cached_group_profiles.borrow_mut().insert(
-                chat_id,
-                (
-                    subject.to_string(),
-                    description.map(|s| s.to_string()),
-                    participants.to_vec(),
-                    i_am_admin,
-                ),
-            );
+        self.inner.cached_group_profiles.borrow_mut().insert(
+            chat_id.to_string(),
+            (
+                subject.to_string(),
+                description.map(|s| s.to_string()),
+                participants.to_vec(),
+                i_am_admin,
+            ),
+        );
+        if !self.is_current_chat(chat_id) {
+            return;
         }
         self.inner.name_label.set_text(subject);
         self.inner.group_name_entry.set_text(subject);
@@ -980,6 +1083,9 @@ impl ProfilePanel {
         if let Some(desc) = description.filter(|d| !d.is_empty()) {
             self.inner.about_label.set_text(desc);
             self.inner.about_section.set_visible(true);
+        } else {
+            self.inner.about_label.set_text("");
+            self.inner.about_section.set_visible(false);
         }
 
         while let Some(child) = self.inner.members_list.first_child() {
@@ -1007,7 +1113,7 @@ impl ProfilePanel {
             let safe = member.jid.replace(['/', '\\', '@', ':'], "_");
             let avatar_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
             if avatar_path.exists() {
-                if let Some(tex) = crate::ui::texture_cache::texture_from_filename(&avatar_path) {
+                if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&avatar_path, 96) {
                     av.set_custom_image(Some(&tex));
                 }
             }
@@ -1034,13 +1140,12 @@ impl ProfilePanel {
                 let m_jid = member.jid.clone();
                 let m_name = member.name.clone();
                 let is_admin = i_am_admin;
-                let gesture = gtk4::GestureClick::new();
-                gesture.set_button(0); // any button
-                gesture.connect_released(move |_, _, x, y| {
+                let popover_parent = row.clone();
+                let show_actions = Rc::new(move |x: i32, y: i32| {
                     let popover = gtk4::Popover::new();
-                    popover.set_parent(&inner_c.members_list);
+                    popover.set_parent(&popover_parent);
                     popover.set_has_arrow(false);
-                    let rect = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+                    let rect = gtk4::gdk::Rectangle::new(x, y, 1, 1);
                     popover.set_pointing_to(Some(&rect));
 
                     let vbox = Box::new(Orientation::Vertical, 0);
@@ -1159,7 +1264,13 @@ impl ProfilePanel {
                     popover.set_child(Some(&vbox));
                     popover.popup();
                 });
-                row.add_controller(gesture);
+
+                // ListBoxRow activation is emitted for pointer clicks and
+                // Enter/Space, so every input method opens the same actions.
+                let show_keyboard_actions = show_actions.clone();
+                row.connect_activate(move |row| {
+                    show_keyboard_actions(row.width() / 2, row.height() / 2);
+                });
             }
 
             row.set_child(Some(&hbox));
@@ -1167,6 +1278,48 @@ impl ProfilePanel {
             self.inner.members_list.append(&row);
         }
         self.inner.members_section.set_visible(true);
+    }
+
+    fn is_current_chat(&self, chat_id: &str) -> bool {
+        self.inner.current_chat_id.borrow().as_deref() == Some(chat_id)
+    }
+}
+
+fn disappearing_duration(selected: u32) -> u32 {
+    match selected {
+        1 => 86_400,
+        2 => 604_800,
+        3 => 7_776_000,
+        _ => 0,
+    }
+}
+
+fn disappearing_selection(duration: u32) -> u32 {
+    match duration {
+        86_400 => 1,
+        604_800 => 2,
+        7_776_000 => 3,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{disappearing_duration, disappearing_selection};
+
+    #[test]
+    fn disappearing_options_round_trip() {
+        for selected in 0..=3 {
+            assert_eq!(
+                disappearing_selection(disappearing_duration(selected)),
+                selected
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_disappearing_duration_is_off() {
+        assert_eq!(disappearing_selection(123), 0);
     }
 }
 

@@ -245,7 +245,9 @@ pub fn rotating_cookie_max_age() -> Option<std::time::Duration> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()?
         .as_secs();
-    Some(std::time::Duration::from_secs(now_secs.saturating_sub(creation_secs)))
+    Some(std::time::Duration::from_secs(
+        now_secs.saturating_sub(creation_secs),
+    ))
 }
 
 /// Forcefully invalidate the in-memory cookie cache so the next
@@ -306,7 +308,9 @@ pub fn merge_into_cache(updates: HashMap<String, String>) {
 
 /// Parse a list of `Set-Cookie` header values (`"name=value; Domain=...; Path=..."`)
 /// into a name → value map. Best-effort: malformed entries are skipped.
-pub fn parse_set_cookie_headers<'a>(values: impl IntoIterator<Item = &'a str>) -> HashMap<String, String> {
+pub fn parse_set_cookie_headers<'a>(
+    values: impl IntoIterator<Item = &'a str>,
+) -> HashMap<String, String> {
     let mut out = HashMap::new();
     for raw in values {
         // The cookie name/value pair is everything up to the first `;`.
@@ -406,8 +410,7 @@ pub fn read_default_firefox_cookies() -> Result<HashMap<String, String>> {
     // We need at least these two for SignInGaia to succeed.
     if !cookies.contains_key("SAPISID") {
         return Err(Error::Pairing(
-            "Firefox has Google cookies but SAPISID is missing. Sign in fully and retry."
-                .into(),
+            "Firefox has Google cookies but SAPISID is missing. Sign in fully and retry.".into(),
         ));
     }
     log::info!("gaia: found {} Google cookies in Firefox", cookies.len());

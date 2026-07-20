@@ -55,9 +55,7 @@ pub(crate) fn allow_recovery(peer: &str) -> bool {
     const COOLDOWN: Duration = Duration::from_secs(300);
 
     let now = Instant::now();
-    let mut guard = RECOVERY_BREAKER
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut guard = RECOVERY_BREAKER.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(std::collections::HashMap::new);
     let st = map.entry(peer.to_string()).or_insert(RecoveryPeerState {
         window_start: now,

@@ -90,11 +90,7 @@ pub fn apply_cookie_auth(
     // has a 30s TTL so hot loops don't slam SQLite. If Firefox isn't
     // running we fall back to the caller-supplied snapshot.
     let live = crate::cookies::get_cached_firefox_cookies();
-    let chosen_cookies = if !live.is_empty() {
-        &live
-    } else {
-        cookies
-    };
+    let chosen_cookies = if !live.is_empty() { &live } else { cookies };
     if chosen_cookies.is_empty() {
         return;
     }
@@ -110,10 +106,7 @@ pub fn apply_cookie_auth(
         && let Some(auth) = sapisid_authorization(chosen_cookies, ORIGIN)
         && let Ok(v) = HeaderValue::from_str(&auth)
     {
-        headers.insert(
-            reqwest::header::HeaderName::from_static("authorization"),
-            v,
-        );
+        headers.insert(reqwest::header::HeaderName::from_static("authorization"), v);
     }
     let chosen = authuser
         .map(|n| n.to_string())
@@ -139,7 +132,10 @@ pub fn relay(content_type: &str, accept: &str) -> HeaderMap {
     }
     h.insert("sec-ch-ua-mobile", HeaderValue::from_static(SEC_UA_MOBILE));
     h.insert("user-agent", HeaderValue::from_static(USER_AGENT));
-    h.insert("sec-ch-ua-platform", HeaderValue::from_static("\"Android\""));
+    h.insert(
+        "sec-ch-ua-platform",
+        HeaderValue::from_static("\"Android\""),
+    );
     if let Ok(v) = HeaderValue::from_str(accept) {
         h.insert("accept", v);
     }
@@ -148,6 +144,9 @@ pub fn relay(content_type: &str, accept: &str) -> HeaderMap {
     h.insert("sec-fetch-mode", HeaderValue::from_static("cors"));
     h.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
     h.insert("referer", HeaderValue::from_static(REFERER));
-    h.insert("accept-language", HeaderValue::from_static("en-US,en;q=0.9"));
+    h.insert(
+        "accept-language",
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
     h
 }

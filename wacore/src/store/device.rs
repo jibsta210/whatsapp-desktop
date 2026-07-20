@@ -124,6 +124,7 @@ pub static CHROME_VERSION_SECONDARY: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 pub static CHROME_VERSION_TERTIARY: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(7727);
+const DEFAULT_DEVICE_OS: &str = "Linux";
 
 pub fn set_chrome_version(primary: u32, secondary: u32, tertiary: u32) {
     use std::sync::atomic::Ordering;
@@ -143,7 +144,7 @@ pub fn set_chrome_version(primary: u32, secondary: u32, tertiary: u32) {
 pub fn device_props() -> wa::DeviceProps {
     use std::sync::atomic::Ordering;
     wa::DeviceProps {
-        os: Some("Linux".to_string()),
+        os: Some(DEFAULT_DEVICE_OS.to_string()),
         version: Some(wa::device_props::AppVersion {
             primary: Some(CHROME_VERSION_PRIMARY.load(Ordering::Relaxed)),
             secondary: Some(CHROME_VERSION_SECONDARY.load(Ordering::Relaxed)),
@@ -258,17 +259,18 @@ impl Device {
 
     /// Returns the default OS string used for device props
     pub fn default_os() -> &'static str {
-        "rust"
+        DEFAULT_DEVICE_OS
     }
 
-    /// Returns the default device props version
+    /// Returns the current default device props version.
+    ///
+    /// This reads the same atomics as [`device_props`], so callers see the
+    /// Chrome version selected at startup rather than the retired `0.1.0`
+    /// placeholder.
     pub fn default_device_props_version() -> wa::device_props::AppVersion {
-        wa::device_props::AppVersion {
-            primary: Some(0),
-            secondary: Some(1),
-            tertiary: Some(0),
-            ..Default::default()
-        }
+        device_props()
+            .version
+            .expect("default device props always include a Chrome version")
     }
 
     pub fn is_ready_for_presence(&self) -> bool {

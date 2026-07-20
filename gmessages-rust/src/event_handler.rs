@@ -64,8 +64,8 @@ async fn handle_pair_event(client: &Client, raw: &IncomingRpcMessage) -> Result<
                 if let Some(token_data) = &paired.token_data {
                     auth.tachyon_auth_token = Some(token_data.tachyon_auth_token.clone());
                     auth.tachyon_ttl = token_data.ttl;
-                    auth.tachyon_expiry = chrono::Utc::now().timestamp_millis()
-                        + (token_data.ttl / 1000); // ttl is microseconds
+                    auth.tachyon_expiry =
+                        chrono::Utc::now().timestamp_millis() + (token_data.ttl / 1000); // ttl is microseconds
                 }
             }
             // Persist the now-complete auth.
@@ -171,9 +171,7 @@ async fn handle_update_events(
         }
         Some(update_events::Event::ConversationEvent(evt)) => {
             for conv in evt.data {
-                client.emit(Event::ConversationUpdate {
-                    conversation_id: conv.conversation_id,
-                });
+                client.emit(Event::ConversationUpdate { conversation: conv });
             }
         }
         Some(update_events::Event::TypingEvent(evt)) => {

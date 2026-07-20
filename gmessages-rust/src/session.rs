@@ -99,7 +99,11 @@ pub async fn refresh_auth_token(client: &Client) -> Result<()> {
     // already does a live Firefox-cookie read with a 30s cache, so this
     // POST always ships the freshest cookies. No per-call retry needed.
     let resp: crate::gmproto::authentication::RegisterRefreshResponse = client
-        .post_protobuf(crate::urls::REGISTER_REFRESH, &payload, crate::http::ContentType::PBLite)
+        .post_protobuf(
+            crate::urls::REGISTER_REFRESH,
+            &payload,
+            crate::http::ContentType::PBLite,
+        )
         .await?;
     let token_data = resp
         .token_data
@@ -123,7 +127,10 @@ pub async fn refresh_auth_token(client: &Client) -> Result<()> {
         auth.tachyon_ttl = ttl_us;
         auth.tachyon_expiry = chrono::Utc::now().timestamp_millis() + ttl_us / 1000;
     }
-    log::info!("refresh_auth_token: renewed; new TTL = {} hours", token_data.ttl / 3_600_000_000);
+    log::info!(
+        "refresh_auth_token: renewed; new TTL = {} hours",
+        token_data.ttl / 3_600_000_000
+    );
     client.notify_auth_changed().await;
     Ok(())
 }
@@ -272,7 +279,13 @@ pub async fn send_rpc_with_id<Req: prost::Message + ReflectMessage>(
     let post_result = client
         .inner
         .http
-        .post::<OutgoingRpcMessage, OutgoingRpcResponse>(url, &payload, ContentType::PBLite, &cookies, authuser)
+        .post::<OutgoingRpcMessage, OutgoingRpcResponse>(
+            url,
+            &payload,
+            ContentType::PBLite,
+            &cookies,
+            authuser,
+        )
         .await;
 
     if let Err(e) = post_result {
@@ -455,14 +468,10 @@ pub async fn send_text(client: &Client, to: &str, text: &str) -> Result<String> 
         reply: None,
     };
 
-    let resp_bytes = send_rpc::<SendMessageRequest>(
-        client,
-        ActionType::SendMessage,
-        Some(&req),
-        true,
-    )
-    .await?
-    .ok_or_else(|| Error::Protocol("send_text: no response".into()))?;
+    let resp_bytes =
+        send_rpc::<SendMessageRequest>(client, ActionType::SendMessage, Some(&req), true)
+            .await?
+            .ok_or_else(|| Error::Protocol("send_text: no response".into()))?;
     let resp = SendMessageResponse::decode(&*resp_bytes.decrypted).map_err(Error::from)?;
     log::info!("send_text: response status={}", resp.status);
     Ok(tmp_id)
@@ -490,10 +499,14 @@ pub async fn get_or_create_conversation(client: &Client, phone: &str) -> Result<
     )
     .await?
     .ok_or_else(|| Error::Protocol("get_or_create_conversation: no response".into()))?;
-    let resp = GetOrCreateConversationResponse::decode(&*resp_bytes.decrypted).map_err(Error::from)?;
-    let conv = resp
-        .conversation
-        .ok_or_else(|| Error::Protocol(format!("no conversation in response (status={})", resp.status)))?;
+    let resp =
+        GetOrCreateConversationResponse::decode(&*resp_bytes.decrypted).map_err(Error::from)?;
+    let conv = resp.conversation.ok_or_else(|| {
+        Error::Protocol(format!(
+            "no conversation in response (status={})",
+            resp.status
+        ))
+    })?;
     if conv.conversation_id.is_empty() {
         return Err(Error::Protocol("empty conversation_id in response".into()));
     }
@@ -582,14 +595,13 @@ pub async fn download_media(
         "download_media: got {} encrypted bytes for media_id={media_id}, decrypting…",
         encrypted.len()
     );
-    let plain = crate::crypto::aesgcm::decrypt(decryption_key, &encrypted)
-        .map_err(|e| {
-            log::warn!(
-                "download_media: AES-GCM decrypt failed (key len={}): {e}",
-                decryption_key.len()
-            );
-            e
-        })?;
+    let plain = crate::crypto::aesgcm::decrypt(decryption_key, &encrypted).map_err(|e| {
+        log::warn!(
+            "download_media: AES-GCM decrypt failed (key len={}): {e}",
+            decryption_key.len()
+        );
+        e
+    })?;
     log::info!(
         "download_media: success media_id={media_id}, {} encrypted → {} plaintext bytes",
         encrypted.len(),
@@ -635,7 +647,10 @@ fn media_upload_headers(
 ) -> reqwest::header::HeaderMap {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     let mut h = HeaderMap::new();
-    h.insert("sec-ch-ua", HeaderValue::from_static(crate::headers::SEC_UA));
+    h.insert(
+        "sec-ch-ua",
+        HeaderValue::from_static(crate::headers::SEC_UA),
+    );
     if let Some(p) = protocol
         && let Ok(v) = HeaderValue::from_str(p)
     {
@@ -764,7 +779,9 @@ pub async fn upload_media(
         return Err(Error::AuthRevoked);
     }
     if !status.is_success() {
-        return Err(Error::Protocol(format!("upload_media start: HTTP {status}")));
+        return Err(Error::Protocol(format!(
+            "upload_media start: HTTP {status}"
+        )));
     }
     let upload_url = resp
         .headers()
@@ -872,9 +889,10 @@ pub async fn send_media(
         force_rcs: false,
         reply: None,
     };
-    let resp_bytes = send_rpc::<SendMessageRequest>(client, ActionType::SendMessage, Some(&req), true)
-        .await?
-        .ok_or_else(|| Error::Protocol("send_media: no response".into()))?;
+    let resp_bytes =
+        send_rpc::<SendMessageRequest>(client, ActionType::SendMessage, Some(&req), true)
+            .await?
+            .ok_or_else(|| Error::Protocol("send_media: no response".into()))?;
     let resp = SendMessageResponse::decode(&*resp_bytes.decrypted).map_err(Error::from)?;
     log::info!("send_media: response status={}", resp.status);
     Ok(tmp_id)

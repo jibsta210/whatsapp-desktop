@@ -38,101 +38,109 @@ pub const ALERT_AFTER_FAILS: u32 = 3;
 /// Spawn the long-poll task + the ditto pinger task. Returns once both are
 /// running; cancels via `client.disconnect()`.
 pub async fn spawn(client: Client) -> Result<()> {
+    if !client.try_start_task_set() {
+        log::debug!("gmessages: long-poll task set already running");
+        return Ok(());
+    }
+
     let connected = Arc::new(AtomicBool::new(false));
-
-    // Long-poll task.
-    {
-        let client = client.clone();
-        let connected = connected.clone();
-        let mut shutdown = client.inner.shutdown.subscribe();
-        tokio::spawn(async move {
-            let result = tokio::select! {
-                r = run_long_poll(client.clone(), connected.clone()) => r,
-                _ = shutdown.recv() => Ok(()),
-            };
-            if let Err(e) = result {
-                log::warn!("long-poll exited with error: {e}");
-                client.emit(Event::AuthRevoked);
-            }
-        });
-    }
-
-    // Ditto pinger task.
-    {
-        let client = client.clone();
-        let connected = connected.clone();
-        let mut shutdown = client.inner.shutdown.subscribe();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = run_pinger(client, connected) => {},
-                _ = shutdown.recv() => {},
-            }
-        });
-    }
-
-    // Ack flush task.
-    {
-        let client = client.clone();
-        let mut shutdown = client.inner.shutdown.subscribe();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = sleep(Duration::from_secs(5)) => {
-                        if let Err(e) = crate::session::flush_acks(&client).await {
-                            log::trace!("ack flush failed: {e}");
-                        }
-                    }
-                    _ = shutdown.recv() => break,
+    let coordinator = client.clone();
+    tokio::spawn(async move {
+        let long_poll = {
+            let client = client.clone();
+            let connected = connected.clone();
+            let mut shutdown = client.inner.shutdown.subscribe();
+            async move {
+                let result = tokio::select! {
+                    r = run_long_poll(client.clone(), connected) => r,
+                    _ = shutdown.recv() => Ok(()),
+                };
+                if let Err(e) = result {
+                    log::warn!("long-poll exited with error: {e}");
+                    client.emit(Event::AuthRevoked);
+                    let _ = client.inner.shutdown.send(());
                 }
             }
-        });
-    }
+        };
 
-    // Proactive token-refresh task. Runs every 15 minutes regardless of
-    // long-poll state. Also detects laptop suspend/resume by comparing
-    // wall-clock between ticks: if the gap is much longer than the sleep
-    // duration (system was suspended), force-refresh the tachyon token
-    // immediately so we don't get revoked while sleeping.
-    {
-        let client = client.clone();
-        let mut shutdown = client.inner.shutdown.subscribe();
-        tokio::spawn(async move {
-            const TICK: Duration = Duration::from_secs(15 * 60);
-            const SUSPEND_THRESHOLD: Duration = Duration::from_secs(60); // wake jump > tick + this = suspended
-            let mut last_wall = std::time::SystemTime::now();
-            loop {
+        let pinger = {
+            let client = client.clone();
+            let connected = connected.clone();
+            let mut shutdown = client.inner.shutdown.subscribe();
+            async move {
                 tokio::select! {
-                    _ = sleep(TICK) => {
-                        let now = std::time::SystemTime::now();
-                        let elapsed = now.duration_since(last_wall).unwrap_or(TICK);
-                        last_wall = now;
-                        let suspended = elapsed > TICK + SUSPEND_THRESHOLD;
-                        if suspended {
-                            log::warn!(
-                                "gmessages: detected wall-clock jump of {}s (likely suspend resume); force-refreshing auth",
-                                elapsed.as_secs()
-                            );
-                        } else {
-                            log::trace!("gmessages: periodic auth refresh tick");
-                        }
-                        if let Err(e) = crate::session::refresh_auth_token(&client).await {
-                            log::warn!("background auth refresh failed: {e}");
-                            // If suspended-and-failed, the long-poll's
-                            // current connection is almost certainly dead.
-                            // Trigger an explicit reconnect by emitting
-                            // shutdown, which the run_long_poll loop
-                            // catches → re-enters its outer loop → opens
-                            // a fresh ReceiveMessages stream.
-                            if suspended {
-                                let _ = client.inner.shutdown.send(());
+                    _ = run_pinger(client, connected) => {},
+                    _ = shutdown.recv() => {},
+                }
+            }
+        };
+
+        let ack_flush = {
+            let client = client.clone();
+            let mut shutdown = client.inner.shutdown.subscribe();
+            async move {
+                loop {
+                    tokio::select! {
+                        _ = sleep(Duration::from_secs(5)) => {
+                            if let Err(e) = crate::session::flush_acks(&client).await {
+                                log::trace!("ack flush failed: {e}");
                             }
                         }
+                        _ = shutdown.recv() => break,
                     }
-                    _ = shutdown.recv() => break,
                 }
             }
-        });
-    }
+        };
+
+        // Proactive token-refresh task. Runs every 15 minutes regardless of
+        // long-poll state. Also detects laptop suspend/resume by comparing
+        // wall-clock between ticks: if the gap is much longer than the sleep
+        // duration (system was suspended), force-refresh the tachyon token
+        // immediately so we don't get revoked while sleeping.
+        let token_refresh = {
+            let client = client.clone();
+            let mut shutdown = client.inner.shutdown.subscribe();
+            async move {
+                const TICK: Duration = Duration::from_secs(15 * 60);
+                const SUSPEND_THRESHOLD: Duration = Duration::from_secs(60); // wake jump > tick + this = suspended
+                let mut last_wall = std::time::SystemTime::now();
+                loop {
+                    tokio::select! {
+                        _ = sleep(TICK) => {
+                            let now = std::time::SystemTime::now();
+                            let elapsed = now.duration_since(last_wall).unwrap_or(TICK);
+                            last_wall = now;
+                            let suspended = elapsed > TICK + SUSPEND_THRESHOLD;
+                            if suspended {
+                                log::warn!(
+                                    "gmessages: detected wall-clock jump of {}s (likely suspend resume); force-refreshing auth",
+                                    elapsed.as_secs()
+                                );
+                            } else {
+                                log::trace!("gmessages: periodic auth refresh tick");
+                            }
+                            if let Err(e) = crate::session::refresh_auth_token(&client).await {
+                                log::warn!("background auth refresh failed: {e}");
+                                // If suspended-and-failed, the long-poll's
+                                // current connection is almost certainly dead.
+                                // Trigger an explicit reconnect by emitting
+                                // shutdown, which the run_long_poll loop
+                                // catches → re-enters its outer loop → opens
+                                // a fresh ReceiveMessages stream.
+                                if suspended {
+                                    let _ = client.inner.shutdown.send(());
+                                }
+                            }
+                        }
+                        _ = shutdown.recv() => break,
+                    }
+                }
+            }
+        };
+
+        tokio::join!(long_poll, pinger, ack_flush, token_refresh);
+        coordinator.finish_task_set();
+    });
 
     Ok(())
 }
@@ -183,13 +191,7 @@ async fn run_long_poll(client: Client, connected: Arc<AtomicBool>) -> Result<()>
         // the clients6.google.com receive endpoint replies 401 and the
         // pair flow bails with AuthRevoked partway through.
         crate::headers::apply_cookie_auth(&mut headers, url, &cookies, authuser);
-        let req = client
-            .inner
-            .http
-            .long
-            .post(url)
-            .headers(headers)
-            .body(body);
+        let req = client.inner.http.long.post(url).headers(headers).body(body);
         let resp = match req.send().await {
             Ok(r) => r,
             Err(e) => {
@@ -197,7 +199,9 @@ async fn run_long_poll(client: Client, connected: Arc<AtomicBool>) -> Result<()>
                 // Cap the linear backoff so a sustained outage doesn't push SMS
                 // recovery out to many minutes.
                 let secs = ((error_count + 1) * 5).min(60);
-                log::warn!("ReceiveMessages POST failed (#{error_count}): {e}; retrying in {secs}s");
+                log::warn!(
+                    "ReceiveMessages POST failed (#{error_count}): {e}; retrying in {secs}s"
+                );
                 tokio::select! {
                     _ = sleep(Duration::from_secs(secs as u64)) => {}
                     _ = shutdown.recv() => return Ok(()),
@@ -218,8 +222,7 @@ async fn run_long_poll(client: Client, connected: Arc<AtomicBool>) -> Result<()>
                 .filter_map(|v| v.to_str().ok())
                 .collect();
             if !set_cookies.is_empty() {
-                let parsed =
-                    crate::cookies::parse_set_cookie_headers(set_cookies.iter().copied());
+                let parsed = crate::cookies::parse_set_cookie_headers(set_cookies.iter().copied());
                 crate::cookies::merge_into_cache(parsed);
             }
         }
@@ -317,7 +320,11 @@ async fn read_stream(
         // by `,`; the stream ends with `]`.
         loop {
             // Skip a single leading comma if present.
-            let scan_start = if accumulated.first() == Some(&b',') { 1 } else { 0 };
+            let scan_start = if accumulated.first() == Some(&b',') {
+                1
+            } else {
+                0
+            };
             if scan_start >= accumulated.len() {
                 break; // need more bytes
             }
@@ -344,7 +351,11 @@ async fn read_stream(
         let chunk = next_chunk(&mut stream, shutdown).await?;
         match chunk {
             Some(c) => {
-                log::trace!("long-poll: chunk +{} bytes (accum now {})", c.len(), accumulated.len() + c.len());
+                log::trace!(
+                    "long-poll: chunk +{} bytes (accum now {})",
+                    c.len(),
+                    accumulated.len() + c.len()
+                );
                 accumulated.extend_from_slice(&c);
             }
             None => {
@@ -414,8 +425,7 @@ fn find_first_value_end(buf: &[u8]) -> Option<usize> {
 }
 
 async fn next_chunk(
-    stream: &mut (impl futures::Stream<Item = std::result::Result<Bytes, reqwest::Error>>
-              + Unpin),
+    stream: &mut (impl futures::Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Unpin),
     shutdown: &mut broadcast::Receiver<()>,
 ) -> Result<Option<Bytes>> {
     tokio::select! {

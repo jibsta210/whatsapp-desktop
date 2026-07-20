@@ -31,7 +31,7 @@ pub enum WaEvent {
     /// sidebar is a pure projection of the owning runtime's persisted summary.
     ChatRowChanged(ChatSummary),
     /// New or updated message arrived
-    MessageReceived(IncomingMessage),
+    MessageReceived(Box<IncomingMessage>),
     /// Server confirmed an outgoing message; GTK should re-key the optimistic bubble.
     /// `tmp_id` is the local ID the GTK side used; `real_id` is the server-assigned ID.
     MessageConfirmed {
@@ -215,11 +215,17 @@ pub enum WaEvent {
     },
     /// GIF search results from Tenor
     GifResults {
+        request_id: u64,
+        query: String,
         gifs: Vec<GifResult>,
+        error: Option<String>,
     },
     /// Sticker search results
     StickerResults {
+        request_id: u64,
+        query: String,
         stickers: Vec<GifResult>,
+        error: Option<String>,
     },
     PhoneLookupResult {
         phone: String,
@@ -368,7 +374,9 @@ pub enum WaCommand {
     /// run pairing flow again, and surface the QR in Settings.
     GmessagesRepair,
     /// Set own profile picture from a file path
-    SetProfilePicture { path: String },
+    SetProfilePicture {
+        path: String,
+    },
     // ── Chat context-menu actions ──────────────────────────────────────────────
     ArchiveChat {
         chat_id: String,
@@ -447,6 +455,7 @@ pub enum WaCommand {
     },
     /// Search for GIFs via Tenor
     SearchGifs {
+        request_id: u64,
         query: String,
     },
     /// Send a GIF by downloading from URL and sending as video with gif_playback
@@ -457,6 +466,7 @@ pub enum WaCommand {
     },
     /// Search stickers via Tenor
     SearchStickers {
+        request_id: u64,
         query: String,
     },
     /// Send a sticker by downloading WebP from URL
@@ -1003,15 +1013,30 @@ mod persistence_regression {
         };
         let bytes = bincode::serialize(&c).expect("serialize");
         let back: ChatSummary = bincode::deserialize(&bytes).expect("deserialize");
-        assert_eq!((c.id, c.unread_count, c.is_favorite, c.auto_mark_read),
-                   (back.id, back.unread_count, back.is_favorite, back.auto_mark_read));
+        assert_eq!(
+            (c.id, c.unread_count, c.is_favorite, c.auto_mark_read),
+            (
+                back.id,
+                back.unread_count,
+                back.is_favorite,
+                back.auto_mark_read
+            )
+        );
     }
 
     #[test]
     fn incoming_message_bincode_roundtrips() {
-        let m = IncomingMessage::outgoing("m1".into(), "chat@s.whatsapp.net".into(), Some("hey".into()), 7);
+        let m = IncomingMessage::outgoing(
+            "m1".into(),
+            "chat@s.whatsapp.net".into(),
+            Some("hey".into()),
+            7,
+        );
         let bytes = bincode::serialize(&m).expect("serialize");
         let back: IncomingMessage = bincode::deserialize(&bytes).expect("deserialize");
-        assert_eq!((m.id, m.text, m.timestamp), (back.id, back.text, back.timestamp));
+        assert_eq!(
+            (m.id, m.text, m.timestamp),
+            (back.id, back.text, back.timestamp)
+        );
     }
 }

@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use async_channel::Sender;
+use base64::Engine as _;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use wacore::download::Downloadable;
@@ -20,7 +21,7 @@ use whatsapp_rust::{Client, Jid, RevokeType, TokioRuntime};
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
-use crate::bridge::{ChatSummary, IncomingMessage, MessageSource, ReceiptStatus, WaCommand, WaEvent};
+use crate::bridge::{ChatSummary, IncomingMessage, ReceiptStatus, WaCommand, WaEvent};
 
 // ── Persistence (bincode binary format) ──────────────────────────────────────
 
@@ -52,8 +53,14 @@ const CHATS_FILE_JSON: &str = "wa_chats.json";
 const CONTACTS_FILE_JSON: &str = "wa_contacts.json";
 const LID_PHONE_FILE_JSON: &str = "wa_lid_phone.json";
 
-/// Load the Tenor API key from env or local file (never hardcoded in source).
-fn tenor_api_key() -> String {
+const TENOR_RESULT_LIMIT: usize = 12;
+const TENOR_SEARCH_RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
+const TENOR_PAGE_RESPONSE_LIMIT: usize = 1024 * 1024;
+const TENOR_GIF_SEND_MAX_BYTES: usize = 25 * 1024 * 1024;
+const TENOR_STICKER_SEND_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+/// Load an explicitly configured Tenor API key from env or a local file.
+fn tenor_api_key() -> Option<String> {
     std::env::var("TENOR_API_KEY")
         .or_else(|_| std::fs::read_to_string("tenor_key.txt").map(|s| s.trim().to_string()))
         .or_else(|_| {
@@ -63,7 +70,350 @@ fn tenor_api_key() -> String {
             )
             .map(|s| s.trim().to_string())
         })
+        .ok()
+        .filter(|key| !key.is_empty())
+}
+
+#[derive(Clone, Debug)]
+struct TenorCredentials {
+    api_key: String,
+    client_key: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TenorSearchKind {
+    Gif,
+    Sticker,
+}
+
+impl TenorSearchKind {
+    fn page_suffix(self) -> &'static str {
+        match self {
+            Self::Gif => "gifs",
+            Self::Sticker => "stickers",
+        }
+    }
+
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Gif => "GIF",
+            Self::Sticker => "sticker",
+        }
+    }
+}
+
+static TENOR_WEB_CREDENTIALS: std::sync::OnceLock<std::result::Result<TenorCredentials, String>> =
+    std::sync::OnceLock::new();
+static TENOR_SEARCH_SEMAPHORE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+static LATEST_GIF_SEARCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LATEST_STICKER_SEARCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn extract_script_contents<'a>(html: &'a str, id: &str) -> Option<&'a str> {
+    let id_marker = format!("id=\"{id}\"");
+    let id_pos = html.find(&id_marker)?;
+    let script_start = html[..id_pos].rfind("<script")?;
+    let body_start = script_start + html[script_start..].find('>')? + 1;
+    let body_end = body_start + html[body_start..].find("</script>")?;
+    Some(html[body_start..body_end].trim())
+}
+
+fn fetch_bounded_text(url: &str, limit: usize) -> Result<String> {
+    use std::io::Read as _;
+
+    let response = ureq::get(url)
+        .set("User-Agent", "whatsapp-desktop/0.1 (Tenor picker)")
+        .timeout(std::time::Duration::from_secs(12))
+        .call()
+        .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+    let mut bytes = Vec::with_capacity(limit.min(256 * 1024));
+    response
+        .into_reader()
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        anyhow::bail!("response exceeded {limit} bytes");
+    }
+    String::from_utf8(bytes).map_err(|e| anyhow::anyhow!("response was not UTF-8: {e}"))
+}
+
+fn fetch_bounded_bytes(url: &str, limit: usize) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    if !url.starts_with("https://") {
+        anyhow::bail!("refusing a non-HTTPS media URL");
+    }
+    let response = ureq::get(url)
+        .set("User-Agent", "whatsapp-desktop/0.1 (Tenor picker)")
+        .timeout(std::time::Duration::from_secs(30))
+        .call()
+        .map_err(|e| anyhow::anyhow!("request failed: {e}"))?;
+    if response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > limit)
+    {
+        anyhow::bail!("media exceeded the {limit}-byte download limit");
+    }
+    let mut bytes = Vec::with_capacity(limit.min(1024 * 1024));
+    response
+        .into_reader()
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        anyhow::bail!("media exceeded the {limit}-byte download limit");
+    }
+    Ok(bytes)
+}
+
+fn validate_mp4(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
+        anyhow::bail!("downloaded GIF payload was not an MP4 file");
+    }
+    Ok(())
+}
+
+fn validate_webp(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        anyhow::bail!("downloaded sticker payload was not a WebP file");
+    }
+    Ok(())
+}
+
+static TENOR_MEDIA_FILE_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+async fn save_tenor_media(prefix: &str, extension: &str, bytes: &[u8]) -> Result<String> {
+    use std::sync::atomic::Ordering;
+
+    let dir = std::env::current_dir()?.join(MEDIA_DIR);
+    tokio::fs::create_dir_all(&dir).await?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
+        .as_millis();
+    let counter = TENOR_MEDIA_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{prefix}_{timestamp}_{counter}.{extension}"));
+    tokio::fs::write(&path, bytes).await?;
+    Ok(tokio::fs::canonicalize(&path)
+        .await
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned())
+}
+
+async fn report_tenor_send_failure(
+    tx: &Sender<WaEvent>,
+    tmp_id: &str,
+    chat_id: &str,
+    message: &str,
+) {
+    let _ = tx
+        .send(WaEvent::MessageFailed {
+            msg_id: tmp_id.to_string(),
+            chat_id: chat_id.to_string(),
+        })
+        .await;
+    let _ = tx.send(WaEvent::ErrorToast(message.to_string())).await;
+}
+
+fn discover_tenor_web_credentials() -> std::result::Result<TenorCredentials, String> {
+    let html = fetch_bounded_text(
+        "https://tenor.com/search/trending-gifs",
+        TENOR_PAGE_RESPONSE_LIMIT,
+    )
+    .map_err(|e| e.to_string())?;
+    let encoded = extract_script_contents(&html, "data")
+        .ok_or_else(|| "Tenor page did not expose its public web configuration".to_string())?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("invalid Tenor web configuration: {e}"))?;
+    let config: serde_json::Value = serde_json::from_slice(&decoded)
+        .map_err(|e| format!("invalid Tenor web configuration JSON: {e}"))?;
+    let api_key = config
+        .get("API_V2_KEY")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "Tenor web configuration has no API key".to_string())?;
+    let client_key = config
+        .get("API_V2_CLIENT_KEY")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("tenor_web");
+    Ok(TenorCredentials {
+        api_key: api_key.to_string(),
+        client_key: client_key.to_string(),
+    })
+}
+
+fn tenor_credentials() -> Result<TenorCredentials> {
+    if let Some(api_key) = tenor_api_key() {
+        return Ok(TenorCredentials {
+            api_key,
+            client_key: "whatsapp_desktop".to_string(),
+        });
+    }
+    TENOR_WEB_CREDENTIALS
+        .get_or_init(discover_tenor_web_credentials)
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
+/// Percent-encode one URL component without relying on ad-hoc replacements.
+fn encode_url_component(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
+fn media_url<'a>(media: &'a serde_json::Value, formats: &[&str]) -> Option<&'a str> {
+    formats.iter().find_map(|format| {
+        media
+            .get(*format)
+            .and_then(|value| value.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|url| url.starts_with("https://"))
+    })
+}
+
+fn parse_tenor_values(
+    values: &[serde_json::Value],
+    kind: TenorSearchKind,
+) -> Vec<crate::bridge::GifResult> {
+    values
+        .iter()
+        .filter_map(|result| {
+            let media = result.get("media_formats")?;
+            let (preview, send) = match kind {
+                TenorSearchKind::Gif => (
+                    media_url(media, &["gifpreview", "nanogif", "tinywebp", "tinygif"]),
+                    media_url(media, &["mp4", "tinymp4"]),
+                ),
+                TenorSearchKind::Sticker => (
+                    media_url(
+                        media,
+                        &[
+                            "nanowebp_transparent",
+                            "tinywebp_transparent",
+                            "webp_transparent",
+                            "tinywebp",
+                            "webp",
+                        ],
+                    ),
+                    // Never fall back to GIF here: SendSticker declares image/webp.
+                    media_url(
+                        media,
+                        &[
+                            "webp_transparent",
+                            "tinywebp_transparent",
+                            "nanowebp_transparent",
+                            "webp",
+                            "tinywebp",
+                        ],
+                    ),
+                ),
+            };
+            let preview = preview?;
+            let send = send?;
+            let title = result
+                .get("content_description")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| result.get("title").and_then(serde_json::Value::as_str))
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| kind.noun());
+            Some(crate::bridge::GifResult {
+                preview_url: preview.to_string(),
+                mp4_url: send.to_string(),
+                title: title.to_string(),
+            })
+        })
+        .take(TENOR_RESULT_LIMIT)
+        .collect()
+}
+
+fn parse_tenor_api_results(
+    body: &str,
+    kind: TenorSearchKind,
+) -> Result<Vec<crate::bridge::GifResult>> {
+    let response: serde_json::Value = serde_json::from_str(body)?;
+    let values = response
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Tenor response did not contain results"))?;
+    Ok(parse_tenor_values(values, kind))
+}
+
+fn parse_tenor_page_results(
+    page: &str,
+    kind: TenorSearchKind,
+) -> Result<Vec<crate::bridge::GifResult>> {
+    let cache = extract_script_contents(page, "store-cache")
+        .ok_or_else(|| anyhow::anyhow!("Tenor page did not contain search results"))?;
+    let state: serde_json::Value = serde_json::from_str(cache)?;
+    let searches = state
+        .pointer("/universal/search")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Tenor page search state was missing"))?;
+    let values = searches
+        .values()
+        .find_map(|search| search.get("results").and_then(serde_json::Value::as_array))
+        .ok_or_else(|| anyhow::anyhow!("Tenor page did not contain a result list"))?;
+    Ok(parse_tenor_values(values, kind))
+}
+
+fn search_tenor(query: &str, kind: TenorSearchKind) -> Result<Vec<crate::bridge::GifResult>> {
+    let query = query.trim();
+    let trending = query.is_empty() || query.eq_ignore_ascii_case("trending");
+    let credentials = tenor_credentials();
+    let api_result = credentials.and_then(|credentials| {
+        let endpoint = if trending { "featured" } else { "search" };
+        let mut url = format!(
+            "https://tenor.googleapis.com/v2/{endpoint}?key={}&client_key={}&limit={TENOR_RESULT_LIMIT}&contentfilter=medium",
+            encode_url_component(&credentials.api_key),
+            encode_url_component(&credentials.client_key),
+        );
+        if !trending {
+            url.push_str("&q=");
+            url.push_str(&encode_url_component(query));
+        }
+        match kind {
+            TenorSearchKind::Gif => {
+                url.push_str("&media_filter=gifpreview,nanogif,tinywebp,tinygif,mp4,tinymp4");
+            }
+            TenorSearchKind::Sticker => {
+                url.push_str("&searchfilter=sticker&media_filter=nanowebp_transparent,tinywebp_transparent,webp_transparent,tinywebp,webp");
+            }
+        }
+        let body = fetch_bounded_text(&url, TENOR_SEARCH_RESPONSE_LIMIT)?;
+        parse_tenor_api_results(&body, kind)
+    });
+
+    match api_result {
+        Ok(results) => Ok(results),
+        Err(api_error) => {
+            // Tenor stopped accepting new API clients in 2026. Its public search
+            // page still carries the same result objects, so retain a bounded
+            // fallback instead of leaving fresh installs permanently broken.
+            log::debug!("Tenor API search unavailable, trying public page: {api_error:#}");
+            let page_query = if trending { "trending" } else { query };
+            let page_url = format!(
+                "https://tenor.com/search/{}-{}",
+                encode_url_component(page_query),
+                kind.page_suffix()
+            );
+            let page =
+                fetch_bounded_text(&page_url, TENOR_PAGE_RESPONSE_LIMIT).map_err(|page_error| {
+                    anyhow::anyhow!("API: {api_error:#}; page: {page_error:#}")
+                })?;
+            parse_tenor_page_results(&page, kind)
+        }
+    }
 }
 
 fn messages_dir() -> PathBuf {
@@ -356,9 +706,7 @@ pub fn rebuild_contact_names_from_history() -> HashMap<String, String> {
         });
         let removed_v2 = before - names.len();
         if removed_v2 > 0 {
-            log::info!(
-                "One-time purge v2: removed {removed_v2} phone-format poison entries"
-            );
+            log::info!("One-time purge v2: removed {removed_v2} phone-format poison entries");
             purged += removed_v2;
         }
         let _ = std::fs::write(&purge_marker_v2, "done");
@@ -598,23 +946,18 @@ pub fn save_messages_scoped(
     // formats via `save_messages` and would recurse.
     let existing = read_bin_path::<Vec<IncomingMessage>>(&path).unwrap_or_default();
 
-    let mut result: Vec<IncomingMessage> =
-        Vec::with_capacity(existing.len() + messages.len());
+    let mut result: Vec<IncomingMessage> = Vec::with_capacity(existing.len() + messages.len());
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     // 1. Other protocols' messages — verbatim from disk (canonical).
     for m in &existing {
-        if MessageSource::from_message(&m.chat_id, &m.id) != owned
-            && seen.insert(m.id.as_str())
-        {
+        if MessageSource::from_message(&m.chat_id, &m.id) != owned && seen.insert(m.id.as_str()) {
             result.push(m.clone());
         }
     }
     // 2. The owned protocol's messages — from the caller (authoritative).
     for m in messages {
-        if MessageSource::from_message(&m.chat_id, &m.id) == owned
-            && seen.insert(m.id.as_str())
-        {
+        if MessageSource::from_message(&m.chat_id, &m.id) == owned && seen.insert(m.id.as_str()) {
             result.push(m.clone());
         }
     }
@@ -809,10 +1152,7 @@ pub fn display_name_from_jid(jid: &str) -> String {
     // LID JIDs look like "12345678.0:90@lid" or "12345:8@lid" — extract digits
     // before the first non-digit (., :) and format as a phone-ish number.
     if let Some(user) = jid.strip_suffix("@lid") {
-        let digits: String = user
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect();
+        let digits: String = user.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.len() >= 5 {
             return format!("+{digits}");
         }
@@ -1060,9 +1400,7 @@ fn resolve_mentions(text: &str, s: &RuntimeState) -> String {
             }
         }
         // Grab the next whitespace-delimited token.
-        let tok_end = rest
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(rest.len());
+        let tok_end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let word = &rest[..tok_end];
         rest = &rest[tok_end..];
 
@@ -1185,7 +1523,10 @@ impl RuntimeState {
             }
             if !read_watermarks.is_empty() {
                 save_read_watermarks(&read_watermarks);
-                log::info!("Seeded {} read watermarks from existing chats", read_watermarks.len());
+                log::info!(
+                    "Seeded {} read watermarks from existing chats",
+                    read_watermarks.len()
+                );
             }
         }
         let chat_names: HashMap<String, String> = chats
@@ -1280,11 +1621,11 @@ impl RuntimeState {
     /// Evict least-recently-used chat histories to keep memory bounded.
     /// Keeps at most MAX_CACHED chats in memory. Evicted chats are saved
     /// to disk first (via queue_save_messages), then dropped.
-    /// Effectively unlimited — even with 5000 chats × 5000 messages each
-    /// at ~200 bytes/msg that's 5GB worst case but realistic is way under.
-    /// Eliminates disk hits on chat switching entirely.
+    /// Keep the working set small. Full histories contain owned strings and
+    /// media metadata, so retaining thousands of chats can consume hundreds
+    /// of megabytes. Evicted chats remain on disk and are loaded on demand.
     fn evict_old_histories(&mut self) {
-        const MAX_CACHED: usize = 5000;
+        const MAX_CACHED: usize = 32;
         let before = self.history.len();
         while self.history_lru.len() > MAX_CACHED {
             let evict_id = self.history_lru.remove(0);
@@ -1330,8 +1671,10 @@ impl RuntimeState {
         let phone_base = strip_dev(&phone);
 
         // Always store the bare→bare mapping (canonical, device-agnostic).
-        self.phone_to_lid.insert(phone_base.clone(), lid_base.clone());
-        self.lid_to_phone.insert(lid_base.clone(), phone_base.clone());
+        self.phone_to_lid
+            .insert(phone_base.clone(), lid_base.clone());
+        self.lid_to_phone
+            .insert(lid_base.clone(), phone_base.clone());
 
         // Also store the originals if they differ from the bare forms — so
         // callers passing device-suffixed JIDs still hit on direct lookup.
@@ -1469,7 +1812,12 @@ impl RuntimeState {
     /// those paths are subject to the read-watermark clobber below. The live
     /// message path (`persist_new_message`) and local actions pass `false` so a
     /// genuine unread bump is never zeroed by a same-second watermark.
-    fn upsert_chat(&mut self, mut summary: ChatSummary, authoritative_unread: bool, from_reseed: bool) {
+    fn upsert_chat(
+        &mut self,
+        mut summary: ChatSummary,
+        authoritative_unread: bool,
+        from_reseed: bool,
+    ) {
         // Never persist an empty or raw-JID name — resolve using all available sources
         let looks_raw = summary.name.is_empty()
             || summary.name.contains("@lid")
@@ -1835,7 +2183,10 @@ pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver
                             chat_id: chat_id.clone(),
                         });
                     }
-                    if wa_cmd_tx.send(WaCommand::SetActiveChat { chat_id }).is_err() {
+                    if wa_cmd_tx
+                        .send(WaCommand::SetActiveChat { chat_id })
+                        .is_err()
+                    {
                         break;
                     }
                     continue;
@@ -1933,7 +2284,9 @@ async fn run_inner(
                     log::warn!("Failed to reset {name}: {e}");
                 }
             }
-            log::info!("Reset app_state_versions for regular collections — next connect will pull all contact names from phone");
+            log::info!(
+                "Reset app_state_versions for regular collections — next connect will pull all contact names from phone"
+            );
             let _ = std::fs::write(&marker, "v4");
         }
     }
@@ -1987,11 +2340,7 @@ async fn run_inner(
                 for (cid, msgs) in latest {
                     // The disk-writer serves the WhatsApp runtime. Save scoped
                     // so SMS history in a merged chat is never clobbered.
-                    save_messages_scoped(
-                        &cid,
-                        crate::bridge::MessageSource::WhatsApp,
-                        &msgs,
-                    );
+                    save_messages_scoped(&cid, crate::bridge::MessageSource::WhatsApp, &msgs);
                 }
             }
         })
@@ -2005,8 +2354,7 @@ async fn run_inner(
     // from every chat's message history so that LIDs resolve to display
     // names from the moment the app starts — no need to open each chat.
     // Rebuild writes to the same disk file that RuntimeState::new() reads.
-    let _ = tokio::task::spawn_blocking(rebuild_contact_names_from_history)
-        .await;
+    let _ = tokio::task::spawn_blocking(rebuild_contact_names_from_history).await;
 
     let state = Arc::new(Mutex::new(RuntimeState::new(save_tx, msg_save_tx)));
     // Wire the projection tap: every WA-owned summary mutation now emits an
@@ -2016,8 +2364,7 @@ async fn run_inner(
     // ── Centralized LID resolver ──
     // Any handler that encounters an unresolved @lid JID sends it here.
     // The resolver batches requests, deduplicates, and runs usync in bulk.
-    let (lid_resolve_tx, mut lid_resolve_rx) =
-        tokio::sync::mpsc::unbounded_channel::<String>();
+    let (lid_resolve_tx, mut lid_resolve_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     let tx = event_tx.clone();
     let state_ev = state.clone();
@@ -2095,6 +2442,31 @@ async fn run_inner(
                         }
                     }
                 }
+            }
+        });
+    }
+
+    // One process-lifetime safety poll for read-state sync. This used to be
+    // spawned from every Connected event, so reconnects accumulated permanent
+    // pollers (and client/state Arcs). A weak reference also lets the client
+    // drop when this runtime exits.
+    {
+        let weak_client = Arc::downgrade(&client);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                let Some(client) = weak_client.upgrade() else {
+                    break;
+                };
+                if let Err(e) = client
+                    .resync_app_state(wacore::appstate::patch_decode::WAPatchName::RegularLow)
+                    .await
+                {
+                    log::debug!("RegularLow safety poll error: {e:#}");
+                }
+                // Return unused glibc arena pages after GTK has released large
+                // batches of chat widgets/textures.
+                unsafe { libc::malloc_trim(0) };
             }
         });
     }
@@ -2184,7 +2556,10 @@ async fn resolve_lid_batch(
                     resolved += 1;
                 }
             }
-            log::info!("LID resolver: resolved {resolved}/{} JIDs", unresolved.len());
+            log::info!(
+                "LID resolver: resolved {resolved}/{} JIDs",
+                unresolved.len()
+            );
             if resolved == 0 {
                 log::warn!(
                     "LID resolver: 0 resolved — usync device query cannot map lid→pn; unresolved: {unresolved:?}"
@@ -2408,51 +2783,6 @@ async fn handle_wa_event(
                 }
 
                 serve_cached_avatars(&state_clone, &tx_clone).await;
-
-                // Poll RegularLow every 15s as safety net for read sync.
-                // Runs in separate task so it doesn't block main processing.
-                {
-                    let c = client_clone.clone();
-                    let st = state_clone.clone();
-                    tokio::spawn(async move {
-                        let mut trim_tick: u64 = 0;
-                        loop {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-                            // Memory diagnostics
-                            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-                                let rss = status
-                                    .lines()
-                                    .find(|l| l.starts_with("VmRSS:"))
-                                    .and_then(|l| l.split_whitespace().nth(1))
-                                    .unwrap_or("?");
-                                let s = st.lock().unwrap();
-                                let cache_chats = s.history.len();
-                                let cache_msgs: usize = s.history.values().map(|v| v.len()).sum();
-                                let contacts = s.contact_names.len();
-                                log::info!(
-                                    "MEM: RSS={rss}KB cache={cache_chats}chats/{cache_msgs}msgs contacts={contacts}"
-                                );
-                            }
-                            // Hand freed heap pages back to the OS. glibc keeps
-                            // freed memory parked in its arenas, so without this
-                            // RSS only ratchets up over a session — every
-                            // chat-switch allocates/frees ~50 bubble widgets and
-                            // decodes image textures. Every ~60s (every 6th 10s
-                            // tick) is plenty and cheap (trims arena tops).
-                            // SAFETY: malloc_trim is thread-safe.
-                            trim_tick = trim_tick.wrapping_add(1);
-                            if trim_tick % 6 == 0 {
-                                unsafe { libc::malloc_trim(0) };
-                            }
-                            use wacore::appstate::patch_decode::WAPatchName;
-                            log::debug!("RegularLow poll tick");
-                            match c.resync_app_state(WAPatchName::RegularLow).await {
-                                Ok(_) => {}
-                                Err(e) => log::debug!("RegularLow poll error: {e:#}"),
-                            }
-                        }
-                    });
-                }
             });
 
             return;
@@ -2572,7 +2902,11 @@ async fn handle_wa_event(
 
                 let mut needs_resolve = false;
                 let resolved = if info.source.is_from_me {
-                    match cached.as_ref().or(cached_base.as_ref()).or(alt_phone.as_ref()) {
+                    match cached
+                        .as_ref()
+                        .or(cached_base.as_ref())
+                        .or(alt_phone.as_ref())
+                    {
                         Some(phone) if s.chats.iter().any(|c| &c.id == phone) => {
                             Some(phone.clone())
                         }
@@ -2607,9 +2941,7 @@ async fn handle_wa_event(
             // the phantom into the real chat.
             if needs_lid_resolve && chat_id.ends_with("@lid") {
                 queue_lid_resolve(&lid_resolver_tx, &chat_id);
-                log::info!(
-                    "Queued LID resolution for self-message phantom chat: {chat_id}"
-                );
+                log::info!("Queued LID resolution for self-message phantom chat: {chat_id}");
             }
 
             // Handle message revoke (delete for everyone) — edit_attribute tells us
@@ -2818,10 +3150,10 @@ async fn handle_wa_event(
                             // Rendered live but never persisted — restart shows
                             // the underlying message text again (A6).
                             if is_latest && !emoji.is_empty() {
-                                state.lock().unwrap().emit_row_ephemeral(
-                                    &chat_id,
-                                    &format!("Reacted {emoji}"),
-                                );
+                                state
+                                    .lock()
+                                    .unwrap()
+                                    .emit_row_ephemeral(&chat_id, &format!("Reacted {emoji}"));
                             }
                             let _ = tx
                                 .send(WaEvent::ReactionUpdated {
@@ -3166,7 +3498,8 @@ async fn handle_wa_event(
                         if let Some(qs) = &m.quoted_sender {
                             if qs.contains('@') {
                                 m.quoted_sender = Some(resolve_sender_name(&s, qs));
-                            } else if qs.starts_with('+') || qs.chars().all(|c| c.is_ascii_digit()) {
+                            } else if qs.starts_with('+') || qs.chars().all(|c| c.is_ascii_digit())
+                            {
                                 let num = qs.trim_start_matches('+');
                                 let phone_jid = format!("{num}@s.whatsapp.net");
                                 let resolved = resolve_sender_name(&s, &phone_jid);
@@ -3273,11 +3606,14 @@ async fn handle_wa_event(
                     }
 
                     // Queue unresolved LID for background resolution
-                    if m.sender_name.contains("@lid") && m.sender_id.ends_with("@lid") && !m.is_from_me {
+                    if m.sender_name.contains("@lid")
+                        && m.sender_id.ends_with("@lid")
+                        && !m.is_from_me
+                    {
                         queue_lid_resolve(&lid_resolver_tx, &m.sender_id);
                     }
 
-                    WaEvent::MessageReceived(m)
+                    WaEvent::MessageReceived(Box::new(m))
                 }
                 None => return,
             }
@@ -3802,7 +4138,7 @@ async fn handle_wa_event(
                 // Push new sync messages to the UI as live messages
                 // (so self-messages from other devices and missed messages appear immediately)
                 for m in &new_messages {
-                    let _ = tx.send(WaEvent::MessageReceived(m.clone())).await;
+                    let _ = tx.send(WaEvent::MessageReceived(Box::new(m.clone()))).await;
                 }
 
                 // Seed the read-receipt anchor from history sync, mirroring the
@@ -3865,7 +4201,7 @@ async fn handle_wa_event(
                     is_favorite: false,
                     label: None,
                     pinned_msg_id: None,
-                auto_mark_read: false,
+                    auto_mark_read: false,
                 };
 
                 if unread_authoritative {
@@ -4245,9 +4581,8 @@ async fn handle_wa_event(
                     raw.clone()
                 };
                 // Show the user's own account as "You" instead of their number.
-                let digits = |j: &str| -> String {
-                    j.chars().filter(|c| c.is_ascii_digit()).collect()
-                };
+                let digits =
+                    |j: &str| -> String { j.chars().filter(|c| c.is_ascii_digit()).collect() };
                 let rd = digits(&resolved);
                 let raw_d = digits(&raw);
                 if !rd.is_empty()
@@ -4267,7 +4602,10 @@ async fn handle_wa_event(
             // Digits of the actor JID (both raw and phone-mapped) so we can tell
             // a self-leave ("Bob left") from an admin-kick ("Alice removed Bob").
             let actor_digits: Option<String> = update.participant.as_ref().map(|p| {
-                p.to_string().chars().filter(|c| c.is_ascii_digit()).collect()
+                p.to_string()
+                    .chars()
+                    .filter(|c| c.is_ascii_digit())
+                    .collect()
             });
             let same_person = |info: &wacore::stanza::groups::GroupParticipantInfo| -> bool {
                 let Some(ad) = actor_digits.as_ref() else {
@@ -4285,7 +4623,12 @@ async fn handle_wa_event(
                 let pd: String = info
                     .phone_number
                     .as_ref()
-                    .map(|p| p.to_string().chars().filter(|c| c.is_ascii_digit()).collect())
+                    .map(|p| {
+                        p.to_string()
+                            .chars()
+                            .filter(|c| c.is_ascii_digit())
+                            .collect()
+                    })
                     .unwrap_or_default();
                 &jd == ad || (!pd.is_empty() && &pd == ad)
             };
@@ -4303,7 +4646,10 @@ async fn handle_wa_event(
                     // A member removing *themselves* is a voluntary leave; anyone
                     // else removing them is an admin kick ("Alice removed Bob").
                     let self_leave = participants.len() == 1
-                        && participants.first().map(|p| same_person(p)).unwrap_or(false);
+                        && participants
+                            .first()
+                            .map(|p| same_person(p))
+                            .unwrap_or(false);
                     if self_leave {
                         format!("{} left", names.join(", "))
                     } else if let Some(actor) = &actor_name {
@@ -4390,7 +4736,7 @@ async fn handle_wa_event(
             // history push froze the row on "You added X" events. Unread stays
             // suppressed (persist_new_message skips the bump for is_system_message).
             persist_new_message(&sys_msg, state);
-            let _ = tx.send(WaEvent::MessageReceived(sys_msg)).await;
+            let _ = tx.send(WaEvent::MessageReceived(Box::new(sys_msg))).await;
 
             // Refresh the member list by requesting fresh group info
             let c = client.clone();
@@ -4462,9 +4808,7 @@ async fn handle_wa_event(
                         if let Ok(_) = c.get_user_devices(&jids).await {
                             let mut newly_resolved = 0u32;
                             for lid_str in &unresolved {
-                                if let Some(phone_jid) =
-                                    c.resolve_lid_to_phone_jid(lid_str).await
-                                {
+                                if let Some(phone_jid) = c.resolve_lid_to_phone_jid(lid_str).await {
                                     let mut st = s.lock().unwrap();
                                     st.insert_lid_phone(lid_str.clone(), phone_jid.clone());
                                     newly_resolved += 1;
@@ -4478,7 +4822,8 @@ async fn handle_wa_event(
                                 }
                                 // Re-resolve all members with updated mappings
                                 for m in &mut members {
-                                    if m.name.contains("@lid") || m.name.contains("@s.whatsapp.net") {
+                                    if m.name.contains("@lid") || m.name.contains("@s.whatsapp.net")
+                                    {
                                         let st = s.lock().unwrap();
                                         m.name = resolve_sender_name(&st, &m.jid);
                                     }
@@ -4581,7 +4926,11 @@ fn persist_new_message(
             // (older, e.g. from history backfill) is a single binary-search
             // insert — avoiding the O(n log n) re-sort of the whole Vec on
             // every append in a large, active group.
-            if history.last().map(|last| m.timestamp >= last.timestamp).unwrap_or(true) {
+            if history
+                .last()
+                .map(|last| m.timestamp >= last.timestamp)
+                .unwrap_or(true)
+            {
                 history.push(m.clone());
             } else {
                 let idx = history.partition_point(|x| x.timestamp <= m.timestamp);
@@ -4589,8 +4938,11 @@ fn persist_new_message(
             }
         }
 
-        // Queue disk write on background thread — non-blocking
-        s.queue_save_messages(&chat_id);
+        // Retransmitted messages do not change the cache, so avoid cloning and
+        // queueing the full history again for those common duplicate events.
+        if msg_is_new {
+            s.queue_save_messages(&chat_id);
+        }
 
         // Read chat info AND compute the unread count to PERSIST. The runtime now
         // owns the count so it survives restart (it used to be carried unchanged,
@@ -4698,7 +5050,7 @@ fn persist_new_message(
         is_favorite: existing_is_favorite,
         label: existing_label,
         pinned_msg_id: None,
-                auto_mark_read: false,
+        auto_mark_read: false,
     };
     persist_chat(state, summary);
 
@@ -4848,9 +5200,7 @@ async fn handle_command(
                 return Ok(());
             };
             let Some(dl) = pending_from_keys(&keys, media_type.as_ref(), filename) else {
-                log::warn!(
-                    "RequestMediaDownload: msg {msg_id} has keys but no usable media_type"
-                );
+                log::warn!("RequestMediaDownload: msg {msg_id} has keys but no usable media_type");
                 return Ok(());
             };
             log::info!("On-demand media download requested: msg={msg_id} chat={chat_id}");
@@ -5080,7 +5430,7 @@ async fn handle_command(
                             chat_id: chat_id.clone(),
                         })
                         .await;
-                    let _ = tx.send(WaEvent::MessageReceived(sent_msg)).await;
+                    let _ = tx.send(WaEvent::MessageReceived(Box::new(sent_msg))).await;
                 }
                 Err(e) => {
                     log::warn!("SendText failed: {e:#}");
@@ -5201,7 +5551,7 @@ async fn handle_command(
                             chat_id: chat_id.clone(),
                         })
                         .await;
-                    let _ = tx.send(WaEvent::MessageReceived(sent_msg)).await;
+                    let _ = tx.send(WaEvent::MessageReceived(Box::new(sent_msg))).await;
                 }
                 Err(e) => {
                     log::warn!("SendReply failed: {e:#}");
@@ -5378,7 +5728,6 @@ async fn handle_command(
                 })
             };
 
-
             let mut all_messages = if let Some(msgs) = cached_last_50 {
                 state.lock().unwrap().touch_history(&chat_id);
                 msgs
@@ -5409,7 +5758,8 @@ async fn handle_command(
             // Phase 2 merge: if this WhatsApp chat has a paired gmessages
             // conversation, pull in the SMS messages from gm_<conv>.bin so
             // they interleave with WhatsApp messages.
-            if let Some(gm_chat_id) = crate::contacts::global().other_chat_id(&chat_id, "gmessages") {
+            if let Some(gm_chat_id) = crate::contacts::global().other_chat_id(&chat_id, "gmessages")
+            {
                 let gm_msgs = {
                     let cid = gm_chat_id.clone();
                     tokio::task::spawn_blocking(move || load_messages(&cid))
@@ -5432,7 +5782,9 @@ async fn handle_command(
             }
 
             // Filter for display + sort
-            all_messages.retain(|m| m.text.is_some() || m.media_type.is_some() || m.media_caption.is_some());
+            all_messages.retain(|m| {
+                m.text.is_some() || m.media_type.is_some() || m.media_caption.is_some()
+            });
             all_messages.sort_by_key(|m| m.timestamp);
             if all_messages.len() > 50 {
                 all_messages = all_messages.split_off(all_messages.len() - 50);
@@ -5571,7 +5923,12 @@ async fn handle_command(
                 .await;
 
             if let Some(msg_id) = pinned_msg_id {
-                let _ = tx.send(WaEvent::MessagePinned { chat_id: chat_id.clone(), msg_id }).await;
+                let _ = tx
+                    .send(WaEvent::MessagePinned {
+                        chat_id: chat_id.clone(),
+                        msg_id,
+                    })
+                    .await;
             }
 
             // Async LID→phone resolution for unresolved group participant senders.
@@ -5613,12 +5970,9 @@ async fn handle_command(
                                 {
                                     let mut s = state_c.lock().unwrap();
                                     s.insert_lid_phone(lid_str.clone(), phone_jid.clone());
-                                    if let Some(name) =
-                                        s.contact_names.get(lid_str).cloned()
-                                    {
+                                    if let Some(name) = s.contact_names.get(lid_str).cloned() {
                                         if !s.contact_names.contains_key(&phone_jid) {
-                                            s.contact_names
-                                                .insert(phone_jid.clone(), name);
+                                            s.contact_names.insert(phone_jid.clone(), name);
                                         }
                                     }
                                     newly_resolved += 1;
@@ -5650,9 +6004,7 @@ async fn handle_command(
                                 let mut s = state_c.lock().unwrap();
                                 if let Some(msgs) = s.history.get_mut(&chat_id_c) {
                                     for m in msgs.iter_mut() {
-                                        if let Some(resolved) =
-                                            resolutions.get(&m.sender_id)
-                                        {
+                                        if let Some(resolved) = resolutions.get(&m.sender_id) {
                                             if !resolved.contains("@lid")
                                                 && *resolved != m.sender_name
                                             {
@@ -5664,9 +6016,7 @@ async fn handle_command(
                             }
                         }
                         Err(e) => {
-                            log::warn!(
-                                "LoadChat {chat_id_c}: usync LID resolution failed: {e:#}"
-                            );
+                            log::warn!("LoadChat {chat_id_c}: usync LID resolution failed: {e:#}");
                         }
                     }
                 });
@@ -5861,9 +6211,12 @@ async fn handle_command(
                         .await;
                     if let Err(e) = &result {
                         log::warn!("MarkRead group attempt 1 failed: {e:#}");
-                        let _ = client.mark_as_read(&jid, None, ids.clone()).await.map_err(
-                            |e2| log::warn!("MarkRead group attempt 2 (no sender): {e2:#}"),
-                        );
+                        let _ = client
+                            .mark_as_read(&jid, None, ids.clone())
+                            .await
+                            .map_err(|e2| {
+                                log::warn!("MarkRead group attempt 2 (no sender): {e2:#}")
+                            });
                         if sender_str.ends_with("@lid") {
                             let phone_jid_opt = state
                                 .lock()
@@ -5907,17 +6260,13 @@ async fn handle_command(
             log::debug!("WhatsApp runtime received GmessagesRepair (gm runtime disabled)");
         }
 
-        WaCommand::SetProfilePicture { path } => {
-            match std::fs::read(&path) {
-                Ok(data) => {
-                    match client.profile().set_profile_picture(data).await {
-                        Ok(_) => log::info!("Profile picture updated from {path}"),
-                        Err(e) => log::warn!("Failed to set profile picture: {e:#}"),
-                    }
-                }
-                Err(e) => log::warn!("Failed to read profile image file {path}: {e}"),
-            }
-        }
+        WaCommand::SetProfilePicture { path } => match std::fs::read(&path) {
+            Ok(data) => match client.profile().set_profile_picture(data).await {
+                Ok(_) => log::info!("Profile picture updated from {path}"),
+                Err(e) => log::warn!("Failed to set profile picture: {e:#}"),
+            },
+            Err(e) => log::warn!("Failed to read profile image file {path}: {e}"),
+        },
 
         WaCommand::SetAutoMarkRead { chat_id, enabled } => {
             let save_tx;
@@ -5934,7 +6283,10 @@ async fn handle_command(
             // If enabling, mark now so the chat transitions immediately.
             if enabled {
                 let jid: Jid = chat_id.parse()?;
-                let _ = client.chat_actions().mark_chat_as_read(&jid, true, None).await;
+                let _ = client
+                    .chat_actions()
+                    .mark_chat_as_read(&jid, true, None)
+                    .await;
             }
         }
 
@@ -6484,7 +6836,7 @@ async fn handle_command(
                                         )),
                                         ..Default::default()
                                     }
-                                },
+                                }
                                 Some(crate::bridge::MediaType::Audio) => wa::Message {
                                     audio_message: Some(Box::new(wa::message::AudioMessage {
                                         mimetype: Some("audio/ogg".into()),
@@ -6527,7 +6879,7 @@ async fn handle_command(
                                 fwd_msg.timestamp = now;
                                 fwd_msg.is_forwarded = true;
                                 persist_new_message(&fwd_msg, state);
-                                let _ = tx.send(WaEvent::MessageReceived(fwd_msg)).await;
+                                let _ = tx.send(WaEvent::MessageReceived(Box::new(fwd_msg))).await;
                             }
                         }
                     }
@@ -6555,7 +6907,7 @@ async fn handle_command(
                         fwd_msg.is_from_me = true;
                         fwd_msg.timestamp = now;
                         persist_new_message(&fwd_msg, state);
-                        let _ = tx.send(WaEvent::MessageReceived(fwd_msg)).await;
+                        let _ = tx.send(WaEvent::MessageReceived(Box::new(fwd_msg))).await;
                     }
                     continue;
                 }
@@ -6618,7 +6970,7 @@ async fn handle_command(
                             };
                             // Add to cache and notify UI
                             persist_new_message(&local_msg, state);
-                            let _ = tx.send(WaEvent::MessageReceived(local_msg)).await;
+                            let _ = tx.send(WaEvent::MessageReceived(Box::new(local_msg))).await;
                         }
                         Err(e) => log::warn!("Forward failed: {e:#}"),
                     }
@@ -6711,7 +7063,7 @@ async fn handle_command(
                         is_favorite: false,
                         label: None,
                         pinned_msg_id: None,
-                auto_mark_read: false,
+                        auto_mark_read: false,
                     };
                     persist_chat(state, summary);
                     // Emit the POST-upsert summary: upsert_chat's hardening
@@ -6869,7 +7221,7 @@ async fn handle_command(
                         is_system_message: false,
                     };
                     let (_, _) = persist_new_message(&poll_msg, state);
-                    let _ = tx.send(WaEvent::MessageReceived(poll_msg)).await;
+                    let _ = tx.send(WaEvent::MessageReceived(Box::new(poll_msg))).await;
                 }
                 Err(e) => log::error!("SendPoll FAILED: {e:#}"),
             }
@@ -7078,7 +7430,7 @@ async fn handle_command(
                                 is_favorite: false,
                                 label: None,
                                 pinned_msg_id: None,
-                auto_mark_read: false,
+                                auto_mark_read: false,
                             })
                         })
                         .collect()
@@ -7302,7 +7654,7 @@ async fn handle_command(
                     is_favorite: false,
                     label: None,
                     pinned_msg_id: None,
-                auto_mark_read: false,
+                    auto_mark_read: false,
                 };
                 persist_chat(state, summary);
                 // Emit the POST-upsert summary (correction 4) — upsert_chat may
@@ -7507,7 +7859,7 @@ async fn handle_command(
                                     chat_id: chat_id.clone(),
                                 })
                                 .await;
-                            let _ = tx.send(WaEvent::MessageReceived(sent_msg)).await;
+                            let _ = tx.send(WaEvent::MessageReceived(Box::new(sent_msg))).await;
                             log::info!("Image sent successfully");
                         }
                         Err(e) => {
@@ -7539,54 +7891,46 @@ async fn handle_command(
             tmp_id,
         } => {
             let jid: Jid = chat_id.parse()?;
-            // Download the GIF MP4 from Tenor on a thread with large stack
-            let (dl_tx, dl_rx) = tokio::sync::oneshot::channel::<anyhow::Result<Vec<u8>>>();
-            let url = mp4_url.clone();
-            std::thread::Builder::new()
-                .name("gif-download".into())
-                .stack_size(4 * 1024 * 1024) // 4MB stack
-                .spawn(move || {
-                    use std::io::Read;
-                    let result = ureq::get(&url)
-                        .call()
-                        .map_err(|e| anyhow::anyhow!("{e}"))
-                        .and_then(|r| {
-                            let mut bytes = Vec::new();
-                            r.into_reader().read_to_end(&mut bytes)?;
-                            Ok(bytes)
-                        });
-                    let _ = dl_tx.send(result);
-                })
-                .ok();
-            let data = match dl_rx.await {
-                Ok(Ok(d)) => d,
+            let data = match tokio::task::spawn_blocking(move || {
+                let bytes = fetch_bounded_bytes(&mp4_url, TENOR_GIF_SEND_MAX_BYTES)?;
+                validate_mp4(&bytes)?;
+                Ok::<_, anyhow::Error>(bytes)
+            })
+            .await
+            {
+                Ok(Ok(data)) => data,
                 Ok(Err(e)) => {
                     log::warn!("GIF download failed: {e:#}");
+                    report_tenor_send_failure(
+                        tx,
+                        &tmp_id,
+                        &chat_id,
+                        "Couldn’t download that GIF. Please try another result.",
+                    )
+                    .await;
                     return Ok(());
                 }
                 Err(e) => {
-                    log::warn!("GIF download channel failed: {e:#}");
+                    log::warn!("GIF download task failed: {e:#}");
+                    report_tenor_send_failure(
+                        tx,
+                        &tmp_id,
+                        &chat_id,
+                        "GIF download stopped unexpectedly. Please try again.",
+                    )
+                    .await;
                     return Ok(());
                 }
             };
 
             // Save locally so the GIF shows in our app
-            let local_path = {
-                let dir = std::env::current_dir().unwrap_or_default().join(MEDIA_DIR);
-                let _ = std::fs::create_dir_all(&dir);
-                let fname = format!(
-                    "gif_{}.mp4",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()
-                );
-                let path = dir.join(&fname);
-                let _ = std::fs::write(&path, &data);
-                path.canonicalize()
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string()
+            let local_path = match save_tenor_media("gif", "mp4", &data).await {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    // Sending can still succeed if the local cache is unwritable.
+                    log::warn!("Could not cache downloaded GIF: {e:#}");
+                    None
+                }
             };
 
             // Upload as video
@@ -7637,7 +7981,7 @@ async fn handle_command(
                                 poll_votes: vec![],
                                 quoted_sender: None,
                                 reactions: vec![],
-                                media_local_path: Some(local_path),
+                                media_local_path: local_path,
                                 media_filename: None,
                                 media_caption: None,
                                 contact_name: None,
@@ -7652,7 +7996,7 @@ async fn handle_command(
                                 quoted_media_path: None,
                             };
                             persist_new_message(&sent, state);
-                            let _ = tx.send(WaEvent::MessageReceived(sent)).await;
+                            let _ = tx.send(WaEvent::MessageReceived(Box::new(sent))).await;
                             let _ = tx
                                 .send(WaEvent::MessageConfirmed {
                                     tmp_id,
@@ -7661,57 +8005,92 @@ async fn handle_command(
                                 })
                                 .await;
                         }
-                        Err(e) => log::warn!("GIF send failed: {e:#}"),
+                        Err(e) => {
+                            log::warn!("GIF send failed: {e:#}");
+                            report_tenor_send_failure(
+                                tx,
+                                &tmp_id,
+                                &chat_id,
+                                "Couldn’t send that GIF. Please try again.",
+                            )
+                            .await;
+                        }
                     }
                 }
-                Err(e) => log::warn!("GIF upload failed: {e:#}"),
+                Err(e) => {
+                    log::warn!("GIF upload failed: {e:#}");
+                    report_tenor_send_failure(
+                        tx,
+                        &tmp_id,
+                        &chat_id,
+                        "Couldn’t upload that GIF. Please try again.",
+                    )
+                    .await;
+                }
             }
         }
 
-        WaCommand::SearchGifs { query } => {
-            // Use Tenor API v2 for GIF search (same as WhatsApp Web)
-            let tenor_key = tenor_api_key();
-            let url = format!(
-                "https://tenor.googleapis.com/v2/search?q={}&key={tenor_key}&client_key=gboard&media_filter=mp4,tinygif&limit=20",
-                query.replace(' ', "+").replace('&', "%26")
-            );
-            match tokio::task::spawn_blocking(move || {
-                ureq::get(&url)
-                    .call()
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-                    .and_then(|resp| {
-                        let body = resp.into_string()?;
-                        Ok(body)
-                    })
-            })
-            .await
-            {
-                Ok(Ok(body)) => {
-                    // Parse Tenor JSON response
-                    let gifs: Vec<crate::bridge::GifResult> =
-                        serde_json::from_str::<serde_json::Value>(&body)
-                            .ok()
-                            .and_then(|v| v.get("results")?.as_array().cloned())
-                            .unwrap_or_default()
-                            .iter()
-                            .filter_map(|r| {
-                                let media = r.get("media_formats")?;
-                                let preview = media.get("tinygif")?.get("url")?.as_str()?;
-                                let mp4 = media.get("mp4")?.get("url")?.as_str()?;
-                                let title = r.get("content_description")?.as_str().unwrap_or("");
-                                Some(crate::bridge::GifResult {
-                                    preview_url: preview.to_string(),
-                                    mp4_url: mp4.to_string(),
-                                    title: title.to_string(),
-                                })
-                            })
-                            .collect();
-                    log::info!("GIF search '{}': {} results", query, gifs.len());
-                    let _ = tx.send(WaEvent::GifResults { gifs }).await;
+        WaCommand::SearchGifs { request_id, query } => {
+            use std::sync::atomic::Ordering;
+            LATEST_GIF_SEARCH.fetch_max(request_id, Ordering::AcqRel);
+            let permit = match TENOR_SEARCH_SEMAPHORE.acquire().await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    log::warn!("GIF search limiter unavailable: {e}");
+                    let _ = tx
+                        .send(WaEvent::GifResults {
+                            request_id,
+                            query,
+                            gifs: Vec::new(),
+                            error: Some("GIF search is unavailable. Please try again.".to_string()),
+                        })
+                        .await;
+                    return Ok(());
                 }
-                Ok(Err(e)) => log::warn!("GIF search failed: {e:#}"),
-                Err(e) => log::warn!("GIF search task failed: {e:#}"),
+            };
+            if LATEST_GIF_SEARCH.load(Ordering::Acquire) != request_id {
+                return Ok(());
             }
+            let search_query = query.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                search_tenor(&search_query, TenorSearchKind::Gif)
+            })
+            .await;
+            drop(permit);
+            if LATEST_GIF_SEARCH.load(Ordering::Acquire) != request_id {
+                return Ok(());
+            }
+            let (gifs, error) = match result {
+                Ok(Ok(gifs)) => {
+                    log::info!("GIF search '{}': {} results", query, gifs.len());
+                    (gifs, None)
+                }
+                Ok(Err(e)) => {
+                    log::warn!("GIF search failed: {e:#}");
+                    (
+                        Vec::new(),
+                        Some(
+                            "Tenor search is unavailable. Check your connection and try again."
+                                .to_string(),
+                        ),
+                    )
+                }
+                Err(e) => {
+                    log::warn!("GIF search task failed: {e:#}");
+                    (
+                        Vec::new(),
+                        Some("GIF search stopped unexpectedly. Please try again.".to_string()),
+                    )
+                }
+            };
+            let _ = tx
+                .send(WaEvent::GifResults {
+                    request_id,
+                    query,
+                    gifs,
+                    error,
+                })
+                .await;
         }
 
         WaCommand::SendContact {
@@ -7777,7 +8156,7 @@ async fn handle_command(
                         is_system_message: false,
                     };
                     persist_new_message(&sent, state);
-                    let _ = tx.send(WaEvent::MessageReceived(sent)).await;
+                    let _ = tx.send(WaEvent::MessageReceived(Box::new(sent))).await;
                     let _ = tx
                         .send(WaEvent::MessageConfirmed {
                             tmp_id,
@@ -7791,53 +8170,66 @@ async fn handle_command(
             }
         }
 
-        WaCommand::SearchStickers { query } => {
-            let tenor_key = tenor_api_key();
-            let url = format!(
-                "https://tenor.googleapis.com/v2/search?q={}&key={tenor_key}&client_key=gboard&searchfilter=sticker&media_filter=webp_transparent,tinygif&limit=20",
-                query.replace(' ', "+").replace('&', "%26")
-            );
-            match tokio::task::spawn_blocking(move || {
-                ureq::get(&url)
-                    .call()
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-                    .and_then(|resp| Ok(resp.into_string()?))
-            })
-            .await
-            {
-                Ok(Ok(body)) => {
-                    let stickers: Vec<crate::bridge::GifResult> =
-                        serde_json::from_str::<serde_json::Value>(&body)
-                            .ok()
-                            .and_then(|v| v.get("results")?.as_array().cloned())
-                            .unwrap_or_default()
-                            .iter()
-                            .filter_map(|r| {
-                                let media = r.get("media_formats")?;
-                                let preview = media
-                                    .get("tinygif")
-                                    .or(media.get("webp_transparent"))?
-                                    .get("url")?
-                                    .as_str()?;
-                                let webp = media
-                                    .get("webp_transparent")
-                                    .or(media.get("tinygif"))?
-                                    .get("url")?
-                                    .as_str()?;
-                                let title = r.get("content_description")?.as_str().unwrap_or("");
-                                Some(crate::bridge::GifResult {
-                                    preview_url: preview.to_string(),
-                                    mp4_url: webp.to_string(), // reuse field for webp URL
-                                    title: title.to_string(),
-                                })
-                            })
-                            .collect();
-                    log::info!("Sticker search '{}': {} results", query, stickers.len());
-                    let _ = tx.send(WaEvent::StickerResults { stickers }).await;
+        WaCommand::SearchStickers { request_id, query } => {
+            use std::sync::atomic::Ordering;
+            LATEST_STICKER_SEARCH.fetch_max(request_id, Ordering::AcqRel);
+            let permit = match TENOR_SEARCH_SEMAPHORE.acquire().await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    log::warn!("Sticker search limiter unavailable: {e}");
+                    let _ = tx
+                        .send(WaEvent::StickerResults {
+                            request_id,
+                            query,
+                            stickers: Vec::new(),
+                            error: Some(
+                                "Sticker search is unavailable. Please try again.".to_string(),
+                            ),
+                        })
+                        .await;
+                    return Ok(());
                 }
-                Ok(Err(e)) => log::warn!("Sticker search failed: {e:#}"),
-                Err(e) => log::warn!("Sticker search task failed: {e:#}"),
+            };
+            if LATEST_STICKER_SEARCH.load(Ordering::Acquire) != request_id {
+                return Ok(());
             }
+            let search_query = query.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                search_tenor(&search_query, TenorSearchKind::Sticker)
+            })
+            .await;
+            drop(permit);
+            if LATEST_STICKER_SEARCH.load(Ordering::Acquire) != request_id {
+                return Ok(());
+            }
+            let (stickers, error) = match result {
+                Ok(Ok(stickers)) => {
+                    log::info!("Sticker search '{}': {} results", query, stickers.len());
+                    (stickers, None)
+                }
+                Ok(Err(e)) => {
+                    log::warn!("Sticker search failed: {e:#}");
+                    (
+                        Vec::new(),
+                        Some("Tenor sticker search is unavailable. Check your connection and try again.".to_string()),
+                    )
+                }
+                Err(e) => {
+                    log::warn!("Sticker search task failed: {e:#}");
+                    (
+                        Vec::new(),
+                        Some("Sticker search stopped unexpectedly. Please try again.".to_string()),
+                    )
+                }
+            };
+            let _ = tx
+                .send(WaEvent::StickerResults {
+                    request_id,
+                    query,
+                    stickers,
+                    error,
+                })
+                .await;
         }
 
         WaCommand::SendSticker {
@@ -7846,53 +8238,45 @@ async fn handle_command(
             tmp_id,
         } => {
             let jid: Jid = chat_id.parse()?;
-            let (dl_tx, dl_rx) = tokio::sync::oneshot::channel::<anyhow::Result<Vec<u8>>>();
-            let url = webp_url.clone();
-            std::thread::Builder::new()
-                .name("sticker-download".into())
-                .stack_size(4 * 1024 * 1024)
-                .spawn(move || {
-                    use std::io::Read;
-                    let result = ureq::get(&url)
-                        .call()
-                        .map_err(|e| anyhow::anyhow!("{e}"))
-                        .and_then(|r| {
-                            let mut b = Vec::new();
-                            r.into_reader().read_to_end(&mut b)?;
-                            Ok(b)
-                        });
-                    let _ = dl_tx.send(result);
-                })
-                .ok();
-            let data = match dl_rx.await {
-                Ok(Ok(d)) => d,
+            let data = match tokio::task::spawn_blocking(move || {
+                let bytes = fetch_bounded_bytes(&webp_url, TENOR_STICKER_SEND_MAX_BYTES)?;
+                validate_webp(&bytes)?;
+                Ok::<_, anyhow::Error>(bytes)
+            })
+            .await
+            {
+                Ok(Ok(data)) => data,
                 Ok(Err(e)) => {
                     log::warn!("Sticker download failed: {e:#}");
+                    report_tenor_send_failure(
+                        tx,
+                        &tmp_id,
+                        &chat_id,
+                        "Couldn’t download that sticker. Please try another result.",
+                    )
+                    .await;
                     return Ok(());
                 }
                 Err(e) => {
-                    log::warn!("Sticker download channel failed: {e:#}");
+                    log::warn!("Sticker download task failed: {e:#}");
+                    report_tenor_send_failure(
+                        tx,
+                        &tmp_id,
+                        &chat_id,
+                        "Sticker download stopped unexpectedly. Please try again.",
+                    )
+                    .await;
                     return Ok(());
                 }
             };
 
             // Save locally
-            let local_path = {
-                let dir = std::env::current_dir().unwrap_or_default().join(MEDIA_DIR);
-                let _ = std::fs::create_dir_all(&dir);
-                let fname = format!(
-                    "sticker_{}.webp",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()
-                );
-                let path = dir.join(&fname);
-                let _ = std::fs::write(&path, &data);
-                path.canonicalize()
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string()
+            let local_path = match save_tenor_media("sticker", "webp", &data).await {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    log::warn!("Could not cache downloaded sticker: {e:#}");
+                    None
+                }
             };
 
             match client
@@ -7941,7 +8325,7 @@ async fn handle_command(
                                 quoted_text: None,
                                 quoted_sender: None,
                                 reactions: vec![],
-                                media_local_path: Some(local_path),
+                                media_local_path: local_path,
                                 media_filename: None,
                                 media_caption: None,
                                 contact_name: None,
@@ -7956,7 +8340,7 @@ async fn handle_command(
                                 quoted_media_path: None,
                             };
                             persist_new_message(&sent, state);
-                            let _ = tx.send(WaEvent::MessageReceived(sent)).await;
+                            let _ = tx.send(WaEvent::MessageReceived(Box::new(sent))).await;
                             let _ = tx
                                 .send(WaEvent::MessageConfirmed {
                                     tmp_id,
@@ -7965,10 +8349,28 @@ async fn handle_command(
                                 })
                                 .await;
                         }
-                        Err(e) => log::warn!("Sticker send failed: {e:#}"),
+                        Err(e) => {
+                            log::warn!("Sticker send failed: {e:#}");
+                            report_tenor_send_failure(
+                                tx,
+                                &tmp_id,
+                                &chat_id,
+                                "Couldn’t send that sticker. Please try again.",
+                            )
+                            .await;
+                        }
                     }
                 }
-                Err(e) => log::warn!("Sticker upload failed: {e:#}"),
+                Err(e) => {
+                    log::warn!("Sticker upload failed: {e:#}");
+                    report_tenor_send_failure(
+                        tx,
+                        &tmp_id,
+                        &chat_id,
+                        "Couldn’t upload that sticker. Please try again.",
+                    )
+                    .await;
+                }
             }
         }
 
@@ -8081,10 +8483,7 @@ async fn handle_command(
                         let s = state.lock().unwrap();
                         resolve_sender_name(&s, &participant_jid)
                     };
-                    let sys_msg = make_system_message(
-                        &chat_id,
-                        &format!("You added {name}"),
-                    );
+                    let sys_msg = make_system_message(&chat_id, &format!("You added {name}"));
                     {
                         let mut s = state.lock().unwrap();
                         if let Some(msgs) = s.history.get_mut(&chat_id) {
@@ -8092,7 +8491,7 @@ async fn handle_command(
                             s.queue_save_messages(&chat_id);
                         }
                     }
-                    let _ = tx.send(WaEvent::MessageReceived(sys_msg)).await;
+                    let _ = tx.send(WaEvent::MessageReceived(Box::new(sys_msg))).await;
                     // Refresh member list
                     if let Ok(meta) = client.groups().get_metadata(&jid).await {
                         let members: Vec<crate::bridge::GroupMember> = meta
@@ -8146,7 +8545,7 @@ async fn handle_command(
                             s.queue_save_messages(&chat_id);
                         }
                     }
-                    let _ = tx.send(WaEvent::MessageReceived(sys_msg)).await;
+                    let _ = tx.send(WaEvent::MessageReceived(Box::new(sys_msg))).await;
                     if let Ok(meta) = client.groups().get_metadata(&group_jid).await {
                         let members: Vec<crate::bridge::GroupMember> = meta
                             .participants
@@ -8190,7 +8589,8 @@ async fn handle_command(
                         let s = state.lock().unwrap();
                         resolve_sender_name(&s, &member_jid)
                     };
-                    let sys_msg = make_system_message(&chat_id, &format!("You made {name} an admin"));
+                    let sys_msg =
+                        make_system_message(&chat_id, &format!("You made {name} an admin"));
                     {
                         let mut s = state.lock().unwrap();
                         if let Some(msgs) = s.history.get_mut(&chat_id) {
@@ -8198,7 +8598,7 @@ async fn handle_command(
                             s.queue_save_messages(&chat_id);
                         }
                     }
-                    let _ = tx.send(WaEvent::MessageReceived(sys_msg)).await;
+                    let _ = tx.send(WaEvent::MessageReceived(Box::new(sys_msg))).await;
                 }
                 Err(e) => {
                     log::warn!("PromoteGroupAdmin failed: {e:#}");
@@ -8225,7 +8625,8 @@ async fn handle_command(
                         let s = state.lock().unwrap();
                         resolve_sender_name(&s, &member_jid)
                     };
-                    let sys_msg = make_system_message(&chat_id, &format!("You removed {name} as admin"));
+                    let sys_msg =
+                        make_system_message(&chat_id, &format!("You removed {name} as admin"));
                     {
                         let mut s = state.lock().unwrap();
                         if let Some(msgs) = s.history.get_mut(&chat_id) {
@@ -8233,7 +8634,7 @@ async fn handle_command(
                             s.queue_save_messages(&chat_id);
                         }
                     }
-                    let _ = tx.send(WaEvent::MessageReceived(sys_msg)).await;
+                    let _ = tx.send(WaEvent::MessageReceived(Box::new(sys_msg))).await;
                 }
                 Err(e) => {
                     log::warn!("DemoteGroupAdmin failed: {e:#}");
@@ -8336,10 +8737,7 @@ async fn handle_command(
                     } else {
                         wacore::download::MediaType::Audio
                     };
-                    match client
-                        .upload(data, upload_type)
-                        .await
-                    {
+                    match client.upload(data, upload_type).await {
                         Ok(upload) => {
                             let now_ts = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -8379,8 +8777,7 @@ async fn handle_command(
                                     );
                                     sent_msg.media_type = Some(crate::bridge::MediaType::Audio);
                                     // Persist out of /tmp so it survives a reboot.
-                                    sent_msg.media_local_path =
-                                        Some(persist_outgoing_media(&path));
+                                    sent_msg.media_local_path = Some(persist_outgoing_media(&path));
                                     sent_msg.receipt_status = ReceiptStatus::Sent;
                                     let (_, new_chat) = persist_new_message(&sent_msg, state);
                                     if let Some(s) = new_chat {
@@ -8393,7 +8790,8 @@ async fn handle_command(
                                             chat_id,
                                         })
                                         .await;
-                                    let _ = tx.send(WaEvent::MessageReceived(sent_msg)).await;
+                                    let _ =
+                                        tx.send(WaEvent::MessageReceived(Box::new(sent_msg))).await;
                                 }
                                 Err(e) => {
                                     log::warn!("SendAudio send failed: {e:#}");
@@ -8523,7 +8921,7 @@ async fn handle_command(
                         if let Some(s) = new_chat {
                             let _ = tx.send(WaEvent::ChatAdded(s)).await;
                         }
-                        let _ = tx.send(WaEvent::MessageReceived(self_msg)).await;
+                        let _ = tx.send(WaEvent::MessageReceived(Box::new(self_msg))).await;
                     }
                     Err(e) => {
                         log::warn!("MultiSend to {cid} failed: {e:#}");
@@ -8556,7 +8954,10 @@ async fn handle_command(
                     ))
                     .await;
                 let _ = tx
-                    .send(WaEvent::MultiSendComplete { sent: 0, failed: chat_ids.len() as u32 })
+                    .send(WaEvent::MultiSendComplete {
+                        sent: 0,
+                        failed: chat_ids.len() as u32,
+                    })
                     .await;
             } else {
                 let total = chat_ids.len() as u32;
@@ -8614,10 +9015,13 @@ async fn handle_command(
                             );
                             {
                                 let mut s = state.lock().unwrap();
-                                s.history.entry(cid.clone()).or_default().push(self_msg.clone());
+                                s.history
+                                    .entry(cid.clone())
+                                    .or_default()
+                                    .push(self_msg.clone());
                                 s.queue_save_messages(cid);
                             }
-                            let _ = tx.send(WaEvent::MessageReceived(self_msg)).await;
+                            let _ = tx.send(WaEvent::MessageReceived(Box::new(self_msg))).await;
                         }
                         Err(e) => {
                             log::warn!("MultiForward to {cid} failed: {e:#}");
@@ -8659,11 +9063,10 @@ fn search_local_messages(query: &str) -> Vec<crate::bridge::SearchHit> {
         if data.len() < 4 {
             continue;
         }
-        let messages: Vec<crate::bridge::IncomingMessage> =
-            match bincode::deserialize(&data[4..]) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
+        let messages: Vec<crate::bridge::IncomingMessage> = match bincode::deserialize(&data[4..]) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
         let chat_id = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -8733,6 +9136,7 @@ fn generate_waveform(audio_data: &[u8], num_bins: usize) -> Vec<u8> {
 
 const MEDIA_DIR: &str = "wa_media";
 const AVATARS_DIR: &str = "wa_avatars";
+static MEDIA_DOWNLOAD_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 
 /// Copy an outgoing media file out of a volatile dir (`/tmp`, wiped on reboot)
 /// into the persistent `wa_media` dir, so the local echo of a sent image still
@@ -8955,6 +9359,9 @@ async fn execute_media_download(
     chat_id: String,
     dl: PendingDownload,
 ) {
+    let Ok(_permit) = MEDIA_DOWNLOAD_LIMIT.acquire().await else {
+        return;
+    };
     let media_type = bridge_media_type_from_pending(&dl);
 
     let result: anyhow::Result<(Vec<u8>, String, Option<String>)> = async {
@@ -9002,10 +9409,6 @@ async fn execute_media_download(
     let dir = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(MEDIA_DIR);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        log::warn!("Cannot create media dir: {e}");
-        return;
-    }
 
     // Use msg_id as the base name, with original filename appended for documents
     let local_name = match &orig_filename {
@@ -9025,18 +9428,28 @@ async fn execute_media_download(
         None => format!("{msg_id}.{ext}"),
     };
     let path = dir.join(&local_name);
-
-    if let Err(e) = std::fs::write(&path, &bytes) {
-        log::warn!("Failed to save media {local_name}: {e}");
-        return;
-    }
-
-    // Use absolute path so GTK Picture can find it regardless of working directory
-    let path_str = path
-        .canonicalize()
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string();
+    let path_str = match tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(&path, bytes)?;
+        // Use absolute path so GTK can find it regardless of working directory.
+        Ok(path
+            .canonicalize()
+            .unwrap_or(path)
+            .to_string_lossy()
+            .into_owned())
+    })
+    .await
+    {
+        Ok(Ok(path)) => path,
+        Ok(Err(e)) => {
+            log::warn!("Failed to save media {local_name}: {e}");
+            return;
+        }
+        Err(e) => {
+            log::warn!("Media writer task failed for {local_name}: {e}");
+            return;
+        }
+    };
     log::info!("Media saved: {path_str}");
 
     // Update in-memory cache and queue disk write (non-blocking)
@@ -10262,4 +10675,83 @@ fn uuid_v4_simple() -> String {
         .unwrap_or_default()
         .subsec_nanos();
     format!("{:08x}", nanos)
+}
+
+#[cfg(test)]
+mod tenor_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn tenor_result(index: usize) -> serde_json::Value {
+        json!({
+            "content_description": format!("result {index}"),
+            "media_formats": {
+                "gifpreview": { "url": format!("https://cdn.example/{index}-preview.gif") },
+                "mp4": { "url": format!("https://cdn.example/{index}.mp4") },
+                "tinygif": { "url": format!("https://cdn.example/{index}.gif") },
+                "webp_transparent": { "url": format!("https://cdn.example/{index}.webp") }
+            }
+        })
+    }
+
+    #[test]
+    fn tenor_url_components_are_encoded_safely() {
+        assert_eq!(
+            encode_url_component("cats & dogs/😺"),
+            "cats%20%26%20dogs%2F%F0%9F%98%BA"
+        );
+    }
+
+    #[test]
+    fn tenor_api_parser_caps_results_and_selects_gif_formats() {
+        let values = (0..20).map(tenor_result).collect::<Vec<_>>();
+        let body = json!({ "results": values }).to_string();
+        let results = parse_tenor_api_results(&body, TenorSearchKind::Gif).unwrap();
+
+        assert_eq!(results.len(), TENOR_RESULT_LIMIT);
+        assert_eq!(results[0].preview_url, "https://cdn.example/0-preview.gif");
+        assert_eq!(results[0].mp4_url, "https://cdn.example/0.mp4");
+        assert_eq!(results[0].title, "result 0");
+    }
+
+    #[test]
+    fn sticker_parser_never_sends_a_gif_as_webp() {
+        let values = vec![tenor_result(7)];
+        let results = parse_tenor_values(&values, TenorSearchKind::Sticker);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].preview_url, "https://cdn.example/7.webp");
+        assert_eq!(results[0].mp4_url, "https://cdn.example/7.webp");
+        assert!(!results[0].mp4_url.ends_with(".gif"));
+    }
+
+    #[test]
+    fn tenor_script_extraction_is_scoped_to_the_requested_id() {
+        let html = r#"<script id="other">wrong</script><script id="data" type="text/x-cache"> right </script>"#;
+        assert_eq!(extract_script_contents(html, "data"), Some("right"));
+    }
+
+    #[test]
+    #[ignore = "requires live Tenor network access"]
+    fn live_tenor_gif_search_returns_sendable_mp4() {
+        let results = search_tenor("hello", TenorSearchKind::Gif).unwrap();
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|result| {
+            result.preview_url.starts_with("https://") && result.mp4_url.starts_with("https://")
+        }));
+        let bytes = fetch_bounded_bytes(&results[0].mp4_url, TENOR_GIF_SEND_MAX_BYTES).unwrap();
+        validate_mp4(&bytes).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires live Tenor network access"]
+    fn live_tenor_sticker_search_returns_sendable_webp() {
+        let results = search_tenor("hello", TenorSearchKind::Sticker).unwrap();
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|result| {
+            result.preview_url.starts_with("https://") && result.mp4_url.starts_with("https://")
+        }));
+        let bytes = fetch_bounded_bytes(&results[0].mp4_url, TENOR_STICKER_SEND_MAX_BYTES).unwrap();
+        validate_webp(&bytes).unwrap();
+    }
 }

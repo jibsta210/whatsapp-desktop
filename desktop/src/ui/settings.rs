@@ -3,10 +3,9 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
 
 use gtk4::prelude::*;
-use gtk4::{Align, Box, Label, Orientation, Switch};
+use gtk4::{Align, Box, Label, Orientation};
 use libadwaita as adw;
 use libadwaita::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -52,6 +51,11 @@ pub struct AppSettings {
     /// UI zoom level: 0.0 = auto-detect, otherwise 0.75 – 3.0
     #[serde(default)]
     pub zoom_level: f64,
+    /// Preferred width of the chat-list pane in logical pixels. `None` means
+    /// the user has not moved the divider yet, so the UI uses its comfortable
+    /// first-run default.
+    #[serde(default)]
+    pub sidebar_width: Option<i32>,
     // ── Behaviour ──
     /// Close to tray instead of quitting
     #[serde(default = "default_true")]
@@ -88,6 +92,7 @@ impl Default for AppSettings {
             ai_model: "gemini".to_string(),
             theme: "dark".to_string(),
             zoom_level: 0.0, // 0.0 = auto-detect
+            sidebar_width: None,
             close_to_tray: true,
             audio_input: String::new(),
         }
@@ -117,8 +122,7 @@ impl AppSettings {
                 .or_else(|| {
                     let home = std::env::var("HOME").unwrap_or_default();
                     std::fs::read_to_string(
-                        std::path::PathBuf::from(home)
-                            .join(".config/whatsapp-desktop/gemini_key"),
+                        std::path::PathBuf::from(home).join(".config/whatsapp-desktop/gemini_key"),
                     )
                     .ok()
                     .map(|s| s.trim().to_string())
@@ -211,6 +215,15 @@ impl SettingsHandle {
 
     pub fn show_preview(&self) -> bool {
         self.inner.borrow().notification_preview
+    }
+
+    /// Persist the user's preferred chat-list width. Callers sanitize the
+    /// value against the layout limits before storing it.
+    pub fn set_sidebar_width(&self, width: i32) {
+        if self.inner.borrow().sidebar_width == Some(width) {
+            return;
+        }
+        self.update(|settings| settings.sidebar_width = Some(width));
     }
 }
 
@@ -447,15 +460,23 @@ pub fn show_settings_window(
     restart_hint.set_margin_top(4);
 
     let sh = settings.clone();
-    let row_ref = zoom_row.clone();
-    let hint_ref = restart_hint.clone();
+    let row_weak = zoom_row.downgrade();
+    let hint_weak = restart_hint.downgrade();
     scale.connect_value_changed(move |s| {
         let val = s.value();
         // Snap: if within 0.1 of 0.75, treat as "auto"
-        let level = if val < 0.85 { 0.0 } else { (val * 4.0).round() / 4.0 };
+        let level = if val < 0.85 {
+            0.0
+        } else {
+            (val * 4.0).round() / 4.0
+        };
         sh.update(|settings| settings.zoom_level = level);
-        row_ref.set_subtitle(&zoom_label(level));
-        hint_ref.set_visible(true);
+        if let Some(row) = row_weak.upgrade() {
+            row.set_subtitle(&zoom_label(level));
+        }
+        if let Some(hint) = hint_weak.upgrade() {
+            hint.set_visible(true);
+        }
     });
     zoom_row.add_suffix(&scale);
     zoom_group.add(&zoom_row);
@@ -542,7 +563,8 @@ pub fn show_settings_window(
     let audio_row = adw::ComboRow::new();
     audio_row.set_title("Microphone");
     audio_row.set_subtitle("Audio input device for voice note recording");
-    let source_list = gtk4::StringList::new(&sources.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+    let source_list =
+        gtk4::StringList::new(&sources.iter().map(|s| s.as_str()).collect::<Vec<_>>());
     audio_row.set_model(Some(&source_list));
 
     // Select current setting
@@ -582,8 +604,11 @@ pub fn show_settings_window(
     logout_btn.add_css_class("destructive-action");
     {
         let bridge = bridge.clone();
-        let window_c = window.clone();
+        let window_weak = window.downgrade();
         logout_btn.connect_clicked(move |_| {
+            let Some(window) = window_weak.upgrade() else {
+                return;
+            };
             // Honest copy: this only disconnects the current session. The
             // device remains linked on the phone and the app reconnects on
             // next launch — a true unlink (remove-device IQ + local session
@@ -601,15 +626,17 @@ pub fn show_settings_window(
             dialog.set_response_appearance("logout", adw::ResponseAppearance::Destructive);
             dialog.set_close_response("cancel");
             let bridge = bridge.clone();
-            let window_c2 = window_c.clone();
+            let window_weak = window.downgrade();
             dialog.connect_response(None, move |dlg, resp| {
                 if resp == "logout" {
                     bridge.send_command(crate::bridge::WaCommand::Logout);
-                    window_c2.close();
+                    if let Some(window) = window_weak.upgrade() {
+                        window.close();
+                    }
                 }
                 dlg.close();
             });
-            dialog.present(Some(&window_c));
+            dialog.present(Some(&window));
         });
     }
     logout_row.add_suffix(&logout_btn);
@@ -720,10 +747,7 @@ fn build_gmessages_page() -> adw::PreferencesPage {
         let _ = crate::gm_qr_state::take_gaia_confirmation();
         crate::gm_qr_state::request_gaia_pair();
         log::info!("gaia: click → resetting status to Starting; opening dialog");
-        if let Some(win) = btn
-            .root()
-            .and_then(|r| r.downcast::<gtk4::Window>().ok())
-        {
+        if let Some(win) = btn.root().and_then(|r| r.downcast::<gtk4::Window>().ok()) {
             start_gaia_status_dialog(win);
         } else {
             log::warn!("gaia: couldn't find parent window for status dialog");
@@ -739,9 +763,7 @@ fn build_gmessages_page() -> adw::PreferencesPage {
     // the GTK main loop from there would require more plumbing.
     let qr_row = adw::ActionRow::new();
     qr_row.set_title("QR code");
-    qr_row.set_subtitle(
-        "Scan with Google Messages → Settings → Device pairing → QR code scanner",
-    );
+    qr_row.set_subtitle("Scan with Google Messages → Settings → Device pairing → QR code scanner");
     let qr_holder = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     qr_holder.set_size_request(280, 280);
     qr_holder.set_valign(gtk4::Align::Center);
@@ -753,15 +775,15 @@ fn build_gmessages_page() -> adw::PreferencesPage {
     let last_url = std::rc::Rc::new(std::cell::RefCell::new(qr_url.clone()));
     refresh_qr_holder(&qr_holder, &qr_row, qr_url.as_deref());
     {
-        let qr_holder = qr_holder.clone();
-        let qr_row = qr_row.clone();
+        let qr_holder_weak = qr_holder.downgrade();
+        let qr_row_weak = qr_row.downgrade();
         let last_url = last_url.clone();
         gtk4::glib::timeout_add_local(std::time::Duration::from_secs(1), move || {
-            let cur = crate::gm_qr_state::get();
-            // Stop ticking once the widget has been destroyed.
-            if qr_holder.parent().is_none() {
+            let (Some(qr_holder), Some(qr_row)) = (qr_holder_weak.upgrade(), qr_row_weak.upgrade())
+            else {
                 return gtk4::glib::ControlFlow::Break;
-            }
+            };
+            let cur = crate::gm_qr_state::get();
             if cur != *last_url.borrow() {
                 refresh_qr_holder(&qr_holder, &qr_row, cur.as_deref());
                 *last_url.borrow_mut() = cur;
@@ -786,7 +808,8 @@ fn build_gmessages_page() -> adw::PreferencesPage {
     );
     // Read from a simple config file in CWD (data dir). Default true.
     let pref_path = std::path::PathBuf::from("gmessages-prefer-whatsapp");
-    let prefer_wa = !pref_path.exists() || std::fs::read_to_string(&pref_path).unwrap_or_default() != "0";
+    let prefer_wa =
+        !pref_path.exists() || std::fs::read_to_string(&pref_path).unwrap_or_default() != "0";
     row_default_wa.set_active(prefer_wa);
     row_default_wa.connect_active_notify(move |row| {
         let v = if row.is_active() { "1" } else { "0" };
@@ -830,19 +853,13 @@ fn build_gmessages_page() -> adw::PreferencesPage {
 
 /// Replace the contents of `holder` with either a QR widget for `url`, or
 /// an "already paired" placeholder when `url` is None.
-fn refresh_qr_holder(
-    holder: &gtk4::Box,
-    row: &adw::ActionRow,
-    url: Option<&str>,
-) {
+fn refresh_qr_holder(holder: &gtk4::Box, row: &adw::ActionRow, url: Option<&str>) {
     use gtk4::prelude::*;
     while let Some(child) = holder.first_child() {
         holder.remove(&child);
     }
     if let Some(u) = url {
-        row.set_subtitle(
-            "Scan with Google Messages → Settings → Device pairing → QR code scanner",
-        );
+        row.set_subtitle("Scan with Google Messages → Settings → Device pairing → QR code scanner");
         holder.append(&render_qr_widget(u, 280));
     } else {
         row.set_subtitle("Already paired — no QR needed");
@@ -994,7 +1011,7 @@ pub fn start_gaia_status_dialog(parent: gtk4::Window) {
 
     let cancelled = Rc::new(RefCell::new(false));
     {
-        let dialog_c = dialog.clone();
+        let dialog_weak = dialog.downgrade();
         let cancelled_c = cancelled.clone();
         cancel_btn.connect_clicked(move |_| {
             log::info!("gaia dialog: user clicked Cancel");
@@ -1002,7 +1019,9 @@ pub fn start_gaia_status_dialog(parent: gtk4::Window) {
             crate::gm_qr_state::answer_chosen_authuser(0); // best-effort no-op if not waiting
             crate::gm_qr_state::answer_gaia_confirmation(false);
             *cancelled_c.borrow_mut() = true;
-            dialog_c.close();
+            if let Some(dialog) = dialog_weak.upgrade() {
+                dialog.close();
+            }
         });
     }
 
@@ -1026,153 +1045,144 @@ pub fn start_gaia_status_dialog(parent: gtk4::Window) {
     let actions_box_w = actions_box.clone();
     let heading_w = heading_label.clone();
     let body_w = body_label.clone();
-    gtk4::glib::timeout_add_local(
-        std::time::Duration::from_millis(250),
-        move || {
-            let Some(dialog) = dialog_weak.upgrade() else {
-                log::info!("gaia dialog: widget gone, stopping timer");
-                return gtk4::glib::ControlFlow::Break;
-            };
-            if matches!(*phase.borrow(), Phase::Closing) {
-                return gtk4::glib::ControlFlow::Break;
-            }
-            // Auto-close after a terminal status with a 3s grace.
-            if let Some(t) = *close_at.borrow()
-                && std::time::Instant::now() >= t
-            {
-                log::info!("gaia dialog: auto-close after terminal status");
-                *phase.borrow_mut() = Phase::Closing;
-                dialog.close();
-                return gtk4::glib::ControlFlow::Break;
-            }
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+        let Some(dialog) = dialog_weak.upgrade() else {
+            log::info!("gaia dialog: widget gone, stopping timer");
+            return gtk4::glib::ControlFlow::Break;
+        };
+        if matches!(*phase.borrow(), Phase::Closing) {
+            return gtk4::glib::ControlFlow::Break;
+        }
+        // Auto-close after a terminal status with a 3s grace.
+        if let Some(t) = *close_at.borrow()
+            && std::time::Instant::now() >= t
+        {
+            log::info!("gaia dialog: auto-close after terminal status");
+            *phase.borrow_mut() = Phase::Closing;
+            dialog.close();
+            return gtk4::glib::ControlFlow::Break;
+        }
 
-            let status = crate::gm_qr_state::get_gaia_status();
-            let emoji = crate::gm_qr_state::get_gaia_emoji();
-            let accounts = crate::gm_qr_state::get_available_accounts();
+        let status = crate::gm_qr_state::get_gaia_status();
+        let emoji = crate::gm_qr_state::get_gaia_emoji();
+        let accounts = crate::gm_qr_state::get_available_accounts();
 
-            let want_phase = if emoji.is_some()
-                && matches!(status, GaiaStatus::WaitingForEmoji)
-            {
-                Phase::EmojiConfirm
-            } else if emoji.is_some()
-                && matches!(status, GaiaStatus::AwaitingPhone)
-            {
-                Phase::AwaitingPhone
-            } else if accounts.is_some()
-                && matches!(status, GaiaStatus::PickingAccount)
-            {
-                Phase::AccountPicker
-            } else {
-                Phase::Status
-            };
+        let want_phase = if emoji.is_some() && matches!(status, GaiaStatus::WaitingForEmoji) {
+            Phase::EmojiConfirm
+        } else if emoji.is_some() && matches!(status, GaiaStatus::AwaitingPhone) {
+            Phase::AwaitingPhone
+        } else if accounts.is_some() && matches!(status, GaiaStatus::PickingAccount) {
+            Phase::AccountPicker
+        } else {
+            Phase::Status
+        };
 
-            // Phase transitions: rebuild the action area.
-            if want_phase != *phase.borrow() {
-                log::info!(
-                    "gaia dialog: phase {:?} → {:?} (status={:?}, accounts={}, emoji={})",
-                    *phase.borrow(),
-                    want_phase,
-                    status,
-                    accounts.as_ref().map(|v| v.len()).unwrap_or(0),
-                    emoji.is_some(),
-                );
-                clear_box(&actions_box_w);
-                match want_phase {
-                    Phase::AccountPicker => {
-                        let list = accounts.clone().unwrap();
-                        heading_w.set_label("Pick a Google account");
-                        body_w.set_label(
+        // Phase transitions: rebuild the action area.
+        if want_phase != *phase.borrow() {
+            log::info!(
+                "gaia dialog: phase {:?} → {:?} (status={:?}, accounts={}, emoji={})",
+                *phase.borrow(),
+                want_phase,
+                status,
+                accounts.as_ref().map(|v| v.len()).unwrap_or(0),
+                emoji.is_some(),
+            );
+            clear_box(&actions_box_w);
+            match want_phase {
+                Phase::AccountPicker => {
+                    let list = accounts.clone().unwrap();
+                    heading_w.set_label("Pick a Google account");
+                    body_w.set_label(
                             "Several accounts are signed in to Firefox. Choose the one that has Google Messages on your phone:",
                         );
-                        for acct in &list {
-                            let label = if acct.display_name.is_empty() {
-                                acct.email.clone()
-                            } else {
-                                format!("{}  ({})", acct.email, acct.display_name)
-                            };
-                            let btn = gtk4::Button::with_label(&label);
-                            btn.add_css_class("pill");
-                            let n = acct.authuser;
-                            btn.connect_clicked(move |_| {
-                                log::info!("gaia dialog: user picked authuser={n}");
-                                crate::gm_qr_state::answer_chosen_authuser(n);
-                            });
-                            actions_box_w.append(&btn);
-                        }
+                    for acct in &list {
+                        let label = if acct.display_name.is_empty() {
+                            acct.email.clone()
+                        } else {
+                            format!("{}  ({})", acct.email, acct.display_name)
+                        };
+                        let btn = gtk4::Button::with_label(&label);
+                        btn.add_css_class("pill");
+                        let n = acct.authuser;
+                        btn.connect_clicked(move |_| {
+                            log::info!("gaia dialog: user picked authuser={n}");
+                            crate::gm_qr_state::answer_chosen_authuser(n);
+                        });
+                        actions_box_w.append(&btn);
                     }
-                    Phase::EmojiConfirm => {
-                        let e = emoji.clone().unwrap_or_default();
-                        heading_w.set_label("Verify pairing emoji");
-                        body_w.set_markup(&format!(
+                }
+                Phase::EmojiConfirm => {
+                    let e = emoji.clone().unwrap_or_default();
+                    heading_w.set_label("Verify pairing emoji");
+                    body_w.set_markup(&format!(
                             "Your phone should be showing this emoji:\n\n\
                              <span size=\"xx-large\">{e}</span>\n\n\
                              Tap \"Yes, this matches\" on the phone, then click <b>Confirm</b> here.\n\
                              If they don't match, click <b>Reject</b>.",
                         ));
-                        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-                        row.set_halign(gtk4::Align::End);
-                        let reject = gtk4::Button::with_label("Reject");
-                        reject.add_css_class("destructive-action");
-                        reject.connect_clicked(|_| {
-                            log::info!("gaia dialog: user rejected emoji");
-                            crate::gm_qr_state::answer_gaia_confirmation(false);
-                        });
-                        row.append(&reject);
-                        let confirm = gtk4::Button::with_label("Confirm");
-                        confirm.add_css_class("suggested-action");
-                        confirm.connect_clicked(|_| {
-                            log::info!("gaia dialog: user confirmed emoji");
-                            crate::gm_qr_state::answer_gaia_confirmation(true);
-                        });
-                        row.append(&confirm);
-                        actions_box_w.append(&row);
-                    }
-                    Phase::AwaitingPhone => {
-                        let e = emoji.clone().unwrap_or_default();
-                        heading_w.set_label("Almost done — confirm on phone");
-                        body_w.set_markup(&format!(
-                            "<span size=\"xx-large\">{e}</span>\n\n\
+                    let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+                    row.set_halign(gtk4::Align::End);
+                    let reject = gtk4::Button::with_label("Reject");
+                    reject.add_css_class("destructive-action");
+                    reject.connect_clicked(|_| {
+                        log::info!("gaia dialog: user rejected emoji");
+                        crate::gm_qr_state::answer_gaia_confirmation(false);
+                    });
+                    row.append(&reject);
+                    let confirm = gtk4::Button::with_label("Confirm");
+                    confirm.add_css_class("suggested-action");
+                    confirm.connect_clicked(|_| {
+                        log::info!("gaia dialog: user confirmed emoji");
+                        crate::gm_qr_state::answer_gaia_confirmation(true);
+                    });
+                    row.append(&confirm);
+                    actions_box_w.append(&row);
+                }
+                Phase::AwaitingPhone => {
+                    let e = emoji.clone().unwrap_or_default();
+                    heading_w.set_label("Almost done — confirm on phone");
+                    body_w.set_markup(&format!(
+                        "<span size=\"xx-large\">{e}</span>\n\n\
                              Your phone is now showing this emoji. \
                              Tap <b>\"Yes, this matches\"</b> on the phone to finish pairing. \
                              This window will close automatically once your phone confirms.",
-                        ));
-                        // No action buttons here — the next move is on the phone.
-                    }
-                    Phase::Status => {
-                        heading_w.set_label("Pair via Firefox");
-                        body_w.set_label(&status.human());
-                    }
-                    Phase::Closing => {}
+                    ));
+                    // No action buttons here — the next move is on the phone.
                 }
-                *phase.borrow_mut() = want_phase;
-                *last_status.borrow_mut() = Some(status.clone());
-            } else if want_phase == Phase::Status {
-                // Same phase, just refresh body text on status change.
-                let stale = last_status.borrow().as_ref() != Some(&status);
-                if stale {
-                    log::info!("gaia dialog: status update → {:?}", status);
+                Phase::Status => {
+                    heading_w.set_label("Pair via Firefox");
                     body_w.set_label(&status.human());
-                    *last_status.borrow_mut() = Some(status.clone());
                 }
+                Phase::Closing => {}
             }
-
-            // Schedule auto-close on terminal states.
-            if matches!(status, GaiaStatus::Success | GaiaStatus::Failed(_))
-                && close_at.borrow().is_none()
-            {
-                *close_at.borrow_mut() =
-                    Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+            *phase.borrow_mut() = want_phase;
+            *last_status.borrow_mut() = Some(status.clone());
+        } else if want_phase == Phase::Status {
+            // Same phase, just refresh body text on status change.
+            let stale = last_status.borrow().as_ref() != Some(&status);
+            if stale {
+                log::info!("gaia dialog: status update → {:?}", status);
+                body_w.set_label(&status.human());
+                *last_status.borrow_mut() = Some(status.clone());
             }
+        }
 
-            // If parent window is dead, stop polling.
-            if parent_weak.upgrade().is_none() {
-                log::info!("gaia dialog: parent gone, stopping timer");
-                return gtk4::glib::ControlFlow::Break;
-            }
+        // Schedule auto-close on terminal states.
+        if matches!(status, GaiaStatus::Success | GaiaStatus::Failed(_))
+            && close_at.borrow().is_none()
+        {
+            *close_at.borrow_mut() =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        }
 
-            gtk4::glib::ControlFlow::Continue
-        },
-    );
+        // If parent window is dead, stop polling.
+        if parent_weak.upgrade().is_none() {
+            log::info!("gaia dialog: parent gone, stopping timer");
+            return gtk4::glib::ControlFlow::Break;
+        }
+
+        gtk4::glib::ControlFlow::Continue
+    });
 
     // When the dialog itself is closed (via Cancel, ESC, or our own
     // close()), stop polling. Avoid leaking the timer into the next
@@ -1203,5 +1213,17 @@ fn read_gaia_account_email() -> Option<String> {
 fn clear_box(b: &gtk4::Box) {
     while let Some(child) = b.first_child() {
         b.remove(&child);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AppSettings;
+
+    #[test]
+    fn settings_without_sidebar_width_remain_compatible() {
+        let settings: AppSettings = serde_json::from_str(r#"{"theme":"light"}"#).unwrap();
+        assert_eq!(settings.theme, "light");
+        assert_eq!(settings.sidebar_width, None);
     }
 }

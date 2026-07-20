@@ -6,13 +6,30 @@ use std::sync::Arc;
 use gtk4::prelude::*;
 use gtk4::{
     Align, Box, Button, GestureClick, Label, ListBox, Orientation, Revealer,
-    RevealerTransitionType, ScrolledWindow, SearchEntry, Separator, TextView, Widget,
+    RevealerTransitionType, ScrolledWindow, SearchEntry, Separator, TextView,
 };
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::bridge::{Bridge, IncomingMessage, ReceiptStatus, WaCommand};
 use crate::ui::message_bubble::MessageBubble;
+
+#[derive(Clone)]
+enum PendingAttachment {
+    File(String),
+    Gif {
+        mp4_url: String,
+        preview_url: String,
+    },
+}
+
+#[derive(Clone)]
+struct PickerResultSet {
+    request_id: u64,
+    query: String,
+    results: Vec<crate::bridge::GifResult>,
+    error: Option<String>,
+}
 
 /// Safely remove all children from a GTK Box.
 /// Guards against infinite loops if `remove` fails (non-child widget).
@@ -36,16 +53,6 @@ fn remove_all_children(parent: &Box) {
     }
 }
 
-/// Where to insert a new bubble within messages_box.
-/// Used by append_bubble_to_inner_at to keep all bubble construction
-/// (gestures, hover wiring, avatar load, etc.) in one place while letting
-/// the caller pick top vs. bottom insertion.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BubblePosition {
-    Append,
-    Prepend,
-}
-
 #[derive(Clone)]
 pub struct ChatViewPanel {
     inner: Rc<ChatViewInner>,
@@ -53,6 +60,13 @@ pub struct ChatViewPanel {
 
 struct ChatViewInner {
     root: Box,
+    /// Message viewport + typing indicator. The header and composer deliberately
+    /// live outside this surface so switching chats can animate without making
+    /// either persistent interaction target flicker or move.
+    conversation_surface: Box,
+    /// Keep the current animation alive and make a rapid switch able to finish
+    /// it before starting the next one.
+    chat_switch_animation: RefCell<Option<adw::TimedAnimation>>,
     messages_box: Box,
     scroll: ScrolledWindow,
     input_view: TextView,
@@ -65,6 +79,10 @@ struct ChatViewInner {
     /// protocol between WhatsApp and SMS for the current chat. Visible
     /// only when the current chat has both protocols available.
     send_mode_btn: Button,
+    /// Favourite state is stored explicitly per chat. The header icon is only
+    /// a presentation of this state and is never used as the source of truth.
+    favorite_button: Button,
+    favorite_chats: RefCell<HashSet<String>>,
     pin_banner: Box,
     bridge: Arc<Bridge>,
     current_chat_id: RefCell<Option<String>>,
@@ -96,6 +114,9 @@ struct ChatViewInner {
     goto_latest_btn: Button,
     // msg_id → bubble (for receipt updates)
     bubbles: RefCell<HashMap<String, MessageBubble>>,
+    /// A message requested by an external search result before history has
+    /// finished rendering. It is consumed as soon as that bubble is inserted.
+    pending_message_jump: RefCell<Option<String>>,
     // msg_id → searchable text (for the in-chat search filter)
     search_texts: RefCell<HashMap<String, String>>,
     // optimistic tmp id → real server id. Bubble menu closures capture the
@@ -131,6 +152,7 @@ struct ChatViewInner {
     // Pending pasted image or GIF
     pending_image_path: RefCell<Option<String>>,
     pending_gif_url: RefCell<Option<String>>,
+    pending_gif_preview_url: RefCell<Option<String>>,
     image_preview_bar: Box,
     image_preview_pic: gtk4::Picture,
     /// Label inside the image preview bar that shows the filename/icon
@@ -143,13 +165,22 @@ struct ChatViewInner {
     /// restored as the active pending. Drafts work the same way — see
     /// `drafts` field. Without this, a screenshot pasted in chat A
     /// would persist into chat B if you switched before sending.
-    pending_attachments: RefCell<HashMap<String, String>>,
+    pending_attachments: RefCell<HashMap<String, PendingAttachment>>,
     // Profile open callback (set by window)
     on_profile_open: RefCell<Option<std::boxed::Box<dyn Fn(String, String)>>>,
     // Emoji/GIF/Sticker panel
     emoji_popover: gtk4::Popover,
     gif_grid: gtk4::FlowBox,
     sticker_grid: gtk4::FlowBox,
+    gif_status: Label,
+    sticker_status: Label,
+    gif_search_request: Cell<u64>,
+    sticker_search_request: Cell<u64>,
+    picker_page: Cell<u32>,
+    gif_result_cache: RefCell<Option<PickerResultSet>>,
+    sticker_result_cache: RefCell<Option<PickerResultSet>>,
+    gif_rendered_request: Cell<u64>,
+    sticker_rendered_request: Cell<u64>,
     // Message editing state: (chat_id, msg_id) of the message being edited
     editing_msg: RefCell<Option<(String, String)>>,
     edit_banner: Revealer,
@@ -167,6 +198,254 @@ struct ChatViewInner {
     /// IncomingMessage carries no starred flag from history, so this is a
     /// best-effort per-session view seeded on each Star/Unstar action).
     starred_msgs: RefCell<HashSet<String>>,
+}
+
+#[derive(Clone, Copy)]
+enum PickerSearchKind {
+    Gif,
+    Sticker,
+}
+
+// Runtime-side stale-request suppression is process-wide, so request IDs must
+// also remain monotonic if the chat view is ever rebuilt during this process.
+static PICKER_SEARCH_REQUEST_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+fn queue_picker_search(
+    inner: &Rc<ChatViewInner>,
+    kind: PickerSearchKind,
+    query: String,
+    debounce: bool,
+) {
+    use std::sync::atomic::Ordering;
+
+    let query = query.trim().to_string();
+    let (request_cell, status, grid, noun) = match kind {
+        PickerSearchKind::Gif => (
+            &inner.gif_search_request,
+            &inner.gif_status,
+            &inner.gif_grid,
+            "GIFs",
+        ),
+        PickerSearchKind::Sticker => (
+            &inner.sticker_search_request,
+            &inner.sticker_status,
+            &inner.sticker_grid,
+            "stickers",
+        ),
+    };
+    let request_id = PICKER_SEARCH_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    request_cell.set(request_id);
+    status.remove_css_class("error");
+
+    if !query.is_empty() && query.chars().count() < 2 {
+        grid.remove_all();
+        grid.set_sensitive(true);
+        status.set_text("Type at least 2 characters");
+        return;
+    }
+
+    let effective_query = if query.is_empty() {
+        "trending".to_string()
+    } else {
+        query
+    };
+    grid.set_sensitive(false);
+    status.set_text(&format!("Searching Tenor {noun}…"));
+
+    let inner = inner.clone();
+    let send = move || {
+        let is_current = match kind {
+            PickerSearchKind::Gif => inner.gif_search_request.get() == request_id,
+            PickerSearchKind::Sticker => inner.sticker_search_request.get() == request_id,
+        };
+        if !is_current {
+            return;
+        }
+        let command = match kind {
+            PickerSearchKind::Gif => WaCommand::SearchGifs {
+                request_id,
+                query: effective_query,
+            },
+            PickerSearchKind::Sticker => WaCommand::SearchStickers {
+                request_id,
+                query: effective_query,
+            },
+        };
+        inner.bridge.send_command(command);
+    };
+    if debounce {
+        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(350), send);
+    } else {
+        send();
+    }
+}
+
+const PICKER_PREVIEW_MAX_BYTES: usize = 2 * 1024 * 1024;
+const PICKER_PREVIEW_QUEUE_DEPTH: usize = 24;
+const PICKER_PREVIEW_WORKERS: usize = 4;
+
+struct PickerPreviewJob {
+    url: String,
+    result: async_channel::Sender<std::result::Result<Vec<u8>, String>>,
+}
+
+static PICKER_PREVIEW_QUEUE: std::sync::LazyLock<std::sync::mpsc::SyncSender<PickerPreviewJob>> =
+    std::sync::LazyLock::new(|| {
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<PickerPreviewJob>(PICKER_PREVIEW_QUEUE_DEPTH);
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        for worker in 0..PICKER_PREVIEW_WORKERS {
+            let rx = rx.clone();
+            let _ = std::thread::Builder::new()
+                .name(format!("tenor-preview-{worker}"))
+                .spawn(move || {
+                    loop {
+                        let job = {
+                            let receiver = rx.lock().unwrap_or_else(|e| e.into_inner());
+                            receiver.recv()
+                        };
+                        let Ok(job) = job else { break };
+                        let result = download_picker_preview(&job.url);
+                        let _ = job.result.send_blocking(result);
+                    }
+                });
+        }
+        tx
+    });
+
+fn download_picker_preview(url: &str) -> std::result::Result<Vec<u8>, String> {
+    use std::io::Read as _;
+
+    if !url.starts_with("https://") {
+        return Err("invalid preview URL".to_string());
+    }
+    let response = ureq::get(url)
+        .set("User-Agent", "whatsapp-desktop/0.1 (Tenor picker)")
+        .timeout(std::time::Duration::from_secs(12))
+        .call()
+        .map_err(|e| e.to_string())?;
+    let mut bytes = Vec::with_capacity(128 * 1024);
+    response
+        .into_reader()
+        .take((PICKER_PREVIEW_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > PICKER_PREVIEW_MAX_BYTES {
+        return Err("preview was too large".to_string());
+    }
+    Ok(bytes)
+}
+
+fn load_picker_preview(
+    pic: &gtk4::Picture,
+    url: String,
+    ready_label: Option<Label>,
+    pending_gif_guard: Option<(std::rc::Weak<ChatViewInner>, String)>,
+) {
+    let (result_tx, result_rx) = async_channel::bounded(1);
+    let job = PickerPreviewJob {
+        url,
+        result: result_tx,
+    };
+    if let Err(error) = PICKER_PREVIEW_QUEUE.try_send(job) {
+        let job = match error {
+            std::sync::mpsc::TrySendError::Full(job)
+            | std::sync::mpsc::TrySendError::Disconnected(job) => job,
+        };
+        let _ = job
+            .result
+            .try_send(Err("preview queue is busy".to_string()));
+    }
+
+    let pic = pic.clone();
+    gtk4::glib::MainContext::default().spawn_local(async move {
+        let result = result_rx.recv().await;
+        if let Some((inner, expected_url)) = pending_gif_guard {
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            if inner.pending_gif_preview_url.borrow().as_deref() != Some(&expected_url) {
+                return;
+            }
+        }
+        match result {
+            Ok(Ok(bytes)) => {
+                let bytes = glib::Bytes::from(&bytes);
+                match gtk4::gdk::Texture::from_bytes(&bytes) {
+                    Ok(texture) => {
+                        pic.set_paintable(Some(&texture));
+                        pic.set_tooltip_text(None);
+                        if let Some(label) = ready_label.as_ref() {
+                            label.set_text("Press Enter to send, Escape to cancel");
+                        }
+                    }
+                    Err(error) => {
+                        pic.set_tooltip_text(Some(&format!("Preview unavailable: {error}")));
+                        if let Some(label) = ready_label.as_ref() {
+                            label.set_text(
+                                "GIF preview unavailable · Enter to send or Escape to cancel",
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(Err(error)) => {
+                pic.set_tooltip_text(Some(&format!("Preview unavailable: {error}")));
+                if let Some(label) = ready_label.as_ref() {
+                    label.set_text("GIF preview unavailable · Enter to send or Escape to cancel");
+                }
+            }
+            Err(_) => {
+                pic.set_tooltip_text(Some("Preview unavailable"));
+                if let Some(label) = ready_label.as_ref() {
+                    label.set_text("GIF preview unavailable · Enter to send or Escape to cancel");
+                }
+            }
+        }
+    });
+}
+
+fn stage_pending_gif(
+    inner: &Rc<ChatViewInner>,
+    mp4_url: String,
+    preview_url: String,
+    paintable: Option<gtk4::gdk::Paintable>,
+) {
+    *inner.pending_gif_url.borrow_mut() = Some(mp4_url.clone());
+    *inner.pending_gif_preview_url.borrow_mut() = Some(preview_url.clone());
+    *inner.pending_image_path.borrow_mut() = None;
+    inner
+        .image_preview_pic
+        .set_paintable(None::<&gtk4::gdk::Paintable>);
+    inner
+        .preview_label
+        .set_text("Loading GIF… (Enter to send, Escape to cancel)");
+    inner.image_preview_bar.set_visible(true);
+    if let Some(paintable) = paintable {
+        inner.image_preview_pic.set_paintable(Some(&paintable));
+        inner
+            .preview_label
+            .set_text("Press Enter to send, Escape to cancel");
+    } else {
+        load_picker_preview(
+            &inner.image_preview_pic,
+            preview_url.clone(),
+            Some(inner.preview_label.clone()),
+            Some((Rc::downgrade(inner), preview_url.clone())),
+        );
+    }
+    if let Some(chat_id) = inner.current_chat_id.borrow().clone() {
+        inner.pending_attachments.borrow_mut().insert(
+            chat_id,
+            PendingAttachment::Gif {
+                mp4_url,
+                preview_url,
+            },
+        );
+    }
+    update_send_button_state(inner);
+    inner.input_view.grab_focus();
 }
 
 impl ChatViewPanel {
@@ -210,9 +489,9 @@ impl ChatViewPanel {
         header.pack_end(&send_mode_btn);
 
         // Favourite button
-        let fav_button = Button::from_icon_name("starred-symbolic");
+        let fav_button = Button::from_icon_name("non-starred-symbolic");
         fav_button.add_css_class("flat");
-        fav_button.set_tooltip_text(Some("Favourite"));
+        fav_button.set_tooltip_text(Some("Add to favourites"));
         header.pack_end(&fav_button);
 
         // Label dropdown
@@ -268,83 +547,6 @@ impl ChatViewPanel {
         // "jump and stop" feel reported by the user.
         scroll.set_kinetic_scrolling(true);
         scroll.set_overlay_scrolling(true);
-
-        // Bubble max-width as a percentage of the message pane width.
-        // GTK4 CSS doesn't support percentage max-width, so we install a
-        // per-display CssProvider whose single rule we rewrite when the
-        // scroll widget's width crosses a bucket boundary.
-        //
-        // Implementation notes:
-        //   - Bucket size 32px keeps CSS rewrites infrequent during drag
-        //     (~30 buckets across the realistic range), which prevents
-        //     drag lag — load_from_string triggers a global style
-        //     invalidation that's expensive at 60Hz.
-        //   - queue_resize on messages_box after each rewrite forces GTK
-        //     to re-measure the bubbles with the new max-width; without
-        //     this, layout stays at the OLD measured sizes until something
-        //     else triggers re-measurement.
-        //   - Priority APPLICATION + 10 ensures we override the static
-        //     bubble rules from app.rs's APP_CSS (loaded at APPLICATION).
-        {
-            let provider = gtk4::CssProvider::new();
-            if let Some(display) = gtk4::gdk::Display::default() {
-                gtk4::style_context_add_provider_for_display(
-                    &display,
-                    &provider,
-                    gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 10,
-                );
-            }
-            // Recompute the bubble max-width only when the pane width
-            // actually changes. This used to be an `add_tick_callback`
-            // returning `ControlFlow::Continue`, which kept GTK's frame
-            // clock running ~60-144x/sec for the ENTIRE life of the app —
-            // even fully idle — just to read a width and compare a bucket.
-            // We now drive it from the horizontal adjustment's `changed`
-            // signal, which fires on viewport reconfigure (window resize OR
-            // sidebar-divider drag, since both re-allocate the pane) and
-            // never on vertical scroll or message append. The bucket guard
-            // makes any stray emission a cheap integer compare.
-            let recompute_width: std::rc::Rc<dyn Fn()> = {
-                let scroll_w = scroll.clone();
-                let messages_box_w = messages_box.clone();
-                let provider_w = provider.clone();
-                let last_bucket: std::cell::Cell<i32> = std::cell::Cell::new(-1);
-                std::rc::Rc::new(move || {
-                    let pane_w = scroll_w.width();
-                    if pane_w <= 0 {
-                        return;
-                    }
-                    // 65% of pane width, hard cap 1100px, soft floor 280px,
-                    // bucketed to 32px so we don't rewrite CSS on every pixel.
-                    let raw = (pane_w as f32 * 0.65) as i32;
-                    let bucket = (raw / 32) * 32;
-                    if bucket != last_bucket.get() {
-                        last_bucket.set(bucket);
-                        let max_w = bucket.clamp(280, 1100);
-                        let css = format!(
-                            "box.message-bubble-out, box.message-bubble-in \
-                             {{ max-width: {max_w}px; }}"
-                        );
-                        provider_w.load_from_string(&css);
-                        // Force re-measurement so the new max-width takes
-                        // effect on the existing widget tree without waiting
-                        // for some unrelated event to invalidate layout.
-                        messages_box_w.queue_resize();
-                    }
-                })
-            };
-            {
-                let rc = recompute_width.clone();
-                scroll.hadjustment().connect_changed(move |_| rc());
-            }
-            {
-                // Run once on first map in case the viewport was already
-                // configured before we connected, so the initial bucket is
-                // set without waiting for the first resize.
-                let rc = recompute_width.clone();
-                scroll.connect_map(move |_| rc());
-            }
-        }
 
         // "Go to latest" floating button — visible when user scrolls up
         // "Go to latest" button — floats above the scroll via Overlay
@@ -651,32 +853,21 @@ impl ChatViewPanel {
 
         let notebook = gtk4::Notebook::new();
 
-        // Tab 1: Emoji grid
-        let emoji_tab = Box::new(Orientation::Vertical, 0);
-        let emoji_grid = gtk4::FlowBox::new();
-        emoji_grid.set_max_children_per_line(8);
-        emoji_grid.set_min_children_per_line(8);
-        emoji_grid.set_selection_mode(gtk4::SelectionMode::None);
-        emoji_grid.set_homogeneous(true);
-        let common_emojis = [
-            "😀", "😂", "😍", "🥰", "😢", "😡", "👍", "👎", "❤️", "🔥", "🎉", "💯", "🙏", "😊",
-            "🤔", "😎", "👋", "✨", "💪", "🤝", "😭", "🥺", "😤", "🫡", "🎊", "💀", "😱", "🤩",
-            "😘", "💕", "👀", "🫶", "🤣", "😇", "🥳", "🤯", "💔", "🫠", "😏", "🙄", "😒", "🤗",
-            "🤭", "🫣", "💅", "🦋", "🌈", "⭐",
-        ];
-        // Will wire clicks after inner is created
-        for emoji in &common_emojis {
-            let btn = Button::with_label(emoji);
-            btn.add_css_class("flat");
-            btn.set_widget_name(emoji);
-            btn.set_size_request(46, 42);
-            emoji_grid.append(&btn);
-        }
-        let emoji_scroll = ScrolledWindow::new();
-        emoji_scroll.set_child(Some(&emoji_grid));
-        emoji_scroll.set_vexpand(true);
-        emoji_tab.append(&emoji_scroll);
-        notebook.append_page(&emoji_tab, Some(&Label::new(Some("😀 Emoji"))));
+        // Tab 1: bounded, ranked local emoji search. Weak widget references
+        // keep the picker's button callbacks from retaining the chat panel.
+        let input_weak = input_view.downgrade();
+        let popover_weak = emoji_popover.downgrade();
+        let emoji_picker = crate::ui::emoji_picker::EmojiPicker::new(move |emoji| {
+            if let Some(input) = input_weak.upgrade() {
+                input.buffer().insert_at_cursor(emoji);
+                input.grab_focus();
+            }
+            if let Some(popover) = popover_weak.upgrade() {
+                popover.popdown();
+            }
+        });
+        let emoji_search = emoji_picker.search_entry().clone();
+        notebook.append_page(emoji_picker.widget(), Some(&Label::new(Some("😀 Emoji"))));
 
         // Tab 2: GIF search
         let gif_tab = Box::new(Orientation::Vertical, 4);
@@ -685,6 +876,12 @@ impl ChatViewPanel {
         gif_search.set_margin_start(4);
         gif_search.set_margin_end(4);
         gif_search.set_margin_top(4);
+        let gif_status = Label::new(Some("Powered by Tenor"));
+        gif_status.add_css_class("caption");
+        gif_status.add_css_class("dim-label");
+        gif_status.set_halign(Align::Start);
+        gif_status.set_margin_start(6);
+        gif_status.set_margin_end(6);
 
         let gif_grid = gtk4::FlowBox::new();
         gif_grid.set_max_children_per_line(2);
@@ -699,6 +896,7 @@ impl ChatViewPanel {
         gif_scroll.set_vexpand(true);
 
         gif_tab.append(&gif_search);
+        gif_tab.append(&gif_status);
         gif_tab.append(&gif_scroll);
         notebook.append_page(&gif_tab, Some(&Label::new(Some("GIF"))));
 
@@ -709,6 +907,12 @@ impl ChatViewPanel {
         sticker_search.set_margin_start(4);
         sticker_search.set_margin_end(4);
         sticker_search.set_margin_top(4);
+        let sticker_status = Label::new(Some("Powered by Tenor"));
+        sticker_status.add_css_class("caption");
+        sticker_status.add_css_class("dim-label");
+        sticker_status.set_halign(Align::Start);
+        sticker_status.set_margin_start(6);
+        sticker_status.set_margin_end(6);
 
         let sticker_grid = gtk4::FlowBox::new();
         sticker_grid.set_max_children_per_line(4);
@@ -723,6 +927,7 @@ impl ChatViewPanel {
         sticker_scroll.set_vexpand(true);
 
         sticker_tab.append(&sticker_search);
+        sticker_tab.append(&sticker_status);
         sticker_tab.append(&sticker_scroll);
         notebook.append_page(&sticker_tab, Some(&Label::new(Some("🎭 Stickers"))));
 
@@ -733,11 +938,18 @@ impl ChatViewPanel {
         pin_banner.add_css_class("pin-banner");
         pin_banner.set_visible(false);
 
+        // Keep the persistent header controls outside the animated message
+        // surface. Dimming the header after its title has already changed reads
+        // as a flash, while animating only the replaceable content makes the
+        // switch obvious without moving the composer or its keyboard focus.
         root.append(&header);
         root.append(&search_revealer);
         root.append(&pin_banner);
-        root.append(&scroll_overlay);
-        root.append(&typing_box);
+        let conversation_surface = Box::new(Orientation::Vertical, 0);
+        conversation_surface.set_vexpand(true);
+        conversation_surface.append(&scroll_overlay);
+        conversation_surface.append(&typing_box);
+        root.append(&conversation_surface);
         // Image preview bar (shown when pasting an image)
         let image_preview_bar = Box::new(Orientation::Horizontal, 8);
         image_preview_bar.set_margin_start(12);
@@ -773,6 +985,8 @@ impl ChatViewPanel {
 
         let inner = Rc::new(ChatViewInner {
             root,
+            conversation_surface,
+            chat_switch_animation: RefCell::new(None),
             messages_box,
             scroll,
             input_view,
@@ -786,6 +1000,8 @@ impl ChatViewPanel {
             header_name,
             header_subtitle,
             send_mode_btn: send_mode_btn.clone(),
+            favorite_button: fav_button.clone(),
+            favorite_chats: RefCell::new(HashSet::new()),
             pin_banner,
             bridge,
             current_chat_id: RefCell::new(None),
@@ -797,6 +1013,7 @@ impl ChatViewPanel {
             at_bottom: Rc::new(Cell::new(true)),
             goto_latest_btn: goto_latest_btn.clone(),
             bubbles: RefCell::new(HashMap::new()),
+            pending_message_jump: RefCell::new(None),
             search_texts: RefCell::new(HashMap::new()),
             id_remap: RefCell::new(HashMap::new()),
             media_items: RefCell::new(Vec::new()),
@@ -820,6 +1037,7 @@ impl ChatViewPanel {
             quick_replies: RefCell::new(crate::ui::quick_replies::load()),
             pending_image_path: RefCell::new(None),
             pending_gif_url: RefCell::new(None),
+            pending_gif_preview_url: RefCell::new(None),
             image_preview_bar,
             image_preview_pic,
             preview_label: preview_label.clone(),
@@ -828,6 +1046,15 @@ impl ChatViewPanel {
             emoji_popover,
             gif_grid,
             sticker_grid,
+            gif_status,
+            sticker_status,
+            gif_search_request: Cell::new(0),
+            sticker_search_request: Cell::new(0),
+            picker_page: Cell::new(0),
+            gif_result_cache: RefCell::new(None),
+            sticker_result_cache: RefCell::new(None),
+            gif_rendered_request: Cell::new(0),
+            sticker_rendered_request: Cell::new(0),
             editing_msg: RefCell::new(None),
             edit_banner,
             ai_spinner,
@@ -942,8 +1169,11 @@ impl ChatViewPanel {
 
         // Send-mode toggle: cycle WhatsApp ↔ SMS for the current chat.
         {
-            let inner_c = inner.clone();
+            let inner_w = Rc::downgrade(&inner);
             send_mode_btn.connect_clicked(move |_btn| {
+                let Some(inner_c) = inner_w.upgrade() else {
+                    return;
+                };
                 let Some(cid) = inner_c.current_chat_id.borrow().clone() else {
                     return;
                 };
@@ -964,22 +1194,19 @@ impl ChatViewPanel {
             // Favourite button
             {
                 let inner_c = inner.clone();
-                fav_button.connect_clicked(move |btn| {
+                fav_button.connect_clicked(move |_| {
                     if let Some(cid) = inner_c.current_chat_id.borrow().clone() {
-                        // Toggle: check current icon to determine state
-                        let is_fav = btn.icon_name().as_deref() == Some("starred-symbolic");
-                        let new_fav = !is_fav;
+                        let new_fav = !inner_c.favorite_chats.borrow().contains(&cid);
+                        if new_fav {
+                            inner_c.favorite_chats.borrow_mut().insert(cid.clone());
+                        } else {
+                            inner_c.favorite_chats.borrow_mut().remove(&cid);
+                        }
                         inner_c.bridge.send_command(WaCommand::FavoriteChat {
                             chat_id: cid,
                             favorite: new_fav,
                         });
-                        if new_fav {
-                            btn.set_icon_name("starred-symbolic");
-                            btn.set_tooltip_text(Some("Remove from favourites"));
-                        } else {
-                            btn.set_icon_name("non-starred-symbolic");
-                            btn.set_tooltip_text(Some("Add to favourites"));
-                        }
+                        ChatViewPanel::apply_favorite_button(&inner_c, new_fav);
                     }
                 });
             }
@@ -1028,7 +1255,6 @@ impl ChatViewPanel {
                         } else {
                             Some(label.to_string())
                         };
-                        let colour_str = colour.to_string();
                         let label_btn_ref = btn.clone();
                         item.connect_clicked(move |_| {
                             if let Some(cid) = inner_cc.current_chat_id.borrow().clone() {
@@ -1097,7 +1323,8 @@ impl ChatViewPanel {
             let recording: Rc<Cell<bool>> = Rc::new(Cell::new(false));
             let record_path: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
             let record_start: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-            let record_child: Rc<RefCell<Option<std::process::Child>>> = Rc::new(RefCell::new(None));
+            let record_child: Rc<RefCell<Option<std::process::Child>>> =
+                Rc::new(RefCell::new(None));
             let inner_c = inner.clone();
 
             // ── Helper: stop recording + show review bar ──
@@ -1109,7 +1336,9 @@ impl ChatViewPanel {
                 let inner_c = inner_c.clone();
                 let mic_btn_c = mic_btn.clone();
                 Rc::new(move || {
-                    if !rec.get() { return; }
+                    if !rec.get() {
+                        return;
+                    }
                     rec.set(false);
                     mic_btn_c.set_icon_name("audio-input-microphone-symbolic");
                     mic_btn_c.set_tooltip_text(Some("Hold to record voice note"));
@@ -1123,13 +1352,16 @@ impl ChatViewPanel {
 
                     // Stop ffmpeg
                     if let Some(mut child) = rc.borrow_mut().take() {
-                        unsafe { libc::kill(child.id() as i32, libc::SIGINT); }
+                        unsafe {
+                            libc::kill(child.id() as i32, libc::SIGINT);
+                        }
                         let _ = child.wait();
                     }
 
-                    if let (Some(cid), Some(path)) =
-                        (inner_c.current_chat_id.borrow().clone(), rp.borrow().clone())
-                    {
+                    if let (Some(cid), Some(path)) = (
+                        inner_c.current_chat_id.borrow().clone(),
+                        rp.borrow().clone(),
+                    ) {
                         // Show review bar: play preview, send, or discard
                         let review = Box::new(Orientation::Horizontal, 8);
                         review.set_margin_start(8);
@@ -1200,7 +1432,9 @@ impl ChatViewPanel {
                         review.append(&send_btn);
 
                         // Insert review bar above the input
-                        inner_c.input_bar.insert_child_after(&review, None::<&gtk4::Widget>);
+                        inner_c
+                            .input_bar
+                            .insert_child_after(&review, None::<&gtk4::Widget>);
 
                         // Discard — remove review bar and delete file
                         let review_d = review.clone();
@@ -1226,41 +1460,40 @@ impl ChatViewPanel {
                             let inner_c3 = inner_c2.clone();
                             gtk4::glib::timeout_add_local_once(
                                 std::time::Duration::from_millis(100),
-                                move || {
-                                    match std::fs::metadata(&path) {
-                                        Ok(meta) if meta.len() > 0 => {
-                                            let tmp_id = format!(
-                                                "vn_{}",
-                                                std::time::SystemTime::now()
-                                                    .duration_since(std::time::UNIX_EPOCH)
-                                                    .unwrap_or_default()
-                                                    .as_millis()
-                                            );
-                                            let now_ts = std::time::SystemTime::now()
+                                move || match std::fs::metadata(&path) {
+                                    Ok(meta) if meta.len() > 0 => {
+                                        let tmp_id = format!(
+                                            "vn_{}",
+                                            std::time::SystemTime::now()
                                                 .duration_since(std::time::UNIX_EPOCH)
                                                 .unwrap_or_default()
-                                                .as_secs() as i64;
-                                            let mut vn_msg = crate::bridge::IncomingMessage::outgoing(
-                                                tmp_id.clone(),
-                                                cid.clone(),
-                                                None,
-                                                now_ts,
-                                            );
-                                            vn_msg.media_type = Some(crate::bridge::MediaType::Audio);
-                                            vn_msg.media_local_path = Some(path.clone());
-                                            ChatViewPanel::append_bubble_to_inner(&inner_c3, vn_msg);
-                                            ChatViewPanel::force_scroll_to_bottom(&inner_c3, 3);
+                                                .as_millis()
+                                        );
+                                        let now_ts = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs()
+                                            as i64;
+                                        let mut vn_msg = crate::bridge::IncomingMessage::outgoing(
+                                            tmp_id.clone(),
+                                            cid.clone(),
+                                            None,
+                                            now_ts,
+                                        );
+                                        vn_msg.media_type = Some(crate::bridge::MediaType::Audio);
+                                        vn_msg.media_local_path = Some(path.clone());
+                                        ChatViewPanel::append_bubble_to_inner(&inner_c3, vn_msg);
+                                        ChatViewPanel::force_scroll_to_bottom(&inner_c3, 3);
 
-                                            bridge.send_command(WaCommand::SendAudio {
-                                                chat_id: ChatViewPanel::resolve_send_target(&cid),
-                                                path,
-                                                duration_secs: dur,
-                                                is_voice_note: true,
-                                                tmp_id,
-                                            });
-                                        }
-                                        _ => log::warn!("Voice note file missing or empty"),
+                                        bridge.send_command(WaCommand::SendAudio {
+                                            chat_id: ChatViewPanel::resolve_send_target(&cid),
+                                            path,
+                                            duration_secs: dur,
+                                            is_voice_note: true,
+                                            tmp_id,
+                                        });
                                     }
+                                    _ => log::warn!("Voice note file missing or empty"),
                                 },
                             );
                         });
@@ -1276,7 +1509,9 @@ impl ChatViewPanel {
                 let rc = record_child.clone();
                 let mic_btn_c = mic_btn.clone();
                 Rc::new(move || {
-                    if rec.get() { return; }
+                    if rec.get() {
+                        return;
+                    }
                     let ts = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -1291,14 +1526,29 @@ impl ChatViewPanel {
                     // Read audio input device from settings
                     let audio_input = {
                         let s = crate::ui::settings::AppSettings::load();
-                        if s.audio_input.is_empty() { "default".to_string() } else { s.audio_input }
+                        if s.audio_input.is_empty() {
+                            "default".to_string()
+                        } else {
+                            s.audio_input
+                        }
                     };
                     match std::process::Command::new("ffmpeg")
                         .args([
-                            "-y", "-f", "pulse", "-i", &audio_input,
-                            "-ac", "1",
-                            "-c:a", "libopus", "-b:a", "32k", "-ar", "48000",
-                            "-application", "voip",
+                            "-y",
+                            "-f",
+                            "pulse",
+                            "-i",
+                            &audio_input,
+                            "-ac",
+                            "1",
+                            "-c:a",
+                            "libopus",
+                            "-b:a",
+                            "32k",
+                            "-ar",
+                            "48000",
+                            "-application",
+                            "voip",
                             &path,
                         ])
                         .stdout(std::process::Stdio::null())
@@ -1319,7 +1569,9 @@ impl ChatViewPanel {
 
             // Press-and-hold: press starts recording, release stops and shows review
             let press_gesture = gtk4::GestureLongPress::new();
-            press_gesture.set_delay_factor(0.3); // ~150ms to trigger
+            // GTK requires a delay factor in the 0.5..=2.0 range. Using the
+            // minimum keeps press-and-hold responsive without runtime warnings.
+            press_gesture.set_delay_factor(0.5);
             let sr = start_recording.clone();
             press_gesture.connect_pressed(move |_, _, _| {
                 (sr)();
@@ -1437,7 +1689,11 @@ impl ChatViewPanel {
                     {
                         *inner_clone.pending_image_path.borrow_mut() = None;
                         *inner_clone.pending_gif_url.borrow_mut() = None;
+                        *inner_clone.pending_gif_preview_url.borrow_mut() = None;
                         inner_clone.image_preview_bar.set_visible(false);
+                        if let Some(cid) = inner_clone.current_chat_id.borrow().clone() {
+                            inner_clone.pending_attachments.borrow_mut().remove(&cid);
+                        }
                         update_send_button_state(&inner_clone);
                         return gtk4::glib::Propagation::Stop;
                     }
@@ -1621,7 +1877,9 @@ impl ChatViewPanel {
                                         .join(format!("{safe}.jpg"));
                                     if av_path.exists() {
                                         if let Some(tex) =
-                                            crate::ui::texture_cache::texture_from_filename(&av_path)
+                                            crate::ui::texture_cache::texture_thumbnail(
+                                                &av_path, 64,
+                                            )
                                         {
                                             av.set_custom_image(Some(&tex));
                                         }
@@ -1840,6 +2098,7 @@ impl ChatViewPanel {
             cancel_preview.connect_clicked(move |_| {
                 *inner_clone.pending_image_path.borrow_mut() = None;
                 *inner_clone.pending_gif_url.borrow_mut() = None;
+                *inner_clone.pending_gif_preview_url.borrow_mut() = None;
                 inner_clone.image_preview_bar.set_visible(false);
                 update_send_button_state(&inner_clone);
                 // Clear stale state so the next attachment starts fresh.
@@ -1923,10 +2182,9 @@ impl ChatViewPanel {
                                 win.as_ref(),
                                 None::<&gtk4::gio::Cancellable>,
                                 move |result| {
-                                    if let (Ok(file), Some(chat_id)) = (
-                                        result,
-                                        inner_ccc.current_chat_id.borrow().clone(),
-                                    ) {
+                                    if let (Ok(file), Some(chat_id)) =
+                                        (result, inner_ccc.current_chat_id.borrow().clone())
+                                    {
                                         if let Some(path) = file.path() {
                                             inner_ccc.bridge.send_command(WaCommand::SendAudio {
                                                 chat_id: ChatViewPanel::resolve_send_target(
@@ -1999,75 +2257,107 @@ impl ChatViewPanel {
 
         // Emoji/GIF/Sticker panel — built once, toggled on click
         {
-            let inner_c = inner.clone();
+            let inner_w = Rc::downgrade(&inner);
+            let emoji_search = emoji_search.clone();
+            let gif_search = gif_search.clone();
+            let sticker_search = sticker_search.clone();
+            let notebook = notebook.clone();
             emoji_btn.connect_clicked(move |_| {
+                let Some(inner_c) = inner_w.upgrade() else {
+                    return;
+                };
                 if inner_c.emoji_popover.is_visible() {
                     inner_c.emoji_popover.popdown();
                 } else {
-                    // Load trending GIFs and stickers on open
-                    inner_c.bridge.send_command(WaCommand::SearchGifs {
-                        query: "trending".to_string(),
-                    });
-                    inner_c.bridge.send_command(WaCommand::SearchStickers {
-                        query: "trending".to_string(),
-                    });
                     inner_c.emoji_popover.popup();
+                    let page = notebook.current_page().unwrap_or(0);
+                    inner_c.picker_page.set(page);
+                    match page {
+                        1 => {
+                            Self::maybe_render_picker_results(&inner_c, PickerSearchKind::Gif);
+                            gif_search.grab_focus();
+                        }
+                        2 => {
+                            Self::maybe_render_picker_results(&inner_c, PickerSearchKind::Sticker);
+                            sticker_search.grab_focus();
+                        }
+                        _ => {
+                            emoji_search.grab_focus();
+                        }
+                    };
                 }
             });
         }
 
-        // Wire emoji grid button clicks
-        {
-            let inner_c = inner.clone();
-            // Iterate all children of emoji_grid (they're FlowBoxChild wrappers)
-            let mut child = emoji_grid.first_child();
-            while let Some(c) = child {
-                let next = c.next_sibling();
-                if let Ok(flow_child) = c.clone().downcast::<gtk4::FlowBoxChild>() {
-                    if let Some(btn) = flow_child.child().and_then(|c| c.downcast::<Button>().ok())
-                    {
-                        let emoji = btn.widget_name().to_string();
-                        let inner_cc = inner_c.clone();
-                        btn.connect_clicked(move |_| {
-                            inner_cc.input_view.buffer().insert_at_cursor(&emoji);
-                            inner_cc.emoji_popover.popdown();
-                        });
-                    }
-                }
-                child = next;
-            }
-        }
-
         // Wire GIF search
         {
-            let inner_c = inner.clone();
+            let inner_w = Rc::downgrade(&inner);
             gif_search.connect_search_changed(move |entry| {
-                let q = entry.text().to_string();
-                if q.len() >= 2 {
-                    inner_c
-                        .bridge
-                        .send_command(WaCommand::SearchGifs { query: q });
-                } else if q.is_empty() {
-                    inner_c.bridge.send_command(WaCommand::SearchGifs {
-                        query: "trending".to_string(),
-                    });
-                }
+                let Some(inner_c) = inner_w.upgrade() else {
+                    return;
+                };
+                queue_picker_search(
+                    &inner_c,
+                    PickerSearchKind::Gif,
+                    entry.text().to_string(),
+                    true,
+                );
             });
         }
 
         // Wire sticker search
         {
-            let inner_c = inner.clone();
+            let inner_w = Rc::downgrade(&inner);
             sticker_search.connect_search_changed(move |entry| {
-                let q = entry.text().to_string();
-                if q.len() >= 2 {
-                    inner_c
-                        .bridge
-                        .send_command(WaCommand::SearchStickers { query: q });
-                } else if q.is_empty() {
-                    inner_c.bridge.send_command(WaCommand::SearchStickers {
-                        query: "trending".to_string(),
-                    });
+                let Some(inner_c) = inner_w.upgrade() else {
+                    return;
+                };
+                queue_picker_search(
+                    &inner_c,
+                    PickerSearchKind::Sticker,
+                    entry.text().to_string(),
+                    true,
+                );
+            });
+        }
+
+        // GIFs and stickers are network-backed. Load each tab only when it is
+        // first viewed; opening the default emoji tab should do no hidden work.
+        {
+            let inner_w = Rc::downgrade(&inner);
+            let gif_search_c = gif_search.clone();
+            let sticker_search_c = sticker_search.clone();
+            notebook.connect_switch_page(move |_, _, page| {
+                let Some(inner_c) = inner_w.upgrade() else {
+                    return;
+                };
+                inner_c.picker_page.set(page);
+                match page {
+                    1 => {
+                        if inner_c.gif_search_request.get() == 0 {
+                            queue_picker_search(
+                                &inner_c,
+                                PickerSearchKind::Gif,
+                                String::new(),
+                                false,
+                            );
+                        }
+                        Self::maybe_render_picker_results(&inner_c, PickerSearchKind::Gif);
+                        gif_search_c.grab_focus();
+                    }
+                    2 => {
+                        if inner_c.sticker_search_request.get() == 0 {
+                            queue_picker_search(
+                                &inner_c,
+                                PickerSearchKind::Sticker,
+                                String::new(),
+                                false,
+                            );
+                        }
+                        Self::maybe_render_picker_results(&inner_c, PickerSearchKind::Sticker);
+                        sticker_search_c.grab_focus();
+                    }
+                    _ => {}
                 }
             });
         }
@@ -2290,6 +2580,54 @@ impl ChatViewPanel {
         }
     }
 
+    fn append_optimistic_picker_media(
+        inner: &Rc<ChatViewInner>,
+        chat_id: &str,
+        tmp_id: &str,
+        media_type: crate::bridge::MediaType,
+    ) {
+        let optimistic = IncomingMessage {
+            id: tmp_id.to_string(),
+            chat_id: chat_id.to_string(),
+            sender_id: String::new(),
+            sender_name: String::new(),
+            text: None,
+            media_type: Some(media_type),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64,
+            is_from_me: true,
+            quoted_msg_id: None,
+            quoted_text: None,
+            quoted_sender: None,
+            quoted_media_path: None,
+            poll_question: None,
+            poll_options: Vec::new(),
+            poll_selectable: 0,
+            poll_secret: Vec::new(),
+            poll_votes: Vec::new(),
+            is_forwarded: false,
+            forwarding_score: 0,
+            reactions: Vec::new(),
+            media_local_path: None,
+            media_filename: None,
+            media_caption: None,
+            contact_name: None,
+            contact_vcard: None,
+            link_title: None,
+            link_description: None,
+            link_url: None,
+            link_thumbnail_path: None,
+            receipt_status: crate::bridge::ReceiptStatus::Pending,
+            is_edited: false,
+            is_system_message: false,
+            media_download: None,
+        };
+        Self::append_bubble_to_inner(inner, optimistic);
+        Self::force_scroll_to_bottom(inner, 5);
+    }
+
     fn do_send(inner: &Rc<ChatViewInner>) {
         let chat_id = match inner.current_chat_id.borrow().clone() {
             Some(id) => id,
@@ -2349,10 +2687,17 @@ impl ChatViewPanel {
 
         let pending_gif = inner.pending_gif_url.borrow_mut().take();
         if let Some(mp4_url) = pending_gif {
+            *inner.pending_gif_preview_url.borrow_mut() = None;
             Self::cancel_typing(inner, true);
             inner.image_preview_bar.set_visible(false);
-            inner.input_view.buffer().set_text("");
+            inner.pending_attachments.borrow_mut().remove(&chat_id);
             let tmp_id = gen_tmp_id();
+            Self::append_optimistic_picker_media(
+                inner,
+                &chat_id,
+                &tmp_id,
+                crate::bridge::MediaType::Gif,
+            );
             inner.bridge.send_command(WaCommand::SendGif {
                 chat_id: ChatViewPanel::resolve_send_target(&chat_id),
                 mp4_url,
@@ -2502,7 +2847,6 @@ impl ChatViewPanel {
         let original_text = text.clone();
         let tmp_id_for_pilafy = tmp_id.clone();
         let bounce_stop = bounce_active.clone();
-        let msgs_box_for_send = inner.messages_box.clone();
         let send_network = move |final_text: String| {
             // Apply @Name → @Number replacement for the WA protocol.
             // Word-boundary-aware (only replaces "@Name" when the char after the
@@ -2596,7 +2940,8 @@ impl ChatViewPanel {
                 let safe_text = if final_text.len() * 2 < original_for_guard.len() {
                     log::warn!(
                         "AC guard: AI output shorter than original ({} < {}), using original",
-                        final_text.len(), original_for_guard.len()
+                        final_text.len(),
+                        original_for_guard.len()
                     );
                     original_for_guard
                 } else {
@@ -2609,7 +2954,9 @@ impl ChatViewPanel {
                     let remaining = min_bounce_ms - elapsed;
                     gtk4::glib::timeout_add_local_once(
                         std::time::Duration::from_millis(remaining),
-                        move || { send_network(safe_text); },
+                        move || {
+                            send_network(safe_text);
+                        },
                     );
                 }
             };
@@ -2622,21 +2969,20 @@ impl ChatViewPanel {
             // Brief pill flash then settle into normal bubble shape
             let bubbles_settle = inner.bubbles.clone();
             let tid = tmp_id_for_pilafy.clone();
-            gtk4::glib::timeout_add_local_once(
-                std::time::Duration::from_millis(150),
-                move || {
-                    if let Some(bubble) = bubbles_settle.borrow().get(&tid) {
-                        let w = bubble.widget();
-                        w.remove_css_class("pilafy");
-                        w.add_css_class("pilafy-settle");
-                        let w2 = w.clone();
-                        gtk4::glib::timeout_add_local_once(
-                            std::time::Duration::from_millis(500),
-                            move || { w2.remove_css_class("pilafy-settle"); },
-                        );
-                    }
-                },
-            );
+            gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(150), move || {
+                if let Some(bubble) = bubbles_settle.borrow().get(&tid) {
+                    let w = bubble.widget();
+                    w.remove_css_class("pilafy");
+                    w.add_css_class("pilafy-settle");
+                    let w2 = w.clone();
+                    gtk4::glib::timeout_add_local_once(
+                        std::time::Duration::from_millis(500),
+                        move || {
+                            w2.remove_css_class("pilafy-settle");
+                        },
+                    );
+                }
+            });
             send_network(text);
         }
     }
@@ -2659,6 +3005,85 @@ impl ChatViewPanel {
     /// Returns the currently open chat ID, if any.
     pub fn current_chat_id(&self) -> Option<String> {
         self.inner.current_chat_id.borrow().clone()
+    }
+
+    /// Fade the selected conversation into place without changing its
+    /// allocation. This is deliberately started *after* synchronous history
+    /// row construction: starting it in `open_chat` meant the main thread was
+    /// blocked for most or all of the old 190ms duration, so GTK had no frames
+    /// to paint and the animation appeared to be missing.
+    fn start_chat_switch_animation(inner: &ChatViewInner) {
+        Self::settle_chat_switch_animation(inner);
+
+        let animations_enabled = gtk4::Settings::default()
+            .map(|settings| settings.is_gtk_enable_animations())
+            .unwrap_or(true);
+        if !animations_enabled {
+            inner.conversation_surface.set_opacity(1.0);
+            return;
+        }
+
+        // A longer, higher-contrast ease is visible even on a high-refresh
+        // display, while remaining short enough that rapid navigation feels
+        // immediate. This is paint-only: no message rows are remeasured.
+        const DURATION_MS: u32 = 280;
+        const START_OPACITY: f64 = 0.28;
+
+        inner.conversation_surface.set_opacity(START_OPACITY);
+        let target = adw::PropertyAnimationTarget::new(&inner.conversation_surface, "opacity");
+        let animation = adw::TimedAnimation::new(
+            &inner.conversation_surface,
+            START_OPACITY,
+            1.0,
+            DURATION_MS,
+            target,
+        );
+        animation.set_easing(adw::Easing::EaseOutCubic);
+        animation.play();
+        *inner.chat_switch_animation.borrow_mut() = Some(animation);
+    }
+
+    /// Finish a transition before replacing its content. In particular, a
+    /// rapid A -> B -> C sequence must not leave B's in-flight opacity value on
+    /// C's loading state while its history is being assembled.
+    fn settle_chat_switch_animation(inner: &ChatViewInner) {
+        if let Some(active) = inner.chat_switch_animation.borrow_mut().take() {
+            active.skip();
+        }
+        inner.conversation_surface.set_opacity(1.0);
+    }
+
+    fn apply_favorite_button(inner: &ChatViewInner, is_favorite: bool) {
+        if is_favorite {
+            inner.favorite_button.set_icon_name("starred-symbolic");
+            inner
+                .favorite_button
+                .set_tooltip_text(Some("Remove from favourites"));
+            inner.favorite_button.add_css_class("favorite-active");
+        } else {
+            inner.favorite_button.set_icon_name("non-starred-symbolic");
+            inner
+                .favorite_button
+                .set_tooltip_text(Some("Add to favourites"));
+            inner.favorite_button.remove_css_class("favorite-active");
+        }
+    }
+
+    /// Update the authoritative favourite state for a chat. Callers may seed
+    /// this from chat-list/history data at any time; the header is refreshed
+    /// immediately when the affected chat is open.
+    pub fn set_chat_favorite(&self, chat_id: &str, is_favorite: bool) {
+        if is_favorite {
+            self.inner
+                .favorite_chats
+                .borrow_mut()
+                .insert(chat_id.to_string());
+        } else {
+            self.inner.favorite_chats.borrow_mut().remove(chat_id);
+        }
+        if self.inner.current_chat_id.borrow().as_deref() == Some(chat_id) {
+            Self::apply_favorite_button(&self.inner, is_favorite);
+        }
     }
 
     /// Update the send-mode toggle button's icon, tooltip and visibility
@@ -2692,17 +3117,17 @@ impl ChatViewPanel {
         match mode {
             crate::bridge::send_mode::Mode::WhatsApp => {
                 inner.send_mode_btn.set_icon_name("user-available-symbolic");
-                inner.send_mode_btn.set_tooltip_text(Some(
-                    "Sending via WhatsApp — click to switch to SMS",
-                ));
+                inner
+                    .send_mode_btn
+                    .set_tooltip_text(Some("Sending via WhatsApp — click to switch to SMS"));
                 inner.send_mode_btn.remove_css_class("send-mode-sms");
                 inner.send_mode_btn.add_css_class("send-mode-wa");
             }
             crate::bridge::send_mode::Mode::Sms => {
                 inner.send_mode_btn.set_icon_name("phone-symbolic");
-                inner.send_mode_btn.set_tooltip_text(Some(
-                    "Sending via SMS — click to switch to WhatsApp",
-                ));
+                inner
+                    .send_mode_btn
+                    .set_tooltip_text(Some("Sending via SMS — click to switch to WhatsApp"));
                 inner.send_mode_btn.remove_css_class("send-mode-wa");
                 inner.send_mode_btn.add_css_class("send-mode-sms");
             }
@@ -2720,16 +3145,14 @@ impl ChatViewPanel {
             // Not merged — send to the chat as-is.
             return chat_id.to_string();
         };
-        let mode = crate::bridge::send_mode::get(chat_id).unwrap_or(
-            if is_gm {
-                crate::bridge::send_mode::Mode::Sms
-            } else {
-                crate::bridge::send_mode::Mode::WhatsApp
-            },
-        );
+        let mode = crate::bridge::send_mode::get(chat_id).unwrap_or(if is_gm {
+            crate::bridge::send_mode::Mode::Sms
+        } else {
+            crate::bridge::send_mode::Mode::WhatsApp
+        });
         match mode {
             crate::bridge::send_mode::Mode::WhatsApp if is_gm => pair, // gm row, send via WA
-            crate::bridge::send_mode::Mode::Sms if !is_gm => pair, // wa row, send via SMS
+            crate::bridge::send_mode::Mode::Sms if !is_gm => pair,     // wa row, send via SMS
             _ => chat_id.to_string(),
         }
     }
@@ -2794,6 +3217,68 @@ impl ChatViewPanel {
         }
     }
 
+    /// Schedule a scroll after GTK has allocated the target bubble. Keeping the
+    /// lookup inside the idle callback also makes this reliable for callers
+    /// that request a jump during history construction.
+    fn jump_to_message_inner(inner: &Rc<ChatViewInner>, msg_id: &str) -> bool {
+        let resolved_id = inner
+            .id_remap
+            .borrow()
+            .get(msg_id)
+            .cloned()
+            .unwrap_or_else(|| msg_id.to_string());
+        if !inner.bubbles.borrow().contains_key(&resolved_id) {
+            *inner.pending_message_jump.borrow_mut() = Some(resolved_id);
+            return false;
+        }
+
+        *inner.pending_message_jump.borrow_mut() = None;
+        let inner_w = Rc::downgrade(inner);
+        glib::idle_add_local_once(move || {
+            let Some(inner) = inner_w.upgrade() else {
+                return;
+            };
+            let widget = inner
+                .bubbles
+                .borrow()
+                .get(&resolved_id)
+                .map(|bubble| bubble.widget().clone());
+            let Some(widget) = widget else {
+                return;
+            };
+
+            // A jump is an explicit user action, so it takes precedence over
+            // the automatic "stay at bottom" lock.
+            inner.at_bottom.set(false);
+            inner.scroll_pending.set(0);
+            let origin = gtk4::graphene::Point::new(0.0, 0.0);
+            if let Some(point) = widget.compute_point(&inner.messages_box, &origin) {
+                let adj = inner.scroll.vadjustment();
+                let target = (point.y() as f64 - adj.page_size() * 0.25).clamp(
+                    adj.lower(),
+                    (adj.upper() - adj.page_size()).max(adj.lower()),
+                );
+                adj.set_value(target);
+                inner
+                    .goto_latest_btn
+                    .set_visible(target < adj.upper() - adj.page_size() - 60.0);
+            }
+
+            widget.add_css_class("flash-highlight");
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                widget.remove_css_class("flash-highlight");
+            });
+        });
+        true
+    }
+
+    /// Scroll to and highlight a message in the open chat. Returns `true` when
+    /// the bubble is already available. If history is still loading, the jump
+    /// is queued and automatically completed when the message is inserted.
+    pub fn jump_to_message(&self, msg_id: &str) -> bool {
+        Self::jump_to_message_inner(&self.inner, msg_id)
+    }
+
     /// Open a chat immediately (sets current_chat_id, clears messages, shows loading).
     /// Returns false if the chat is already open (no reload needed).
     /// Restore a failed edit: put the edited text back in the composer and
@@ -2846,9 +3331,15 @@ impl ChatViewPanel {
         let already_open = self.inner.current_chat_id.borrow().as_deref() == Some(&chat_id);
         if already_open {
             self.inner.header_name.set_text(chat_name);
+            let is_favorite = self.inner.favorite_chats.borrow().contains(&chat_id);
+            Self::apply_favorite_button(&self.inner, is_favorite);
             self.inner.input_view.grab_focus();
             return false;
         }
+
+        // Settle any in-flight fade before the message surface is replaced.
+        // The newly loaded history starts its own transition after rendering.
+        Self::settle_chat_switch_animation(&self.inner);
 
         // ── Flush the outgoing chat's typing indicator ──
         // Before we swap current_chat_id, tell the OLD chat we've stopped
@@ -2865,19 +3356,35 @@ impl ChatViewPanel {
             if draft.trim().is_empty() {
                 self.inner.drafts.borrow_mut().remove(&old_chat_id);
             } else {
-                self.inner.drafts.borrow_mut().insert(old_chat_id.clone(), draft);
+                self.inner
+                    .drafts
+                    .borrow_mut()
+                    .insert(old_chat_id.clone(), draft);
             }
 
             // ── Save pending attachment for the OUTGOING chat ──
             // Without this, a paste/drop staged in chat A leaked into
             // chat B when the user switched chats — pending_image_path
             // was global, not per-chat.
-            let pending = self.inner.pending_image_path.borrow().clone();
-            if let Some(p) = pending {
+            let pending = self
+                .inner
+                .pending_image_path
+                .borrow()
+                .clone()
+                .map(PendingAttachment::File)
+                .or_else(|| {
+                    let mp4_url = self.inner.pending_gif_url.borrow().clone()?;
+                    let preview_url = self.inner.pending_gif_preview_url.borrow().clone()?;
+                    Some(PendingAttachment::Gif {
+                        mp4_url,
+                        preview_url,
+                    })
+                });
+            if let Some(pending) = pending {
                 self.inner
                     .pending_attachments
                     .borrow_mut()
-                    .insert(old_chat_id, p);
+                    .insert(old_chat_id, pending);
             } else {
                 self.inner
                     .pending_attachments
@@ -2899,10 +3406,13 @@ impl ChatViewPanel {
         crate::ui::autocorrect::cancel_pending();
 
         *self.inner.current_chat_id.borrow_mut() = Some(chat_id.clone());
+        *self.inner.pending_message_jump.borrow_mut() = None;
         // Clear send group mode when switching to a real chat
         *self.inner.send_group_ids.borrow_mut() = None;
         // Update the WhatsApp/SMS toggle in the header for this chat.
         ChatViewPanel::apply_send_mode_btn(&self.inner, &chat_id);
+        let is_favorite = self.inner.favorite_chats.borrow().contains(&chat_id);
+        Self::apply_favorite_button(&self.inner, is_favorite);
         self.inner.header_name.set_text(chat_name);
         // Clear group subtitle — it'll be set when GroupMembers arrives
         self.inner.header_subtitle.set_text("");
@@ -2927,6 +3437,7 @@ impl ChatViewPanel {
         // label setup; clearing covers the no-pending case.
         *self.inner.pending_image_path.borrow_mut() = None;
         *self.inner.pending_gif_url.borrow_mut() = None;
+        *self.inner.pending_gif_preview_url.borrow_mut() = None;
         self.inner.image_preview_bar.set_visible(false);
         self.inner
             .image_preview_pic
@@ -2934,17 +3445,24 @@ impl ChatViewPanel {
         self.inner
             .preview_label
             .set_markup("Press Enter to send, Escape to cancel");
-        if let Some(saved) = self
+        let saved = self
             .inner
             .pending_attachments
             .borrow()
             .get(&chat_id)
-            .cloned()
-        {
-            // Re-render the preview UI for the saved file via the same
-            // helper used by paste/drop/file-chooser, so the look is
-            // identical to how the user originally staged it.
-            set_pending_attachment(&self.inner, &saved);
+            .cloned();
+        if let Some(saved) = saved {
+            match saved {
+                PendingAttachment::File(path) => {
+                    // Re-render the preview UI for the saved file via the same
+                    // helper used by paste/drop/file-chooser.
+                    set_pending_attachment(&self.inner, &path);
+                }
+                PendingAttachment::Gif {
+                    mp4_url,
+                    preview_url,
+                } => stage_pending_gif(&self.inner, mp4_url, preview_url, None),
+            }
         }
         // Normalise the send button for the freshly-restored draft/attachment
         // state (the connect_changed from set_text above may have observed a
@@ -2966,9 +3484,9 @@ impl ChatViewPanel {
             if let Some(typers) = all.get(&chat_id) {
                 if !typers.is_empty() {
                     let label = typers.join(", ");
-                    self.inner.typing_name.set_markup(
-                        &format!("<small><b>{label}</b> </small>")
-                    );
+                    self.inner
+                        .typing_name
+                        .set_markup(&format!("<small><b>{label}</b> </small>"));
                     self.inner.typing_box.set_visible(true);
                 } else {
                     self.inner.typing_box.set_visible(false);
@@ -3030,7 +3548,7 @@ impl ChatViewPanel {
         let virtual_id = format!("sendgroup::{}", group_name);
         let n = chat_ids.len();
         // open_chat resets the UI and clears send_group_ids, so we set AFTER.
-        self.open_chat(virtual_id, group_name);
+        let switched_chat = self.open_chat(virtual_id, group_name);
         *self.inner.send_group_ids.borrow_mut() = Some(chat_ids);
 
         self.inner
@@ -3052,9 +3570,12 @@ impl ChatViewPanel {
             self.inner.messages_box.append(&label);
         } else {
             for msg in history {
-                self.append_message_inner(msg);
+                Self::append_history_bubble_to_inner(&self.inner, msg);
             }
             Self::force_scroll_to_bottom(&self.inner, 3);
+        }
+        if switched_chat {
+            Self::start_chat_switch_animation(&self.inner);
         }
     }
 
@@ -3073,7 +3594,6 @@ impl ChatViewPanel {
             return;
         }
 
-
         // Remove placeholder
         self.remove_placeholder();
 
@@ -3086,6 +3606,7 @@ impl ChatViewPanel {
             label.set_vexpand(true);
             label.set_valign(Align::Center);
             self.inner.messages_box.append(&label);
+            Self::start_chat_switch_animation(&self.inner);
             return;
         }
 
@@ -3100,7 +3621,7 @@ impl ChatViewPanel {
         // Cost: ~100-300ms hitch on chat switch for 50 messages. Acceptable
         // tradeoff vs. the "messages don't paint until hover" bug.
         for msg in messages {
-            self.append_message_inner(msg);
+            Self::append_history_bubble_to_inner(&self.inner, msg);
         }
         self.inner.at_bottom.set(true);
         self.inner.goto_latest_btn.set_visible(false);
@@ -3111,21 +3632,20 @@ impl ChatViewPanel {
         // bottom while at_bottom remains true.
         Self::force_scroll_to_bottom(&self.inner, 4);
 
-        // BULLETPROOF PAINT FIX (delayed past bubble-enter animation):
+        // History rows are constructed synchronously above. Starting the
+        // frame-clock animation only now guarantees that its first frame is
+        // the real replacement conversation rather than an unpainted loading
+        // placeholder, and that row construction cannot consume its duration.
+        Self::start_chat_switch_animation(&self.inner);
+
+        // BULLETPROOF PAINT FIX:
         // GTK4's GL renderer occasionally fails to paint newly-rendered
-        // bubbles until something damages the surface. The bubble-enter
-        // CSS animations run for ~480ms on every new bubble, so during
-        // that window each frame produces damage and the renderer paints
-        // correctly. AFTER animations complete, async events (GroupMembers,
-        // ChatNameUpdated, AvatarReady) may still mutate parent layout
-        // and cause the cache-stale scenario that needs hide/show.
-        //
-        // Fire the hide/show at +700ms — past the bubble animations so
-        // it doesn't interrupt them, but still soon enough to recover
-        // from late layout shifts before the user notices.
+        // bubbles until something damages the surface. History bubbles no
+        // longer animate, so one short delayed invalidation is sufficient and
+        // avoids holding the chat in an animated/layout-heavy state for 700ms.
         {
             let inner_w = Rc::downgrade(&self.inner);
-            glib::timeout_add_local_once(std::time::Duration::from_millis(700), move || {
+            glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
                 let Some(inner) = inner_w.upgrade() else {
                     return;
                 };
@@ -3267,30 +3787,33 @@ impl ChatViewPanel {
     }
 
     fn append_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
-        Self::append_bubble_to_inner_at(inner, msg, BubblePosition::Append);
+        Self::append_bubble_to_inner_at(inner, msg, true);
     }
 
-    fn append_bubble_to_inner_at(
-        inner: &Rc<ChatViewInner>,
-        msg: IncomingMessage,
-        position: BubblePosition,
-    ) {
+    fn append_history_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
+        Self::append_bubble_to_inner_at(inner, msg, false);
+    }
+
+    fn append_bubble_to_inner_at(inner: &Rc<ChatViewInner>, msg: IncomingMessage, animate: bool) {
         // Dedup: if a bubble already exists for this msg id (e.g. optimistic bubble
         // was already confirmed via MessageConfirmed), skip creating a new one.
         if inner.bubbles.borrow().contains_key(&msg.id) {
             return;
         }
 
-        // Insert a date separator when the day changes — only on append.
-        // Prepend inserts at the top of the box, where any new separator
-        // would actually land at the BOTTOM (since maybe_insert_date_separator
-        // appends), producing the wrong order entirely.
-        if matches!(position, BubblePosition::Append) {
-            maybe_insert_date_separator(inner, msg.timestamp);
-        }
+        maybe_insert_date_separator(inner, msg.timestamp);
 
         let own_name = inner.own_name.borrow().clone();
         let bubble = MessageBubble::new(&msg, &own_name, &inner.bridge);
+
+        // A quoted reply is a real navigation control: clicking or activating
+        // it from the keyboard scrolls to and highlights the original message.
+        if let Some(quoted_id) = bubble.quoted_msg_id.clone() {
+            let inner_c = inner.clone();
+            bubble.set_quoted_click_handler(move || {
+                ChatViewPanel::jump_to_message_inner(&inner_c, &quoted_id);
+            });
+        }
 
         // Right-click context menu — anchor to the bubble widget
         let gesture = GestureClick::new();
@@ -3341,7 +3864,6 @@ impl ChatViewPanel {
         {
             let inner_c = inner.clone();
             let msg_c = msg.clone();
-            let chevron = bubble.chevron_button().clone();
             bubble.chevron_button().connect_clicked(move |btn| {
                 show_message_menu(&inner_c, &msg_c, btn.upcast_ref(), 0.0, 0.0);
             });
@@ -3350,7 +3872,6 @@ impl ChatViewPanel {
         // Wire quick action buttons: React, Reply, Forward
         // System-message bubbles have no hover actions — skip wiring
         if let Some((btn_react, btn_reply, btn_forward)) = bubble.quick_action_buttons() {
-
             let inner_c = inner.clone();
             let msg_c = msg.clone();
             btn_react.connect_clicked(move |btn| {
@@ -3424,59 +3945,90 @@ impl ChatViewPanel {
                 msg.sender_name.clone()
             };
             let inner_c = inner.clone();
+            let activate_profile: Rc<dyn Fn()> = Rc::new(move || {
+                if let Some(cb) = inner_c.on_profile_open.borrow().as_ref()
+                    && !chat_id_for_profile.is_empty()
+                {
+                    cb(chat_id_for_profile.clone(), name_for_profile.clone());
+                }
+            });
             let av_gesture = GestureClick::new();
             av_gesture.set_button(1);
+            let activate_click = activate_profile.clone();
             av_gesture.connect_released(move |g, _, _, _| {
                 g.set_state(gtk4::EventSequenceState::Claimed);
-                if let Some(cb) = inner_c.on_profile_open.borrow().as_ref() {
-                    if !chat_id_for_profile.is_empty() {
-                        cb(chat_id_for_profile.clone(), name_for_profile.clone());
-                    }
-                }
+                activate_click();
             });
             bubble.avatar_widget().add_controller(av_gesture);
             bubble.avatar_widget().set_cursor_from_name(Some("pointer"));
+            bubble.avatar_widget().set_focusable(true);
+            bubble
+                .avatar_widget()
+                .set_accessible_role(gtk4::AccessibleRole::Button);
+            bubble
+                .avatar_widget()
+                .update_property(&[gtk4::accessible::Property::Label("Open contact profile")]);
+            let key = gtk4::EventControllerKey::new();
+            key.connect_key_pressed(move |_, key, _, _| {
+                if matches!(
+                    key,
+                    gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter | gtk4::gdk::Key::space
+                ) {
+                    activate_profile();
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            });
+            bubble.avatar_widget().add_controller(key);
         }
 
-        // Wire contact card "Message" button — find by widget_name containing JID
-        if bubble.contact_jid.is_some() {
+        // Wire the contact card's native Button directly. It is keyboard
+        // focusable by GTK and avoids recursively walking every bubble's widget
+        // tree to rediscover a control MessageBubble already owns.
+        if let (Some(jid), Some(msg_btn)) = (
+            bubble.contact_jid.clone(),
+            bubble.contact_message_button().cloned(),
+        ) {
             let name = msg.contact_name.clone().unwrap_or_default();
             let inner_c = inner.clone();
-            fn find_btn_by_name(widget: &gtk4::Widget) -> Option<(Button, String)> {
-                if let Ok(btn) = widget.clone().downcast::<Button>() {
-                    let wn = btn.widget_name().to_string();
-                    if wn.contains("@s.whatsapp.net") {
-                        return Some((btn, wn));
-                    }
+            msg_btn.connect_clicked(move |_| {
+                let j = jid.clone();
+                ChatViewPanel::cancel_typing(&inner_c, true);
+                *inner_c.current_chat_id.borrow_mut() = Some(j.clone());
+                *inner_c.send_group_ids.borrow_mut() = None;
+                *inner_c.reply_context.borrow_mut() = None;
+                inner_c.reply_bar.set_visible(false);
+                *inner_c.editing_msg.borrow_mut() = None;
+                inner_c.edit_banner.set_reveal_child(false);
+                *inner_c.pending_message_jump.borrow_mut() = None;
+                ChatViewPanel::apply_send_mode_btn(&inner_c, &j);
+                let is_favorite = inner_c.favorite_chats.borrow().contains(&j);
+                ChatViewPanel::apply_favorite_button(&inner_c, is_favorite);
+                inner_c.header_name.set_text(&name);
+                while let Some(child) = inner_c.messages_box.first_child() {
+                    inner_c.messages_box.remove(&child);
                 }
-                let mut child = widget.first_child();
-                while let Some(c) = child {
-                    if let Some(found) = find_btn_by_name(&c) {
-                        return Some(found);
-                    }
-                    child = c.next_sibling();
-                }
-                None
-            }
-            if let Some((msg_btn, jid)) = find_btn_by_name(bubble.widget().upcast_ref()) {
-                msg_btn.connect_clicked(move |_| {
-                    let j = jid.clone();
-                    *inner_c.current_chat_id.borrow_mut() = Some(j.clone());
-                    inner_c.header_name.set_text(&name);
-                    while let Some(child) = inner_c.messages_box.first_child() {
-                        inner_c.messages_box.remove(&child);
-                    }
-                    inner_c.bubbles.borrow_mut().clear();
-                    inner_c
-                        .bridge
-                        .send_command(WaCommand::StartNewChat { jid: j.clone() });
-                    inner_c.bridge.send_command(WaCommand::LoadChat {
-                        chat_id: j.clone(),
-                        chat_name: name.clone(),
-                    });
-                    inner_c.input_view.grab_focus();
+                inner_c.bubbles.borrow_mut().clear();
+                inner_c.search_texts.borrow_mut().clear();
+                inner_c.id_remap.borrow_mut().clear();
+                inner_c.media_items.borrow_mut().clear();
+                *inner_c.last_msg_date.borrow_mut() = None;
+                inner_c.search_entry.set_text("");
+                inner_c.search_revealer.set_reveal_child(false);
+                inner_c.pin_banner.set_visible(false);
+                inner_c
+                    .bridge
+                    .send_command(WaCommand::StartNewChat { jid: j.clone() });
+                inner_c.bridge.send_command(WaCommand::SetActiveChat {
+                    chat_id: Some(j.clone()),
                 });
-            }
+                inner_c.bridge.send_command(WaCommand::LoadChat {
+                    chat_id: j.clone(),
+                    chat_name: name.clone(),
+                });
+                inner_c.input_view.grab_focus();
+            });
         }
 
         // If this message already has a local media path, register it and wire the carousel
@@ -3565,9 +4117,7 @@ impl ChatViewPanel {
                 }
                 drop(bubbles);
             } else {
-                if matches!(position, BubblePosition::Append) {
-                    Self::scroll_if_at_bottom(inner);
-                }
+                Self::scroll_if_at_bottom(inner);
                 return;
             }
         }
@@ -3575,37 +4125,36 @@ impl ChatViewPanel {
         // Tag the widget with the msg_id. Useful for runtime debugging
         // (e.g. inspecting widget tree via GTK Inspector to find a bubble
         // by message id) and harmless to leave in.
-        bubble.widget().set_widget_name(&format!("bubble-{}", msg.id));
+        bubble
+            .widget()
+            .set_widget_name(&format!("bubble-{}", msg.id));
 
-        // Slide-in animation: add bubble-enter class so the CSS keyframe
-        // animation plays on first paint, then schedule removal of the
-        // class so margins settle back to baseline. 500ms covers the
-        // 480ms CSS animation duration with a small buffer.
-        bubble.widget().add_css_class("bubble-enter");
-        let bubble_w = bubble.widget().clone();
-        glib::timeout_add_local_once(
-            std::time::Duration::from_millis(500),
-            move || {
+        // Only genuinely live messages animate. Animating every history row
+        // simultaneously caused hundreds of layout-changing margin updates and
+        // negative-width GTK warnings on chat open. Honour the desktop reduced-
+        // motion setting for live messages too.
+        let animations_enabled = gtk4::Settings::default()
+            .map(|settings| settings.is_gtk_enable_animations())
+            .unwrap_or(true);
+        if animate && animations_enabled {
+            bubble.widget().add_css_class("bubble-enter");
+            let bubble_w = bubble.widget().clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
                 bubble_w.remove_css_class("bubble-enter");
-            },
-        );
-
-        match position {
-            BubblePosition::Append => inner.messages_box.append(bubble.widget()),
-            // insert_child_after(widget, NONE) inserts at the top of the box
-            // in one step. No append-then-remove dance, so `upper` only grows
-            // (never momentarily shrinks), and the auto-clamp on
-            // GtkAdjustment that was pinning the scroll position above the
-            // true bottom no longer fires.
-            BubblePosition::Prepend => inner
-                .messages_box
-                .insert_child_after(bubble.widget(), gtk4::Widget::NONE),
+            });
         }
+
+        inner.messages_box.append(bubble.widget());
         inner.bubbles.borrow_mut().insert(msg.id.clone(), bubble);
         inner
             .search_texts
             .borrow_mut()
             .insert(msg.id.clone(), search_text);
+
+        let should_complete_jump = inner.pending_message_jump.borrow().as_deref() == Some(&msg.id);
+        if should_complete_jump {
+            Self::jump_to_message_inner(inner, &msg.id);
+        }
 
         // Apply current search filter to the new bubble
         let query = inner.search_entry.text().to_lowercase();
@@ -3613,14 +4162,7 @@ impl ChatViewPanel {
             Self::apply_search_filter(inner, &query);
         }
 
-        // Only the append path tries to auto-scroll. Prepend inserts above
-        // the visible viewport — the existing connect_changed handler will
-        // re-anchor the bottom while at_bottom is true, but we don't want
-        // to fire a redundant set_value here (it would race with the layout
-        // pass that hasn't happened yet for the just-inserted top widget).
-        if matches!(position, BubblePosition::Append) {
-            Self::scroll_if_at_bottom(inner);
-        }
+        Self::scroll_if_at_bottom(inner);
     }
 
     pub fn set_media_loaded(
@@ -3827,14 +4369,68 @@ impl ChatViewPanel {
         }
     }
 
-    pub fn show_gif_results(&self, gifs: Vec<crate::bridge::GifResult>) {
-        let grid = &self.inner.gif_grid;
-        grid.remove_all();
+    fn maybe_render_picker_results(inner: &Rc<ChatViewInner>, kind: PickerSearchKind) {
+        let expected_page = match kind {
+            PickerSearchKind::Gif => 1,
+            PickerSearchKind::Sticker => 2,
+        };
+        if !inner.emoji_popover.is_visible() || inner.picker_page.get() != expected_page {
+            return;
+        }
 
-        for gif in &gifs {
+        let (cached, current_request, rendered_request) = match kind {
+            PickerSearchKind::Gif => (
+                inner.gif_result_cache.borrow().clone(),
+                inner.gif_search_request.get(),
+                &inner.gif_rendered_request,
+            ),
+            PickerSearchKind::Sticker => (
+                inner.sticker_result_cache.borrow().clone(),
+                inner.sticker_search_request.get(),
+                &inner.sticker_rendered_request,
+            ),
+        };
+        let Some(cached) = cached else {
+            return;
+        };
+        if cached.request_id != current_request || rendered_request.get() == cached.request_id {
+            return;
+        }
+
+        match kind {
+            PickerSearchKind::Gif => Self::render_gif_results(inner, &cached),
+            PickerSearchKind::Sticker => Self::render_sticker_results(inner, &cached),
+        }
+        rendered_request.set(cached.request_id);
+    }
+
+    fn render_gif_results(inner: &Rc<ChatViewInner>, result: &PickerResultSet) {
+        let grid = &inner.gif_grid;
+        grid.remove_all();
+        grid.set_sensitive(true);
+        inner.gif_status.remove_css_class("error");
+        if let Some(error) = result.error.as_deref() {
+            inner.gif_status.add_css_class("error");
+            inner.gif_status.set_text(error);
+            return;
+        }
+        if result.results.is_empty() {
+            let label = if result.query.eq_ignore_ascii_case("trending") {
+                "No trending GIFs are available right now".to_string()
+            } else {
+                format!("No GIFs found for “{}”", result.query)
+            };
+            inner.gif_status.set_text(&label);
+            return;
+        }
+        inner.gif_status.set_text(&format!(
+            "{} results · Powered by Tenor",
+            result.results.len()
+        ));
+
+        for gif in &result.results {
             let frame = Box::new(Orientation::Vertical, 2);
             frame.set_size_request(170, 130);
-            frame.set_cursor_from_name(Some("pointer"));
 
             // Download and show preview image asynchronously
             let pic = gtk4::Picture::new();
@@ -3851,131 +4447,98 @@ impl ChatViewPanel {
             title.set_halign(Align::Center);
             frame.append(&title);
 
-            // Download preview on background thread, update via async_channel
-            let preview_url = gif.preview_url.clone();
-            let pic_clone = pic.clone();
-            let (tx_img, rx_img) = async_channel::bounded::<Vec<u8>>(1);
-            glib::MainContext::default().spawn_local(async move {
-                if let Ok(bytes) = rx_img.recv().await {
-                    let gbytes = glib::Bytes::from(&bytes);
-                    if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&gbytes) {
-                        pic_clone.set_paintable(Some(&tex));
-                    }
-                }
-            });
-            std::thread::spawn(move || {
-                use std::io::Read;
-                if let Ok(resp) = ureq::get(&preview_url).call() {
-                    let mut bytes = Vec::new();
-                    if resp.into_reader().read_to_end(&mut bytes).is_ok() {
-                        let _ = tx_img.send_blocking(bytes);
-                    }
-                }
-            });
+            load_picker_preview(&pic, gif.preview_url.clone(), None, None);
 
-            // Click GIF → show preview, user presses Enter to send
+            // A real Button supplies focus, Enter/Space activation and an
+            // accessible role without custom key controllers.
+            let tile = Button::new();
+            tile.set_has_frame(false);
+            tile.add_css_class("flat");
+            tile.set_focusable(true);
+            tile.set_cursor_from_name(Some("pointer"));
+            tile.set_child(Some(&frame));
+            let accessible_label = format!("Choose GIF: {}", gif.title);
+            tile.set_tooltip_text(Some(&accessible_label));
+            tile.update_property(&[gtk4::accessible::Property::Label(&accessible_label)]);
+
             let mp4_url = gif.mp4_url.clone();
             let preview_url_c = gif.preview_url.clone();
-            let inner_c = self.inner.clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_released(move |_, _, _, _| {
-                // Set the preview image from the already-loaded thumbnail
-                // and store the MP4 URL for sending on Enter
-                *inner_c.pending_gif_url.borrow_mut() = Some(mp4_url.clone());
-                *inner_c.pending_image_path.borrow_mut() = None;
-                // Clear any stale preview and show a loading hint until the
-                // thumbnail arrives, so a slow network doesn't leave the bar
-                // blank (which made users click again).
-                inner_c
-                    .image_preview_pic
-                    .set_paintable(None::<&gtk4::gdk::Paintable>);
-                inner_c
-                    .preview_label
-                    .set_text("Loading GIF… (Enter to send, Escape to cancel)");
-                inner_c.image_preview_bar.set_visible(true);
-                update_send_button_state(&inner_c);
+            let result_pic = pic.clone();
+            let inner_w = Rc::downgrade(inner);
+            tile.connect_clicked(move |_| {
+                let Some(inner_c) = inner_w.upgrade() else {
+                    return;
+                };
+                stage_pending_gif(
+                    &inner_c,
+                    mp4_url.clone(),
+                    preview_url_c.clone(),
+                    result_pic.paintable(),
+                );
                 inner_c.emoji_popover.popdown();
-                // Load preview into the preview bar
-                let url = preview_url_c.clone();
-                let pic = inner_c.image_preview_pic.clone();
-                let label_reset = inner_c.preview_label.clone();
-                let (tx, rx) = async_channel::bounded::<Vec<u8>>(1);
-                glib::MainContext::default().spawn_local(async move {
-                    if let Ok(bytes) = rx.recv().await {
-                        let gb = glib::Bytes::from(&bytes);
-                        if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&gb) {
-                            pic.set_paintable(Some(&tex));
-                            label_reset.set_text("Press Enter to send, Escape to cancel");
-                        }
-                    }
-                });
-                std::thread::spawn(move || {
-                    use std::io::Read;
-                    if let Ok(resp) = ureq::get(&url).call() {
-                        let mut bytes = Vec::new();
-                        if resp.into_reader().read_to_end(&mut bytes).is_ok() {
-                            let _ = tx.send_blocking(bytes);
-                        }
-                    }
-                });
-                inner_c.input_view.grab_focus();
             });
-            frame.add_controller(gesture);
-
-            grid.append(&frame);
+            grid.append(&tile);
         }
     }
 
-    pub fn show_sticker_results(&self, stickers: Vec<crate::bridge::GifResult>) {
-        let grid = &self.inner.sticker_grid;
+    fn render_sticker_results(inner: &Rc<ChatViewInner>, result: &PickerResultSet) {
+        let grid = &inner.sticker_grid;
         grid.remove_all();
+        grid.set_sensitive(true);
+        inner.sticker_status.remove_css_class("error");
+        if let Some(error) = result.error.as_deref() {
+            inner.sticker_status.add_css_class("error");
+            inner.sticker_status.set_text(error);
+            return;
+        }
+        if result.results.is_empty() {
+            let label = if result.query.eq_ignore_ascii_case("trending") {
+                "No trending stickers are available right now".to_string()
+            } else {
+                format!("No stickers found for “{}”", result.query)
+            };
+            inner.sticker_status.set_text(&label);
+            return;
+        }
+        inner.sticker_status.set_text(&format!(
+            "{} results · Powered by Tenor",
+            result.results.len()
+        ));
 
-        for sticker in &stickers {
+        for sticker in &result.results {
             let pic = gtk4::Picture::new();
             pic.set_size_request(90, 90);
             pic.set_content_fit(gtk4::ContentFit::Contain);
             pic.set_can_shrink(true);
-            pic.set_cursor_from_name(Some("pointer"));
 
-            // Download preview
-            let preview_url = sticker.preview_url.clone();
-            let pic_clone = pic.clone();
-            let (tx_img, rx_img) = async_channel::bounded::<Vec<u8>>(1);
-            glib::MainContext::default().spawn_local(async move {
-                if let Ok(bytes) = rx_img.recv().await {
-                    let gb = glib::Bytes::from(&bytes);
-                    if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&gb) {
-                        pic_clone.set_paintable(Some(&tex));
-                    }
-                }
-            });
-            std::thread::spawn(move || {
-                use std::io::Read;
-                if let Ok(resp) = ureq::get(&preview_url).call() {
-                    let mut bytes = Vec::new();
-                    if resp.into_reader().read_to_end(&mut bytes).is_ok() {
-                        let _ = tx_img.send_blocking(bytes);
-                    }
-                }
-            });
+            load_picker_preview(&pic, sticker.preview_url.clone(), None, None);
 
-            // Click to send sticker
+            let tile = Button::new();
+            tile.set_has_frame(false);
+            tile.add_css_class("flat");
+            tile.set_focusable(true);
+            tile.set_cursor_from_name(Some("pointer"));
+            tile.set_child(Some(&pic));
+            let accessible_label = format!("Send sticker: {}", sticker.title);
+            tile.set_tooltip_text(Some(&accessible_label));
+            tile.update_property(&[gtk4::accessible::Property::Label(&accessible_label)]);
+
             let webp_url = sticker.mp4_url.clone(); // reused field for webp URL
-            let inner_c = self.inner.clone();
-            let gesture = gtk4::GestureClick::new();
-            gesture.set_button(1);
-            gesture.connect_released(move |_, _, _, _| {
+            let inner_w = Rc::downgrade(inner);
+            tile.connect_clicked(move |_| {
+                let Some(inner_c) = inner_w.upgrade() else {
+                    return;
+                };
                 let bridge = inner_c.bridge.clone();
                 let chat_id = inner_c.current_chat_id.borrow().clone();
                 inner_c.emoji_popover.popdown();
                 if let Some(chat_id) = chat_id {
-                    let tmp_id = format!(
-                        "tmp-stk-{:08x}",
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .subsec_nanos()
+                    let tmp_id = gen_tmp_id();
+                    Self::append_optimistic_picker_media(
+                        &inner_c,
+                        &chat_id,
+                        &tmp_id,
+                        crate::bridge::MediaType::Sticker,
                     );
                     bridge.send_command(WaCommand::SendSticker {
                         chat_id: ChatViewPanel::resolve_send_target(&chat_id),
@@ -3984,10 +4547,46 @@ impl ChatViewPanel {
                     });
                 }
             });
-            pic.add_controller(gesture);
-
-            grid.append(&pic);
+            grid.append(&tile);
         }
+    }
+
+    pub fn show_gif_results(
+        &self,
+        request_id: u64,
+        query: &str,
+        gifs: Vec<crate::bridge::GifResult>,
+        error: Option<&str>,
+    ) {
+        if self.inner.gif_search_request.get() != request_id {
+            return;
+        }
+        *self.inner.gif_result_cache.borrow_mut() = Some(PickerResultSet {
+            request_id,
+            query: query.to_string(),
+            results: gifs,
+            error: error.map(str::to_string),
+        });
+        Self::maybe_render_picker_results(&self.inner, PickerSearchKind::Gif);
+    }
+
+    pub fn show_sticker_results(
+        &self,
+        request_id: u64,
+        query: &str,
+        stickers: Vec<crate::bridge::GifResult>,
+        error: Option<&str>,
+    ) {
+        if self.inner.sticker_search_request.get() != request_id {
+            return;
+        }
+        *self.inner.sticker_result_cache.borrow_mut() = Some(PickerResultSet {
+            request_id,
+            query: query.to_string(),
+            results: stickers,
+            error: error.map(str::to_string),
+        });
+        Self::maybe_render_picker_results(&self.inner, PickerSearchKind::Sticker);
     }
 
     pub fn set_group_members(&self, chat_id: &str, members: Vec<crate::bridge::GroupMember>) {
@@ -4127,24 +4726,7 @@ impl ChatViewPanel {
         let inner_c = self.inner.clone();
         let msg_id_c = msg_id.to_string();
         pin_btn.connect_clicked(move |_| {
-            // Scroll to the pinned message bubble
-            let bubbles = inner_c.bubbles.borrow();
-            if let Some(bubble) = bubbles.get(&msg_id_c) {
-                let widget = bubble.widget();
-                // Use scroll_child or compute position manually
-                let adj = inner_c.scroll.vadjustment();
-                // Get the widget's allocation relative to the messages_box
-                if let Some((_, y)) = widget.translate_coordinates(&inner_c.messages_box, 0.0, 0.0)
-                {
-                    adj.set_value(y as f64);
-                }
-                // Flash the bubble briefly to highlight it
-                widget.add_css_class("flash-highlight");
-                let w = widget.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
-                    w.remove_css_class("flash-highlight");
-                });
-            }
+            ChatViewPanel::jump_to_message_inner(&inner_c, &msg_id_c);
         });
 
         let close_btn = Button::from_icon_name("window-close-symbolic");
@@ -4181,8 +4763,13 @@ impl ChatViewPanel {
         }
 
         // Only update UI if this is the currently open chat
-        let is_current = self.inner.current_chat_id.borrow()
-            .as_deref().map(|id| id == chat_id).unwrap_or(false);
+        let is_current = self
+            .inner
+            .current_chat_id
+            .borrow()
+            .as_deref()
+            .map(|id| id == chat_id)
+            .unwrap_or(false);
         if !is_current {
             return;
         }
@@ -4206,31 +4793,32 @@ impl ChatViewPanel {
             let inner_w = Rc::downgrade(&self.inner);
             let cid = chat_id.to_string();
             let name = display;
-            gtk4::glib::timeout_add_local_once(
-                std::time::Duration::from_secs(15),
-                move || {
-                    if let Some(inner) = inner_w.upgrade() {
-                        let mut all = inner.all_typers.borrow_mut();
-                        if let Some(typers) = all.get_mut(&cid) {
-                            typers.retain(|t| *t != name);
-                        }
-                        let is_current = inner.current_chat_id.borrow()
-                            .as_deref().map(|id| id == cid).unwrap_or(false);
-                        if is_current {
-                            let remaining = all.get(&cid).cloned().unwrap_or_default();
-                            drop(all);
-                            if remaining.is_empty() {
-                                inner.typing_box.set_visible(false);
-                            } else {
-                                let label = remaining.join(", ");
-                                inner.typing_name.set_markup(
-                                    &format!("<small><b>{label}</b> </small>"),
-                                );
-                            }
+            gtk4::glib::timeout_add_local_once(std::time::Duration::from_secs(15), move || {
+                if let Some(inner) = inner_w.upgrade() {
+                    let mut all = inner.all_typers.borrow_mut();
+                    if let Some(typers) = all.get_mut(&cid) {
+                        typers.retain(|t| *t != name);
+                    }
+                    let is_current = inner
+                        .current_chat_id
+                        .borrow()
+                        .as_deref()
+                        .map(|id| id == cid)
+                        .unwrap_or(false);
+                    if is_current {
+                        let remaining = all.get(&cid).cloned().unwrap_or_default();
+                        drop(all);
+                        if remaining.is_empty() {
+                            inner.typing_box.set_visible(false);
+                        } else {
+                            let label = remaining.join(", ");
+                            inner
+                                .typing_name
+                                .set_markup(&format!("<small><b>{label}</b> </small>"));
                         }
                     }
-                },
-            );
+                }
+            });
         }
     }
 }
@@ -4245,8 +4833,8 @@ fn update_send_button_state(inner: &Rc<ChatViewInner>) {
         .text(&buf.start_iter(), &buf.end_iter(), false)
         .trim()
         .is_empty();
-    let has_attachment = inner.pending_image_path.borrow().is_some()
-        || inner.pending_gif_url.borrow().is_some();
+    let has_attachment =
+        inner.pending_image_path.borrow().is_some() || inner.pending_gif_url.borrow().is_some();
     inner.send_button.set_sensitive(has_text || has_attachment);
 }
 
@@ -4349,9 +4937,7 @@ fn run_wl_paste() -> WlPasteResult {
     // 1. Enumerate offered MIME types.
     let types_out = Command::new("wl-paste").arg("--list-types").output();
     let types = match types_out {
-        Ok(o) if o.status.success() => {
-            String::from_utf8_lossy(&o.stdout).to_string()
-        }
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         Ok(o) => {
             // Non-zero exit usually means "clipboard empty".
             log::info!(
@@ -4573,11 +5159,8 @@ fn paste_clipboard_text(
                 log::info!("Paste: inserted {} chars (attempt {attempt})", text.len());
             }
             _ if attempt < PASTE_MAX_RETRIES => {
-                log::info!(
-                    "Paste: text read empty/failed (attempt {attempt}) — retrying"
-                );
-                let delay =
-                    std::time::Duration::from_millis(60 * (attempt as u64 + 1));
+                log::info!("Paste: text read empty/failed (attempt {attempt}) — retrying");
+                let delay = std::time::Duration::from_millis(60 * (attempt as u64 + 1));
                 gtk4::glib::timeout_add_local_once(delay, move || {
                     paste_clipboard_text(cb_retry, iv, inner, attempt + 1);
                 });
@@ -4586,9 +5169,7 @@ fn paste_clipboard_text(
                 // Text genuinely failed after all retries. Last resort:
                 // the clipboard may actually hold an image that
                 // formats() didn't report. Try one image read.
-                log::warn!(
-                    "Paste: text read exhausted retries — trying image as last resort"
-                );
+                log::warn!("Paste: text read exhausted retries — trying image as last resort");
                 paste_clipboard_image(cb_retry, inner, 0);
             }
         }
@@ -4599,11 +5180,7 @@ fn paste_clipboard_text(
 /// Tries a GDK texture read first, then a raw-bytes read for MIME types
 /// GDK can't decode directly. Retries the whole thing on COSMIC's
 /// intermittent dropped reads.
-fn paste_clipboard_image(
-    clipboard: gtk4::gdk::Clipboard,
-    inner: Rc<ChatViewInner>,
-    attempt: u32,
-) {
+fn paste_clipboard_image(clipboard: gtk4::gdk::Clipboard, inner: Rc<ChatViewInner>, attempt: u32) {
     let cb_retry = clipboard.clone();
     clipboard.read_texture_async(None::<&gtk4::gio::Cancellable>, move |result| {
         match result {
@@ -4641,9 +5218,8 @@ fn paste_clipboard_image(
                                 log::info!(
                                     "Paste: image read failed (attempt {attempt}) — retrying"
                                 );
-                                let delay = std::time::Duration::from_millis(
-                                    60 * (attempt as u64 + 1),
-                                );
+                                let delay =
+                                    std::time::Duration::from_millis(60 * (attempt as u64 + 1));
                                 gtk4::glib::timeout_add_local_once(delay, move || {
                                     paste_clipboard_image(cb_for_bytes, inner_fb, attempt + 1);
                                 });
@@ -4713,7 +5289,7 @@ fn set_pending_attachment(inner: &Rc<ChatViewInner>, path_str: &str) {
         .to_string();
 
     if is_image {
-        if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path_str) {
+        if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(path_str, 720) {
             inner.image_preview_pic.set_paintable(Some(&tex));
         }
         inner
@@ -4721,52 +5297,36 @@ fn set_pending_attachment(inner: &Rc<ChatViewInner>, path_str: &str) {
             .set_markup("Press Enter to send, Escape to cancel");
     } else if is_pdf {
         // Render the first page via pdftocairo (same approach the inline
-        // bubble uses for received PDFs). Cache to <path>.thumb.png so a
-        // re-drop of the same file is instant. If pdftocairo is missing
-        // we silently fall through to the icon-only preview below.
-        let thumb_path = format!("{path_str}.thumb.png");
-        if !std::path::Path::new(&thumb_path).exists() {
-            let _ = std::process::Command::new("pdftocairo")
-                .args([
-                    "-png",
-                    "-f",
-                    "1",
-                    "-l",
-                    "1",
-                    "-scale-to",
-                    "380",
-                    "-singlefile",
-                    path_str,
-                    &format!("{path_str}.thumb"),
-                ])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-        if let Some(tex) =
-            crate::ui::texture_cache::texture_from_filename(&thumb_path)
-        {
-            inner.image_preview_pic.set_paintable(Some(&tex));
-            let escaped = gtk4::glib::markup_escape_text(&filename);
-            inner.preview_label.set_markup(&format!(
-                "<b>📄 {escaped}</b>\n<small>Press Enter to send, Escape to cancel</small>"
-            ));
-        } else {
-            // pdftocairo failed (not installed?) — fall back to icon
-            let escaped = gtk4::glib::markup_escape_text(&filename);
-            inner.preview_label.set_markup(&format!(
-                "<b>📄 {escaped}</b>\n<small>Press Enter to send, Escape to cancel</small>"
-            ));
-        }
+        // bubble uses for received PDFs), but never wait for the external
+        // process on GTK's main thread. The filename appears immediately and
+        // the thumbnail is filled in when ready.
+        let escaped = gtk4::glib::markup_escape_text(&filename);
+        inner.preview_label.set_markup(&format!(
+            "<b>📄 {escaped}</b>\n<small>Press Enter to send, Escape to cancel</small>"
+        ));
+        let inner_w = Rc::downgrade(inner);
+        let staged_path = path_str.to_string();
+        crate::ui::message_bubble::render_pdf_thumbnail_async(path_str, move |thumb_path| {
+            let Some(inner) = inner_w.upgrade() else {
+                return;
+            };
+            // The user may have selected a different attachment while the PDF
+            // was rendering. Never paint an old thumbnail over the new preview.
+            if inner.pending_image_path.borrow().as_deref() != Some(&staged_path) {
+                return;
+            }
+            if let Some(thumb_path) = thumb_path
+                && let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&thumb_path, 480)
+            {
+                inner.image_preview_pic.set_paintable(Some(&tex));
+            }
+        });
     } else {
         let icon = if lower.ends_with(".pdf") {
             "📄"
         } else if lower.ends_with(".doc") || lower.ends_with(".docx") {
             "📝"
-        } else if lower.ends_with(".xls")
-            || lower.ends_with(".xlsx")
-            || lower.ends_with(".csv")
-        {
+        } else if lower.ends_with(".xls") || lower.ends_with(".xlsx") || lower.ends_with(".csv") {
             "📊"
         } else if lower.ends_with(".ppt") || lower.ends_with(".pptx") {
             "📽"
@@ -4799,6 +5359,7 @@ fn set_pending_attachment(inner: &Rc<ChatViewInner>, path_str: &str) {
     }
     *inner.pending_image_path.borrow_mut() = Some(path_str.to_string());
     *inner.pending_gif_url.borrow_mut() = None;
+    *inner.pending_gif_preview_url.borrow_mut() = None;
     inner.image_preview_bar.set_visible(true);
     // A staged attachment is sendable even with empty text.
     update_send_button_state(inner);
@@ -4810,7 +5371,7 @@ fn set_pending_attachment(inner: &Rc<ChatViewInner>, path_str: &str) {
         inner
             .pending_attachments
             .borrow_mut()
-            .insert(cid, path_str.to_string());
+            .insert(cid, PendingAttachment::File(path_str.to_string()));
     }
 }
 
@@ -4896,27 +5457,41 @@ fn show_message_menu(
     }
 
     if is_failed {
-        let btn = menu_btn!("Resend");
-        let inner_c = inner.clone();
+        // ResendMessage can reconstruct text only. Offering it for an
+        // optimistic media bubble (which deliberately stores no remote URL or
+        // local payload) sent an empty text message instead of the GIF/sticker.
         let msg_id = msg.id.clone();
-        let text = inner
-            .bubbles
-            .borrow()
-            .get(&msg_id)
-            .and_then(|b| b.text.clone())
-            .unwrap_or_default();
-        let pop = popover.clone();
-        btn.connect_clicked(move |_| {
-            if let Some(cid) = inner_c.current_chat_id.borrow().clone() {
-                inner_c.bridge.send_command(WaCommand::ResendMessage {
-                    chat_id: cid,
-                    msg_id: msg_id.clone(),
-                    text: text.clone(),
-                });
-            }
-            pop.popdown();
-        });
-        vbox.append(&btn);
+        let resend_text = (msg.media_type.is_none())
+            .then(|| {
+                inner
+                    .bubbles
+                    .borrow()
+                    .get(&msg_id)
+                    .and_then(|bubble| bubble.text.clone())
+            })
+            .flatten()
+            .filter(|text| !text.trim().is_empty());
+        if let Some(text) = resend_text {
+            let btn = menu_btn!("Resend");
+            let inner_c = inner.clone();
+            let pop = popover.clone();
+            btn.connect_clicked(move |_| {
+                if let Some(cid) = inner_c.current_chat_id.borrow().clone() {
+                    inner_c.bridge.send_command(WaCommand::ResendMessage {
+                        chat_id: cid,
+                        msg_id: msg_id.clone(),
+                        text: text.clone(),
+                    });
+                }
+                pop.popdown();
+            });
+            vbox.append(&btn);
+        } else {
+            let unavailable = menu_btn!("Resend unavailable");
+            unavailable.set_sensitive(false);
+            unavailable.set_tooltip_text(Some("Choose the media again to retry"));
+            vbox.append(&unavailable);
+        }
     } else {
         // Reply
         let btn = menu_btn!("Reply");
@@ -4954,8 +5529,8 @@ fn show_message_menu(
                 // "from a group chat I click message privately... it made
                 // 2 chats in 1".
                 let raw_jid = msg_c.sender_id.clone();
-                let dm_jid = crate::ui::runtime::lid_to_canonical_phone_jid(&raw_jid)
-                    .unwrap_or(raw_jid);
+                let dm_jid =
+                    crate::ui::runtime::lid_to_canonical_phone_jid(&raw_jid).unwrap_or(raw_jid);
                 let sender_name = if msg_c.sender_name.is_empty() {
                     crate::ui::runtime::display_name_from_jid(&dm_jid)
                 } else {
@@ -5263,10 +5838,7 @@ fn show_message_menu(
                 {
                     let dialog_e = dialog.clone();
                     entry.connect_changed(move |e| {
-                        dialog_e.set_response_enabled(
-                            "save",
-                            !e.text().trim().is_empty(),
-                        );
+                        dialog_e.set_response_enabled("save", !e.text().trim().is_empty());
                     });
                 }
 
@@ -5368,7 +5940,11 @@ fn show_event_creator(inner: &Rc<ChatViewInner>) {
         .default_width(400)
         .modal(true)
         .build();
-    if let Some(root) = inner.root.root().and_then(|r| r.downcast::<gtk4::Window>().ok()) {
+    if let Some(root) = inner
+        .root
+        .root()
+        .and_then(|r| r.downcast::<gtk4::Window>().ok())
+    {
         window.set_transient_for(Some(&root));
     }
 
@@ -5387,7 +5963,9 @@ fn show_event_creator(inner: &Rc<ChatViewInner>) {
     let date = Entry::builder()
         .placeholder_text("Date (e.g. Sat 12 Jul)")
         .build();
-    let time = Entry::builder().placeholder_text("Time (e.g. 7:00 PM)").build();
+    let time = Entry::builder()
+        .placeholder_text("Time (e.g. 7:00 PM)")
+        .build();
     let location = Entry::builder()
         .placeholder_text("Location (optional)")
         .build();
@@ -5584,7 +6162,7 @@ fn show_poll_creator_impl(
     let q_c = question.clone();
     let opts_c = options_box.clone();
     let multi_c = multi_check.clone();
-    let win_c = window.clone();
+    let win_c = window.downgrade();
     create_btn.connect_clicked(move |_| {
         let q = q_c.text().to_string();
         if q.trim().is_empty() {
@@ -5620,12 +6198,13 @@ fn show_poll_creator_impl(
             options,
             selectable_count: selectable,
         });
-        win_c.close();
+        if let Some(window) = win_c.upgrade() {
+            window.close();
+        }
     });
     content.append(&create_btn);
 
     scroll.set_child(Some(&content));
-    let vbox = Box::new(Orientation::Vertical, 0);
     window.set_child(Some(&scroll));
     window.present();
 }
@@ -5732,7 +6311,7 @@ fn show_poll_creator_for_forward(
     let q_c = question_entry.clone();
     let opts_c = options_box.clone();
     let multi_c = multi_check.clone();
-    let win_c = window.clone();
+    let win_c = window.downgrade();
     create_btn.connect_clicked(move |_| {
         let q = q_c.text().to_string();
         if q.trim().is_empty() {
@@ -5766,7 +6345,9 @@ fn show_poll_creator_for_forward(
             .and_then(|r| r.downcast::<gtk4::Window>().ok());
         let bridge_c = bridge.clone();
 
-        win_c.close();
+        if let Some(window) = win_c.upgrade() {
+            window.close();
+        }
 
         crate::ui::chat_picker::show_chat_picker(
             "Send poll to…",
@@ -5888,7 +6469,7 @@ fn do_reply(inner: &Rc<ChatViewInner>, msg: &IncomingMessage) {
 
     // Media thumbnail in reply bar (uses pre-resolved media_path)
     if let Some(ref path) = media_path {
-        if let Some(tex) = crate::ui::texture_cache::texture_from_filename(path) {
+        if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(path, 64) {
             let thumb = gtk4::Picture::new();
             thumb.set_paintable(Some(&tex));
             thumb.set_size_request(42, 42);
@@ -6043,14 +6624,47 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
 
     let zoom_level = Rc::new(Cell::new(1.0f64));
 
-    for (_, path) in &items {
-        let pic = gtk4::Picture::for_filename(path);
+    let carousel_pictures: Rc<Vec<gtk4::Picture>> = Rc::new(
+        items
+            .iter()
+            .map(|_| {
+                let pic = gtk4::Picture::new();
+                pic
+            })
+            .collect(),
+    );
+    for pic in carousel_pictures.iter() {
         pic.set_can_shrink(true);
         pic.set_content_fit(gtk4::ContentFit::Contain);
         pic.set_hexpand(true);
         pic.set_vexpand(true);
-        carousel.append(&pic);
+        carousel.append(pic);
     }
+
+    // Keep only the current full-resolution carousel image decoded. The old
+    // implementation eagerly decoded every image in the conversation; a dozen
+    // modern phone photos could consume hundreds of megabytes before the user
+    // even navigated to them.
+    let carousel_items = Rc::new(items.clone());
+    let load_carousel_page: Rc<dyn Fn(usize)> = {
+        let pictures = carousel_pictures.clone();
+        let paths = carousel_items.clone();
+        Rc::new(move |active| {
+            for (idx, picture) in pictures.iter().enumerate() {
+                if idx != active {
+                    picture.set_paintable(None::<&gtk4::gdk::Paintable>);
+                    continue;
+                }
+                if picture.paintable().is_none()
+                    && let Some((_, path)) = paths.get(idx)
+                    && let Some(texture) = crate::ui::texture_cache::texture_from_filename(path)
+                {
+                    picture.set_paintable(Some(&texture));
+                }
+            }
+        })
+    };
+    load_carousel_page(start_idx);
 
     // Mouse wheel zoom on the carousel
     {
@@ -6097,8 +6711,11 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
     {
         let items_ref = items.clone();
         let car = carousel.clone();
-        let win_ref = window.clone();
+        let win_ref = window.downgrade();
         save_btn.connect_clicked(move |_| {
+            let Some(win_ref) = win_ref.upgrade() else {
+                return;
+            };
             let idx = car.position().round() as usize;
             let Some((_, src_path)) = items_ref.get(idx).cloned() else {
                 return;
@@ -6116,44 +6733,43 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
                 .nth(1)
                 .unwrap_or(&default_name)
                 .to_string();
-            let dialog = gtk4::FileChooserDialog::new(
-                Some("Save media"),
-                Some(&win_ref),
-                gtk4::FileChooserAction::Save,
-                &[
-                    ("Cancel", gtk4::ResponseType::Cancel),
-                    ("Save", gtk4::ResponseType::Accept),
-                ],
-            );
-            dialog.set_current_name(&clean_name);
+            let dialog = gtk4::FileDialog::builder().title("Save media").build();
+            dialog.set_initial_name(Some(&clean_name));
             if let Some(home) = std::env::var_os("HOME") {
                 let downloads = std::path::PathBuf::from(&home).join("Downloads");
                 if downloads.exists() {
-                    let _ = dialog.set_current_folder(Some(&gtk4::gio::File::for_path(&downloads)));
+                    dialog.set_initial_folder(Some(&gtk4::gio::File::for_path(&downloads)));
                 }
             }
             let src_owned = src.clone();
-            dialog.connect_response(move |d, resp| {
-                if resp == gtk4::ResponseType::Accept {
-                    if let Some(target) = d.file().and_then(|f| f.path()) {
+            dialog.save(
+                Some(&win_ref),
+                gtk4::gio::Cancellable::NONE,
+                move |result| {
+                    let Some(target) = result.ok().and_then(|file| file.path()) else {
+                        return;
+                    };
+                    std::thread::spawn(move || {
                         if let Err(e) = std::fs::copy(&src_owned, &target) {
                             log::warn!("Save media failed: {e}");
                         } else {
                             log::info!("Saved media to {}", target.display());
                         }
-                    }
-                }
-                d.close();
-            });
-            dialog.show();
+                    });
+                },
+            );
         });
     }
 
     let close_btn = Button::from_icon_name("window-close-symbolic");
     close_btn.add_css_class("flat");
     close_btn.set_halign(Align::End);
-    let win_clone = window.clone();
-    close_btn.connect_clicked(move |_| win_clone.close());
+    let win_clone = window.downgrade();
+    close_btn.connect_clicked(move |_| {
+        if let Some(window) = win_clone.upgrade() {
+            window.close();
+        }
+    });
 
     top_bar.append(&counter);
     top_bar.append(&save_btn);
@@ -6199,8 +6815,10 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
     // Update counter as user swipes
     {
         let total = items.len();
+        let load_page = load_carousel_page.clone();
         carousel.connect_page_changed(move |_, idx| {
             counter.set_text(&format!("{} / {}", idx + 1, total));
+            load_page(idx as usize);
         });
     }
 
@@ -6209,7 +6827,7 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
     {
         let c = carousel.clone();
         let total = items.len() as u32;
-        let win = window.clone();
+        let win = window.downgrade();
         key_ctrl.connect_key_pressed(move |_, key, _, _| match key {
             gtk4::gdk::Key::Left | gtk4::gdk::Key::bracketleft => {
                 let cur = c.position().round() as u32;
@@ -6226,7 +6844,9 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
                 gtk4::glib::Propagation::Stop
             }
             gtk4::gdk::Key::Escape => {
-                win.close();
+                if let Some(window) = win.upgrade() {
+                    window.close();
+                }
                 gtk4::glib::Propagation::Stop
             }
             _ => gtk4::glib::Propagation::Proceed,
@@ -6237,14 +6857,26 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
     // Double-click or click outside image area to close
     let bg_click = GestureClick::new();
     bg_click.set_button(1);
-    let win_bg = window.clone();
-    bg_click.connect_released(move |g, n_press, _, _| {
+    let win_bg = window.downgrade();
+    bg_click.connect_released(move |_, n_press, _, _| {
         // Double-click to close (single click navigates carousel)
         if n_press >= 2 {
-            win_bg.close();
+            if let Some(window) = win_bg.upgrade() {
+                window.close();
+            }
         }
     });
     carousel.add_controller(bg_click);
+
+    // Release the active full-resolution texture immediately on close. Weak
+    // window captures above ensure the viewer itself can then be destroyed.
+    let pictures_on_close = carousel_pictures.clone();
+    window.connect_close_request(move |_| {
+        for picture in pictures_on_close.iter() {
+            picture.set_paintable(None::<&gtk4::gdk::Paintable>);
+        }
+        gtk4::glib::Propagation::Proceed
+    });
 
     window.set_child(Some(&overlay));
     window.fullscreen();

@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use prost::Message;
 use prost_reflect::ReflectMessage;
-use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::headers;
 use crate::{Error, Result};
@@ -70,7 +69,8 @@ impl RelayHttp {
         Req: Message + ReflectMessage,
         Resp: Message + ReflectMessage + Default,
     {
-        self.post_inner(url, req, ct, cookies, authuser, false).await
+        self.post_inner(url, req, ct, cookies, authuser, false)
+            .await
     }
 
     pub async fn post_long<Req, Resp>(
@@ -117,12 +117,7 @@ impl RelayHttp {
         headers::apply_cookie_auth(&mut headers, url, cookies, authuser);
 
         let client = if long_poll { &self.long } else { &self.short };
-        let resp = client
-            .post(url)
-            .headers(headers)
-            .body(body)
-            .send()
-            .await?;
+        let resp = client.post(url).headers(headers).body(body).send().await?;
 
         let status = resp.status();
         let resp_ct = resp
@@ -149,8 +144,7 @@ impl RelayHttp {
                 .filter_map(|v| v.to_str().ok())
                 .collect();
             if !set_cookies.is_empty() {
-                let parsed =
-                    crate::cookies::parse_set_cookie_headers(set_cookies.iter().copied());
+                let parsed = crate::cookies::parse_set_cookie_headers(set_cookies.iter().copied());
                 crate::cookies::merge_into_cache(parsed);
             }
         }

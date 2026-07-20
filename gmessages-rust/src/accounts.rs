@@ -190,10 +190,9 @@ fn decode_js_string(s: &str) -> String {
         if b == b'\\' && i + 1 < bytes.len() {
             let n = bytes[i + 1];
             if n == b'x' && i + 3 < bytes.len() {
-                if let Ok(byte) = u8::from_str_radix(
-                    std::str::from_utf8(&bytes[i + 2..i + 4]).unwrap_or(""),
-                    16,
-                ) {
+                if let Ok(byte) =
+                    u8::from_str_radix(std::str::from_utf8(&bytes[i + 2..i + 4]).unwrap_or(""), 16)
+                {
                     out.push(byte as char);
                     i += 4;
                     continue;

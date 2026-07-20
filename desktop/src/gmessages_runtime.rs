@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_channel::Sender;
-use gmessages_rust::gmproto::conversations::{Message as GmMessage, MediaContent, message_info};
+use gmessages_rust::gmproto::conversations::{MediaContent, Message as GmMessage, message_info};
 use gmessages_rust::{AuthData, Client, Event};
 use tokio::sync::mpsc::UnboundedReceiver as TokioUnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender as TokioUnboundedSender;
@@ -60,16 +60,23 @@ pub fn spawn(
     wa_cmd_tx: TokioUnboundedSender<WaCommand>,
 ) -> Option<TokioUnboundedSender<WaCommand>> {
     if std::env::var("GMESSAGES_ENABLE").as_deref() != Ok("1") {
-        log::info!("gmessages: GMESSAGES_ENABLE not set; skipping (set GMESSAGES_ENABLE=1 to enable)");
+        log::info!(
+            "gmessages: GMESSAGES_ENABLE not set; skipping (set GMESSAGES_ENABLE=1 to enable)"
+        );
         return None;
     }
     let data_dir = data_dir.to_path_buf();
-    log::info!("gmessages: ENABLED — spawning runtime; data_dir={}", data_dir.display());
+    log::info!(
+        "gmessages: ENABLED — spawning runtime; data_dir={}",
+        data_dir.display()
+    );
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         if let Err(e) = run(data_dir, event_tx.clone(), cmd_rx, wa_cmd_tx).await {
             log::error!("gmessages runtime error: {e:#}");
-            let _ = event_tx.send(WaEvent::ErrorToast(format!("gmessages: {e}"))).await;
+            let _ = event_tx
+                .send(WaEvent::ErrorToast(format!("gmessages: {e}")))
+                .await;
         }
     });
     Some(cmd_tx)
@@ -115,7 +122,9 @@ fn gm_media_dest(media_id: &str, mime: &str, data_dir: &Path) -> PathBuf {
     };
     let safe_id = sanitize(media_id);
     let safe_ext = sanitize(ext);
-    data_dir.join("gm_media").join(format!("{safe_id}.{safe_ext}"))
+    data_dir
+        .join("gm_media")
+        .join(format!("{safe_id}.{safe_ext}"))
 }
 
 /// GTK/gdk-pixbuf has no HEIC/HEIF loader, so iPhone MMS/RCS photos download fine
@@ -338,6 +347,163 @@ fn upsert_gm_chat_cache(
     Some(result)
 }
 
+/// A conversation-update payload is authoritative for identity/flags, while
+/// the message stream is authoritative for preview/time/unread. Merge only the
+/// former into an existing row so an update racing a newer message cannot move
+/// the row backwards or clear its badge.
+fn merge_gm_conversation_metadata(
+    cache: &mut Vec<ChatSummary>,
+    fresh: &ChatSummary,
+) -> ChatSummary {
+    if let Some(existing) = cache.iter_mut().find(|c| c.id == fresh.id) {
+        // Never replace a real contact name with a numeric conversation id or
+        // phone placeholder. Conversely, a full conversation update is the
+        // best source for replacing such a placeholder with a saved name.
+        let fresh_quality = chat_name_quality(&fresh.name);
+        let existing_quality = chat_name_quality(&existing.name);
+        if fresh_quality > 0 && fresh_quality >= existing_quality {
+            existing.name = fresh.name.clone();
+        }
+        existing.is_group = fresh.is_group;
+        existing.is_pinned = fresh.is_pinned;
+        existing.is_archived = fresh.is_archived;
+        return existing.clone();
+    }
+
+    cache.push(fresh.clone());
+    fresh.clone()
+}
+
+fn upsert_gm_conversation_metadata_cache(
+    path: &Path,
+    fresh: &ChatSummary,
+    conversation: &gmessages_rust::gmproto::conversations::Conversation,
+) -> ChatSummary {
+    let mut cache = gm_load_chats_cache(path);
+    if let Some(existing) = cache.iter_mut().find(|chat| chat.id == fresh.id)
+        && conversation_name_is_self(conversation, &existing.name)
+    {
+        // Repair names poisoned by older builds before applying quality rules;
+        // a self name must never outrank the other party's phone fallback.
+        existing.name = fresh.name.clone();
+    }
+    let result = merge_gm_conversation_metadata(&mut cache, fresh);
+    gm_save_chats_cache(path, &cache);
+    result
+}
+
+fn conversation_name_is_self(
+    conversation: &gmessages_rust::gmproto::conversations::Conversation,
+    candidate: &str,
+) -> bool {
+    let candidate = candidate.trim();
+    !candidate.is_empty()
+        && conversation
+            .participants
+            .iter()
+            .filter(|participant| participant.is_me)
+            .flat_map(|participant| [&participant.full_name, &participant.first_name])
+            .map(|value| value.trim())
+            .any(|value| !value.is_empty() && value.eq_ignore_ascii_case(candidate))
+}
+
+/// Name quality used throughout the SMS identity pipeline:
+///   0 = empty/internal conversation or participant id (`25`, `gm:6689`)
+///   1 = a plausible full phone number (correct fallback for unsaved contacts)
+///   2 = a human/contact/group name
+fn chat_name_quality(name: &str) -> u8 {
+    let name = name.trim();
+    if name.is_empty()
+        || name.starts_with(CHAT_PREFIX)
+        || name.ends_with("@lid")
+        || name.ends_with("@s.whatsapp.net")
+        || name.ends_with("@g.us")
+    {
+        return 0;
+    }
+    let digits = name.chars().filter(|c| c.is_ascii_digit()).count();
+    let phone_chars_only = name
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '(' | ')' | '-' | '.' | '\u{a0}'));
+    if phone_chars_only {
+        return if digits >= 7 { 1 } else { 0 };
+    }
+    2
+}
+
+fn chat_name_is_named(name: &str) -> bool {
+    chat_name_quality(name) == 2
+}
+
+fn chat_name_is_usable(name: &str) -> bool {
+    chat_name_quality(name) > 0
+}
+
+/// Short SMS sender codes are valid identities despite being fewer than seven
+/// digits. They are only safe in conversation context: a value equal to the
+/// conversation's own numeric id is an internal placeholder (for example the
+/// old `gm:25` / `25` bug), while a different value such as `87225` is the
+/// actual SMS sender.
+fn conversation_shortcode<'a>(conversation_id: &str, name: &'a str) -> Option<&'a str> {
+    let name = name.trim();
+    let digits = name.chars().filter(|c| c.is_ascii_digit()).count();
+    (name != conversation_id
+        && (3..=6).contains(&digits)
+        && name.chars().all(|c| c.is_ascii_digit()))
+    .then_some(name)
+}
+
+fn participant_phone(
+    participant: &gmessages_rust::gmproto::conversations::Participant,
+) -> Option<String> {
+    let id = participant.id.as_ref();
+    [
+        id.map(|v| v.number.as_str()),
+        Some(participant.formatted_number.as_str()),
+        id.map(|v| v.participant_id.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| chat_name_quality(value) == 1)
+    .map(str::to_string)
+}
+
+fn participant_display_name(
+    participant: &gmessages_rust::gmproto::conversations::Participant,
+    contacts: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if participant.is_me {
+        return None;
+    }
+    [&participant.full_name, &participant.first_name]
+        .into_iter()
+        .map(|value| value.trim())
+        .find(|value| chat_name_is_named(value))
+        .map(str::to_string)
+        .or_else(|| {
+            participant_phone(participant).and_then(|phone| {
+                lookup_contact_name(contacts, &phone)
+                    .filter(|name| chat_name_is_named(name))
+                    .or(Some(phone))
+            })
+        })
+}
+
+fn update_gm_chat_name_cache(path: &Path, chat_id: &str, name: &str) -> Option<ChatSummary> {
+    if !chat_name_is_usable(name) {
+        return None;
+    }
+    let mut cache = gm_load_chats_cache(path);
+    let existing = cache.iter_mut().find(|chat| chat.id == chat_id)?;
+    if chat_name_quality(name) >= chat_name_quality(&existing.name) {
+        existing.name = name.to_string();
+    }
+    let result = existing.clone();
+    gm_save_chats_cache(path, &cache);
+    Some(result)
+}
+
 /// Build phone-digits → wa_chat_id (JID) index from the persisted WhatsApp
 /// chat list. Used to detect gm chats that should merge into existing
 /// WhatsApp chats for the same person.
@@ -368,10 +534,7 @@ fn build_phone_to_wa_index() -> std::collections::HashMap<String, String> {
 
 /// Rewrite a `WaEvent`'s chat_id in-place using the merge map. Used to
 /// redirect gm chat traffic onto the matching WhatsApp chat row.
-fn redirect_chat_id(
-    event: &mut WaEvent,
-    merge_map: &std::collections::HashMap<String, String>,
-) {
+fn redirect_chat_id(event: &mut WaEvent, merge_map: &std::collections::HashMap<String, String>) {
     let map_id = |id: &mut String| {
         if let Some(conv_id) = id.strip_prefix(CHAT_PREFIX)
             && let Some(target) = merge_map.get(conv_id)
@@ -385,8 +548,9 @@ fn redirect_chat_id(
         | WaEvent::ChatNameUpdated { chat_id, .. }
         | WaEvent::ChatReadOnOtherDevice { chat_id, .. }
         | WaEvent::HistoryMessages { chat_id, .. } => map_id(chat_id),
-        WaEvent::MessageConfirmed { chat_id, .. }
-        | WaEvent::MessageFailed { chat_id, .. } => map_id(chat_id),
+        WaEvent::MessageConfirmed { chat_id, .. } | WaEvent::MessageFailed { chat_id, .. } => {
+            map_id(chat_id)
+        }
         WaEvent::ChatAdded(s) => map_id(&mut s.id),
         _ => {}
     }
@@ -530,7 +694,10 @@ async fn run(
     // Capture the data dir so free functions can resolve gm_media/ paths.
     let _ = GM_DATA_DIR.set(data_dir.clone());
     let auth_path = resolve_auth_path(&data_dir);
-    log::info!("gmessages: looking for auth file at {}", auth_path.display());
+    log::info!(
+        "gmessages: looking for auth file at {}",
+        auth_path.display()
+    );
     let auth = load_auth(&auth_path).await?;
     if !auth.is_paired() {
         log::warn!("gmessages: auth file empty or missing — will run pairing flow now");
@@ -596,16 +763,22 @@ async fn run(
     // persisted so a chat the user read stays read across restart instead of
     // being reseeded unread from Google's `unread` flag every launch.
     let gm_read_wm_path = data_dir.join("gm_read_watermarks.bin");
-    let gm_read_watermarks: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, i64>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(load_gm_watermarks(&gm_read_wm_path)));
+    let gm_read_watermarks: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, i64>>,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(load_gm_watermarks(
+        &gm_read_wm_path,
+    )));
 
     // Conversation_ids known to route into the synthetic "Verification Codes"
     // inbox (learned from live 2FA detection, persisted). Consulted at reseed to
     // suppress the standalone shortcode rows and at MarkRead to fan the read
     // watermark + server ACK to the real underlying convs.
     let gm_verif_path = data_dir.join("gm_verification_convs.bin");
-    let gm_verification_convs: std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(load_gm_verification_convs(&gm_verif_path)));
+    let gm_verification_convs: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashSet<String>>,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(load_gm_verification_convs(
+        &gm_verif_path,
+    )));
 
     let client = Arc::new(Client::new(auth));
     let mut events = client
@@ -635,9 +808,8 @@ async fn run(
     // ListTopContacts and enriched at runtime from message
     // `sender_participant` data so names flow into the chat list as soon
     // as we see anyone we know.
-    let contact_cache: ContactCache = std::sync::Arc::new(tokio::sync::Mutex::new(
-        std::collections::HashMap::new(),
-    ));
+    let contact_cache: ContactCache =
+        std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
     // Per-message dedup ring, used to suppress server retransmissions of
     // batches we've already forwarded.
@@ -647,6 +819,10 @@ async fn run(
     // thumbnail re-relayed several times only triggers one request.
     let mut requested_full_image: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // Media payloads are held as complete byte vectors while decrypting and
+    // writing. Bound concurrency so a large incoming batch cannot multiply
+    // that memory cost without limit.
+    let media_download_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
 
     // Pin the synthetic "Verification Codes" inbox at the top of the chat
     // list. All 2FA / OTP SMS get routed here instead of creating a new
@@ -699,11 +875,7 @@ async fn run(
             // session, the most likely cause is rotated Firefox cookies
             // (1PSIDTS rotates daily). Try a SECOND connect with fresh
             // cookies before assuming we're permanently revoked.
-            let is_gaia = client
-                .auth_snapshot()
-                .await
-                .gaia_authuser
-                .is_some();
+            let is_gaia = client.auth_snapshot().await.gaia_authuser.is_some();
             let mut recovered = false;
             if is_gaia {
                 if let Ok(fresh) = gmessages_rust::cookies::read_default_firefox_cookies() {
@@ -723,14 +895,17 @@ async fn run(
             if !recovered {
                 log::warn!("gmessages: auth revoked — wiping stale auth file and re-pairing");
                 // Intentionally NOT wiping the auth file — notify_auth_changed
-            // overwrites it with fresh contents on a successful re-pair,
-            // and if the new pair fails we'd rather keep the old (possibly
-            // recoverable) auth than be left with nothing. User asked for
-            // this explicitly: "why are you letting the auth file be
-            // deleted".
+                // overwrites it with fresh contents on a successful re-pair,
+                // and if the new pair fails we'd rather keep the old (possibly
+                // recoverable) auth than be left with nothing. User asked for
+                // this explicitly: "why are you letting the auth file be
+                // deleted".
                 // Reset in-memory auth so is_paired() returns false.
                 run_pair_flow(&client, &auth_path, &mut events, &event_tx).await?;
-                client.connect().await.context("gmessages: connect after re-pair")?;
+                client
+                    .connect()
+                    .await
+                    .context("gmessages: connect after re-pair")?;
             }
         } else {
             return Err(e.into());
@@ -766,27 +941,32 @@ async fn run(
             // format the conversation participant ends up using.
             let mut contact_map: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
-            let mut insert = |key: &str, name: &str, map: &mut std::collections::HashMap<String, String>| {
-                let key = key.trim();
-                if key.is_empty() {
-                    return;
-                }
-                map.insert(key.to_string(), name.to_string());
-                // Digits-only variant.
-                let digits: String = key.chars().filter(|c| c.is_ascii_digit()).collect();
-                if !digits.is_empty() && digits != key {
-                    map.insert(digits.clone(), name.to_string());
-                }
-                // With and without leading +.
-                if let Some(stripped) = key.strip_prefix('+') {
-                    map.insert(stripped.to_string(), name.to_string());
-                } else if !key.starts_with('+') {
-                    map.insert(format!("+{key}"), name.to_string());
-                }
-            };
+            let mut insert =
+                |key: &str, name: &str, map: &mut std::collections::HashMap<String, String>| {
+                    let key = key.trim();
+                    if key.is_empty() {
+                        return;
+                    }
+                    map.insert(key.to_string(), name.to_string());
+                    // Digits-only variant.
+                    let digits: String = key.chars().filter(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() && digits != key {
+                        map.insert(digits.clone(), name.to_string());
+                    }
+                    // With and without leading +.
+                    if let Some(stripped) = key.strip_prefix('+') {
+                        map.insert(stripped.to_string(), name.to_string());
+                    } else if !key.starts_with('+') {
+                        map.insert(format!("+{key}"), name.to_string());
+                    }
+                };
             let mut feed = |contacts: Vec<gmessages_rust::gmproto::conversations::Contact>,
                             map: &mut std::collections::HashMap<String, String>,
-                            insert_fn: &mut dyn FnMut(&str, &str, &mut std::collections::HashMap<String, String>)| {
+                            insert_fn: &mut dyn FnMut(
+                &str,
+                &str,
+                &mut std::collections::HashMap<String, String>,
+            )| {
                 for c in contacts {
                     if c.name.is_empty() {
                         continue;
@@ -804,40 +984,50 @@ async fn run(
 
             // Helper that feeds both the local contact_map AND the global
             // cross-protocol directory.
-            let mut feed_to_global = |contacts: Vec<gmessages_rust::gmproto::conversations::Contact>,
-                                      map: &mut std::collections::HashMap<String, String>,
-                                      insert_fn: &mut dyn FnMut(&str, &str, &mut std::collections::HashMap<String, String>)| {
-                let global = crate::contacts::global();
-                for c in contacts {
-                    if c.name.is_empty() {
-                        continue;
-                    }
-                    insert_fn(&c.participant_id, &c.name, map);
-                    global.insert(&c.participant_id, &c.name, "gmessages");
-                    if let Some(n) = &c.number {
-                        insert_fn(&n.number, &c.name, map);
-                        insert_fn(&n.number2, &c.name, map);
-                        global.insert(&n.number, &c.name, "gmessages");
-                        global.insert(&n.number2, &c.name, "gmessages");
-                        if let Some(fn_) = &n.formatted_number {
-                            insert_fn(fn_, &c.name, map);
-                            global.insert(fn_, &c.name, "gmessages");
+            let mut feed_to_global =
+                |contacts: Vec<gmessages_rust::gmproto::conversations::Contact>,
+                 map: &mut std::collections::HashMap<String, String>,
+                 insert_fn: &mut dyn FnMut(
+                    &str,
+                    &str,
+                    &mut std::collections::HashMap<String, String>,
+                )| {
+                    let global = crate::contacts::global();
+                    for c in contacts {
+                        if c.name.is_empty() {
+                            continue;
+                        }
+                        insert_fn(&c.participant_id, &c.name, map);
+                        global.insert(&c.participant_id, &c.name, "gmessages");
+                        if let Some(n) = &c.number {
+                            insert_fn(&n.number, &c.name, map);
+                            insert_fn(&n.number2, &c.name, map);
+                            global.insert(&n.number, &c.name, "gmessages");
+                            global.insert(&n.number2, &c.name, "gmessages");
+                            if let Some(fn_) = &n.formatted_number {
+                                insert_fn(fn_, &c.name, map);
+                                global.insert(fn_, &c.name, "gmessages");
+                            }
                         }
                     }
-                }
-            };
+                };
             let _ = feed; // silence "unused"; we still need it for the feed() helper variable scope
 
             match client.list_contacts().await {
                 Ok(resp) => {
-                    log::info!("gmessages: ListContacts returned {} contacts", resp.contacts.len());
+                    log::info!(
+                        "gmessages: ListContacts returned {} contacts",
+                        resp.contacts.len()
+                    );
                     if log::log_enabled!(log::Level::Debug) {
                         for c in resp.contacts.iter().take(3) {
                             log::debug!(
                                 "gmessages: sample contact: name={:?} pid={:?} num={:?}",
                                 c.name,
                                 c.participant_id,
-                                c.number.as_ref().map(|n| (n.number.as_str(), n.number2.as_str())),
+                                c.number
+                                    .as_ref()
+                                    .map(|n| (n.number.as_str(), n.number2.as_str())),
                             );
                         }
                     }
@@ -847,7 +1037,10 @@ async fn run(
             }
             match client.list_top_contacts(50).await {
                 Ok(resp) => {
-                    log::info!("gmessages: ListTopContacts returned {} contacts", resp.contacts.len());
+                    log::info!(
+                        "gmessages: ListTopContacts returned {} contacts",
+                        resp.contacts.len()
+                    );
                     feed_to_global(resp.contacts, &mut contact_map, &mut insert);
                 }
                 Err(e) => log::warn!("gmessages: list_top_contacts failed: {e}"),
@@ -863,216 +1056,247 @@ async fn run(
             *contact_cache.lock().await = contact_map.clone();
 
             log::info!("gmessages: fetching conversation list to seed chat rows");
-            // Fetch a generous window. `list_conversations(50)` used to be the
-            // limit and silently dropped every gm chat past the top 50 from
-            // the cache, so anything you hadn't messaged recently
-            // disappeared on every restart. 1000 covers any plausible
-            // SMS history.
-            match client.list_conversations(1000).await {
-                Ok(resp) => {
-                    log::info!("gmessages: got {} conversations", resp.conversations.len());
-                    // Clamp unread against our local read watermarks BEFORE
-                    // emitting or caching, so a chat the user already read isn't
-                    // reseeded unread from Google's stale `unread` flag. Flows to
-                    // both the ChatAdded events and the persisted gm_chats.bin.
-                    let wm_snap = gm_read_watermarks.lock().await.clone();
-                    // Conversations we've previously seen route into the synthetic
-                    // "Verification Codes" inbox. Their standalone shortcode rows
-                    // must NOT be reseeded here — they carry Google's `unread` flag
-                    // and would re-appear unread every launch (and can never be
-                    // marked read as a standalone row). They live inside the
-                    // Verification Codes inbox instead.
-                    let verif_snap = gm_verification_convs.lock().await.clone();
-                    let summaries: Vec<ChatSummary> = resp
-                        .conversations
-                        .iter()
-                        .map(|c| {
-                            let mut s = conversation_to_summary(c, &contact_map);
-                            apply_gm_read_watermark(&mut s, &wm_snap);
-                            s
-                        })
-                        .collect();
-                    // Persist the chat-list cache so the next startup shows
-                    // gm chats instantly. Persistence happens AFTER the
-                    // merge_map is built below, so we can exclude rows that
-                    // would be merged — otherwise the next startup hydrates
-                    // duplicates before merge data arrives.
-                    // Build the merge map AND register chat IDs in the
-                    // global contact directory. The directory becomes the
-                    // persistent source of truth for cross-protocol merge —
-                    // the merge_map is just a hot cache of it.
-                    {
-                        let mut mm = merge_map.lock().await;
-                        let global = crate::contacts::global();
-                        for (summary, conv) in summaries.iter().zip(resp.conversations.iter()) {
-                            let conv_id = &conv.conversation_id;
-                            let phone = conv
-                                .participants
-                                .iter()
-                                .find(|p| p.is_visible && !p.is_me)
-                                .and_then(|p| p.id.as_ref())
-                                .filter(|id| !id.number.is_empty())
-                                .map(|id| id.number.clone())
-                                .or_else(|| conv.other_participants.first().cloned());
-                            // Record the gm chat_id in the global directory.
+            // Fetch a generous window. A single timeout must not permanently
+            // strand cached rows under numeric internal IDs for this entire
+            // session. Start at the phone's observed 300-conversation response
+            // ceiling, retry with smaller requests, then keep retrying at a bounded
+            // backoff until the phone answers.
+            let mut list_attempt = 0_u32;
+            let resp = loop {
+                let count = match list_attempt {
+                    0 => 300,
+                    1 => 200,
+                    2 => 100,
+                    _ => 300,
+                };
+                match client.list_conversations(count).await {
+                    Ok(resp) => break resp,
+                    Err(e) => {
+                        list_attempt = list_attempt.saturating_add(1);
+                        let delay = (list_attempt * 3).min(30);
+                        log::warn!(
+                            "gmessages: list_conversations({count}) failed (attempt {list_attempt}): {e}; retrying in {delay}s"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(delay.into())).await;
+                    }
+                }
+            };
+            {
+                log::info!("gmessages: got {} conversations", resp.conversations.len());
+                // Clamp unread against our local read watermarks BEFORE
+                // emitting or caching, so a chat the user already read isn't
+                // reseeded unread from Google's stale `unread` flag. Flows to
+                // both the ChatAdded events and the persisted gm_chats.bin.
+                let wm_snap = gm_read_watermarks.lock().await.clone();
+                // Conversations we've previously seen route into the synthetic
+                // "Verification Codes" inbox. Their standalone shortcode rows
+                // must NOT be reseeded here — they carry Google's `unread` flag
+                // and would re-appear unread every launch (and can never be
+                // marked read as a standalone row). They live inside the
+                // Verification Codes inbox instead.
+                let verif_snap = gm_verification_convs.lock().await.clone();
+                let summaries: Vec<ChatSummary> = resp
+                    .conversations
+                    .iter()
+                    .map(|c| {
+                        let mut s = conversation_to_summary(c, &contact_map);
+                        apply_gm_read_watermark(&mut s, &wm_snap);
+                        s
+                    })
+                    .collect();
+                // Persist the chat-list cache so the next startup shows
+                // gm chats instantly. Persistence happens AFTER the
+                // merge_map is built below, so we can exclude rows that
+                // would be merged — otherwise the next startup hydrates
+                // duplicates before merge data arrives.
+                // Build the merge map AND register chat IDs in the
+                // global contact directory. The directory becomes the
+                // persistent source of truth for cross-protocol merge —
+                // the merge_map is just a hot cache of it.
+                {
+                    let mut mm = merge_map.lock().await;
+                    let global = crate::contacts::global();
+                    for (summary, conv) in summaries.iter().zip(resp.conversations.iter()) {
+                        let conv_id = &conv.conversation_id;
+                        let phone = conv
+                            .participants
+                            .iter()
+                            .find(|p| p.is_visible && !p.is_me)
+                            .and_then(|p| p.id.as_ref())
+                            .filter(|id| !id.number.is_empty())
+                            .map(|id| id.number.clone())
+                            .or_else(|| conv.other_participants.first().cloned());
+                        // Record the gm chat_id in the global directory.
+                        if let Some(p) = &phone {
+                            global.record_chat_id(p, "gmessages", &summary.id);
+                        }
+                        let unified =
+                            unified_chat_id(&summary.id, phone.as_deref(), &phone_to_wa_chat);
+                        if unified != summary.id {
+                            log::info!(
+                                "gmessages: MERGE gm:{} (gm-name={:?}) → wa={} (gm phone {:?})",
+                                conv_id,
+                                summary.name,
+                                unified,
+                                phone,
+                            );
                             if let Some(p) = &phone {
-                                global.record_chat_id(p, "gmessages", &summary.id);
+                                global.record_chat_id(p, "whatsapp", &unified);
                             }
-                            let unified = unified_chat_id(&summary.id, phone.as_deref(), &phone_to_wa_chat);
-                            if unified != summary.id {
-                                log::info!(
-                                    "gmessages: MERGE gm:{} (gm-name={:?}) → wa={} (gm phone {:?})",
-                                    conv_id,
-                                    summary.name,
-                                    unified,
-                                    phone,
-                                );
-                                if let Some(p) = &phone {
-                                    global.record_chat_id(p, "whatsapp", &unified);
-                                }
-                                mm.insert(conv_id.clone(), unified);
-                            }
+                            mm.insert(conv_id.clone(), unified);
                         }
-                        global.save_if_dirty();
                     }
-                    let mm_snap = merge_map.lock().await.clone();
+                    global.save_if_dirty();
+                }
+                let mm_snap = merge_map.lock().await.clone();
 
-                    // Persist the cache NOW. CRITICAL: this MERGES into
-                    // the previous cache instead of overwriting. The
-                    // server's list_conversations returns at most N
-                    // chats per call (top N by recency). If we
-                    // overwrote, every chat past the top N silently
-                    // dropped off the cache and never came back on
-                    // restart — exactly the "SMS not persisting across
-                    // restart" the user has been chasing.
-                    //
-                    // Merge semantics:
-                    //   - For chats in the FRESH response, fresh wins.
-                    //   - For chats in the OLD cache but absent from
-                    //     the fresh response, keep the old entry (still
-                    //     a real chat, server just didn't include it).
-                    //   - Always exclude entries that are now merged
-                    //     (in mm_snap) — those are absorbed by the WA row.
-                    use std::collections::HashMap as StdHashMap;
-                    let mut merged_cache: StdHashMap<String, ChatSummary> = StdHashMap::new();
-                    // Seed with the OLD cache contents (if any).
-                    for s in gm_load_chats_cache(&gm_chats_cache_path) {
-                        let conv = strip_prefix(&s.id);
-                        if !mm_snap.contains_key(conv) && !verif_snap.contains(conv) {
-                            merged_cache.insert(s.id.clone(), s);
-                        }
+                // Persist the cache NOW. CRITICAL: this MERGES into
+                // the previous cache instead of overwriting. The
+                // server's list_conversations returns at most N
+                // chats per call (top N by recency). If we
+                // overwrote, every chat past the top N silently
+                // dropped off the cache and never came back on
+                // restart — exactly the "SMS not persisting across
+                // restart" the user has been chasing.
+                //
+                // Merge semantics:
+                //   - For chats in the FRESH response, fresh wins.
+                //   - For chats in the OLD cache but absent from
+                //     the fresh response, keep the old entry (still
+                //     a real chat, server just didn't include it).
+                //   - Always exclude entries that are now merged
+                //     (in mm_snap) — those are absorbed by the WA row.
+                use std::collections::HashMap as StdHashMap;
+                let mut merged_cache: StdHashMap<String, ChatSummary> = StdHashMap::new();
+                // Seed with the OLD cache contents (if any).
+                for s in gm_load_chats_cache(&gm_chats_cache_path) {
+                    let conv = strip_prefix(&s.id);
+                    if !mm_snap.contains_key(conv) && !verif_snap.contains(conv) {
+                        merged_cache.insert(s.id.clone(), s);
                     }
-                    // Overlay the fresh response (fresh wins).
-                    for s in &summaries {
-                        let conv = strip_prefix(&s.id);
-                        if mm_snap.contains_key(conv) {
-                            // Merged into a WA row — drop it from the
-                            // gm cache so it doesn't get hydrated again.
-                            merged_cache.remove(&s.id);
-                            continue;
-                        }
-                        if verif_snap.contains(conv) {
-                            // 2FA shortcode — lives in the Verification Codes
-                            // inbox; never a standalone row in the cache.
-                            merged_cache.remove(&s.id);
-                            continue;
-                        }
-                        merged_cache.insert(s.id.clone(), s.clone());
+                }
+                // Overlay the fresh response. Fresh activity/flags win, but
+                // an unresolved internal id must never erase a previously
+                // resolved contact name or phone number.
+                for (s, conversation) in summaries.iter().zip(resp.conversations.iter()) {
+                    let conv = strip_prefix(&s.id);
+                    if mm_snap.contains_key(conv) {
+                        // Merged into a WA row — drop it from the
+                        // gm cache so it doesn't get hydrated again.
+                        merged_cache.remove(&s.id);
+                        continue;
                     }
-                    let mut to_persist: Vec<ChatSummary> =
-                        merged_cache.into_values().collect();
-                    // Sort by timestamp desc so the file is stable + easy
-                    // to inspect.
-                    to_persist
-                        .sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                    if verif_snap.contains(conv) {
+                        // 2FA shortcode — lives in the Verification Codes
+                        // inbox; never a standalone row in the cache.
+                        merged_cache.remove(&s.id);
+                        continue;
+                    }
+                    let mut fresh = s.clone();
+                    if let Some(old) = merged_cache.get(&s.id)
+                        && chat_name_quality(&old.name) > chat_name_quality(&fresh.name)
+                        && !conversation_name_is_self(conversation, &old.name)
+                    {
+                        fresh.name = old.name.clone();
+                    }
+                    merged_cache.insert(s.id.clone(), fresh);
+                }
+                let mut to_persist: Vec<ChatSummary> = merged_cache.into_values().collect();
+                // Sort by timestamp desc so the file is stable + easy
+                // to inspect.
+                to_persist.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+                log::info!(
+                    "gmessages: persisting {} chats to cache (fresh: {}, merge_map: {})",
+                    to_persist.len(),
+                    summaries.len(),
+                    mm_snap.len(),
+                );
+                gm_save_chats_cache(&gm_chats_cache_path, &to_persist);
+
+                // First, evict stale gm rows that may have been hydrated
+                // from gm_chats.bin cache on startup but should now be
+                // merged into a WhatsApp row. Without this, the user
+                // sees BOTH a gm:NN row AND the matching WA row, can
+                // click the gm row, but messages get redirected by the
+                // merge_map to the WA row's view — so they vanish into
+                // the wrong chat. Emit ChatDeleted for each merged id.
+                for conv_id in mm_snap.keys() {
+                    let stale_id = format!("{CHAT_PREFIX}{conv_id}");
                     log::info!(
-                        "gmessages: persisting {} chats to cache (fresh: {}, merge_map: {})",
-                        to_persist.len(),
-                        summaries.len(),
-                        mm_snap.len(),
+                        "gmessages: evicting stale gm row {stale_id} (merged into {})",
+                        mm_snap.get(conv_id).map(|s| s.as_str()).unwrap_or("?")
                     );
-                    gm_save_chats_cache(&gm_chats_cache_path, &to_persist);
-
-                    // First, evict stale gm rows that may have been hydrated
-                    // from gm_chats.bin cache on startup but should now be
-                    // merged into a WhatsApp row. Without this, the user
-                    // sees BOTH a gm:NN row AND the matching WA row, can
-                    // click the gm row, but messages get redirected by the
-                    // merge_map to the WA row's view — so they vanish into
-                    // the wrong chat. Emit ChatDeleted for each merged id.
-                    for conv_id in mm_snap.keys() {
-                        let stale_id = format!("{CHAT_PREFIX}{conv_id}");
-                        log::info!(
-                            "gmessages: evicting stale gm row {stale_id} (merged into {})",
-                            mm_snap.get(conv_id).map(|s| s.as_str()).unwrap_or("?")
-                        );
-                        let _ = event_tx
-                            .send(WaEvent::ChatDeleted {
-                                chat_id: stale_id,
-                            })
-                            .await;
+                    let _ = event_tx
+                        .send(WaEvent::ChatDeleted { chat_id: stale_id })
+                        .await;
+                }
+                // Evict any standalone shortcode row that was hydrated from
+                // cache on startup: its SMS belong in the Verification Codes
+                // inbox, not a per-shortcode row that keeps re-flagging unread.
+                for conv_id in &verif_snap {
+                    let stale_id = format!("{CHAT_PREFIX}{conv_id}");
+                    log::info!(
+                        "gmessages: evicting stale 2FA shortcode row {stale_id} (→ {VERIFICATION_CODES_CHAT_ID})"
+                    );
+                    let _ = event_tx
+                        .send(WaEvent::ChatDeleted { chat_id: stale_id })
+                        .await;
+                }
+                // G6 monotonic overlay: re-read gm_chats.bin (kept current
+                // message-by-message by G2/G4) so a stale server reseed can't
+                // regress a row's preview/timestamp. The UI-side strict->
+                // guard that used to absorb stale reseeds is gone, so any
+                // staleness must die HERE. Keyed by conv id.
+                let live_overlay: std::collections::HashMap<String, ChatSummary> =
+                    gm_load_chats_cache(&gm_chats_cache_path)
+                        .into_iter()
+                        .map(|c| (strip_prefix(&c.id).to_string(), c))
+                        .collect();
+                for summary in &summaries {
+                    let conv_id = strip_prefix(&summary.id);
+                    if mm_snap.contains_key(conv_id) {
+                        // Don't add a duplicate row — the existing
+                        // WhatsApp row will absorb this conversation's
+                        // messages via the merge_map redirect.
+                        continue;
                     }
-                    // Evict any standalone shortcode row that was hydrated from
-                    // cache on startup: its SMS belong in the Verification Codes
-                    // inbox, not a per-shortcode row that keeps re-flagging unread.
-                    for conv_id in &verif_snap {
-                        let stale_id = format!("{CHAT_PREFIX}{conv_id}");
-                        log::info!(
-                            "gmessages: evicting stale 2FA shortcode row {stale_id} (→ {VERIFICATION_CODES_CHAT_ID})"
-                        );
-                        let _ = event_tx
-                            .send(WaEvent::ChatDeleted {
-                                chat_id: stale_id,
-                            })
-                            .await;
+                    if verif_snap.contains(conv_id) {
+                        // 2FA shortcode — routed into the Verification Codes
+                        // inbox; don't reseed a standalone (unread) row.
+                        continue;
                     }
-                    // G6 monotonic overlay: re-read gm_chats.bin (kept current
-                    // message-by-message by G2/G4) so a stale server reseed can't
-                    // regress a row's preview/timestamp. The UI-side strict->
-                    // guard that used to absorb stale reseeds is gone, so any
-                    // staleness must die HERE. Keyed by conv id.
-                    let live_overlay: std::collections::HashMap<String, ChatSummary> =
-                        gm_load_chats_cache(&gm_chats_cache_path)
-                            .into_iter()
-                            .map(|c| (strip_prefix(&c.id).to_string(), c))
-                            .collect();
-                    for summary in &summaries {
-                        let conv_id = strip_prefix(&summary.id);
-                        if mm_snap.contains_key(conv_id) {
-                            // Don't add a duplicate row — the existing
-                            // WhatsApp row will absorb this conversation's
-                            // messages via the merge_map redirect.
-                            continue;
+                    // Overlay a newer live preview/timestamp if gm_chats.bin
+                    // holds one for this conv (a message arrived after the
+                    // server list was fetched).
+                    let mut summary = summary.clone();
+                    if let Some(live) = live_overlay.get(conv_id) {
+                        if chat_name_quality(&live.name) > chat_name_quality(&summary.name) {
+                            summary.name = live.name.clone();
                         }
-                        if verif_snap.contains(conv_id) {
-                            // 2FA shortcode — routed into the Verification Codes
-                            // inbox; don't reseed a standalone (unread) row.
-                            continue;
-                        }
-                        // Overlay a newer live preview/timestamp if gm_chats.bin
-                        // holds one for this conv (a message arrived after the
-                        // server list was fetched).
-                        let mut summary = summary.clone();
-                        if let Some(live) = live_overlay.get(conv_id) {
-                            if live.timestamp > summary.timestamp {
-                                summary.timestamp = live.timestamp;
-                                if !live.last_message.is_empty() {
-                                    summary.last_message = live.last_message.clone();
-                                }
-                                summary.unread_count = live.unread_count;
+                        if live.timestamp > summary.timestamp {
+                            summary.timestamp = live.timestamp;
+                            if !live.last_message.is_empty() {
+                                summary.last_message = live.last_message.clone();
                             }
+                            summary.unread_count = live.unread_count;
                         }
-                        log::debug!(
-                            "gmessages → desktop: ChatAdded({} \"{}\")",
-                            summary.id,
-                            summary.name
-                        );
-                        if event_tx.send(WaEvent::ChatAdded(summary.clone())).await.is_err() {
-                            return;
-                        }
-                        // Also push a ChatNameUpdated so any cached row (from a
-                        // previous session) refreshes its title now that
-                        // contacts are loaded.
+                    }
+                    log::debug!(
+                        "gmessages → desktop: ChatAdded({} \"{}\")",
+                        summary.id,
+                        summary.name
+                    );
+                    if event_tx
+                        .send(WaEvent::ChatAdded(summary.clone()))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    // Also push a ChatNameUpdated so any cached row (from a
+                    // previous session) refreshes its title now that
+                    // contacts are loaded.
+                    if chat_name_is_usable(&summary.name) {
                         let _ = event_tx
                             .send(WaEvent::ChatNameUpdated {
                                 chat_id: summary.id.clone(),
@@ -1080,67 +1304,85 @@ async fn run(
                             })
                             .await;
                     }
+                }
 
-                    // EAGERLY enrich chat names: for any conversation whose
-                    // resolved name still looks like a phone number / numeric
-                    // ID, fetch one message and pull the real name out of
-                    // sender_participant. Done in parallel so 50 chats don't
-                    // serialize.
-                    let conversations = resp.conversations.clone();
-                    let unresolved: Vec<_> = summaries
-                        .iter()
-                        .zip(conversations.iter())
-                        .filter(|(s, _)| {
-                            // Name looks unresolved if it's all digits, or a
-                            // formatted phone number, or starts with +.
-                            let n = s.name.trim();
-                            n.is_empty()
-                                || n.starts_with('+')
-                                || n.chars().all(|c| !c.is_alphabetic())
-                        })
-                        .map(|(s, _)| s.id.clone())
-                        .collect();
-                    log::info!(
-                        "gmessages: eagerly enriching {} chats with unresolved names",
-                        unresolved.len()
-                    );
-                    for chat_id in unresolved {
-                        let client = client.clone();
-                        let event_tx = event_tx.clone();
-                        let conv_id = strip_prefix(&chat_id).to_string();
-                        tokio::spawn(async move {
-                            if let Ok(resp) = client.fetch_messages(&conv_id, 5).await {
+                // EAGERLY enrich chat names: for any conversation whose
+                // resolved name still looks like a phone number / numeric
+                // ID, fetch one message and pull the real name out of
+                // sender_participant. Done in parallel so 50 chats don't
+                // serialize.
+                let conversations = resp.conversations.clone();
+                let unresolved: Vec<_> = summaries
+                    .iter()
+                    .zip(conversations.iter())
+                    .filter(|(s, _)| {
+                        // Name looks unresolved if it's all digits, or a
+                        // formatted phone number, or starts with +.
+                        !chat_name_is_named(&s.name)
+                    })
+                    .map(|(s, _)| s.id.clone())
+                    .collect();
+                log::info!(
+                    "gmessages: eagerly enriching {} chats with unresolved names",
+                    unresolved.len()
+                );
+                // The relay/phone starts timing out when a large startup list
+                // fires one history RPC per unresolved row at once. Keep a
+                // small bounded queue: recent conversations still resolve in
+                // order, while normal event and command traffic remains
+                // responsive.
+                let enrichment_slots = Arc::new(tokio::sync::Semaphore::new(4));
+                for chat_id in unresolved {
+                    let client = client.clone();
+                    let event_tx = event_tx.clone();
+                    let contacts = contact_map.clone();
+                    let cache_path = gm_chats_cache_path.clone();
+                    let conv_id = strip_prefix(&chat_id).to_string();
+                    let enrichment_slots = enrichment_slots.clone();
+                    tokio::spawn(async move {
+                        let Ok(_permit) = enrichment_slots.acquire_owned().await else {
+                            return;
+                        };
+                        match client.fetch_messages(&conv_id, 5).await {
+                            Ok(resp) => {
                                 for m in resp.messages {
                                     if let Some(sp) = &m.sender_participant {
                                         // Skip outgoing — `is_me` is set
                                         // when this participant is the
                                         // desktop user.
-                                        if sp.is_me {
+                                        if gm_message_is_from_me(&m) {
                                             continue;
                                         }
-                                        let name = if !sp.full_name.is_empty() {
-                                            Some(sp.full_name.clone())
-                                        } else if !sp.first_name.is_empty() {
-                                            Some(sp.first_name.clone())
-                                        } else {
-                                            None
-                                        };
+                                        // A phone fallback is already present
+                                        // from the conversation payload. Only
+                                        // stop when history actually improves
+                                        // it to a saved/human contact name.
+                                        let name = participant_display_name(sp, &contacts)
+                                            .filter(|name| chat_name_is_named(name));
                                         if let Some(name) = name {
+                                            if let Some(summary) = update_gm_chat_name_cache(
+                                                &cache_path,
+                                                &chat_id,
+                                                &name,
+                                            ) {
+                                                let _ = event_tx
+                                                    .send(WaEvent::ChatRowChanged(summary))
+                                                    .await;
+                                            }
                                             let _ = event_tx
-                                                .send(WaEvent::ChatNameUpdated {
-                                                    chat_id,
-                                                    name,
-                                                })
+                                                .send(WaEvent::ChatNameUpdated { chat_id, name })
                                                 .await;
                                             return;
                                         }
                                     }
                                 }
                             }
-                        });
-                    }
+                            Err(error) => log::debug!(
+                                "gmessages: startup name enrichment failed for {conv_id}: {error}"
+                            ),
+                        }
+                    });
                 }
-                Err(e) => log::warn!("gmessages: list_conversations failed: {e}"),
             }
         });
     }
@@ -1179,9 +1421,7 @@ async fn run(
             // deleted".
             match run_gaia_pair_flow(&client, &auth_path, &mut events, &event_tx).await {
                 Ok(()) => {
-                    crate::gm_qr_state::set_gaia_status(
-                        crate::gm_qr_state::GaiaStatus::Finalizing,
-                    );
+                    crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::Finalizing);
                     if let Err(e) = client.connect().await {
                         log::warn!("gmessages: reconnect after Gaia pair failed: {e}");
                         crate::gm_qr_state::set_gaia_status(
@@ -1197,9 +1437,9 @@ async fn run(
                 }
                 Err(e) => {
                     log::warn!("gmessages: Gaia pairing failed: {e}");
-                    crate::gm_qr_state::set_gaia_status(
-                        crate::gm_qr_state::GaiaStatus::Failed(format!("{e}")),
-                    );
+                    crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::Failed(
+                        format!("{e}"),
+                    ));
                 }
             }
             continue;
@@ -1255,6 +1495,59 @@ async fn run(
                     continue;
                 }
 
+                // Conversation updates carry the recipient identity even when
+                // the accompanying message was sent FROM the paired phone. An
+                // outgoing Message payload identifies its sender as `is_me`, so
+                // message-only name resolution intentionally skips it; dropping
+                // this conversation payload was why a new row stayed as "25"
+                // until opening the chat triggered a separate history fetch.
+                if let Event::ConversationUpdate { conversation } = &event {
+                    let contacts = contact_cache.lock().await.clone();
+                    let mut summary = conversation_to_summary(conversation, &contacts);
+                    let conv_id = conversation.conversation_id.as_str();
+                    let wm_snap = gm_read_watermarks.lock().await.clone();
+                    apply_gm_read_watermark(&mut summary, &wm_snap);
+
+                    // A merged SMS conversation is displayed on its WhatsApp
+                    // row; standalone verification senders live in the shared
+                    // Verification Codes inbox. Neither should create a gm row.
+                    let visible_chat_id = merge_map
+                        .lock()
+                        .await
+                        .get(conv_id)
+                        .cloned()
+                        .unwrap_or_else(|| summary.id.clone());
+                    if gm_verification_convs.lock().await.contains(conv_id) {
+                        continue;
+                    }
+
+                    if visible_chat_id == summary.id {
+                        summary = upsert_gm_conversation_metadata_cache(
+                            &gm_chats_cache_path,
+                            &summary,
+                            conversation,
+                        );
+                        let _ = event_tx
+                            .send(WaEvent::ChatRowChanged(summary.clone()))
+                            .await;
+                    }
+
+                    if chat_name_is_usable(&summary.name) {
+                        log::info!(
+                            "gmessages: conversation update resolved {} → {:?}",
+                            visible_chat_id,
+                            summary.name,
+                        );
+                        let _ = event_tx
+                            .send(WaEvent::ChatNameUpdated {
+                                chat_id: visible_chat_id,
+                                name: summary.name,
+                            })
+                            .await;
+                    }
+                    continue;
+                }
+
                 // For Messages events, also: (a) opportunistically learn the
                 // sender's name via `sender_participant` data and emit a
                 // `ChatNameUpdated` so chat rows that started life with an
@@ -1264,6 +1557,7 @@ async fn run(
                 if let Event::Messages { messages, .. } = &event {
                     let cache = contact_cache.lock().await.clone();
                     let global = crate::contacts::global();
+                    let name_mm = merge_map.lock().await.clone();
                     for m in messages {
                         if let Some(sp) = &m.sender_participant {
                             // Skip OUTGOING messages: the proto's
@@ -1272,35 +1566,35 @@ async fn run(
                             // signal. Status-based detection misses
                             // status=0 (Unknown) cases — using is_me is
                             // reliable for every code path.
-                            if sp.is_me {
+                            if gm_message_is_from_me(m) {
                                 continue;
                             }
-                            // Get the best name we can from the participant.
-                            let name = if !sp.full_name.is_empty() {
-                                Some(sp.full_name.clone())
-                            } else if !sp.first_name.is_empty() {
-                                Some(sp.first_name.clone())
-                            } else {
-                                sp.id.as_ref().and_then(|id| {
-                                    if id.number.is_empty() {
-                                        None
-                                    } else {
-                                        lookup_contact_name(&cache, &id.number)
-                                            .or_else(|| Some(id.number.clone()))
-                                    }
-                                })
-                            };
+                            let name = participant_display_name(sp, &cache);
                             // Feed the global directory so other protocols
                             // can use this name later.
                             if let Some(name) = &name
-                                && let Some(id) = &sp.id
-                                && !id.number.is_empty()
-                                && name.chars().any(|c| c.is_alphabetic())
+                                && chat_name_is_named(name)
+                                && let Some(phone) = participant_phone(sp)
                             {
-                                global.insert(&id.number, name, "gmessages-msg");
+                                global.insert(&phone, name, "gmessages-msg");
                             }
                             if let Some(name) = name {
-                                let chat_id = format!("{CHAT_PREFIX}{}", m.conversation_id);
+                                let raw_chat_id = format!("{CHAT_PREFIX}{}", m.conversation_id);
+                                let chat_id = name_mm
+                                    .get(&m.conversation_id)
+                                    .cloned()
+                                    .unwrap_or_else(|| raw_chat_id.clone());
+                                if chat_id == raw_chat_id
+                                    && let Some(summary) = update_gm_chat_name_cache(
+                                        &gm_chats_cache_path,
+                                        &raw_chat_id,
+                                        &name,
+                                    )
+                                {
+                                    let _ = event_tx
+                                        .send(WaEvent::ChatRowChanged(summary))
+                                        .await;
+                                }
                                 let _ = event_tx
                                     .send(WaEvent::ChatNameUpdated {
                                         chat_id,
@@ -1311,7 +1605,7 @@ async fn run(
                         }
                     }
                     global.save_if_dirty();
-                    let dl_mm = merge_map.lock().await.clone();
+                    let dl_mm = name_mm;
                     for m in messages {
                         let downloads = pending_downloads(m, &data_dir);
                         if m.r#type != 1 {
@@ -1341,7 +1635,12 @@ async fn run(
                             // which then downloads via this same path.
                             // Request once per message.
                             if pm.is_thumbnail
-                                && requested_full_image.insert(m.message_id.clone())
+                                && {
+                                    if requested_full_image.len() >= 4096 {
+                                        requested_full_image.clear();
+                                    }
+                                    requested_full_image.insert(m.message_id.clone())
+                                }
                             {
                                 let client = client.clone();
                                 let raw_msg = m.message_id.clone();
@@ -1362,7 +1661,11 @@ async fn run(
                             let kind = pm.kind;
                             let client = client.clone();
                             let event_tx = event_tx.clone();
+                            let media_download_limit = media_download_limit.clone();
                             tokio::spawn(async move {
+                                let Ok(_permit) = media_download_limit.acquire_owned().await else {
+                                    return;
+                                };
                                 if dest.exists() {
                                     log::debug!(
                                         "gmessages: media already downloaded at {}",
@@ -1391,17 +1694,26 @@ async fn run(
                                 );
                                 match client.download_media(&media_id, &key).await {
                                     Ok(bytes) => {
-                                        if let Err(e) = std::fs::write(&dest, &bytes) {
-                                            log::warn!("gmessages: write media file: {e}");
-                                            return;
-                                        }
-                                        // HEIC can't render in GTK — transcode to JPEG off the runtime.
-                                        let dest_fallback = dest.clone();
-                                        let render_path = tokio::task::spawn_blocking(move || {
-                                            convert_heic_to_jpg(&dest)
-                                        })
+                                        // Keep the potentially large write and
+                                        // HEIC conversion off Tokio workers.
+                                        let render_path = match tokio::task::spawn_blocking(
+                                            move || -> std::io::Result<PathBuf> {
+                                                std::fs::write(&dest, &bytes)?;
+                                                Ok(convert_heic_to_jpg(&dest))
+                                            },
+                                        )
                                         .await
-                                        .unwrap_or(dest_fallback);
+                                        {
+                                            Ok(Ok(path)) => path,
+                                            Ok(Err(e)) => {
+                                                log::warn!("gmessages: write media file: {e}");
+                                                return;
+                                            }
+                                            Err(e) => {
+                                                log::warn!("gmessages: media writer task failed: {e}");
+                                                return;
+                                            }
+                                        };
                                         let _ = event_tx
                                             .send(WaEvent::MediaReady {
                                                 msg_id,
@@ -1617,6 +1929,7 @@ async fn run(
                 let gm_verification_convs = gm_verification_convs.clone();
                 let wa_cmd_tx = wa_cmd_tx.clone();
                 let gm_chats_cache_path = gm_chats_cache_path.clone();
+                let contact_cache = contact_cache.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_command(
                         &client,
@@ -1627,6 +1940,7 @@ async fn run(
                         &gm_verification_convs,
                         &wa_cmd_tx,
                         &gm_chats_cache_path,
+                        &contact_cache,
                         cmd,
                     )
                     .await
@@ -1701,6 +2015,7 @@ async fn handle_command(
     verification_convs: &std::sync::Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
     wa_cmd_tx: &TokioUnboundedSender<WaCommand>,
     gm_chats_cache_path: &std::path::Path,
+    contact_cache: &ContactCache,
     cmd: WaCommand,
 ) -> Result<()> {
     use crate::bridge::IncomingMessage;
@@ -1708,8 +2023,18 @@ async fn handle_command(
         // SMS/RCS has no reply-quoting, so a SendReply to a gm chat is downgraded
         // to a plain text SMS (the reply text still sends) rather than being
         // silently dropped and leaving the optimistic bubble stuck forever.
-        WaCommand::SendText { chat_id, text, tmp_id, .. }
-        | WaCommand::SendReply { chat_id, text, tmp_id, .. } => {
+        WaCommand::SendText {
+            chat_id,
+            text,
+            tmp_id,
+            ..
+        }
+        | WaCommand::SendReply {
+            chat_id,
+            text,
+            tmp_id,
+            ..
+        } => {
             let conv = strip_prefix(&chat_id);
             log::info!("gmessages: SendText to {conv}: {text:?}");
             match client.send_text(conv, &text).await {
@@ -1776,7 +2101,9 @@ async fn handle_command(
                     // Persist + bump the row (merged → WA runtime, else gm cache).
                     emit_sent_echo_row(&echo, merge_map, wa_cmd_tx, gm_chats_cache_path, event_tx)
                         .await;
-                    let _ = event_tx.send(WaEvent::MessageReceived(echo)).await;
+                    let _ = event_tx
+                        .send(WaEvent::MessageReceived(Box::new(echo)))
+                        .await;
                 }
                 Err(e) => {
                     log::warn!("gmessages: send_text failed: {e}");
@@ -1793,7 +2120,11 @@ async fn handle_command(
         // send_text path as SendText and re-key the existing failed bubble
         // (msg_id) via MessageConfirmed on success, or re-emit MessageFailed
         // on error so the red ✗ / Resend affordance stays.
-        WaCommand::ResendMessage { chat_id, msg_id, text } => {
+        WaCommand::ResendMessage {
+            chat_id,
+            msg_id,
+            text,
+        } => {
             let conv = strip_prefix(&chat_id);
             log::info!("gmessages: ResendMessage to {conv}: {text:?}");
             match client.send_text(conv, &text).await {
@@ -1851,15 +2182,14 @@ async fn handle_command(
                     };
                     emit_sent_echo_row(&echo, merge_map, wa_cmd_tx, gm_chats_cache_path, event_tx)
                         .await;
-                    let _ = event_tx.send(WaEvent::MessageReceived(echo)).await;
+                    let _ = event_tx
+                        .send(WaEvent::MessageReceived(Box::new(echo)))
+                        .await;
                 }
                 Err(e) => {
                     log::warn!("gmessages: ResendMessage send_text failed: {e}");
                     let _ = event_tx
-                        .send(WaEvent::MessageFailed {
-                            msg_id,
-                            chat_id,
-                        })
+                        .send(WaEvent::MessageFailed { msg_id, chat_id })
                         .await;
                 }
             }
@@ -1870,9 +2200,11 @@ async fn handle_command(
 
             // Start from on-disk cache so locally-known history (including
             // anything we sent since the last server fetch) shows up.
-            let mut merged: Vec<IncomingMessage> =
-                crate::ui::runtime::load_messages(&chat_id);
-            log::debug!("gmessages: LoadChat starting with {} cached messages", merged.len());
+            let mut merged: Vec<IncomingMessage> = crate::ui::runtime::load_messages(&chat_id);
+            log::debug!(
+                "gmessages: LoadChat starting with {} cached messages",
+                merged.len()
+            );
             let mut have: std::collections::HashSet<String> =
                 merged.iter().map(|m| m.id.clone()).collect();
 
@@ -1882,25 +2214,19 @@ async fn handle_command(
                     // but ONLY from incoming messages. The user's own
                     // sender_participant on outgoing messages would
                     // rename the chat to the user's own name otherwise.
+                    let contacts = contact_cache.lock().await.clone();
                     for m in &resp.messages {
-                        let status = m
-                            .message_status
-                            .as_ref()
-                            .map(|s| s.status)
-                            .unwrap_or(0);
-                        let is_from_me = (1..=22).contains(&status);
-                        if is_from_me {
+                        if gm_message_is_from_me(m) {
                             continue;
                         }
                         if let Some(sp) = &m.sender_participant {
-                            let name = if !sp.full_name.is_empty() {
-                                Some(sp.full_name.clone())
-                            } else if !sp.first_name.is_empty() {
-                                Some(sp.first_name.clone())
-                            } else {
-                                None
-                            };
-                            if let Some(name) = name {
+                            if let Some(mut name) = participant_display_name(sp, &contacts) {
+                                if let Some(summary) =
+                                    update_gm_chat_name_cache(gm_chats_cache_path, &chat_id, &name)
+                                {
+                                    name = summary.name.clone();
+                                    let _ = event_tx.send(WaEvent::ChatRowChanged(summary)).await;
+                                }
                                 let _ = event_tx
                                     .send(WaEvent::ChatNameUpdated {
                                         chat_id: chat_id.clone(),
@@ -1932,7 +2258,9 @@ async fn handle_command(
                         &merged,
                     );
                 }
-                Err(e) => log::warn!("gmessages: fetch_messages failed (using disk cache only): {e}"),
+                Err(e) => {
+                    log::warn!("gmessages: fetch_messages failed (using disk cache only): {e}")
+                }
             }
 
             merged.sort_by_key(|m| m.timestamp);
@@ -2016,8 +2344,7 @@ async fn handle_command(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let watermark_ts =
-                now_s.max(messages.iter().map(|m| m.timestamp).max().unwrap_or(0));
+            let watermark_ts = now_s.max(messages.iter().map(|m| m.timestamp).max().unwrap_or(0));
             if watermark_ts > 0 {
                 let snapshot = {
                     let mut wm = read_watermarks.lock().await;
@@ -2172,10 +2499,11 @@ async fn handle_command(
             // Google Messages reaction action: 1 = Add, 2 = Remove. The UI
             // sends an empty emoji to clear an existing reaction.
             let action = if emoji.is_empty() { 2 } else { 1 };
-            log::info!(
-                "gmessages: SendReaction {emoji:?} on msg {raw_msg_id} (action {action})"
-            );
-            match client.send_reaction(&conv, &raw_msg_id, &emoji, action).await {
+            log::info!("gmessages: SendReaction {emoji:?} on msg {raw_msg_id} (action {action})");
+            match client
+                .send_reaction(&conv, &raw_msg_id, &emoji, action)
+                .await
+            {
                 Ok(()) => {
                     // Persist directly so the reaction survives a restart —
                     // the long-poll echo path doesn't re-save existing
@@ -2221,7 +2549,11 @@ async fn handle_command(
                         Some((r, is_latest)) => (
                             r.into_iter()
                                 .map(|(who, e)| {
-                                    if who == "me" { (String::new(), e) } else { (who, e) }
+                                    if who == "me" {
+                                        (String::new(), e)
+                                    } else {
+                                        (who, e)
+                                    }
                                 })
                                 .collect(),
                             is_latest,
@@ -2368,7 +2700,9 @@ async fn handle_command(
                     };
                     emit_sent_echo_row(&echo, merge_map, wa_cmd_tx, gm_chats_cache_path, event_tx)
                         .await;
-                    let _ = event_tx.send(WaEvent::MessageReceived(echo)).await;
+                    let _ = event_tx
+                        .send(WaEvent::MessageReceived(Box::new(echo)))
+                        .await;
                 }
                 Err(e) => {
                     log::warn!("gmessages: SendImage failed: {e}");
@@ -2381,15 +2715,36 @@ async fn handle_command(
                 }
             }
         }
-        // Commands that carry an optimistic bubble (tmp_id) but that gmessages
-        // can't send (GIF / sticker / voice note over SMS/RCS). The UI already
-        // showed a bubble and cleared the input, so tell it the send FAILED
-        // (red ✗ + Resend) instead of leaving the bubble on ⏳ forever with the
-        // recipient getting nothing.
-        WaCommand::SendGif { chat_id, tmp_id, .. }
-        | WaCommand::SendAudio { chat_id, tmp_id, .. }
-        | WaCommand::SendSticker { chat_id, tmp_id, .. } => {
-            log::warn!("gmessages: {chat_id} — GIF/sticker/voice not supported over SMS; marking failed");
+        // GIFs and stickers cannot be reconstructed as SMS/RCS attachments.
+        // Mark the optimistic bubble failed and explain the protocol limitation;
+        // a bare red X looked like a transient network error and invited a retry
+        // that could never succeed.
+        WaCommand::SendGif {
+            chat_id, tmp_id, ..
+        }
+        | WaCommand::SendSticker {
+            chat_id, tmp_id, ..
+        } => {
+            log::warn!("gmessages: {chat_id} — GIF/sticker not supported over SMS; marking failed");
+            let _ = event_tx
+                .send(WaEvent::MessageFailed {
+                    msg_id: tmp_id,
+                    chat_id,
+                })
+                .await;
+            let _ = event_tx
+                .send(WaEvent::ErrorToast(
+                    "GIFs and stickers can’t be sent over SMS/RCS. Choose a WhatsApp chat instead."
+                        .to_string(),
+                ))
+                .await;
+        }
+        // Voice notes are likewise unsupported, but retain their existing
+        // failure-bubble behavior independently from picker media.
+        WaCommand::SendAudio {
+            chat_id, tmp_id, ..
+        } => {
+            log::warn!("gmessages: {chat_id} — voice notes not supported over SMS; marking failed");
             let _ = event_tx
                 .send(WaEvent::MessageFailed {
                     msg_id: tmp_id,
@@ -2401,7 +2756,9 @@ async fn handle_command(
         // already showed an optimistic ⏳ bubble (tmp_id) and cleared the
         // composer. Mark it FAILED (red ✗ + Resend) instead of leaving the
         // bubble hanging on ⏳ forever.
-        WaCommand::SendContact { to_chat_id, tmp_id, .. } => {
+        WaCommand::SendContact {
+            to_chat_id, tmp_id, ..
+        } => {
             log::warn!(
                 "gmessages: {to_chat_id} — contact card not supported over SMS; marking failed"
             );
@@ -2444,7 +2801,11 @@ fn describe_wa_event(e: &WaEvent) -> String {
         WaEvent::MessageReceived(im) => format!(
             "MessageReceived(chat_id={}, from={}, body={:?})",
             im.chat_id,
-            if im.is_from_me { "<self>" } else { im.sender_id.as_str() },
+            if im.is_from_me {
+                "<self>"
+            } else {
+                im.sender_id.as_str()
+            },
             // Truncate to 40 *chars*, not bytes. `&s[..40]` panics when byte
             // 40 lands inside a multi-byte char (smart quote, emoji, accent)
             // — that crashed the whole gmessages task on a real message (see
@@ -2454,7 +2815,9 @@ fn describe_wa_event(e: &WaEvent) -> String {
                 None => s,
             }),
         ),
-        WaEvent::TypingIndicator { chat_id, is_typing, .. } => {
+        WaEvent::TypingIndicator {
+            chat_id, is_typing, ..
+        } => {
             format!("TypingIndicator(chat_id={chat_id}, on={is_typing})")
         }
         WaEvent::ErrorToast(s) => format!("ErrorToast({s:?})"),
@@ -2493,8 +2856,10 @@ async fn run_pair_flow(
     // Fire a desktop notification too so the user sees it even when they
     // alt-tabbed away from the terminal.
     let _ = std::process::Command::new("notify-send")
-        .arg("-u").arg("critical")
-        .arg("-t").arg("0") // never auto-dismiss
+        .arg("-u")
+        .arg("critical")
+        .arg("-t")
+        .arg("0") // never auto-dismiss
         .arg("Google Messages: pairing required")
         .arg("SMS will not arrive until you scan the QR code in the terminal.")
         .spawn();
@@ -2522,19 +2887,14 @@ async fn run_pair_flow(
             pair_task.abort();
             // Surface the Starting status immediately so the dialog
             // doesn't sit on whatever it was before.
-            crate::gm_qr_state::set_gaia_status(
-                crate::gm_qr_state::GaiaStatus::Starting,
-            );
+            crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::Starting);
             return run_gaia_pair_flow(client, auth_path, events, event_tx).await;
         }
-        let event = match tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            events.recv(),
-        )
-        .await
+        let event = match tokio::time::timeout(std::time::Duration::from_millis(500), events.recv())
+            .await
         {
             Ok(Some(e)) => e,
-            Ok(None) => break, // channel closed
+            Ok(None) => break,  // channel closed
             Err(_) => continue, // timer tick — re-check escape hatch
         };
         match event {
@@ -2542,9 +2902,10 @@ async fn run_pair_flow(
                 // Publish to the in-app settings page.
                 crate::gm_qr_state::set(Some(url.clone()));
                 // Also render in the terminal for users not in settings.
-                eprintln!("\n=== Google Messages pairing — scan with phone (or open Settings) ===\n");
-                let code = QrCode::new(url.as_bytes())
-                    .context("gmessages: failed to encode QR")?;
+                eprintln!(
+                    "\n=== Google Messages pairing — scan with phone (or open Settings) ===\n"
+                );
+                let code = QrCode::new(url.as_bytes()).context("gmessages: failed to encode QR")?;
                 let rendered = code
                     .render::<Dense1x2>()
                     .dark_color(Dense1x2::Light)
@@ -2566,7 +2927,10 @@ async fn run_pair_flow(
             Event::AuthRevoked => {
                 anyhow::bail!("gmessages: auth revoked during pairing");
             }
-            other => log::debug!("gmessages: ignoring event during pair: {}", describe_event(&other)),
+            other => log::debug!(
+                "gmessages: ignoring event during pair: {}",
+                describe_event(&other)
+            ),
         }
     }
 
@@ -2671,13 +3035,10 @@ async fn run_gaia_pair_flow(
                     "gmessages: gaia pair: {} accounts available",
                     accounts.len()
                 );
-                crate::gm_qr_state::set_gaia_status(
-                    crate::gm_qr_state::GaiaStatus::PickingAccount,
-                );
+                crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::PickingAccount);
                 crate::gm_qr_state::set_available_accounts(Some(accounts));
                 // Poll for the user's choice.
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
                 let chosen = loop {
                     if let Some(n) = crate::gm_qr_state::take_chosen_authuser() {
                         break Some(n);
@@ -2713,8 +3074,7 @@ async fn run_gaia_pair_flow(
 
                 // Poll for the user's confirmation. Timeout matches the
                 // 5-minute window in pairing::gaia.
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
                 let confirmed = loop {
                     if let Some(ans) = crate::gm_qr_state::take_gaia_confirmation() {
                         break Some(ans);
@@ -2753,32 +3113,25 @@ async fn run_gaia_pair_flow(
                 // through run_pair_flow skips the outer-loop branch
                 // that would otherwise set it. Without this, the dialog
                 // sits at the previous status forever and looks "stuck".
-                crate::gm_qr_state::set_gaia_status(
-                    crate::gm_qr_state::GaiaStatus::Success,
-                );
+                crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::Success);
                 crate::gm_qr_state::set_gaia_emoji(None);
                 break;
             }
             Event::PairFailed { reason } => {
                 crate::gm_qr_state::set_gaia_emoji(None);
-                crate::gm_qr_state::set_gaia_status(
-                    crate::gm_qr_state::GaiaStatus::Failed(reason.clone()),
-                );
+                crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::Failed(
+                    reason.clone(),
+                ));
                 anyhow::bail!("gaia pair failed: {reason}");
             }
             Event::AuthRevoked => {
                 crate::gm_qr_state::set_gaia_emoji(None);
-                crate::gm_qr_state::set_gaia_status(
-                    crate::gm_qr_state::GaiaStatus::Failed(
-                        "auth revoked mid-flow".into(),
-                    ),
-                );
+                crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::Failed(
+                    "auth revoked mid-flow".into(),
+                ));
                 anyhow::bail!("gaia pair: auth revoked mid-flow");
             }
-            other => log::debug!(
-                "gmessages: gaia pair: ignoring {}",
-                describe_event(&other)
-            ),
+            other => log::debug!("gmessages: gaia pair: ignoring {}", describe_event(&other)),
         }
     }
 
@@ -2795,8 +3148,8 @@ async fn load_auth(path: &Path) -> Result<AuthData> {
         return Ok(AuthData::default());
     }
     let bytes = tokio::fs::read(path).await?;
-    let auth: AuthData = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let auth: AuthData =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
     Ok(auth)
 }
 
@@ -2875,7 +3228,7 @@ fn translate_event(event: Event) -> Vec<WaEvent> {
                     });
                 }
                 if let Some(im) = message_to_incoming(m) {
-                    out.push(WaEvent::MessageReceived(im));
+                    out.push(WaEvent::MessageReceived(Box::new(im)));
                 }
                 out
             })
@@ -2889,8 +3242,11 @@ fn translate_event(event: Event) -> Vec<WaEvent> {
             sender_name: participant_id,
             is_typing: typing,
         }],
-        Event::ConversationUpdate { conversation_id } => {
-            log::debug!("gmessages: conversation updated {conversation_id}");
+        Event::ConversationUpdate { conversation } => {
+            log::debug!(
+                "gmessages: conversation updated {}",
+                conversation.conversation_id
+            );
             Vec::new()
         }
         Event::PhoneNotResponding => vec![WaEvent::ErrorToast(
@@ -2955,7 +3311,11 @@ fn pending_downloads(m: &GmMessage, data_dir: &Path) -> Vec<PendingMedia> {
             let dest = gm_media_dest(blob_id, &mc.mime_type, data_dir);
             let mime = mc.mime_type.as_str();
             let kind = if mime.starts_with("image/") {
-                if mime == "image/gif" { MediaType::Gif } else { MediaType::Image }
+                if mime == "image/gif" {
+                    MediaType::Gif
+                } else {
+                    MediaType::Image
+                }
             } else if mime.starts_with("video/") {
                 MediaType::Video
             } else if mime.starts_with("audio/") {
@@ -3005,6 +3365,14 @@ fn sender_phone_and_name(m: &GmMessage) -> (String, String) {
     (m.participant_id.clone(), m.participant_id.clone())
 }
 
+fn gm_message_is_from_me(m: &GmMessage) -> bool {
+    let status = m.message_status.as_ref().map(|s| s.status).unwrap_or(0);
+    (1..=22).contains(&status)
+        || m.sender_participant
+            .as_ref()
+            .is_some_and(|participant| participant.is_me)
+}
+
 /// Convert one gmessages `Message` to a desktop `IncomingMessage`.
 /// Returns `None` for messages with no displayable content.
 fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
@@ -3036,7 +3404,11 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
                 );
                 let mime = mc.mime_type.as_str();
                 media = Some(if mime.starts_with("image/") {
-                    if mime == "image/gif" { MediaType::Gif } else { MediaType::Image }
+                    if mime == "image/gif" {
+                        MediaType::Gif
+                    } else {
+                        MediaType::Image
+                    }
                 } else if mime.starts_with("video/") {
                     MediaType::Video
                 } else if mime.starts_with("audio/") {
@@ -3090,7 +3462,7 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
         .as_ref()
         .map(|sp| sp.is_me)
         .unwrap_or(false);
-    let is_from_me = (1..=22).contains(&status) || sp_is_me;
+    let is_from_me = gm_message_is_from_me(m);
     let ts_s = gm_timestamp_to_unix_s(m.timestamp);
     log::debug!(
         "gmessages msg: id={} conv={} raw_ts={} → s={} ({}); status={status} sp_is_me={sp_is_me} from_me={is_from_me}",
@@ -3168,13 +3540,17 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
             .reactions
             .iter()
             .filter_map(|r| {
-                let participants = r
-                    .participant_i_ds
-                    .first()
-                    .cloned()
+                let participants = r.participant_i_ds.first().cloned().unwrap_or_default();
+                let unicode = r
+                    .data
+                    .as_ref()
+                    .map(|d| d.unicode.clone())
                     .unwrap_or_default();
-                let unicode = r.data.as_ref().map(|d| d.unicode.clone()).unwrap_or_default();
-                if unicode.is_empty() { None } else { Some((participants, unicode)) }
+                if unicode.is_empty() {
+                    None
+                } else {
+                    Some((participants, unicode))
+                }
             })
             .collect(),
         media_local_path,
@@ -3192,7 +3568,9 @@ fn message_to_incoming(m: &GmMessage) -> Option<IncomingMessage> {
         poll_selectable: 0,
         poll_secret: vec![],
         poll_votes: vec![],
-        receipt_status: gm_status_to_receipt(m.message_status.as_ref().map(|s| s.status).unwrap_or(0)),
+        receipt_status: gm_status_to_receipt(
+            m.message_status.as_ref().map(|s| s.status).unwrap_or(0),
+        ),
         is_edited: false,
         is_system_message: false,
     })
@@ -3279,37 +3657,41 @@ pub fn conversation_to_summary(
     c: &gmessages_rust::gmproto::conversations::Conversation,
     contacts: &std::collections::HashMap<String, String>,
 ) -> ChatSummary {
+    let me = c.participants.iter().find(|p| p.is_me);
     let other = c
         .participants
         .iter()
         .find(|p| p.is_visible && !p.is_me)
-        .cloned();
+        .or_else(|| c.participants.iter().find(|p| !p.is_me));
+
+    let is_self_name = |candidate: &str| {
+        let candidate = candidate.trim();
+        !candidate.is_empty()
+            && me.is_some_and(|p| {
+                [&p.full_name, &p.first_name]
+                    .into_iter()
+                    .map(|value| value.trim())
+                    .any(|value| !value.is_empty() && value.eq_ignore_ascii_case(candidate))
+            })
+    };
 
     // Best phone number we can extract for the OTHER participant. Tries:
     //   - the visible non-me Participant's SmallInfo.number
     //   - that Participant's SmallInfo.participant_id (often a phone)
     //   - the first entry in `other_participants` (Conversation field —
     //     populated even when `participants` is empty)
-    let phone = other
-        .as_ref()
-        .and_then(|p| p.id.as_ref())
-        .map(|id| {
-            if !id.number.is_empty() {
-                id.number.clone()
-            } else {
-                id.participant_id.clone()
-            }
-        })
-        .or_else(|| c.other_participants.first().cloned());
+    let phone = other.and_then(participant_phone).or_else(|| {
+        c.other_participants
+            .iter()
+            .find(|value| chat_name_quality(value) == 1)
+            .cloned()
+    });
 
-    // Name resolution priority:
-    //   1. Conversation-level name with letters (set for group chats)
-    //   2. Participant.full_name (saved contact pulled from phone)
-    //   3. Participant.first_name
-    //   4. Contact map lookup by phone (handles SMS where participants
-    //      entry has no name but contacts list does)
-    //   5. Phone number itself
-    //   6. conversation_id as a last resort
+    // One-to-one conversation-level/latest-message names can describe the
+    // sender of the latest OUTGOING message (the desktop user), not the other
+    // party. Trust the non-me participant/contact/phone first, and only use a
+    // latest-message name when that latest message is incoming. Conversation
+    // names remain authoritative for groups.
     log::debug!(
         "gmessages: resolving name for conv {} (c.name={:?}, participants={}, other_participants={:?}, phone={:?})",
         c.conversation_id,
@@ -3318,40 +3700,38 @@ pub fn conversation_to_summary(
         c.other_participants,
         phone,
     );
-    // `latest_message.display_name` is what gmessages itself shows in the
-    // chat header — server-side resolved name including saved-contact
-    // lookups. Use it as a high-priority fallback BEFORE we go to the
-    // raw participant data.
     let latest_name = c
         .latest_message
         .as_ref()
+        .filter(|lm| lm.from_me == 0)
         .map(|lm| lm.display_name.trim().to_string())
-        .filter(|n| !n.is_empty() && n.chars().any(|ch| !ch.is_ascii_digit() && ch != '+' && ch != ' ' && ch != '(' && ch != ')' && ch != '-'));
+        .filter(|name| chat_name_is_named(name) && !is_self_name(name));
+    let participant_name = other
+        .and_then(|participant| participant_display_name(participant, contacts))
+        .filter(|name| !is_self_name(name));
+    let phonebook_or_phone = phone.as_ref().map(|phone| {
+        lookup_contact_name(contacts, phone)
+            .filter(|name| chat_name_is_named(name) && !is_self_name(name))
+            .unwrap_or_else(|| phone.clone())
+    });
 
-    let name = if !c.name.is_empty() && c.name.chars().any(|ch| !ch.is_ascii_digit()) {
+    let shortcode = (!c.is_group_chat)
+        .then(|| conversation_shortcode(&c.conversation_id, &c.name))
+        .flatten();
+    let name = if c.is_group_chat && chat_name_is_named(&c.name) {
         c.name.clone()
-    } else if let Some(p) = other.as_ref()
-        && !p.full_name.is_empty()
-    {
-        p.full_name.clone()
-    } else if let Some(p) = other.as_ref()
-        && !p.first_name.is_empty()
-    {
-        p.first_name.clone()
-    } else if let Some(n) = latest_name {
-        log::debug!("gmessages: using latest_message.display_name {n:?} for conv {}", c.conversation_id);
-        n
-    } else if let Some(p) = phone.as_ref()
-        && let Some(name) = lookup_contact_name(contacts, p)
-    {
-        log::debug!("gmessages: matched contact for {p} → {name}");
+    } else if let Some(name) = participant_name {
         name
-    } else if let Some(p) = phone {
+    } else if let Some(name) = phonebook_or_phone {
+        name
+    } else if let Some(n) = latest_name {
         log::debug!(
-            "gmessages: name fallback to phone {p} for conv {} (no contact match)",
+            "gmessages: using latest_message.display_name {n:?} for conv {}",
             c.conversation_id
         );
-        p
+        n
+    } else if let Some(shortcode) = shortcode {
+        shortcode.to_string()
     } else {
         log::warn!(
             "gmessages: no name source for conv {} (c.name={:?}, participants={}, other_participants={:?})",
@@ -3389,3 +3769,195 @@ pub fn conversation_to_summary(
 // self-rotate via Set-Cookie capture (http.rs + longpoll.rs), so we
 // never need to nudge FF at runtime. FF is only required for the
 // initial pair (to get the cookies in the first place).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(id: &str, name: &str) -> ChatSummary {
+        ChatSummary {
+            id: id.into(),
+            name: name.into(),
+            last_message: "newest preview".into(),
+            timestamp: 123,
+            unread_count: 4,
+            is_group: false,
+            is_muted: false,
+            is_pinned: false,
+            is_archived: false,
+            is_favorite: false,
+            label: None,
+            pinned_msg_id: None,
+            auto_mark_read: false,
+        }
+    }
+
+    #[test]
+    fn conversation_metadata_resolves_numeric_name_without_regressing_row() {
+        let existing = summary("gm:25", "25");
+        let mut fresh = summary("gm:25", "Brandon Longstaff");
+        fresh.last_message = "older server preview".into();
+        fresh.timestamp = 100;
+        fresh.unread_count = 0;
+        fresh.is_pinned = true;
+        let mut cache = vec![existing];
+
+        let merged = merge_gm_conversation_metadata(&mut cache, &fresh);
+
+        assert_eq!(merged.name, "Brandon Longstaff");
+        assert_eq!(merged.last_message, "newest preview");
+        assert_eq!(merged.timestamp, 123);
+        assert_eq!(merged.unread_count, 4);
+        assert!(merged.is_pinned);
+    }
+
+    #[test]
+    fn conversation_metadata_does_not_replace_real_name_with_numeric_placeholder() {
+        let existing = summary("gm:25", "Brandon Longstaff");
+        let fresh = summary("gm:25", "25");
+        let mut cache = vec![existing];
+
+        let merged = merge_gm_conversation_metadata(&mut cache, &fresh);
+
+        assert_eq!(merged.name, "Brandon Longstaff");
+    }
+
+    #[test]
+    fn identity_quality_rejects_internal_ids_but_accepts_full_phone_numbers() {
+        assert_eq!(chat_name_quality("25"), 0);
+        assert_eq!(chat_name_quality("gm:6689"), 0);
+        assert_eq!(chat_name_quality("6912"), 0);
+        assert_eq!(chat_name_quality("79749019898100@lid"), 0);
+        assert_eq!(chat_name_quality("+1 (416) 555-0123"), 1);
+        assert_eq!(chat_name_quality("Brandon Longstaff"), 2);
+    }
+
+    #[test]
+    fn conversation_summary_keeps_real_shortcode_but_rejects_own_internal_id() {
+        use gmessages_rust::gmproto::conversations::Conversation;
+
+        let shortcode = Conversation {
+            conversation_id: "6650".into(),
+            name: "87225".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            conversation_to_summary(&shortcode, &Default::default()).name,
+            "87225"
+        );
+
+        let internal_id = Conversation {
+            conversation_id: "25".into(),
+            name: "25".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            conversation_to_summary(&internal_id, &Default::default()).name,
+            "25"
+        );
+        assert_eq!(conversation_shortcode("25", "25"), None);
+    }
+
+    #[test]
+    fn participant_protocol_id_never_replaces_a_real_phone_number() {
+        use gmessages_rust::gmproto::conversations::Participant;
+
+        let participant = Participant {
+            full_name: "79749019898100@lid".into(),
+            formatted_number: "+15145190335".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            participant_display_name(&participant, &Default::default()),
+            Some("+15145190335".into())
+        );
+    }
+
+    #[test]
+    fn conversation_summary_prefers_participant_name_over_formatted_phone_placeholder() {
+        use gmessages_rust::gmproto::conversations::{Conversation, Participant, SmallInfo};
+
+        let conversation = Conversation {
+            conversation_id: "25".into(),
+            name: "+1 (416) 555-0123".into(),
+            participants: vec![Participant {
+                id: Some(SmallInfo {
+                    number: "+14165550123".into(),
+                    ..Default::default()
+                }),
+                full_name: "Brandon Longstaff".into(),
+                is_visible: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let got = conversation_to_summary(&conversation, &Default::default());
+
+        assert_eq!(got.name, "Brandon Longstaff");
+    }
+
+    #[test]
+    fn direct_outgoing_conversation_never_uses_own_name() {
+        use gmessages_rust::gmproto::conversations::{
+            Conversation, LatestMessage, Participant, SmallInfo,
+        };
+
+        let conversation = Conversation {
+            conversation_id: "6689".into(),
+            // Google can put the latest outgoing sender here.
+            name: "Jake".into(),
+            latest_message: Some(LatestMessage {
+                from_me: 1,
+                display_name: "Jake Steinman".into(),
+                ..Default::default()
+            }),
+            participants: vec![
+                Participant {
+                    full_name: "Jake Steinman".into(),
+                    first_name: "Jake".into(),
+                    is_me: true,
+                    is_visible: true,
+                    ..Default::default()
+                },
+                Participant {
+                    id: Some(SmallInfo {
+                        number: "+14165550123".into(),
+                        ..Default::default()
+                    }),
+                    is_visible: false,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let got = conversation_to_summary(&conversation, &Default::default());
+
+        assert_eq!(got.name, "+14165550123");
+    }
+
+    #[test]
+    fn history_sender_marked_as_me_is_always_outgoing_even_with_unknown_status() {
+        use gmessages_rust::gmproto::conversations::{Message, Participant};
+
+        let message = Message {
+            sender_participant: Some(Participant {
+                full_name: "Jake Steinman".into(),
+                is_me: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(gm_message_is_from_me(&message));
+        assert_eq!(
+            participant_display_name(
+                message.sender_participant.as_ref().unwrap(),
+                &Default::default()
+            ),
+            None
+        );
+    }
+}

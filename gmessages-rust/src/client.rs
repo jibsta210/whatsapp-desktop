@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
@@ -78,9 +79,7 @@ pub struct AuthData {
 
 impl AuthData {
     pub fn is_paired(&self) -> bool {
-        self.tachyon_auth_token.is_some()
-            && self.request_crypto.is_some()
-            && self.browser.is_some()
+        self.tachyon_auth_token.is_some() && self.request_crypto.is_some() && self.browser.is_some()
     }
 
     pub fn has_cookies(&self) -> bool {
@@ -155,6 +154,9 @@ pub struct ClientInner {
     /// receiver) so it shuts down cleanly. Use `broadcast` so multiple
     /// background tasks can listen.
     pub(crate) shutdown: broadcast::Sender<()>,
+    /// Guards the long-poll/pinger/ack/refresh task set against duplicate
+    /// starts from pairing followed by connect, or repeated connect calls.
+    pub(crate) task_set_running: AtomicBool,
 }
 
 /// Top-level Google Messages client.
@@ -177,10 +179,26 @@ impl Client {
             session: Mutex::new(SessionState::default()),
             on_auth_changed: Mutex::new(None),
             shutdown,
+            task_set_running: AtomicBool::new(false),
         };
         Self {
             inner: Arc::new(inner),
         }
+    }
+
+    pub(crate) fn try_start_task_set(&self) -> bool {
+        self.inner
+            .task_set_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn finish_task_set(&self) {
+        self.inner.task_set_running.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn is_task_set_running(&self) -> bool {
+        self.inner.task_set_running.load(Ordering::Acquire)
     }
 
     /// Snapshot the current [`AuthData`]. Persist between sessions.
@@ -313,6 +331,14 @@ impl Client {
     /// Cancel the long-poll loop and any in-flight RPCs.
     pub async fn disconnect(&self) -> Result<()> {
         let _ = self.inner.shutdown.send(());
+        // Wait briefly for the task coordinator to release the running guard,
+        // so an immediate re-pair/reconnect starts a fresh task set reliably.
+        for _ in 0..100 {
+            if !self.is_task_set_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         Ok(())
     }
 
@@ -385,11 +411,7 @@ impl Client {
 
     /// Download a media attachment and decrypt it. `decryption_key` comes
     /// from the `MediaContent` proto on the originating message.
-    pub async fn download_media(
-        &self,
-        media_id: &str,
-        decryption_key: &[u8],
-    ) -> Result<Vec<u8>> {
+    pub async fn download_media(&self, media_id: &str, decryption_key: &[u8]) -> Result<Vec<u8>> {
         crate::session::download_media(self, media_id, decryption_key).await
     }
 
@@ -438,5 +460,22 @@ impl Client {
             .http
             .post::<Req, Resp>(url, req, ct, &cookies, authuser)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuthData, Client};
+
+    #[test]
+    fn task_set_guard_is_idempotent_and_reusable_after_finish() {
+        let client = Client::new(AuthData::default());
+        assert!(client.try_start_task_set());
+        assert!(!client.try_start_task_set());
+        assert!(client.is_task_set_running());
+
+        client.finish_task_set();
+        assert!(!client.is_task_set_running());
+        assert!(client.try_start_task_set());
     }
 }

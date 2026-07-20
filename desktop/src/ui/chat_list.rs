@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -12,6 +12,12 @@ use libadwaita as adw;
 use libadwaita::prelude::*;
 
 use crate::bridge::{Bridge, ChatSummary, IncomingMessage, WaCommand};
+
+/// `gtk::ListBox` is not virtualized: every row is a fairly large widget tree
+/// with gestures, labels, an avatar and a context menu. Keep the normal working
+/// set bounded and materialize a few additional old chats only while searching.
+const MAX_WORKING_ROWS: usize = 350;
+const MAX_SEARCH_ROWS: usize = 50;
 
 #[derive(Clone, Copy, PartialEq, Default)]
 enum ChatFilter {
@@ -34,9 +40,17 @@ struct ChatListInner {
     new_chat_btn: gtk4::Button,
     bridge: Arc<Bridge>,
     on_select: Rc<dyn Fn(String, String)>,
+    /// Lightweight source of truth for every known chat. `rows` below contains
+    /// only the currently materialized GTK working set.
+    catalog: RefCell<HashMap<String, ChatSummary>>,
+    /// Last downloaded avatar path per chat. Paths are cheap to retain; decoded
+    /// textures are loaded only for rows in the bounded working set.
+    avatar_paths: RefCell<HashMap<String, String>>,
     rows: RefCell<HashMap<String, ChatRow>>,
     timestamps: RefCell<HashMap<String, i64>>,
     active_filter: RefCell<ChatFilter>,
+    search_query: RefCell<String>,
+    selected_chat: RefCell<Option<String>>,
     /// Active typers per chat (for multi-typer display)
     active_typers: RefCell<HashMap<String, Vec<String>>>,
     /// Message search results section (visible when search query matches messages)
@@ -46,11 +60,6 @@ struct ChatListInner {
     /// Updated on every note_recent_message. Keeps last 10 per chat.
     /// Wrapped in Rc so stealth hover closures can share it.
     recent_messages: Rc<RefCell<HashMap<String, Vec<IncomingMessage>>>>,
-    /// Stored so we can clear it programmatically when a chat is selected
-    /// from filtered results. Without clearing, the SearchEntry retains
-    /// keyboard focus across the row-activation, which intercepts Ctrl+V
-    /// before our paste handler on input_view sees it.
-    search_entry: SearchEntry,
 }
 
 impl ChatListPanel {
@@ -110,8 +119,11 @@ impl ChatListPanel {
         // Manual radio behavior — clicking one deactivates the others.
         // This avoids ToggleButton::set_group() which draws internal separators.
         let all_btns: Vec<ToggleButton> = vec![
-            btn_all.clone(), btn_unread.clone(), btn_favs.clone(),
-            btn_groups.clone(), btn_archived.clone(),
+            btn_all.clone(),
+            btn_unread.clone(),
+            btn_favs.clone(),
+            btn_groups.clone(),
+            btn_archived.clone(),
         ];
         for btn in &all_btns {
             let btns = all_btns.clone();
@@ -188,14 +200,17 @@ impl ChatListPanel {
             new_chat_btn,
             bridge,
             on_select: Rc::new(on_select),
+            catalog: RefCell::new(HashMap::new()),
+            avatar_paths: RefCell::new(HashMap::new()),
             rows: RefCell::new(HashMap::new()),
             timestamps: RefCell::new(HashMap::new()),
             active_filter: RefCell::new(ChatFilter::All),
+            search_query: RefCell::new(String::new()),
+            selected_chat: RefCell::new(None),
             active_typers: RefCell::new(HashMap::new()),
             msg_results_section,
             msg_results_box,
             recent_messages: Rc::new(RefCell::new(HashMap::new())),
-            search_entry: search.clone(),
         });
 
         // Sort: pinned first, then newest
@@ -293,20 +308,25 @@ impl ChatListPanel {
                     return true;
                 }
                 chat_row.chat_name.to_lowercase().contains(&query)
+                    || id.to_lowercase().contains(&query)
             });
 
             search.connect_search_changed({
                 let list = inner.list_box.clone();
                 let msg_section = inner.msg_results_section.clone();
                 let msg_box = inner.msg_results_box.clone();
-                let bridge = inner.bridge.clone();
                 let on_select = inner.on_select.clone();
                 let inner_weak = Rc::downgrade(&inner);
                 // Debounce timer for message search
                 let debounce: Rc<Cell<u32>> = Rc::new(Cell::new(0));
                 move |entry| {
-                    list.invalidate_filter();
                     let query = entry.text().to_string();
+                    let Some(inner) = inner_weak.upgrade() else {
+                        return;
+                    };
+                    *inner.search_query.borrow_mut() = query.trim().to_lowercase();
+                    reconcile_materialized_rows(&inner);
+                    list.invalidate_filter();
                     if query.trim().is_empty() || query.len() < 2 {
                         msg_section.set_visible(false);
                         // Clear old results
@@ -323,88 +343,90 @@ impl ChatListPanel {
                     let ms = msg_section.clone();
                     let mb = msg_box.clone();
                     let os = on_select.clone();
-                    let br = bridge.clone();
-                    let inner_w = inner_weak.clone();
+                    let inner_w = Rc::downgrade(&inner);
                     gtk4::glib::timeout_add_local_once(
                         std::time::Duration::from_millis(400),
                         move || {
                             if db.get() != tag {
                                 return; // superseded by a newer keystroke
                             }
-                            // Search synchronously (message cache is small, < 50ms)
-                            let hits = search_local_messages(&q);
-                            // Clear old results
-                            while let Some(child) = mb.first_child() {
-                                mb.remove(&child);
-                            }
-                            if hits.is_empty() {
-                                ms.set_visible(false);
-                                return;
-                            }
-                            ms.set_visible(true);
-                            for hit in hits.iter().take(15) {
-                                let row = Box::new(Orientation::Vertical, 2);
-                                row.set_margin_start(14);
-                                row.set_margin_end(14);
-                                row.set_margin_top(4);
-                                row.set_margin_bottom(4);
-                                let sender = Label::new(Some(
-                                    if hit.sender_name.is_empty() { "You" } else { &hit.sender_name }
-                                ));
-                                sender.add_css_class("caption");
-                                sender.add_css_class("accent");
-                                sender.set_halign(Align::Start);
-                                let text = Label::new(Some(
-                                    &hit.text.chars().take(80).collect::<String>()
-                                ));
-                                text.set_halign(Align::Start);
-                                text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                                text.set_max_width_chars(40);
-                                row.append(&sender);
-                                row.append(&text);
-                                let gtk_row = ListBoxRow::new();
-                                gtk_row.set_child(Some(&row));
-                                gtk_row.set_selectable(true);
-                                let cid = hit.chat_id.clone();
-                                let cn = hit.chat_name.clone();
-                                let rows_ref = inner_w.clone();
-                                let os2 = os.clone();
-                                let br2 = br.clone();
-                                let gesture = GestureClick::new();
-                                gesture.set_button(1);
-                                gesture.connect_released(move |_, _, _, _| {
-                                    // Look up the actual chat display name from
-                                    // the existing chat list rows. Falls back to
-                                    // the hit's chat_name, then to formatted JID.
-                                    let name = if !cn.is_empty() {
-                                        cn.clone()
-                                    } else if let Some(inner) = rows_ref.upgrade() {
-                                        inner
-                                            .rows
-                                            .borrow()
-                                            .get(&cid)
-                                            .map(|r| r.chat_name.clone())
-                                            .filter(|n| !n.is_empty())
-                                            .unwrap_or_else(|| {
-                                                crate::ui::runtime::display_name_from_jid(&cid)
-                                            })
+                            let (tx, rx) = async_channel::bounded(1);
+                            std::thread::spawn(move || {
+                                let _ = tx.send_blocking(search_local_messages(&q));
+                            });
+
+                            // Disk-backed message search must never block the GTK
+                            // thread. Ignore a result if the user has typed again
+                            // while the worker was running.
+                            gtk4::glib::MainContext::default().spawn_local(async move {
+                                let Ok(hits) = rx.recv().await else { return };
+                                if db.get() != tag {
+                                    return;
+                                }
+                                while let Some(child) = mb.first_child() {
+                                    mb.remove(&child);
+                                }
+                                if hits.is_empty() {
+                                    ms.set_visible(false);
+                                    return;
+                                }
+                                ms.set_visible(true);
+                                for hit in hits.iter().take(15) {
+                                    let row = Box::new(Orientation::Vertical, 2);
+                                    row.set_margin_start(14);
+                                    row.set_margin_end(14);
+                                    row.set_margin_top(4);
+                                    row.set_margin_bottom(4);
+                                    let sender = Label::new(Some(if hit.sender_name.is_empty() {
+                                        "You"
                                     } else {
-                                        crate::ui::runtime::display_name_from_jid(&cid)
-                                    };
-                                    // Note: search_entry is left intact so
-                                    // the user can keep clicking through
-                                    // results without re-typing the query.
-                                    // Focus moves to the message input via
-                                    // on_select → open_chat → grab_focus.
-                                    (os2)(cid.clone(), name.clone());
-                                    br2.send_command(crate::bridge::WaCommand::LoadChat {
-                                        chat_id: cid.clone(),
-                                        chat_name: name,
+                                        &hit.sender_name
+                                    }));
+                                    sender.add_css_class("caption");
+                                    sender.add_css_class("accent");
+                                    sender.set_halign(Align::Start);
+                                    let text = Label::new(Some(
+                                        &hit.text.chars().take(80).collect::<String>(),
+                                    ));
+                                    text.set_halign(Align::Start);
+                                    text.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                                    text.set_max_width_chars(40);
+                                    row.append(&sender);
+                                    row.append(&text);
+                                    let gtk_row = ListBoxRow::new();
+                                    gtk_row.set_child(Some(&row));
+                                    gtk_row.set_selectable(true);
+                                    let cid = hit.chat_id.clone();
+                                    let cn = hit.chat_name.clone();
+                                    let rows_ref = inner_w.clone();
+                                    let os2 = os.clone();
+                                    let gesture = GestureClick::new();
+                                    gesture.set_button(1);
+                                    gesture.connect_released(move |_, _, _, _| {
+                                        let name = if !cn.is_empty() {
+                                            cn.clone()
+                                        } else if let Some(inner) = rows_ref.upgrade() {
+                                            inner
+                                                .catalog
+                                                .borrow()
+                                                .get(&cid)
+                                                .map(|r| r.name.clone())
+                                                .filter(|n| !n.is_empty())
+                                                .unwrap_or_else(|| {
+                                                    crate::ui::runtime::display_name_from_jid(&cid)
+                                                })
+                                        } else {
+                                            crate::ui::runtime::display_name_from_jid(&cid)
+                                        };
+                                        // The centralized selection callback owns
+                                        // LoadChat/SetActiveChat/MarkRead. Sending a
+                                        // second LoadChat here used to render twice.
+                                        (os2)(cid.clone(), name);
                                     });
-                                });
-                                gtk_row.add_controller(gesture);
-                                mb.append(&gtk_row);
-                            }
+                                    gtk_row.add_controller(gesture);
+                                    mb.append(&gtk_row);
+                                }
+                            });
                         },
                     );
                 }
@@ -431,6 +453,7 @@ impl ChatListPanel {
                             .map(|(id, r)| (id.clone(), r.chat_name.clone()))
                     };
                     if let Some((chat_id, chat_name)) = found {
+                        *inner.selected_chat.borrow_mut() = Some(chat_id.clone());
                         // Note: we deliberately DO NOT clear search_entry
                         // here. Users browsing search results often click
                         // through several matches; clearing forces them
@@ -467,18 +490,54 @@ impl ChatListPanel {
     pub fn remove_stale(&self, keep_ids: &std::collections::HashSet<&str>) {
         let inner = &self.inner;
         let stale_ids: Vec<String> = inner
-            .rows
+            .catalog
             .borrow()
             .keys()
             .filter(|id| !keep_ids.contains(id.as_str()) && !id.starts_with("gm:"))
             .cloned()
             .collect();
         for id in &stale_ids {
-            if let Some(row) = inner.rows.borrow_mut().remove(id) {
-                inner.list_box.remove(&row.gtk_row);
-            }
-            inner.timestamps.borrow_mut().remove(id);
+            remove_catalog_chat(inner, id);
         }
+        reconcile_materialized_rows(inner);
+    }
+
+    /// Replace the WhatsApp portion of the lightweight catalog and reconcile
+    /// the bounded GTK working set once. Google Messages entries are retained
+    /// because their runtime owns a separate stream of updates.
+    pub fn load_catalog(&self, chats: &[ChatSummary]) {
+        let incoming: HashSet<&str> = chats.iter().map(|chat| chat.id.as_str()).collect();
+        let stale: Vec<String> = self
+            .inner
+            .catalog
+            .borrow()
+            .keys()
+            .filter(|id| !id.starts_with("gm:") && !incoming.contains(id.as_str()))
+            .cloned()
+            .collect();
+        for id in stale {
+            remove_catalog_chat(&self.inner, &id);
+        }
+
+        {
+            let mut catalog = self.inner.catalog.borrow_mut();
+            for chat in chats {
+                catalog.insert(chat.id.clone(), chat.clone());
+            }
+        }
+
+        // Refresh rows that stayed in the working set, then add/evict only the
+        // rows whose desired materialization changed.
+        for chat in chats {
+            if let Some(row) = self.inner.rows.borrow().get(&chat.id) {
+                apply_materialized_summary(row, chat);
+                self.inner
+                    .timestamps
+                    .borrow_mut()
+                    .insert(chat.id.clone(), chat.timestamp);
+            }
+        }
+        reconcile_materialized_rows(&self.inner);
     }
 
     /// Re-sort and re-filter the list box.
@@ -495,10 +554,15 @@ impl ChatListPanel {
     /// (which calls `apply_summary`). Verbatim-applying a `ChatAdded` here would
     /// regress a fresher row.
     pub fn add_chat(&self, chat: ChatSummary) {
-        if self.inner.rows.borrow().contains_key(&chat.id) {
+        if self.inner.catalog.borrow().contains_key(&chat.id) {
             return;
         }
-        self.add_chat_row(chat);
+        remove_phone_duplicate(&self.inner, &chat);
+        self.inner
+            .catalog
+            .borrow_mut()
+            .insert(chat.id.clone(), chat);
+        reconcile_materialized_rows(&self.inner);
     }
 
     /// The SOLE writer of sidebar row state (preview, timestamp, unread, flags,
@@ -514,58 +578,37 @@ impl ChatListPanel {
     /// typing_box is visible (the label is hidden, so the change isn't seen;
     /// `note_recent_message` / `set_typing` own the overlay visibility).
     pub fn apply_summary(&self, chat: &ChatSummary) {
-        {
-            let rows = self.inner.rows.borrow();
-            let Some(row) = rows.get(&chat.id) else {
-                drop(rows);
-                // Creation path — keeps phone-dedup (add_chat_row 1163-1181).
-                self.add_chat_row(chat.clone());
-                return;
-            };
-
-            // Preview + time + unread: render verbatim. GTK's Label::set_text /
-            // set_visible already short-circuit internally when the value is
-            // unchanged, so a reseed storm that re-applies identical summaries
-            // (item 8 of the corrections) costs only the comparisons, not a
-            // relayout. The expensive part — invalidate_sort — is gated below on
-            // an actual timestamp change.
-            row.update_preview(&chat.last_message, chat.timestamp);
-            row.set_unread(chat.unread_count);
-
-            // Flags verbatim (as in the old add_chat 518-525 / set_chat_label
-            // 1143-1156). Indicators mirror the backing Cells.
-            row.is_pinned.set(chat.is_pinned);
-            row.is_muted.set(chat.is_muted);
-            row.is_archived.set(chat.is_archived);
-            row.is_favorite.set(chat.is_favorite);
-            row.pin_indicator.set_visible(chat.is_pinned);
-            row.mute_indicator.set_visible(chat.is_muted);
-            row.auto_mark_read.set(chat.auto_mark_read);
-            row.auto_mr_indicator.set_visible(chat.auto_mark_read);
-            match chat.label.as_deref() {
-                Some(l) => {
-                    row.label_badge.set_text(l);
-                    row.label_badge.set_visible(true);
-                }
-                None => row.label_badge.set_visible(false),
-            }
+        if !self.inner.catalog.borrow().contains_key(&chat.id) {
+            remove_phone_duplicate(&self.inner, chat);
         }
-
-        // Sort key = summary timestamp, nothing else, ever. Only invalidate the
-        // sort when the timestamp actually moved (perf — item 8).
-        let ts_moved = self
+        let previous = self
             .inner
+            .catalog
+            .borrow_mut()
+            .insert(chat.id.clone(), chat.clone());
+        let ordering_changed = previous.as_ref().is_none_or(|old| {
+            old.timestamp != chat.timestamp
+                || old.is_pinned != chat.is_pinned
+                || old.is_favorite != chat.is_favorite
+                || old.is_archived != chat.is_archived
+                || old.is_group != chat.is_group
+                || old.unread_count != chat.unread_count
+        });
+
+        if ordering_changed {
+            reconcile_materialized_rows(&self.inner);
+        }
+        if let Some(row) = self.inner.rows.borrow().get(&chat.id) {
+            apply_materialized_summary(row, chat);
+        }
+        self.inner
             .timestamps
-            .borrow()
-            .get(&chat.id)
-            .copied()
-            .unwrap_or(i64::MIN)
-            != chat.timestamp;
-        if ts_moved {
-            self.inner
-                .timestamps
-                .borrow_mut()
-                .insert(chat.id.clone(), chat.timestamp);
+            .borrow_mut()
+            .insert(chat.id.clone(), chat.timestamp);
+        if previous
+            .as_ref()
+            .is_none_or(|old| old.timestamp != chat.timestamp)
+        {
             self.inner.list_box.invalidate_sort();
         }
         self.inner.list_box.invalidate_filter();
@@ -601,7 +644,7 @@ impl ChatListPanel {
     }
 
     pub fn has_chat(&self, chat_id: &str) -> bool {
-        self.inner.rows.borrow().contains_key(chat_id)
+        self.inner.catalog.borrow().contains_key(chat_id)
     }
 
     /// Remove any @lid chat row whose name matches the given name.
@@ -609,10 +652,10 @@ impl ChatListPanel {
     pub fn remove_lid_duplicate(&self, name: &str) {
         let lid_ids: Vec<String> = self
             .inner
-            .rows
+            .catalog
             .borrow()
             .iter()
-            .filter(|(id, row)| id.ends_with("@lid") && row.chat_name == name)
+            .filter(|(id, chat)| id.ends_with("@lid") && chat.name == name)
             .map(|(id, _)| id.clone())
             .collect();
         for id in lid_ids {
@@ -620,28 +663,12 @@ impl ChatListPanel {
         }
     }
 
-    /// Extract phone number from JID (strips :device and @domain).
-    fn phone_from_jid(jid: &str) -> String {
-        // Google Messages chat ids are `gm:<conversation_id>` — the
-        // colon separates the source-tag from the gmessages internal
-        // ID, NOT a device suffix on a phone number. If we naively
-        // split on `:` like we do for WhatsApp JIDs, every gm chat
-        // reduces to "gm" and they all dedup against each other,
-        // collapsing the entire gmessages portion of the chat list
-        // down to the last one inserted. Keep the full id in that case.
-        if jid.starts_with("gm:") {
-            return jid.to_string();
-        }
-        let local = jid.split('@').next().unwrap_or(jid);
-        local.split(':').next().unwrap_or(local).to_string()
-    }
-
     pub fn chat_name(&self, chat_id: &str) -> Option<String> {
         self.inner
-            .rows
+            .catalog
             .borrow()
             .get(chat_id)
-            .map(|r| r.chat_name.clone())
+            .map(|chat| chat.name.clone())
     }
 
     /// Clear a chat's unread badge. KEPT (not folded into apply_summary): gm
@@ -649,16 +676,24 @@ impl ChatListPanel {
     /// a no-op for gm: ids — this is the only badge-clear for a gm row read on
     /// the phone (called from ChatReadOnOtherDevice in window.rs).
     pub fn reset_unread(&self, chat_id: &str) {
+        if let Some(chat) = self.inner.catalog.borrow_mut().get_mut(chat_id) {
+            chat.unread_count = 0;
+        }
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             row.set_unread(0);
         }
+        drop(rows);
+        reconcile_materialized_rows(&self.inner);
     }
 
     /// Highlight the given chat's row as selected in the sidebar list, so the
     /// sidebar selection follows chats opened from elsewhere (notification
-    /// click, profile-panel jump). No-op if the row doesn't exist.
+    /// click, profile-panel jump). Older catalog entries are materialized on
+    /// demand and retained while selected.
     pub fn select_chat(&self, chat_id: &str) {
+        *self.inner.selected_chat.borrow_mut() = Some(chat_id.to_string());
+        reconcile_materialized_rows(&self.inner);
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             self.inner.list_box.select_row(Some(&row.gtk_row));
@@ -698,9 +733,7 @@ impl ChatListPanel {
             // Update the name label inside the typing_box (first child)
             if let Some(first) = row.typing_box.first_child() {
                 if let Some(name_lbl) = first.downcast_ref::<Label>() {
-                    name_lbl.set_markup(
-                        &format!("<span foreground='#00a884'>{label} </span>")
-                    );
+                    name_lbl.set_markup(&format!("<span foreground='#00a884'>{label} </span>"));
                 }
             }
             row.preview_label.set_visible(false);
@@ -712,40 +745,39 @@ impl ChatListPanel {
             let inner_w = Rc::downgrade(&self.inner);
             let cid = chat_id.to_string();
             let name = display;
-            gtk4::glib::timeout_add_local_once(
-                std::time::Duration::from_secs(15),
-                move || {
-                    let Some(inner) = inner_w.upgrade() else { return };
-                    let mut typers = inner.active_typers.borrow_mut();
-                    if let Some(chat_typers) = typers.get_mut(&cid) {
-                        chat_typers.retain(|t| *t != name);
-                    }
-                    let empty = typers.get(&cid).map(|t| t.is_empty()).unwrap_or(true);
+            gtk4::glib::timeout_add_local_once(std::time::Duration::from_secs(15), move || {
+                let Some(inner) = inner_w.upgrade() else {
+                    return;
+                };
+                let mut typers = inner.active_typers.borrow_mut();
+                if let Some(chat_typers) = typers.get_mut(&cid) {
+                    chat_typers.retain(|t| *t != name);
+                }
+                let empty = typers.get(&cid).map(|t| t.is_empty()).unwrap_or(true);
+                if empty {
+                    typers.remove(&cid);
+                }
+                drop(typers);
+                let rows = inner.rows.borrow();
+                if let Some(row) = rows.get(&cid) {
                     if empty {
-                        typers.remove(&cid);
-                    }
-                    drop(typers);
-                    let rows = inner.rows.borrow();
-                    if let Some(row) = rows.get(&cid) {
-                        if empty {
-                            row.preview_label.set_visible(true);
-                            row.typing_box.set_visible(false);
-                        } else {
-                            let all = inner.active_typers.borrow();
-                            if let Some(remaining) = all.get(&cid) {
-                                let label = remaining.join(", ");
-                                if let Some(first) = row.typing_box.first_child() {
-                                    if let Some(name_lbl) = first.downcast_ref::<Label>() {
-                                        name_lbl.set_markup(
-                                            &format!("<span foreground='#00a884'>{label} </span>")
-                                        );
-                                    }
+                        row.preview_label.set_visible(true);
+                        row.typing_box.set_visible(false);
+                    } else {
+                        let all = inner.active_typers.borrow();
+                        if let Some(remaining) = all.get(&cid) {
+                            let label = remaining.join(", ");
+                            if let Some(first) = row.typing_box.first_child() {
+                                if let Some(name_lbl) = first.downcast_ref::<Label>() {
+                                    name_lbl.set_markup(&format!(
+                                        "<span foreground='#00a884'>{label} </span>"
+                                    ));
                                 }
                             }
                         }
                     }
-                },
-            );
+                }
+            });
         }
     }
 
@@ -767,50 +799,55 @@ impl ChatListPanel {
     }
 
     fn update_chat_name_inner(&self, chat_id: &str, name: &str, authoritative: bool) {
-        let mut rows = self.inner.rows.borrow_mut();
-        if let Some(row) = rows.get_mut(chat_id) {
-            let old = row.chat_name.clone();
-            if old == name {
+        let old = match self.inner.catalog.borrow().get(chat_id) {
+            Some(chat) => chat.name.clone(),
+            None => return,
+        };
+        if old == name {
+            return;
+        }
+        // Don't overwrite a fully-alphabetic, multi-word name with a shorter
+        // or numeric one. Authoritative callers skip this check.
+        if !authoritative {
+            let old_words = old.split_whitespace().count();
+            let new_words = name.split_whitespace().count();
+            let old_alpha = old.chars().any(|c| c.is_alphabetic());
+            let new_alpha = name.chars().any(|c| c.is_alphabetic());
+            let is_downgrade = match (old_alpha, new_alpha) {
+                (true, false) => true,
+                (true, true) => {
+                    new_words < old_words || (new_words == old_words && name.len() < old.len())
+                }
+                _ => false,
+            };
+            if is_downgrade {
+                log::info!("update_chat_name: {chat_id}: REFUSED downgrade {old:?} → {name:?}");
                 return;
             }
-            // Don't overwrite a fully-alphabetic, multi-word name with a
-            // shorter or numeric one. This guards against typing-event /
-            // sender_participant updates stomping a properly-resolved
-            // contact name (the "Craig Thompson → Jake Steinman" class
-            // of bug). The ContactDirectory has the same length-aware
-            // ranking; chat-list rows benefit from the same protection.
-            // Authoritative callers skip this check.
-            if !authoritative {
-                let old_words = old.split_whitespace().count();
-                let new_words = name.split_whitespace().count();
-                let old_alpha = old.chars().any(|c| c.is_alphabetic());
-                let new_alpha = name.chars().any(|c| c.is_alphabetic());
-                let is_downgrade = match (old_alpha, new_alpha) {
-                    (true, false) => true,                // alpha → numeric: never
-                    (true, true) => new_words < old_words // multi-word → fewer words
-                        || (new_words == old_words && name.len() < old.len()),
-                    _ => false,
-                };
-                if is_downgrade {
-                    log::info!(
-                        "update_chat_name: {chat_id}: REFUSED downgrade {old:?} → {name:?}"
-                    );
-                    return;
-                }
-            }
-            log::info!(
-                "update_chat_name{auth}: {chat_id}: {old:?} → {name:?}",
-                auth = if authoritative { "(auth)" } else { "" }
-            );
+        }
+        log::info!(
+            "update_chat_name{auth}: {chat_id}: {old:?} → {name:?}",
+            auth = if authoritative { "(auth)" } else { "" }
+        );
+        if let Some(chat) = self.inner.catalog.borrow_mut().get_mut(chat_id) {
+            chat.name = name.to_string();
+        }
+        if let Some(row) = self.inner.rows.borrow_mut().get_mut(chat_id) {
             row.chat_name = name.to_string();
             row.name_label.set_text(name);
         }
+        reconcile_materialized_rows(&self.inner);
+        self.inner.list_box.invalidate_filter();
     }
 
     pub fn set_avatar(&self, chat_id: &str, path: &str) {
+        self.inner
+            .avatar_paths
+            .borrow_mut()
+            .insert(chat_id.to_string(), path.to_string());
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
-            if let Some(texture) = crate::ui::texture_cache::texture_from_filename(path) {
+            if let Some(texture) = crate::ui::texture_cache::texture_thumbnail(path, 96) {
                 row.avatar.set_custom_image(Some(&texture));
             }
         }
@@ -819,15 +856,21 @@ impl ChatListPanel {
     // ── Context-menu event handlers ───────────────────────────────────────────
 
     pub fn set_chat_archived(&self, chat_id: &str, archived: bool) {
+        if let Some(chat) = self.inner.catalog.borrow_mut().get_mut(chat_id) {
+            chat.is_archived = archived;
+        }
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             row.is_archived.set(archived);
         }
         drop(rows);
-        self.inner.list_box.invalidate_filter();
+        reconcile_materialized_rows(&self.inner);
     }
 
     pub fn set_chat_muted(&self, chat_id: &str, muted: bool) {
+        if let Some(chat) = self.inner.catalog.borrow_mut().get_mut(chat_id) {
+            chat.is_muted = muted;
+        }
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             row.is_muted.set(muted);
@@ -838,10 +881,10 @@ impl ChatListPanel {
     /// Query whether the given chat is configured to auto-mark-read on incoming messages.
     pub fn is_auto_mark_read(&self, chat_id: &str) -> bool {
         self.inner
-            .rows
+            .catalog
             .borrow()
             .get(chat_id)
-            .map(|r| r.auto_mark_read.get())
+            .map(|chat| chat.auto_mark_read)
             .unwrap_or(false)
     }
 
@@ -849,16 +892,19 @@ impl ChatListPanel {
     /// sound (muting was previously cosmetic; only the mute icon changed).
     pub fn is_chat_muted(&self, chat_id: &str) -> bool {
         self.inner
-            .rows
+            .catalog
             .borrow()
             .get(chat_id)
-            .map(|r| r.is_muted.get())
+            .map(|chat| chat.is_muted)
             .unwrap_or(false)
     }
 
     /// Toggle the auto-mark-read flag for a chat. Caller is responsible for
     /// sending the WaCommand::SetAutoMarkRead to persist server-side.
     pub fn set_auto_mark_read(&self, chat_id: &str, enabled: bool) {
+        if let Some(chat) = self.inner.catalog.borrow_mut().get_mut(chat_id) {
+            chat.auto_mark_read = enabled;
+        }
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             row.auto_mark_read.set(enabled);
@@ -867,33 +913,41 @@ impl ChatListPanel {
     }
 
     pub fn set_chat_pinned(&self, chat_id: &str, pinned: bool) {
+        if let Some(chat) = self.inner.catalog.borrow_mut().get_mut(chat_id) {
+            chat.is_pinned = pinned;
+        }
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             row.is_pinned.set(pinned);
             row.pin_indicator.set_visible(pinned);
         }
         drop(rows);
+        reconcile_materialized_rows(&self.inner);
         self.inner.list_box.invalidate_sort();
     }
 
     pub fn set_chat_favorite(&self, chat_id: &str, favorite: bool) {
+        if let Some(chat) = self.inner.catalog.borrow_mut().get_mut(chat_id) {
+            chat.is_favorite = favorite;
+        }
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             row.is_favorite.set(favorite);
         }
         drop(rows);
+        reconcile_materialized_rows(&self.inner);
         self.inner.list_box.invalidate_filter();
     }
 
     pub fn remove_chat(&self, chat_id: &str) {
-        let row = self.inner.rows.borrow_mut().remove(chat_id);
-        if let Some(row) = row {
-            self.inner.list_box.remove(&row.gtk_row);
-        }
-        self.inner.timestamps.borrow_mut().remove(chat_id);
+        remove_catalog_chat(&self.inner, chat_id);
+        reconcile_materialized_rows(&self.inner);
     }
 
     pub fn set_chat_label(&self, chat_id: &str, label: Option<&str>) {
+        if let Some(chat) = self.inner.catalog.borrow_mut().get_mut(chat_id) {
+            chat.label = label.map(ToOwned::to_owned);
+        }
         let rows = self.inner.rows.borrow();
         if let Some(row) = rows.get(chat_id) {
             match label {
@@ -907,49 +961,196 @@ impl ChatListPanel {
             }
         }
     }
+}
 
-    fn add_chat_row(&self, chat: ChatSummary) {
-        let inner = &self.inner;
-
-        // ── Phone-number dedup ──
-        // Same phone number = same person, regardless of @lid, :device, etc.
-        if !chat.id.ends_with("@g.us") {
-            let new_phone = Self::phone_from_jid(&chat.id);
-            let dup_id = inner
-                .rows
-                .borrow()
-                .keys()
-                .find(|existing_id| {
-                    !existing_id.ends_with("@g.us")
-                        && Self::phone_from_jid(existing_id) == new_phone
-                        && *existing_id != &chat.id
-                })
-                .cloned();
-            if let Some(dup) = dup_id {
-                log::info!(
-                    "Dedup: {} ({}) — removing existing {} (same phone {})",
-                    chat.name, chat.id, dup, new_phone
-                );
-                self.remove_chat(&dup);
-            }
+fn summary_passes_filter(chat: &ChatSummary, filter: ChatFilter) -> bool {
+    if filter == ChatFilter::Archived {
+        if !chat.is_archived {
+            return false;
         }
+    } else if chat.is_archived {
+        return false;
+    }
 
-        let row = ChatRow::new(&chat);
-        row.gtk_row.set_widget_name(&chat.id);
+    if chat.id == crate::bridge::VERIFICATION_CODES_CHAT_ID && chat.unread_count == 0 {
+        return false;
+    }
 
-        // Attach right-click context menu
-        attach_context_menu(&row, inner, chat.id.clone());
+    match filter {
+        ChatFilter::All | ChatFilter::Archived => true,
+        ChatFilter::Unread => chat.unread_count > 0,
+        ChatFilter::Favourites => chat.is_pinned || chat.is_favorite,
+        ChatFilter::Groups => chat.is_group,
+    }
+}
 
-        // Attach hover-to-stealth-read popup (shows unread messages without marking read)
-        attach_stealth_hover(&row, chat.id.clone(), self.inner.recent_messages.clone());
+fn desired_materialized_ids(inner: &ChatListInner) -> HashSet<String> {
+    let filter = *inner.active_filter.borrow();
+    let query = inner.search_query.borrow().clone();
+    let selected = inner.selected_chat.borrow().clone();
+    let catalog = inner.catalog.borrow();
 
-        inner.list_box.append(&row.gtk_row);
-        inner
-            .timestamps
-            .borrow_mut()
-            .insert(chat.id.clone(), chat.timestamp);
-        inner.rows.borrow_mut().insert(chat.id, row);
-        inner.list_box.invalidate_sort();
+    let mut desired = HashSet::new();
+
+    // Pinned/favourite rows are cheap in number and must always be instantly
+    // available for the rail/filter, even if they are older than the cutoff.
+    desired.extend(
+        catalog
+            .values()
+            .filter(|chat| chat.is_pinned || chat.is_favorite)
+            .map(|chat| chat.id.clone()),
+    );
+
+    let mut eligible: Vec<&ChatSummary> = catalog
+        .values()
+        .filter(|chat| summary_passes_filter(chat, filter))
+        .collect();
+    eligible.sort_unstable_by(|a, b| b.timestamp.cmp(&a.timestamp).then_with(|| a.id.cmp(&b.id)));
+    desired.extend(
+        eligible
+            .iter()
+            .take(MAX_WORKING_ROWS)
+            .map(|chat| chat.id.clone()),
+    );
+
+    if !query.is_empty() {
+        desired.extend(
+            eligible
+                .into_iter()
+                .filter(|chat| {
+                    chat.name.to_lowercase().contains(&query)
+                        || chat.id.to_lowercase().contains(&query)
+                })
+                .take(MAX_SEARCH_ROWS)
+                .map(|chat| chat.id.clone()),
+        );
+    }
+
+    if let Some(id) = selected
+        && catalog.contains_key(&id)
+    {
+        desired.insert(id);
+    }
+    desired
+}
+
+fn reconcile_materialized_rows(inner: &Rc<ChatListInner>) {
+    let desired = desired_materialized_ids(inner);
+    let stale: Vec<String> = inner
+        .rows
+        .borrow()
+        .keys()
+        .filter(|id| !desired.contains(*id))
+        .cloned()
+        .collect();
+    for id in stale {
+        dematerialize_chat(inner, &id);
+    }
+
+    let missing: Vec<ChatSummary> = {
+        let rows = inner.rows.borrow();
+        let catalog = inner.catalog.borrow();
+        desired
+            .iter()
+            .filter(|id| !rows.contains_key(*id))
+            .filter_map(|id| catalog.get(id).cloned())
+            .collect()
+    };
+    for chat in missing {
+        materialize_chat(inner, chat);
+    }
+    inner.list_box.invalidate_sort();
+    inner.list_box.invalidate_filter();
+}
+
+fn materialize_chat(inner: &Rc<ChatListInner>, chat: ChatSummary) {
+    if inner.rows.borrow().contains_key(&chat.id) {
+        return;
+    }
+    let row = ChatRow::new(&chat);
+    if let Some(path) = inner.avatar_paths.borrow().get(&chat.id)
+        && let Some(texture) = crate::ui::texture_cache::texture_thumbnail(path, 96)
+    {
+        row.avatar.set_custom_image(Some(&texture));
+    }
+    row.gtk_row.set_widget_name(&chat.id);
+    attach_context_menu(&row, inner, chat.id.clone());
+    attach_stealth_hover(&row, chat.id.clone(), inner.recent_messages.clone());
+    inner.list_box.append(&row.gtk_row);
+    inner
+        .timestamps
+        .borrow_mut()
+        .insert(chat.id.clone(), chat.timestamp);
+    inner.rows.borrow_mut().insert(chat.id, row);
+}
+
+fn dematerialize_chat(inner: &ChatListInner, chat_id: &str) {
+    if let Some(row) = inner.rows.borrow_mut().remove(chat_id) {
+        inner.list_box.remove(&row.gtk_row);
+    }
+    inner.timestamps.borrow_mut().remove(chat_id);
+    inner.active_typers.borrow_mut().remove(chat_id);
+}
+
+fn remove_catalog_chat(inner: &Rc<ChatListInner>, chat_id: &str) {
+    inner.catalog.borrow_mut().remove(chat_id);
+    inner.avatar_paths.borrow_mut().remove(chat_id);
+    inner.recent_messages.borrow_mut().remove(chat_id);
+    let was_selected = inner.selected_chat.borrow().as_deref() == Some(chat_id);
+    if was_selected {
+        *inner.selected_chat.borrow_mut() = None;
+    }
+    dematerialize_chat(inner, chat_id);
+}
+
+fn phone_from_jid(jid: &str) -> String {
+    if jid.starts_with("gm:") {
+        return jid.to_string();
+    }
+    let local = jid.split('@').next().unwrap_or(jid);
+    local.split(':').next().unwrap_or(local).to_string()
+}
+
+fn remove_phone_duplicate(inner: &Rc<ChatListInner>, chat: &ChatSummary) {
+    if chat.id.ends_with("@g.us") {
+        return;
+    }
+    let phone = phone_from_jid(&chat.id);
+    let duplicate = inner
+        .catalog
+        .borrow()
+        .keys()
+        .find(|id| !id.ends_with("@g.us") && id.as_str() != chat.id && phone_from_jid(id) == phone)
+        .cloned();
+    if let Some(id) = duplicate {
+        log::info!(
+            "Dedup: {} ({}) — removing catalog entry {} (same phone {})",
+            chat.name,
+            chat.id,
+            id,
+            phone
+        );
+        remove_catalog_chat(inner, &id);
+    }
+}
+
+fn apply_materialized_summary(row: &ChatRow, chat: &ChatSummary) {
+    row.update_preview(&chat.last_message, chat.timestamp);
+    row.set_unread(chat.unread_count);
+    row.is_pinned.set(chat.is_pinned);
+    row.is_muted.set(chat.is_muted);
+    row.is_archived.set(chat.is_archived);
+    row.is_favorite.set(chat.is_favorite);
+    row.pin_indicator.set_visible(chat.is_pinned);
+    row.mute_indicator.set_visible(chat.is_muted);
+    row.auto_mark_read.set(chat.auto_mark_read);
+    row.auto_mr_indicator.set_visible(chat.auto_mark_read);
+    match chat.label.as_deref() {
+        Some(label) => {
+            row.label_badge.set_text(label);
+            row.label_badge.set_visible(true);
+        }
+        None => row.label_badge.set_visible(false),
     }
 }
 
@@ -957,9 +1158,16 @@ impl ChatListPanel {
 
 /// Shows a popover with recent unread messages when the user hovers over a
 /// chat row for ≥600ms. Does NOT mark messages as read — pure stealth peek.
-fn attach_stealth_hover(row: &ChatRow, chat_id: String, recent_cache: Rc<RefCell<HashMap<String, Vec<IncomingMessage>>>>) {
+fn attach_stealth_hover(
+    row: &ChatRow,
+    chat_id: String,
+    recent_cache: Rc<RefCell<HashMap<String, Vec<IncomingMessage>>>>,
+) {
     let hover = gtk4::EventControllerMotion::new();
-    let row_widget = row.gtk_row.clone();
+    // The controller is owned by the row, so capture only a weak row reference
+    // in its signal closures. A strong clone here would keep every evicted row
+    // alive even after it was removed from the ListBox.
+    let row_widget = row.gtk_row.downgrade();
     let unread_count = row.unread_count.clone();
 
     // Timer handle so we can cancel on leave.
@@ -981,8 +1189,10 @@ fn attach_stealth_hover(row: &ChatRow, chat_id: String, recent_cache: Rc<RefCell
         if pop_clone.borrow().is_some() {
             return;
         }
+        let Some(rw2) = rw.upgrade() else {
+            return;
+        };
         let cid2 = cid.clone();
-        let rw2 = rw.clone();
         let pop2 = pop_clone.clone();
         let timer_clear = timer_clone.clone();
         let cache = recent_cache.clone();
@@ -1004,18 +1214,15 @@ fn attach_stealth_hover(row: &ChatRow, chat_id: String, recent_cache: Rc<RefCell
                 // it already, so we must not dismiss a newer popover.
                 let pop_safety = pop2.clone();
                 let this_pop = popover.clone();
-                gtk4::glib::timeout_add_local_once(
-                    std::time::Duration::from_secs(8),
-                    move || {
-                        let mut slot = pop_safety.borrow_mut();
-                        if slot.as_ref() == Some(&this_pop) {
-                            *slot = None;
-                            drop(slot);
-                            this_pop.popdown();
-                            this_pop.unparent();
-                        }
-                    },
-                );
+                gtk4::glib::timeout_add_local_once(std::time::Duration::from_secs(8), move || {
+                    let mut slot = pop_safety.borrow_mut();
+                    if slot.as_ref() == Some(&this_pop) {
+                        *slot = None;
+                        drop(slot);
+                        this_pop.popdown();
+                        this_pop.unparent();
+                    }
+                });
             });
         *timer_clone.borrow_mut() = Some(id);
     });
@@ -1033,12 +1240,16 @@ fn attach_stealth_hover(row: &ChatRow, chat_id: String, recent_cache: Rc<RefCell
         }
     });
 
-    row_widget.add_controller(hover);
+    row.gtk_row.add_controller(hover);
 }
 
 /// Build the stealth read popover — loads messages from disk cache,
 /// shows the last N unread ones without sending read receipts.
-fn build_stealth_popover(parent: &ListBoxRow, chat_id: &str, recent_cache: &Rc<RefCell<HashMap<String, Vec<IncomingMessage>>>>) -> Popover {
+fn build_stealth_popover(
+    parent: &ListBoxRow,
+    chat_id: &str,
+    recent_cache: &Rc<RefCell<HashMap<String, Vec<IncomingMessage>>>>,
+) -> Popover {
     let popover = Popover::new();
     popover.set_parent(parent);
     popover.add_css_class("stealth-popover");
@@ -1172,11 +1383,16 @@ fn attach_context_menu(row: &ChatRow, inner: &Rc<ChatListInner>, chat_id: String
     // apply pin/mute/archive/favorite changes optimistically (CL-06).
     let pin_indicator = row.pin_indicator.clone();
     let mute_indicator = row.mute_indicator.clone();
-    let row_widget = row.gtk_row.clone();
+    // Avoid row → controller → callback → row reference cycles so bounded rows
+    // are actually freed when dematerialized.
+    let row_widget = row.gtk_row.downgrade();
     let list_box = inner.list_box.clone();
     let bridge = inner.bridge.clone();
 
     gesture.connect_pressed(move |_, _, x, y| {
+        let Some(row_widget) = row_widget.upgrade() else {
+            return;
+        };
         show_context_menu(
             &row_widget,
             bridge.clone(),
@@ -1622,7 +1838,7 @@ fn wire_filter_chip(btn: &ToggleButton, filter: ChatFilter, inner: &Rc<ChatListI
         if b.is_active() {
             if let Some(inner) = weak.upgrade() {
                 *inner.active_filter.borrow_mut() = filter;
-                inner.list_box.invalidate_filter();
+                reconcile_materialized_rows(&inner);
             }
         }
     });

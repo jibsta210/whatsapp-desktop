@@ -36,7 +36,7 @@ pub mod aesctr {
     }
 
     impl AesCtrHelper {
-            /// Generate fresh 32-byte AES + 32-byte HMAC keys.
+        /// Generate fresh 32-byte AES + 32-byte HMAC keys.
         pub fn new_random() -> Self {
             Self {
                 aes_key: super::random_bytes(32),
@@ -156,7 +156,10 @@ pub mod aesgcm {
 
     pub fn encrypt(key: &[u8], data: &[u8]) -> Result<Vec<u8>> {
         if key.len() != 32 {
-            return Err(Error::Crypto(format!("aes-gcm key must be 32, got {}", key.len())));
+            return Err(Error::Crypto(format!(
+                "aes-gcm key must be 32, got {}",
+                key.len()
+            )));
         }
         let cipher = Aes256Gcm::new(key.into());
         let mut out = Vec::with_capacity(2 + data.len() + 2 * CHUNK_OVERHEAD);
@@ -198,7 +201,10 @@ pub mod aesgcm {
             return Ok(Vec::new());
         }
         if key.len() != 32 {
-            return Err(Error::Crypto(format!("aes-gcm key must be 32, got {}", key.len())));
+            return Err(Error::Crypto(format!(
+                "aes-gcm key must be 32, got {}",
+                key.len()
+            )));
         }
         if data[0] != 0x00 {
             return Err(Error::Crypto(format!(
@@ -321,11 +327,11 @@ pub mod ecdsa {
         pub fn serialize<S: Serializer>(b: &[u8], s: S) -> std::result::Result<S::Ok, S::Error> {
             s.serialize_str(&URL_SAFE_NO_PAD.encode(b))
         }
-        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<u8>, D::Error> {
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            d: D,
+        ) -> std::result::Result<Vec<u8>, D::Error> {
             let s = String::deserialize(d)?;
-            URL_SAFE_NO_PAD
-                .decode(s)
-                .map_err(serde::de::Error::custom)
+            URL_SAFE_NO_PAD.decode(s).map_err(serde::de::Error::custom)
         }
     }
 
@@ -343,8 +349,14 @@ pub mod ecdsa {
                 if let Ok(secret) = SecretKey::from_slice(&bytes) {
                     let public = secret.public_key();
                     let pt = public.to_encoded_point(false);
-                    let x = pt.x().ok_or_else(|| Error::Crypto("missing x".into()))?.to_vec();
-                    let y = pt.y().ok_or_else(|| Error::Crypto("missing y".into()))?.to_vec();
+                    let x = pt
+                        .x()
+                        .ok_or_else(|| Error::Crypto("missing x".into()))?
+                        .to_vec();
+                    let y = pt
+                        .y()
+                        .ok_or_else(|| Error::Crypto("missing y".into()))?
+                        .to_vec();
                     return Ok(Self {
                         key_type: "EC".into(),
                         curve: "P-256".into(),
@@ -359,8 +371,7 @@ pub mod ecdsa {
 
         /// Reconstruct the [`SigningKey`] (private signing key).
         pub fn signing_key(&self) -> Result<SigningKey> {
-            SigningKey::from_slice(&self.d)
-                .map_err(|e| Error::Crypto(format!("signing key: {e}")))
+            SigningKey::from_slice(&self.d).map_err(|e| Error::Crypto(format!("signing key: {e}")))
         }
 
         /// Reconstruct the [`VerifyingKey`] (public side).
@@ -387,9 +398,8 @@ pub mod ecdsa {
         /// SEC1 point (`0x04 || X || Y`).
         pub fn public_key_pkix_der(&self) -> Result<Vec<u8>> {
             const P256_SPKI_PREFIX: [u8; 26] = [
-                0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02,
-                0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03,
-                0x42, 0x00,
+                0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06,
+                0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
             ];
             if self.x.len() != 32 || self.y.len() != 32 {
                 return Err(Error::Crypto(format!(
@@ -436,8 +446,7 @@ pub mod ecdsa {
 
     /// Reconstruct a [`SecretKey`] from a [`JwkPair`].
     pub fn jwk_to_secret_key(j: &JwkPair) -> Result<SecretKey> {
-        SecretKey::from_slice(&j.d)
-            .map_err(|e| Error::Crypto(format!("secret key from JWK: {e}")))
+        SecretKey::from_slice(&j.d).map_err(|e| Error::Crypto(format!("secret key from JWK: {e}")))
     }
 
     #[cfg(test)]
@@ -485,9 +494,7 @@ mod serde_bytes {
         s.serialize_str(&STANDARD.encode(b))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> std::result::Result<Vec<u8>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<u8>, D::Error> {
         let s = String::deserialize(d)?;
         STANDARD.decode(s).map_err(serde::de::Error::custom)
     }

@@ -197,9 +197,7 @@ pub mod qr {
 
     /// Run steps 1-3 and persist the partial AuthData. Returns the pairing
     /// key (for QR encoding) and the AES/HMAC pair (for QR encoding too).
-    async fn register_phone_relay(
-        client: &Client,
-    ) -> Result<(Vec<u8>, AesCtrHelper)> {
+    async fn register_phone_relay(client: &Client) -> Result<(Vec<u8>, AesCtrHelper)> {
         // 1. Generate fresh keys.
         let refresh_key = JwkPair::generate()?;
         let request_crypto = AesCtrHelper::new_random();
@@ -301,34 +299,318 @@ pub mod ukey2 {
     /// 32-byte HKDF info constant used to derive the per-direction session
     /// keys. Ported verbatim from mautrix-gmessages `encryptionKeyInfo`.
     pub const ENCRYPTION_KEY_INFO: [u8; 32] = [
-        130, 170, 85, 160, 211, 151, 248, 131, 70, 202, 28, 238, 141, 57, 9, 185, 95, 19, 250,
-        125, 235, 29, 74, 179, 131, 118, 184, 37, 109, 168, 85, 16,
+        130, 170, 85, 160, 211, 151, 248, 131, 70, 202, 28, 238, 141, 57, 9, 185, 95, 19, 250, 125,
+        235, 29, 74, 179, 131, 118, 184, 37, 109, 168, 85, 16,
     ];
 
     /// Verification-code-version table: the V0 emoji set. Ported verbatim from
     /// `pairingEmojisV0` in mautrix-gmessages. 284 entries.
     pub const PAIRING_EMOJIS_V0: &[&str] = &[
-        "😁", "😅", "🤣", "🫠", "🥰", "😇", "🤩", "😘", "😜", "🤗", "🤔", "🤐", "😴", "🥶", "🤯",
-        "🤠", "🥳", "🥸", "😎", "🤓", "🧐", "🥹", "😭", "😱", "😖", "🥱", "😮\u{200d}💨", "🤡",
-        "💩", "👻", "👽", "🤖", "😻", "💌", "💘", "💕", "❤", "💢", "💥", "💫", "💬", "🗯", "💤",
-        "👋", "🙌", "🙏", "✍", "🦶", "👂", "🧠", "🦴", "👀", "🧑", "🧚", "🧍", "👣", "🐵", "🐶",
-        "🐺", "🦊", "🦁", "🐯", "🦓", "🦄", "🐑", "🐮", "🐷", "🐿", "🐰", "🦇", "🐻", "🐨", "🐼",
-        "🦥", "🐾", "🐔", "🐥", "🐦", "🕊", "🦆", "🦉", "🪶", "🦩", "🐸", "🐢", "🦎", "🐍", "🐳",
-        "🐬", "🦭", "🐠", "🐡", "🦈", "🪸", "🐌", "🦋", "🐛", "🐝", "🐞", "🪱", "💐", "🌸", "🌹",
-        "🌻", "🌱", "🌲", "🌴", "🌵", "🌾", "☘", "🍁", "🍂", "🍄", "🪺", "🍇", "🍈", "🍉", "🍋",
-        "🍌", "🍍", "🍎", "🍐", "🍒", "🍓", "🥝", "🥥", "🥑", "🥕", "🌽", "🌶", "🫑", "🥦", "🥜",
-        "🍞", "🥐", "🥨", "🧀", "🍗", "🍔", "🍟", "🍕", "🌭", "🌮", "🥗", "🥣", "🍿", "🦀", "🦑",
-        "🍦", "🍩", "🍪", "🍫", "🍰", "🍬", "🍭", "☕", "🫖", "🍹", "🥤", "🧊", "🥢", "🍽", "🥄",
-        "🧭", "🏔", "🌋", "🏕", "🏖", "🪵", "🏗", "🏡", "🏰", "🛝", "🚂", "🛵", "🛴", "🛼", "🚥",
-        "⚓", "🛟", "⛵", "✈", "🚀", "🛸", "🧳", "⏰", "🌙", "🌡", "🌞", "🪐", "🌠", "🌧", "🌀",
-        "🌈", "☂", "⚡", "❄", "⛄", "🔥", "🎇", "🧨", "✨", "🎈", "🎉", "🎁", "🏆", "🏅", "⚽",
-        "⚾", "🏀", "🏐", "🏈", "🎾", "🎳", "🏓", "🥊", "⛳", "⛸", "🎯", "🪁", "🔮", "🎮", "🧩",
-        "🧸", "🪩", "🖼", "🎨", "🧵", "🧶", "🦺", "🧣", "🧤", "🧦", "🎒", "🩴", "👟", "👑", "👒",
-        "🎩", "🧢", "💎", "🔔", "🎤", "📻", "🎷", "🪗", "🎸", "🎺", "🎻", "🥁", "📺", "🔋", "💻",
-        "💿", "☎", "🕯", "💡", "📖", "📚", "📬", "✏", "✒", "🖌", "🖍", "📝", "💼", "📋", "📌",
-        "📎", "🔑", "🔧", "🧲", "🪜", "🧬", "🔭", "🩹", "🩺", "🪞", "🛋", "🪑", "🛁", "🧹", "🧺",
-        "🔱", "🏁", "🐪", "🐘", "🦃", "🍞", "🍜", "🍠", "🚘", "🤿", "🃏", "👕", "📸", "🏷", "✂",
-        "🧪", "🚪", "🧴", "🧻", "🪣", "🧽", "🚸",
+        "😁",
+        "😅",
+        "🤣",
+        "🫠",
+        "🥰",
+        "😇",
+        "🤩",
+        "😘",
+        "😜",
+        "🤗",
+        "🤔",
+        "🤐",
+        "😴",
+        "🥶",
+        "🤯",
+        "🤠",
+        "🥳",
+        "🥸",
+        "😎",
+        "🤓",
+        "🧐",
+        "🥹",
+        "😭",
+        "😱",
+        "😖",
+        "🥱",
+        "😮\u{200d}💨",
+        "🤡",
+        "💩",
+        "👻",
+        "👽",
+        "🤖",
+        "😻",
+        "💌",
+        "💘",
+        "💕",
+        "❤",
+        "💢",
+        "💥",
+        "💫",
+        "💬",
+        "🗯",
+        "💤",
+        "👋",
+        "🙌",
+        "🙏",
+        "✍",
+        "🦶",
+        "👂",
+        "🧠",
+        "🦴",
+        "👀",
+        "🧑",
+        "🧚",
+        "🧍",
+        "👣",
+        "🐵",
+        "🐶",
+        "🐺",
+        "🦊",
+        "🦁",
+        "🐯",
+        "🦓",
+        "🦄",
+        "🐑",
+        "🐮",
+        "🐷",
+        "🐿",
+        "🐰",
+        "🦇",
+        "🐻",
+        "🐨",
+        "🐼",
+        "🦥",
+        "🐾",
+        "🐔",
+        "🐥",
+        "🐦",
+        "🕊",
+        "🦆",
+        "🦉",
+        "🪶",
+        "🦩",
+        "🐸",
+        "🐢",
+        "🦎",
+        "🐍",
+        "🐳",
+        "🐬",
+        "🦭",
+        "🐠",
+        "🐡",
+        "🦈",
+        "🪸",
+        "🐌",
+        "🦋",
+        "🐛",
+        "🐝",
+        "🐞",
+        "🪱",
+        "💐",
+        "🌸",
+        "🌹",
+        "🌻",
+        "🌱",
+        "🌲",
+        "🌴",
+        "🌵",
+        "🌾",
+        "☘",
+        "🍁",
+        "🍂",
+        "🍄",
+        "🪺",
+        "🍇",
+        "🍈",
+        "🍉",
+        "🍋",
+        "🍌",
+        "🍍",
+        "🍎",
+        "🍐",
+        "🍒",
+        "🍓",
+        "🥝",
+        "🥥",
+        "🥑",
+        "🥕",
+        "🌽",
+        "🌶",
+        "🫑",
+        "🥦",
+        "🥜",
+        "🍞",
+        "🥐",
+        "🥨",
+        "🧀",
+        "🍗",
+        "🍔",
+        "🍟",
+        "🍕",
+        "🌭",
+        "🌮",
+        "🥗",
+        "🥣",
+        "🍿",
+        "🦀",
+        "🦑",
+        "🍦",
+        "🍩",
+        "🍪",
+        "🍫",
+        "🍰",
+        "🍬",
+        "🍭",
+        "☕",
+        "🫖",
+        "🍹",
+        "🥤",
+        "🧊",
+        "🥢",
+        "🍽",
+        "🥄",
+        "🧭",
+        "🏔",
+        "🌋",
+        "🏕",
+        "🏖",
+        "🪵",
+        "🏗",
+        "🏡",
+        "🏰",
+        "🛝",
+        "🚂",
+        "🛵",
+        "🛴",
+        "🛼",
+        "🚥",
+        "⚓",
+        "🛟",
+        "⛵",
+        "✈",
+        "🚀",
+        "🛸",
+        "🧳",
+        "⏰",
+        "🌙",
+        "🌡",
+        "🌞",
+        "🪐",
+        "🌠",
+        "🌧",
+        "🌀",
+        "🌈",
+        "☂",
+        "⚡",
+        "❄",
+        "⛄",
+        "🔥",
+        "🎇",
+        "🧨",
+        "✨",
+        "🎈",
+        "🎉",
+        "🎁",
+        "🏆",
+        "🏅",
+        "⚽",
+        "⚾",
+        "🏀",
+        "🏐",
+        "🏈",
+        "🎾",
+        "🎳",
+        "🏓",
+        "🥊",
+        "⛳",
+        "⛸",
+        "🎯",
+        "🪁",
+        "🔮",
+        "🎮",
+        "🧩",
+        "🧸",
+        "🪩",
+        "🖼",
+        "🎨",
+        "🧵",
+        "🧶",
+        "🦺",
+        "🧣",
+        "🧤",
+        "🧦",
+        "🎒",
+        "🩴",
+        "👟",
+        "👑",
+        "👒",
+        "🎩",
+        "🧢",
+        "💎",
+        "🔔",
+        "🎤",
+        "📻",
+        "🎷",
+        "🪗",
+        "🎸",
+        "🎺",
+        "🎻",
+        "🥁",
+        "📺",
+        "🔋",
+        "💻",
+        "💿",
+        "☎",
+        "🕯",
+        "💡",
+        "📖",
+        "📚",
+        "📬",
+        "✏",
+        "✒",
+        "🖌",
+        "🖍",
+        "📝",
+        "💼",
+        "📋",
+        "📌",
+        "📎",
+        "🔑",
+        "🔧",
+        "🧲",
+        "🪜",
+        "🧬",
+        "🔭",
+        "🩹",
+        "🩺",
+        "🪞",
+        "🛋",
+        "🪑",
+        "🛁",
+        "🧹",
+        "🧺",
+        "🔱",
+        "🏁",
+        "🐪",
+        "🐘",
+        "🦃",
+        "🍞",
+        "🍜",
+        "🍠",
+        "🚘",
+        "🤿",
+        "🃏",
+        "👕",
+        "📸",
+        "🏷",
+        "✂",
+        "🧪",
+        "🚪",
+        "🧴",
+        "🧻",
+        "🪣",
+        "🧽",
+        "🚸",
     ];
 
     /// V1 emoji set. Built once at startup by removing 10 from V0,
@@ -338,15 +620,26 @@ pub mod ukey2 {
         use std::sync::OnceLock;
         static CACHE: OnceLock<Vec<&'static str>> = OnceLock::new();
         CACHE.get_or_init(|| {
-            const REMOVED: &[&str] = &[
-                "💻", "🤗", "💬", "👋", "😁", "😎", "😇", "🥰", "🤓", "🤩",
-            ];
+            const REMOVED: &[&str] = &["💻", "🤗", "💬", "👋", "😁", "😎", "😇", "🥰", "🤓", "🤩"];
             const ADDED: &[&str] = &[
-                "🍋\u{200d}🟩", "🐦\u{200d}🔥", "🐲", "🪅", "🦜", "🏺", "🗿", "🫐", "⛽", "🍱",
-                "🥡", "🧋", "🍼", "📐",
+                "🍋\u{200d}🟩",
+                "🐦\u{200d}🔥",
+                "🐲",
+                "🪅",
+                "🦜",
+                "🏺",
+                "🗿",
+                "🫐",
+                "⛽",
+                "🍱",
+                "🥡",
+                "🧋",
+                "🍼",
+                "📐",
             ];
             // Deduplicate while preserving order (V0 has duplicates).
-            let mut out: Vec<&'static str> = Vec::with_capacity(PAIRING_EMOJIS_V0.len() + ADDED.len());
+            let mut out: Vec<&'static str> =
+                Vec::with_capacity(PAIRING_EMOJIS_V0.len() + ADDED.len());
             let mut seen = std::collections::HashSet::new();
             for &e in PAIRING_EMOJIS_V0 {
                 if seen.insert(e) {
@@ -570,7 +863,8 @@ pub mod ukey2 {
             enc[33..65].copy_from_slice(&y);
             let server_point = EncodedPoint::from_bytes(&enc)
                 .map_err(|e| Error::Pairing(format!("decode server EC point: {e}")))?;
-            let server_pubkey: Option<PublicKey> = PublicKey::from_encoded_point(&server_point).into();
+            let server_pubkey: Option<PublicKey> =
+                PublicKey::from_encoded_point(&server_point).into();
             let server_pubkey = server_pubkey
                 .ok_or_else(|| Error::Pairing("server EC point not on curve".into()))?;
 
@@ -628,10 +922,9 @@ pub mod ukey2 {
         ///   different infos. Order of the concat depends on the Java
         ///   `Arrays.hashCode` of each (smaller hash first).
         pub fn derive_session_keys(&self) -> Result<([u8; 32], [u8; 32])> {
-            let next_key = self
-                .next_key
-                .as_ref()
-                .ok_or_else(|| Error::Pairing("derive_session_keys before process_server_init".into()))?;
+            let next_key = self.next_key.as_ref().ok_or_else(|| {
+                Error::Pairing("derive_session_keys before process_server_init".into())
+            })?;
             let client_key = hkdf32(next_key, &ENCRYPTION_KEY_INFO, b"client")?;
             let server_key = hkdf32(next_key, &ENCRYPTION_KEY_INFO, b"server")?;
             match self.confirmed_key_derivation_version {
@@ -724,7 +1017,9 @@ pub mod ukey2 {
             sy[1..].copy_from_slice(&raw[33..65]);
 
             let mut server_random = vec![0u8; 32];
-            rand::rngs::SysRng.try_fill_bytes(&mut server_random).unwrap();
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut server_random)
+                .unwrap();
             let server_init_inner = Ukey2ServerInit {
                 version: 1,
                 random: server_random,
@@ -737,7 +1032,9 @@ pub mod ukey2 {
                 }),
             };
             let mut server_init_inner_buf = Vec::new();
-            server_init_inner.encode(&mut server_init_inner_buf).unwrap();
+            server_init_inner
+                .encode(&mut server_init_inner_buf)
+                .unwrap();
             let server_init_msg = Ukey2Message {
                 message_type: ukey2_message::Type::ServerInit as i32,
                 message_data: server_init_inner_buf,
@@ -786,8 +1083,10 @@ pub mod ukey2 {
             let mut auth_info = init_bytes.clone();
             auth_info.extend_from_slice(&server_init_bytes);
 
-            let server_v1_auth = hkdf32(&server_shared_secret, b"UKEY2 v1 auth", &auth_info).unwrap();
-            let server_next_key = hkdf32(&server_shared_secret, b"UKEY2 v1 next", &auth_info).unwrap();
+            let server_v1_auth =
+                hkdf32(&server_shared_secret, b"UKEY2 v1 auth", &auth_info).unwrap();
+            let server_next_key =
+                hkdf32(&server_shared_secret, b"UKEY2 v1 next", &auth_info).unwrap();
 
             // Emojis must match.
             let auth_num = u32::from_be_bytes([
@@ -824,7 +1123,11 @@ pub mod ukey2 {
             assert_eq!(PAIRING_EMOJIS_V0.len(), 305);
             // V1 = dedup(V0) ∖ removed10 ∪ added14.
             let v1 = pairing_emojis_v1();
-            assert!(v1.len() > 280 && v1.len() < 320, "v1 size off: {}", v1.len());
+            assert!(
+                v1.len() > 280 && v1.len() < 320,
+                "v1 size off: {}",
+                v1.len()
+            );
         }
     }
 }
@@ -862,8 +1165,8 @@ pub mod gaia {
     use uuid::Uuid;
 
     use crate::gmproto::authentication::{
-        AuthMessage, GaiaPairingRequestContainer, GaiaPairingResponseContainer,
-        SignInGaiaRequest, SignInGaiaResponse, sign_in_gaia_request,
+        AuthMessage, GaiaPairingRequestContainer, GaiaPairingResponseContainer, SignInGaiaRequest,
+        SignInGaiaResponse, sign_in_gaia_request,
     };
     use crate::gmproto::rpc::{ActionType, MessageType};
     use crate::http::ContentType;
@@ -885,15 +1188,14 @@ pub mod gaia {
         // GMESSAGES_AUTHUSER env var so subsequent SignInGaia in this
         // process picks it up.
         let cookies = client.inner.auth.lock().await.cookies.clone();
-        let accounts = match crate::accounts::list_google_accounts(&client.inner.http, &cookies)
-            .await
-        {
-            Ok(a) => a,
-            Err(e) => {
-                log::warn!("gaia: ListAccounts failed ({e}); falling back to authuser=0");
-                Vec::new()
-            }
-        };
+        let accounts =
+            match crate::accounts::list_google_accounts(&client.inner.http, &cookies).await {
+                Ok(a) => a,
+                Err(e) => {
+                    log::warn!("gaia: ListAccounts failed ({e}); falling back to authuser=0");
+                    Vec::new()
+                }
+            };
         log::info!("gaia: ListAccounts found {} account(s)", accounts.len());
         for a in &accounts {
             log::info!("gaia:   authuser={} email={}", a.authuser, a.email);

@@ -404,7 +404,9 @@ impl ContactDirectory {
         match entry.chat_ids.get(source) {
             Some(existing) if existing == chat_id => {} // no-op
             _ => {
-                entry.chat_ids.insert(source.to_string(), chat_id.to_string());
+                entry
+                    .chat_ids
+                    .insert(source.to_string(), chat_id.to_string());
                 inner.dirty = true;
             }
         }
@@ -495,9 +497,7 @@ impl ContactDirectory {
             .by_digits
             .iter()
             .filter(|(digits, entry)| {
-                !entry.is_lid
-                    && digits.len() >= 7
-                    && entry.name.chars().any(|c| c.is_alphabetic())
+                !entry.is_lid && digits.len() >= 7 && entry.name.chars().any(|c| c.is_alphabetic())
             })
             .map(|(digits, _)| digits.clone())
             .collect()
@@ -786,7 +786,10 @@ mod tests {
         let dir = ContactDirectory::new();
         dir.insert("14164000790", "Lorne", "test");
         assert_eq!(dir.lookup("+1 (416) 400-0790").as_deref(), Some("Lorne"));
-        assert_eq!(dir.lookup("14164000790@s.whatsapp.net").as_deref(), Some("Lorne"));
+        assert_eq!(
+            dir.lookup("14164000790@s.whatsapp.net").as_deref(),
+            Some("Lorne")
+        );
         assert_eq!(dir.lookup("16472876066").as_deref(), None);
     }
 
@@ -850,7 +853,7 @@ mod tests {
         let dir = ContactDirectory::new();
         dir.insert("16475311689", "Saad Suleman", "whatsapp-contacts");
         dir.insert("16475311689", "Saad", "typing"); // would-be regression
-        dir.insert("16475311689", "S", "typing");    // even worse
+        dir.insert("16475311689", "S", "typing"); // even worse
         assert_eq!(dir.lookup("16475311689").as_deref(), Some("Saad Suleman"));
     }
 
@@ -1090,4 +1093,3 @@ mod tests {
         assert_eq!(source_priority("unknown-src"), 0);
     }
 }
-

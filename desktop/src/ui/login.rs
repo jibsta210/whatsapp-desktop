@@ -1,10 +1,7 @@
 use std::sync::Arc;
 
 use gtk4::prelude::*;
-use gtk4::{Align, Box, Image, Label, Orientation, Picture, Spinner};
-use image::{ImageBuffer, Rgb};
-use libadwaita as adw;
-use libadwaita::prelude::*;
+use gtk4::{Align, Box, Label, Orientation, Picture, Spinner};
 use qrcode::QrCode;
 
 use crate::bridge::Bridge;
@@ -15,11 +12,10 @@ pub struct LoginScreen {
     qr_picture: Picture,
     status_label: Label,
     spinner: Spinner,
-    bridge: Arc<Bridge>,
 }
 
 impl LoginScreen {
-    pub fn new(bridge: Arc<Bridge>) -> Self {
+    pub fn new(_bridge: Arc<Bridge>) -> Self {
         let root = Box::new(Orientation::Vertical, 24);
         root.set_halign(Align::Center);
         root.set_valign(Align::Center);
@@ -60,7 +56,6 @@ impl LoginScreen {
             qr_picture,
             status_label,
             spinner,
-            bridge,
         }
     }
 
@@ -99,11 +94,8 @@ impl LoginScreen {
 
 fn qr_to_texture(content: &str) -> anyhow::Result<gtk4::gdk::MemoryTexture> {
     let code = QrCode::new(content.as_bytes())?;
-    let img = code.render::<qrcode::render::unicode::Dense1x2>().build();
-
     // Render to pixel buffer (white on dark)
-    let code2 = QrCode::new(content.as_bytes())?;
-    let img_buf = code2
+    let img_buf = code
         .render::<image::Luma<u8>>()
         .min_dimensions(300, 300)
         .max_dimensions(300, 300)

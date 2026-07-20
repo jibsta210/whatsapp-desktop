@@ -450,12 +450,8 @@ impl Client {
             let own_lid_str = own_lid.as_ref().map(|j| j.to_string());
             // Also strip device suffix for comparison: a fanout target may
             // include :device while our local jid may not (or vice versa).
-            let own_pn_base = own_pn.as_ref().map(|j| {
-                format!("{}@{}", j.user, j.server)
-            });
-            let own_lid_base = own_lid.as_ref().map(|j| {
-                format!("{}@{}", j.user, j.server)
-            });
+            let own_pn_base = own_pn.as_ref().map(|j| format!("{}@{}", j.user, j.server));
+            let own_lid_base = own_lid.as_ref().map(|j| format!("{}@{}", j.user, j.server));
             for to_node in to_nodes {
                 let to_jid = match to_node.attrs().optional_string("jid") {
                     Some(jid) => jid.to_string(),
@@ -2963,10 +2959,7 @@ mod tests {
         // recipient_alt now carries the peer's phone number (from peer_recipient_pn),
         // which is what lets the desktop map the peer LID chat → phone JID.
         assert_eq!(
-            info.source
-                .recipient_alt
-                .as_ref()
-                .map(|j| j.user.as_str()),
+            info.source.recipient_alt.as_ref().map(|j| j.user.as_str()),
             Some("559985213786"),
             "recipient_alt should be populated from peer_recipient_pn"
         );
