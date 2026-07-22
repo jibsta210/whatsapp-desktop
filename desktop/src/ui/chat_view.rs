@@ -5641,11 +5641,20 @@ fn show_message_menu(
         // to ~/Downloads under a clean name. Before this, only the image viewer
         // had a save affordance, so audio/documents were unreachable without
         // digging into ~/.local/share/whatsapp-desktop/wa_media.
-        if let Some(path) = msg
-            .media_local_path
-            .as_ref()
-            .filter(|p| std::path::Path::new(p.as_str()).exists())
-        {
+        // Prefer the bubble's live path: the menu's msg clone predates any
+        // on-demand download (voice notes especially), so its media_local_path
+        // is often still None even though the file is on disk.
+        let media_path = inner
+            .bubbles
+            .borrow()
+            .get(&msg.id)
+            .and_then(|b| b.media_path())
+            .or_else(|| {
+                msg.media_local_path
+                    .clone()
+                    .filter(|p| std::path::Path::new(p).exists())
+            });
+        if let Some(path) = media_path {
             let btn = menu_btn!("Save to Downloads");
             let path_c = path.clone();
             let inner_c = inner.clone();

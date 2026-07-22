@@ -60,6 +60,9 @@ pub struct MessageBubble {
     media_box: Option<Box>,
     media_type: Option<MediaType>,
     media_loaded: RefCell<bool>,
+    /// Live on-disk media path — set at build and by MediaReady, so the context
+    /// menu works even when the message clone it captured predates the download.
+    media_path: RefCell<Option<String>>,
     on_image_click: Rc<RefCell<Option<ClickHandler>>>,
     /// Invoked when the user taps the quoted-reply context box — chat_view wires
     /// this to jump/scroll to the original message (mb-01).
@@ -137,6 +140,7 @@ impl MessageBubble {
                 media_box: None,
                 media_type: None,
                 media_loaded: RefCell::new(false),
+                media_path: RefCell::new(None),
                 on_image_click: Rc::new(RefCell::new(None)),
                 on_quoted_click: Rc::new(RefCell::new(None)),
                 quoted_msg_id: None,
@@ -633,6 +637,7 @@ impl MessageBubble {
             .as_deref()
             .filter(|p| std::path::Path::new(p).exists());
         let media_exists_on_disk = existing_path.is_some();
+        let existing_media_path_for_menu = existing_path.map(str::to_string);
 
         // Media widget
         let media_box = if msg.media_type.is_some() {
@@ -1034,6 +1039,9 @@ impl MessageBubble {
             media_box,
             media_type: msg.media_type.clone(),
             media_loaded: RefCell::new(media_exists_on_disk),
+            media_path: RefCell::new(
+                existing_media_path_for_menu,
+            ),
             on_image_click,
             on_quoted_click,
             quoted_msg_id: msg.quoted_msg_id.clone(),
@@ -1352,6 +1360,7 @@ impl MessageBubble {
 
     /// Replace the media placeholder with the actual downloaded file.
     pub fn set_media_loaded(&self, path: &str) {
+        *self.media_path.borrow_mut() = Some(path.to_string());
         if *self.media_loaded.borrow() {
             return;
         }
@@ -1367,6 +1376,15 @@ impl MessageBubble {
         }
         build_media_content(mb, path, mt, &self.on_image_click);
         *self.media_loaded.borrow_mut() = true;
+    }
+
+    /// On-disk media path if the file is present (live view — survives the
+    /// stale message clones captured by menu closures).
+    pub fn media_path(&self) -> Option<String> {
+        self.media_path
+            .borrow()
+            .clone()
+            .filter(|p| std::path::Path::new(p).exists())
     }
 
     /// True if this bubble holds visual media (image / gif / sticker).

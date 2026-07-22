@@ -9509,6 +9509,15 @@ async fn execute_media_download(
     // Update in-memory cache and queue disk write (non-blocking)
     {
         let mut s = state.lock().unwrap();
+        // Evicted/never-opened chats silently skipped the write-back, so the
+        // downloaded path never persisted (voice notes showed re-download
+        // placeholders and no Save menu after restart).
+        if !s.history.contains_key(&chat_id) {
+            let disk_msgs = load_messages(&chat_id);
+            if !disk_msgs.is_empty() {
+                s.history.insert(chat_id.clone(), disk_msgs);
+            }
+        }
         if let Some(history) = s.history.get_mut(&chat_id) {
             if let Some(m) = history.iter_mut().find(|m| m.id == msg_id) {
                 m.media_local_path = Some(path_str.clone());

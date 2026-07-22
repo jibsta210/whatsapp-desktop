@@ -10,6 +10,22 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## Save button fix: voice notes now actually expose it
+
+The new "Save to Downloads" menu item gated on the message's persisted media path — which
+voice notes never had: the download write-back silently skipped chats not in the RAM cache,
+and the menu's captured message clone predates on-demand downloads anyway.
+- **desktop/src/ui/message_bubble.rs**: bubbles track their live on-disk media path
+  (set at build + on MediaReady) and expose it via `media_path()`.
+- **desktop/src/ui/chat_view.rs**: the menu prefers the bubble's live path over the stale
+  message clone.
+- **desktop/src/ui/runtime.rs**: the download write-back loads history from disk when the
+  chat isn't cached, so `media_local_path` always persists (voice notes no longer show
+  re-download placeholders after restart).
+- Note: voice notes downloaded before this fix still lack a persisted path — tapping one
+  re-fetches and permanently heals it.
+- Revert: `git revert <commit>`.
+
 ## Save media from the bubble menu
 
 Voice notes (and all media) were auto-saved internally but unreachable from the UI — only
