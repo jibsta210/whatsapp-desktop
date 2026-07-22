@@ -5637,6 +5637,35 @@ fn show_message_menu(
             vbox.append(&btn);
         }
 
+        // Save any downloaded media — voice notes, images, video, documents —
+        // to ~/Downloads under a clean name. Before this, only the image viewer
+        // had a save affordance, so audio/documents were unreachable without
+        // digging into ~/.local/share/whatsapp-desktop/wa_media.
+        if let Some(path) = msg
+            .media_local_path
+            .as_ref()
+            .filter(|p| std::path::Path::new(p.as_str()).exists())
+        {
+            let btn = menu_btn!("Save to Downloads");
+            let path_c = path.clone();
+            let inner_c = inner.clone();
+            let pop = popover.clone();
+            btn.connect_clicked(move |_| {
+                let saved = crate::ui::message_bubble::save_to_downloads(
+                    std::path::Path::new(&path_c),
+                );
+                if let Some(overlay) = ChatViewPanel::toast_overlay(&inner_c) {
+                    let text = match &saved {
+                        Some(p) => format!("Saved to {}", p.display()),
+                        None => "Could not save file".to_string(),
+                    };
+                    overlay.add_toast(adw::Toast::new(&text));
+                }
+                pop.popdown();
+            });
+            vbox.append(&btn);
+        }
+
         // React
         let btn = menu_btn!("React");
         let inner_c = inner.clone();

@@ -10,6 +10,16 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## Save media from the bubble menu
+
+Voice notes (and all media) were auto-saved internally but unreachable from the UI — only
+the image viewer had a save button.
+- **desktop/src/ui/chat_view.rs**: right-click / chevron menu now offers **"Save to
+  Downloads"** on any message with a downloaded media file (voice notes, images, video,
+  documents); copies to ~/Downloads under a clean name (idempotent, collision-suffixed)
+  and confirms with a toast showing the destination.
+- Revert: `git revert <commit>`.
+
 ## Autocorrect: @mentions are untouchable
 
 The inline autocorrector was overwriting `@name` while the user was mid-mention (the AI

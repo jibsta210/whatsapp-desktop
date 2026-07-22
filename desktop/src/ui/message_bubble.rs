@@ -2559,7 +2559,7 @@ fn open_with_xdg(path: &str) {
 /// name (our `<8hex>_` download prefix stripped, percent-decoded). Returns the
 /// destination path. Idempotent: a same-name, same-size file is reused; a name
 /// collision with *different* content gets a " (n)" suffix.
-fn save_to_downloads(src: &std::path::Path) -> Option<std::path::PathBuf> {
+pub(crate) fn save_to_downloads(src: &std::path::Path) -> Option<std::path::PathBuf> {
     let fname = src.file_name()?.to_str()?;
     let base = fname
         .splitn(2, '_')
