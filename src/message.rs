@@ -1521,7 +1521,7 @@ impl Client {
     }
 
     pub(crate) async fn handle_app_state_sync_key_share(
-        &self,
+        self: &Arc<Self>,
         keys: &wa::message::AppStateSyncKeyShare,
     ) {
         struct KeyComponents<'a> {
@@ -1581,14 +1581,35 @@ impl Client {
             );
         }
 
-        // Notify any waiters (initial full sync) that at least one key share was processed.
-        if stored_count > 0
-            && !self
-                .initial_app_state_keys_received
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            // First time setting; notify any waiters
+        if stored_count > 0 {
+            self.initial_app_state_keys_received
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            // Notify on EVERY share, not just the first: a later share is exactly
+            // what unblocks a collection whose decode we deferred on a rotated key.
             self.initial_keys_synced_notifier.notify(usize::MAX);
+
+            // Re-sync now that the key exists, otherwise the deferred patches
+            // (markChatAsRead lives in RegularLow) wait for the next reconnect.
+            let client = Arc::clone(self);
+            self.runtime
+                .spawn(Box::pin(async move {
+                    if let Err(e) = client
+                        .sync_collections_batched(vec![
+                            wacore::appstate::patch_decode::WAPatchName::CriticalBlock,
+                            wacore::appstate::patch_decode::WAPatchName::CriticalUnblockLow,
+                            wacore::appstate::patch_decode::WAPatchName::RegularLow,
+                            wacore::appstate::patch_decode::WAPatchName::RegularHigh,
+                            wacore::appstate::patch_decode::WAPatchName::Regular,
+                        ])
+                        .await
+                    {
+                        log::warn!(
+                            target: "Client/AppState",
+                            "App-state resync after key share failed: {e:#}"
+                        );
+                    }
+                }))
+                .detach();
         }
     }
 

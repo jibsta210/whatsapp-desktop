@@ -36,6 +36,33 @@ the image viewer had a save button.
   and confirms with a toast showing the destination.
 - Revert: `git revert <commit>`.
 
+## Read-sync + mention regressions after protocol v0.6.0
+
+The v0.6.0 merge resolved src/receipt.rs, wacore/src/messages.rs and src/message.rs to
+"theirs", dropping local read-sync work (and its regression tests, which is why CI stayed
+green). Root causes found and fixed:
+
+### app-state key request was addressed to ourselves (CRITICAL)
+`request_app_state_keys` used `device.pn` verbatim — which carries THIS desktop's device id
+(`:2`) — so the request was encrypted to a session we can never hold. 81 log occurrences of
+`session with <own-lid>:2@lid.0 not found`. The key never arrived, RegularLow stayed
+permanently undecodable, its version froze, and the outbound markChatAsRead patch was built
+on a stale base version the server rejects — so reads never reached the phone.
+- **src/client.rs**: target `Jid::to_non_ad()` (device 0 = the primary phone), matching
+  whatsmeow's `getOwnID().ToNonAD()`.
+- **src/message.rs**: key-share handler notifies on EVERY share (not just the first-ever)
+  and re-syncs the app-state collections, so a rotated key unblocks the deferred
+  markChatAsRead patches immediately instead of waiting for a reconnect.
+- **desktop/src/ui/runtime.rs**: the mark_chat_as_read failure log was `debug!` — invisible
+  at the default level, which is how this hid for days. Now `warn!`.
+
+### @mentions in media captions rendered as raw LID digits
+`resolve_mentions` was applied to `text` and `quoted_text` but never `media_caption`, so an
+@mention written on an image/video persisted and rendered as `@231696725180510` forever.
+- **desktop/src/ui/runtime.rs**: new `resolve_message_mentions` covering all three fields,
+  called from the live-incoming, LoadChat, and history-sync push paths (the third was
+  missing, leaving synced captions raw until the chat was reopened).
+
 ## Autocorrect: @mentions are untouchable
 
 The inline autocorrector was overwriting `@name` while the user was mid-mention (the AI

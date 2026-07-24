@@ -1383,6 +1383,21 @@ fn resolve_mention_token(jid_part: &str, s: &RuntimeState) -> Option<String> {
 /// Walks the text token-by-token (preserving original whitespace) instead of
 /// doing a global substring `replace`, so one mention token can never mangle
 /// another when one is a substring of the other.
+/// Resolve `@<jid-digits>` tokens to display names in every user-visible field.
+///
+/// `media_caption` was missing here, so an @mention written on an image/video
+/// rendered as raw LID digits forever (the renderer does no resolution of its own).
+fn resolve_message_mentions(m: &mut crate::bridge::IncomingMessage, s: &RuntimeState) {
+    for field in [&mut m.text, &mut m.quoted_text, &mut m.media_caption] {
+        if let Some(current) = field.as_deref() {
+            let resolved = resolve_mentions(current, s);
+            if resolved != current {
+                *field = Some(resolved);
+            }
+        }
+    }
+}
+
 fn resolve_mentions(text: &str, s: &RuntimeState) -> String {
     let mut result = String::with_capacity(text.len());
     // Split on whitespace boundaries while keeping the separators intact.
@@ -3532,19 +3547,7 @@ async fn handle_wa_event(
                                 *sender = resolve_sender_name(&s, sender);
                             }
                         }
-                        // Resolve @mentions in text AND quoted_text
-                        if let Some(ref text) = m.text {
-                            let resolved = resolve_mentions(text, &s);
-                            if resolved != *text {
-                                m.text = Some(resolved);
-                            }
-                        }
-                        if let Some(ref qt) = m.quoted_text {
-                            let resolved = resolve_mentions(qt, &s);
-                            if resolved != *qt {
-                                m.quoted_text = Some(resolved);
-                            }
-                        }
+                        resolve_message_mentions(&mut m, &s);
                     }
                     // Store push_name as contact name for group participants
                     // who aren't in the user's contacts. This lets resolve_sender_name
@@ -4167,7 +4170,12 @@ async fn handle_wa_event(
                 // Push new sync messages to the UI as live messages
                 // (so self-messages from other devices and missed messages appear immediately)
                 for m in &new_messages {
-                    let _ = tx.send(WaEvent::MessageReceived(Box::new(m.clone()))).await;
+                    let mut m = m.clone();
+                    {
+                        let s = state.lock().unwrap();
+                        resolve_message_mentions(&mut m, &s);
+                    }
+                    let _ = tx.send(WaEvent::MessageReceived(Box::new(m))).await;
                 }
 
                 // Seed the read-receipt anchor from history sync, mirroring the
@@ -5866,19 +5874,7 @@ async fn handle_command(
                             *sender = resolve_cached(sender, &mut name_cache, &s);
                         }
                     }
-                    // Resolve @mentions in message text AND quoted_text
-                    if let Some(ref text) = m.text {
-                        let resolved = resolve_mentions(text, &s);
-                        if resolved != *text {
-                            m.text = Some(resolved);
-                        }
-                    }
-                    if let Some(ref qt) = m.quoted_text {
-                        let resolved = resolve_mentions(qt, &s);
-                        if resolved != *qt {
-                            m.quoted_text = Some(resolved);
-                        }
-                    }
+                    resolve_message_mentions(m, &s);
                 }
             }
 
@@ -6161,7 +6157,9 @@ async fn handle_command(
                 .mark_chat_as_read(&jid, true, None)
                 .await
             {
-                log::debug!("mark_chat_as_read (app state) failed: {e:#}");
+                // warn, not debug: this is the phone-side read sync silently
+                // dying — at debug level it hid a multi-day regression.
+                log::warn!("mark_chat_as_read (app state) failed: {e:#}");
             }
 
             // Mechanism 1: Read receipts to the sender(s). Ack EVERY unread

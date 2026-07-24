@@ -3018,7 +3018,13 @@ impl Client {
             return Ok(());
         }
         let device_snapshot = self.persistence_manager.get_device_snapshot().await;
-        let own_jid = match device_snapshot.pn.clone() {
+        // Must target the PRIMARY (device 0), not our own companion device:
+        // device.pn carries our device id, and resolve_encryption_jid preserves
+        // it, so without to_non_ad the request is encrypted to ourselves — a
+        // session we never hold — and dies with "session not found", leaving the
+        // collection permanently undecodable. Matches whatsmeow's
+        // getOwnID().ToNonAD().
+        let own_jid = match device_snapshot.pn.as_ref().map(Jid::to_non_ad) {
             Some(j) => j,
             None => {
                 return Err(anyhow::anyhow!(
