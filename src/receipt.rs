@@ -41,10 +41,33 @@ impl Client {
         let receipt_type_cow = attrs.optional_string("type");
         let receipt_type_str = receipt_type_cow.as_deref().unwrap_or("delivery");
         let participant = attrs.optional_jid("participant");
+        let recipient = attrs.optional_jid("recipient");
+        // The read time from the stanza. Falling back to a local clock makes a
+        // self-read that arrives in a reconnect backlog look like it happened
+        // now, which over-suppresses genuinely-unread messages.
+        let timestamp = attrs
+            .optional_u64("t")
+            .filter(|t| *t > 0)
+            .and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0))
+            .unwrap_or_else(wacore::time::now_utc);
 
         let receipt_type = ReceiptType::parse(receipt_type_str);
 
         debug!("Received receipt type '{receipt_type:?}' for message {id} from {from}");
+
+        // Every acked id: the `id` attr plus any in <list><item id=.../></list>.
+        // Without the list only the first message's ticks/read state updated.
+        let mut message_ids = vec![id];
+        if let Some(list) = nr.get_optional_child("list") {
+            for item in list.get_children_by_tag("item") {
+                if let Some(item_id) = item.attrs().optional_string("id") {
+                    let item_id = item_id.to_string();
+                    if !message_ids.contains(&item_id) {
+                        message_ids.push(item_id);
+                    }
+                }
+            }
+        }
 
         let is_group = from.is_group();
         let sender = if is_group {
@@ -53,14 +76,28 @@ impl Client {
             from.clone()
         };
 
+        // A DM self-read arrives from our OWN jid with the real chat in
+        // `recipient`; without resolving it the chat resolves to ourselves.
+        let device = self.persistence_manager.get_device_snapshot().await;
+        let from_is_self = match (&device.pn, &device.lid) {
+            (Some(pn), lid) => from.matches_user_or_lid(pn, lid.as_ref()),
+            (None, Some(lid)) => from.is_same_user_as(lid),
+            (None, None) => false,
+        };
+        let (chat, is_from_me) = match recipient {
+            Some(r) if from_is_self && !is_group => (r.to_non_ad(), true),
+            _ => (from, false),
+        };
+
         let receipt = Receipt {
-            message_ids: vec![id],
+            message_ids,
             source: crate::types::message::MessageSource {
-                chat: from,
+                chat,
                 sender,
+                is_from_me,
                 ..Default::default()
             },
-            timestamp: wacore::time::now_utc(),
+            timestamp,
             r#type: receipt_type,
         };
 

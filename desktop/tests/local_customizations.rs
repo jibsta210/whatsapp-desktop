@@ -77,10 +77,8 @@ fn local_protocol_customizations_survive_upstream_merges() {
 
 /// The desktop stamps read watermarks from the receipt timestamp, so a receipt
 /// carrying only a local wall clock over-suppresses genuinely-unread messages
-/// after a reconnect backlog. Kept separate: this one is currently KNOWN-LOST to
-/// the v0.6.0 merge and is tracked, not enforced, until re-applied.
+/// after a reconnect backlog.
 #[test]
-#[ignore = "known lost to v0.6.0 merge; re-enable when receipt t/recipient parsing is restored"]
 fn receipt_parses_recipient_and_timestamp_attrs() {
     let src = read("src/receipt.rs");
     assert!(
@@ -90,5 +88,9 @@ fn receipt_parses_recipient_and_timestamp_attrs() {
     assert!(
         src.contains("optional_jid(\"recipient\")"),
         "handle_receipt must parse 'recipient' so DM self-reads resolve to the real chat"
+    );
+    assert!(
+        src.contains("get_children_by_tag(\"item\")"),
+        "handle_receipt must parse the <list><item> extension so every acked id updates"
     );
 }

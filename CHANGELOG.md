@@ -74,6 +74,13 @@ on a stale base version the server rejects — so reads never reached the phone.
   called from the live-incoming, LoadChat, and history-sync push paths (the third was
   missing, leaving synced captions raw until the chat was reopened).
 
+### receipt parsing restored (last lost piece)
+`handle_receipt` again parses the `recipient` attr (DM self-reads resolve to the real chat
+instead of ourselves), the `t` attr (read watermarks use the phone's read time, not a local
+wall clock that over-suppressed unread after a reconnect backlog), and the
+`<list><item id=.../>` extension (every acked id updates, not just the first). Guard test
+re-enabled.
+
 ### own-echo LID DMs could route into the wrong chat (regression the upgrade CREATED)
 Upstream's v0.6.0 own-echo branch now sets `sender_alt` to OUR OWN identity (to warm the
 LID-PN cache), but the surviving desktop consumer still assumed `sender_alt` was None there
