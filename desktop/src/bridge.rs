@@ -108,6 +108,9 @@ pub enum WaEvent {
     ErrorToast(String),
     /// Neutral/positive confirmation to display as a toast (e.g. "Contact blocked").
     InfoToast(String),
+    /// An update is staged. Rendered as a toast with a "Restart now" button so the
+    /// user doesn't have to hunt for it in Settings.
+    UpdateReadyToast(String),
     /// A chat's display name was resolved/updated (group name fetch or push name)
     ChatNameUpdated {
         chat_id: String,

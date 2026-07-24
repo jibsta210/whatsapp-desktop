@@ -36,6 +36,17 @@ the image viewer had a save button.
   and confirms with a toast showing the destination.
 - Revert: `git revert <commit>`.
 
+## Updater: "Restart now" button + don't clobber local builds
+
+- **desktop/src/bridge.rs, desktop/src/updater.rs, desktop/src/ui/window.rs**: the
+  update-ready toast now carries a **Restart now** button (wired to the existing
+  `restart_to_apply`) and no longer auto-dismisses, instead of making the user find the
+  button in Settings.
+- **desktop/src/updater.rs**: a locally-built binary reports `build 0`, so EVERY channel
+  release compared as newer and would silently replace a local build containing newer work
+  (a Jul-15 release was staged over a Jul-24 build carrying the read-sync fixes). Local
+  builds are no longer auto-staged; an explicit check in Settings still updates.
+
 ## Read-sync + mention regressions after protocol v0.6.0
 
 The v0.6.0 merge resolved src/receipt.rs, wacore/src/messages.rs and src/message.rs to

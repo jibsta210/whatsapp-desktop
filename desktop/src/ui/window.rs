@@ -846,6 +846,7 @@ impl MainWindow {
             }
             WaEvent::ErrorToast(msg) => format!("ErrorToast: {msg}"),
             WaEvent::InfoToast(msg) => format!("InfoToast: {msg}"),
+            WaEvent::UpdateReadyToast(msg) => format!("UpdateReady: {msg}"),
             WaEvent::GroupInviteLink { link, .. } => format!("InviteLink: {link}"),
             WaEvent::ForwardComplete { count, .. } => format!("Forwarded: {count} msgs"),
             WaEvent::ChatListForPicker(c) => format!("ChatListForPicker: {} chats", c.len()),
@@ -1552,6 +1553,20 @@ impl MainWindow {
             }
             WaEvent::InfoToast(msg) => {
                 show_toast_deduped(inner, &msg);
+            }
+            WaEvent::UpdateReadyToast(msg) => {
+                let toast = adw::Toast::new(&msg);
+                toast.set_button_label(Some("Restart now"));
+                toast.set_timeout(0); // stays until acted on or dismissed
+                let overlay = inner.toast_overlay.clone();
+                toast.connect_button_clicked(move |_| {
+                    if let Err(error) = crate::updater::restart_to_apply() {
+                        overlay.add_toast(adw::Toast::new(&format!(
+                            "Could not restart: {error}"
+                        )));
+                    }
+                });
+                inner.toast_overlay.add_toast(toast);
             }
             WaEvent::ForwardComplete { to_chat_id, count } => {
                 log::info!("Forwarded {count} messages to {to_chat_id}");

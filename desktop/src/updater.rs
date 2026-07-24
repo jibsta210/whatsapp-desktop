@@ -407,6 +407,18 @@ pub fn check_for_updates(
                 if !is_newer(&manifest)? {
                     return Ok(None);
                 }
+                // A locally-built binary reports build 0, so EVERY channel release
+                // looks newer and would silently replace a build that is actually
+                // ahead of the release. Only do that when explicitly asked.
+                if current_build() == 0 && !force {
+                    log::info!(
+                        "Update {} (build {}) available, but this is a local build — \
+                         not staging automatically (use Settings to update anyway)",
+                        manifest.version,
+                        manifest.build
+                    );
+                    return Ok(None);
+                }
                 stage_update(&data_dir, &manifest)?;
                 Ok(Some(manifest))
             })();
@@ -419,7 +431,7 @@ pub fn check_for_updates(
                     );
                     set_status(&text, false, true);
                     if let Some(tx) = &notifications {
-                        let _ = tx.try_send(WaEvent::InfoToast(text));
+                        let _ = tx.try_send(WaEvent::UpdateReadyToast(text));
                     }
                 }
                 Ok(None) => {
