@@ -2885,14 +2885,15 @@ async fn handle_wa_event(
             // phone numbers (bug where self-sent messages from phone land in a
             // completely different chat).
             let (chat_id, needs_lid_resolve) = if raw_chat_id.ends_with("@lid") {
-                // For an own-echo DM the peer's phone is in recipient_alt (sender_alt
-                // is None); recipient_alt is None on all inbound-DM and group paths,
-                // so the `.or` is a safe no-op there.
-                let alt_phone = info
-                    .source
-                    .sender_alt
-                    .as_ref()
-                    .or(info.source.recipient_alt.as_ref())
+                // Branch on direction: upstream sets sender_alt to OUR OWN identity
+                // on an own-echo (it warms the LID-PN cache), so using it here would
+                // resolve the peer's chat to our own number. The peer's phone lives
+                // in recipient_alt.
+                let alt_phone = if info.source.is_from_me {
+                    info.source.recipient_alt.as_ref()
+                } else {
+                    info.source.sender_alt.as_ref()
+                }
                     .filter(|a| a.to_string().ends_with("@s.whatsapp.net"))
                     .map(|a| a.to_string());
                 let s = state.lock().unwrap();

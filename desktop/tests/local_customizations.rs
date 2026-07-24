@@ -40,6 +40,18 @@ const GUARDS: &[Guard] = &[
               markChatAsRead can never reach the phone.",
     },
     Guard {
+        file: "wacore/src/messages.rs",
+        needle: "peer_recipient_pn",
+        why: "the own-echo branch must capture the PEER's phone into recipient_alt, \
+              otherwise LID-addressed self-echoes can't resolve to a real chat.",
+    },
+    Guard {
+        file: "desktop/src/ui/runtime.rs",
+        needle: "if info.source.is_from_me {",
+        why: "alt_phone must branch on direction: upstream sets sender_alt to OUR OWN \
+              identity on an own-echo, so using it resolves the peer chat to our number.",
+    },
+    Guard {
         file: "src/message.rs",
         needle: "sync_collections_batched",
         why: "handle_app_state_sync_key_share must re-sync collections when a key \

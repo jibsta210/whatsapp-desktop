@@ -207,6 +207,11 @@ pub fn parse_message_info(
         }
     } else if from.matches_user_or_lid(own_jid, own_lid) {
         let recipient = attrs.optional_jid("recipient");
+        // The PEER's phone number on a LID-addressed own-echo. Without it the
+        // desktop can't map the peer LID to a real chat and mints a phantom.
+        let recipient_alt = attrs
+            .optional_jid("peer_recipient_pn")
+            .or_else(|| attrs.optional_jid("recipient_pn"));
         let chat = recipient
             .as_ref()
             .map(|r| r.to_non_ad())
@@ -225,6 +230,7 @@ pub fn parse_message_info(
             is_from_me: true,
             recipient,
             sender_alt,
+            recipient_alt,
             ..Default::default()
         }
     } else {

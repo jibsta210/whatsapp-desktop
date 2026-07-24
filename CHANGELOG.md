@@ -63,6 +63,21 @@ on a stale base version the server rejects — so reads never reached the phone.
   called from the live-incoming, LoadChat, and history-sync push paths (the third was
   missing, leaving synced captions raw until the chat was reopened).
 
+### own-echo LID DMs could route into the wrong chat (regression the upgrade CREATED)
+Upstream's v0.6.0 own-echo branch now sets `sender_alt` to OUR OWN identity (to warm the
+LID-PN cache), but the surviving desktop consumer still assumed `sender_alt` was None there
+and used it to resolve the peer's chat — so a LID-addressed self-echo resolved to our own
+number.
+- **wacore/src/messages.rs**: restore `peer_recipient_pn` -> `recipient_alt` (the peer's phone).
+- **desktop/src/ui/runtime.rs**: `alt_phone` now branches on direction (recipient_alt for
+  own-echoes, sender_alt for inbound) instead of `.or()`-ing them.
+
+### guardrail
+`desktop/tests/local_customizations.rs` asserts each load-bearing local protocol behavior
+still exists. It lives in the desktop crate, which upstream does not ship, so a wholesale
+protocol-core replacement cannot delete the test along with the code — the exact failure
+mode that let this regression through CI. Verified to fail on genuine absence.
+
 ## Autocorrect: @mentions are untouchable
 
 The inline autocorrector was overwriting `@name` while the user was mid-mention (the AI
