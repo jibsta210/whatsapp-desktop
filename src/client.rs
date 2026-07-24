@@ -3002,13 +3002,22 @@ impl Client {
         }
         guard.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(24 * 3600));
         drop(guard);
-        if !to_request.is_empty()
-            && let Err(e) = self.request_app_state_keys(&to_request).await
-        {
-            warn!("Failed to send app state key request: {e}");
-            let mut guard = self.app_state_key_requests.lock().await;
-            for key_id in &to_request {
-                guard.remove(&hex::encode(key_id));
+        if !to_request.is_empty() {
+            // Log both outcomes: a silent success here made a dead key-request
+            // path (and days of broken read sync) indistinguishable from a healthy one.
+            match self.request_app_state_keys(&to_request).await {
+                Ok(()) => log::info!(
+                    target: "Client/AppState",
+                    "Requested {} missing app-state sync key(s) from primary device",
+                    to_request.len()
+                ),
+                Err(e) => {
+                    warn!("Failed to send app state key request: {e}");
+                    let mut guard = self.app_state_key_requests.lock().await;
+                    for key_id in &to_request {
+                        guard.remove(&hex::encode(key_id));
+                    }
+                }
             }
         }
     }
