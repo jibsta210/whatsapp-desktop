@@ -10,6 +10,20 @@ applied here — see `DECISIONS.md`.
 
 ---
 
+## Group SMS threads no longer merge into a 1:1 WhatsApp chat
+
+A group SMS thread was matched to a WhatsApp DM by taking its FIRST non-me
+participant, so a group Alexandra belongs to was folded into the private chat with
+her — showing the group's roster as the chat header. Worse, the link is persisted in
+the contact directory and `other_chat_id` drives send-routing, so an SMS sent from
+her private chat could have gone to the entire group.
+- **desktop/src/gmessages_runtime.rs**: never derive a merge phone for a group thread
+  (`is_group_chat`, >1 visible non-me participant, or >1 other_participant), and heal
+  any previously-recorded bad link on reseed (clears the directory entry + hot cache).
+- **desktop/src/contacts.rs**: `clear_chat_id(source, chat_id)` removes stale
+  cross-protocol links without dropping the contact. Test:
+  `clear_chat_id_heals_a_bad_group_merge`.
+
 ## Save button fix: voice notes now actually expose it
 
 The new "Save to Downloads" menu item gated on the message's persisted media path — which

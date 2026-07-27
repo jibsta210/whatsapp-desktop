@@ -1118,14 +1118,41 @@ async fn run(
                     let global = crate::contacts::global();
                     for (summary, conv) in summaries.iter().zip(resp.conversations.iter()) {
                         let conv_id = &conv.conversation_id;
-                        let phone = conv
-                            .participants
-                            .iter()
-                            .find(|p| p.is_visible && !p.is_me)
-                            .and_then(|p| p.id.as_ref())
-                            .filter(|id| !id.number.is_empty())
-                            .map(|id| id.number.clone())
-                            .or_else(|| conv.other_participants.first().cloned());
+                        // A GROUP SMS thread has no single counterpart, so it must
+                        // never be merged: picking its first participant would fold
+                        // the whole group into that person's 1:1 WhatsApp chat.
+                        let is_group = conv.is_group_chat
+                            || conv
+                                .participants
+                                .iter()
+                                .filter(|p| p.is_visible && !p.is_me)
+                                .count()
+                                > 1
+                            || conv.other_participants.len() > 1;
+                        let phone = if is_group {
+                            None
+                        } else {
+                            conv.participants
+                                .iter()
+                                .find(|p| p.is_visible && !p.is_me)
+                                .and_then(|p| p.id.as_ref())
+                                .filter(|id| !id.number.is_empty())
+                                .map(|id| id.number.clone())
+                                .or_else(|| conv.other_participants.first().cloned())
+                        };
+                        if is_group {
+                            // Heal a previously-recorded bad merge: this thread was
+                            // once linked to whichever participant happened to be
+                            // first, which both showed the group under that person's
+                            // 1:1 chat and could route their SMS to everyone.
+                            let healed = global.clear_chat_id("gmessages", &summary.id);
+                            if healed > 0 {
+                                log::warn!(
+                                    "gmessages: cleared {healed} stale merge link(s) pointing at group conv {conv_id}"
+                                );
+                            }
+                            mm.remove(conv_id);
+                        }
                         // Record the gm chat_id in the global directory.
                         if let Some(p) = &phone {
                             global.record_chat_id(p, "gmessages", &summary.id);

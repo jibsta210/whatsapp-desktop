@@ -432,6 +432,31 @@ impl ContactDirectory {
     /// source for the same contact. Returns None if we have no record of
     /// that pair. Used by the gmessages runtime to redirect a `gm:N`
     /// chat_id to the matching WhatsApp JID.
+    /// Drop every cross-protocol link that points at `chat_id` for `source`,
+    /// returning how many were removed. Heals bad merges (a group SMS thread
+    /// linked to a 1:1 contact), which otherwise persist here forever and can
+    /// misroute a send to the whole group.
+    pub fn clear_chat_id(&self, source: &str, chat_id: &str) -> usize {
+        if chat_id.is_empty() {
+            return 0;
+        }
+        let mut inner = match self.inner.write() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        let mut cleared = 0;
+        for entry in inner.by_digits.values_mut() {
+            if entry.chat_ids.get(source).is_some_and(|v| v == chat_id) {
+                entry.chat_ids.remove(source);
+                cleared += 1;
+            }
+        }
+        if cleared > 0 {
+            inner.dirty = true;
+        }
+        cleared
+    }
+
     pub fn other_chat_id(&self, chat_id: &str, target_source: &str) -> Option<String> {
         let digits = digits_only(chat_id);
         if digits.is_empty() {
@@ -771,6 +796,26 @@ pub fn global() -> &'static ContactDirectory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_chat_id_heals_a_bad_group_merge() {
+        let dir = ContactDirectory::new();
+        dir.insert("14164000790", "Alexandra", "test");
+        // A group SMS thread was wrongly linked to her 1:1 row.
+        dir.record_chat_id("14164000790", "gmessages", "gm:group-999");
+        assert_eq!(
+            dir.other_chat_id("14164000790@s.whatsapp.net", "gmessages").as_deref(),
+            Some("gm:group-999")
+        );
+        assert_eq!(dir.clear_chat_id("gmessages", "gm:group-999"), 1);
+        assert_eq!(
+            dir.other_chat_id("14164000790@s.whatsapp.net", "gmessages"),
+            None,
+            "a healed group link must not keep routing her chat to the group"
+        );
+        assert_eq!(dir.lookup("14164000790").as_deref(), Some("Alexandra"),
+            "healing the link must not drop the contact");
+    }
 
     #[test]
     fn digits_only_handles_jid() {
