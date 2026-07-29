@@ -3801,6 +3801,36 @@ impl ChatViewPanel {
             return;
         }
 
+        // SMS self-echo fallback: the relay sometimes echoes our own sent message
+        // with an empty tmp_id, so no MessageConfirmed fires and the id-based dedup
+        // above can't match the still-pending optimistic bubble — it rendered twice.
+        // Adopt the pending bubble by identical text instead of appending.
+        if msg.is_from_me && msg.id.starts_with("gm:") && msg.text.is_some() {
+            let pending = {
+                let bubbles = inner.bubbles.borrow();
+                bubbles
+                    .iter()
+                    .find(|(key, bubble)| {
+                        (key.starts_with("tmp-") || key.starts_with("gm:tmp_"))
+                            && bubble.text.as_deref() == msg.text.as_deref()
+                    })
+                    .map(|(key, _)| key.clone())
+            };
+            if let Some(pending_key) = pending {
+                let mut bubbles = inner.bubbles.borrow_mut();
+                if let Some(bubble) = bubbles.remove(&pending_key) {
+                    bubble.update_receipt(&msg.receipt_status);
+                    bubbles.insert(msg.id.clone(), bubble);
+                }
+                drop(bubbles);
+                let mut texts = inner.search_texts.borrow_mut();
+                if let Some(text) = texts.remove(&pending_key) {
+                    texts.entry(msg.id.clone()).or_insert(text);
+                }
+                return;
+            }
+        }
+
         maybe_insert_date_separator(inner, msg.timestamp);
 
         let own_name = inner.own_name.borrow().clone();

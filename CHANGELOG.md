@@ -110,6 +110,15 @@ still exists. It lives in the desktop crate, which upstream does not ship, so a 
 protocol-core replacement cannot delete the test along with the code — the exact failure
 mode that let this regression through CI. Verified to fail on genuine absence.
 
+## SMS self-echo rendered twice when the relay omits tmp_id
+
+The Packet D fix re-keys the optimistic bubble off `MessageConfirmed`, but the relay
+sometimes echoes our own sent SMS with an EMPTY `tmp_id`, so no confirm fires, the id-based
+dedup can't match the pending bubble, and the echo appended a second copy (first ✓, second
+✓✓). Disk always held one copy — purely visual.
+- **desktop/src/ui/chat_view.rs**: an is_from_me `gm:` echo that misses the id dedup now
+  adopts a still-pending `tmp-`/`gm:tmp_` bubble with identical text instead of appending.
+
 ## Hardening after the @call outage
 
 ### unknown JID servers no longer take down all inbound
