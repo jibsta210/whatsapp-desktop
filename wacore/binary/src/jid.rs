@@ -181,6 +181,11 @@ pub enum Server {
     /// was written; an unknown server aborts the whole node decode, so every
     /// stanza batch containing one was dropped — including offline delivery.
     Call = 11,
+    /// A server string this build doesn't know. Decoding MUST NOT fail on it:
+    /// one unrecognised server used to abort the whole node, silently dropping
+    /// every incoming batch that referenced it. Inert — matches no routing
+    /// predicate — so the rest of the batch still gets processed.
+    Unknown = 255,
 }
 
 #[cfg(feature = "serde")]
@@ -214,6 +219,7 @@ impl Server {
             Self::Bot => "bot",
             Self::Legacy => "c.us",
             Self::Call => "call",
+            Self::Unknown => "unknown",
         }
     }
 
@@ -228,6 +234,15 @@ impl Server {
     #[inline]
     pub fn is_lid_family(self) -> bool {
         matches!(self, Self::Lid | Self::HostedLid)
+    }
+
+    /// Wire-decoding conversion that never fails. `try_from` stays strict for
+    /// user input and validation; the decoder uses this so a server type
+    /// WhatsApp adds later degrades to an inert JID instead of taking down all
+    /// inbound traffic.
+    #[inline]
+    pub fn from_wire_lenient(s: &str) -> Self {
+        Self::try_from(s).unwrap_or(Self::Unknown)
     }
 }
 
@@ -1473,5 +1488,28 @@ mod tests {
             );
             assert_eq!(display, push_buf, "case {i}: Display vs Jid::push_to");
         }
+    }
+}
+
+#[cfg(test)]
+mod unknown_server_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_server_decodes_inert_instead_of_failing() {
+        // A server type this build predates must NOT abort decoding: one such
+        // JID used to drop the entire stanza batch (total inbound outage).
+        let s = Server::from_wire_lenient("some_future_server");
+        assert_eq!(s, Server::Unknown);
+        assert!(!s.is_pn_family() && !s.is_lid_family());
+        // strict path stays strict for validation/user input
+        assert!(Server::try_from("some_future_server").is_err());
+    }
+
+    #[test]
+    fn call_server_round_trips() {
+        assert_eq!(Server::try_from("call").unwrap(), Server::Call);
+        assert_eq!(Server::Call.as_str(), "call");
+        assert_eq!(Server::from_wire_lenient("call"), Server::Call);
     }
 }

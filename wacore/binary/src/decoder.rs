@@ -118,9 +118,7 @@ impl<'a> Decoder<'a> {
     fn read_jid_pair(&mut self) -> Result<JidRef<'a>> {
         let user = self.read_value_as_string()?.unwrap_or_default();
         let server_str = self.read_value_as_string()?.unwrap_or_default();
-        let server = crate::jid::Server::try_from(server_str.as_ref()).map_err(|_| {
-            BinaryError::AttrParse(format!("JID_PAIR unknown server: {}", server_str))
-        })?;
+        let server = crate::jid::Server::from_wire_lenient(server_str.as_ref());
         Ok(JidRef {
             user,
             server,

@@ -10176,6 +10176,20 @@ async fn fetch_profile_pictures(
             continue;
         }
 
+        // Chats with no picture cached nothing, so every reconnect re-queried
+        // all of them — ~700 round trips that starved the read loop and tripped
+        // the keepalive watchdog into a reconnect loop. Remember the negative.
+        let nopic_path = avatar_dir.join(format!("{safe_id}.nopic"));
+        if let Ok(meta) = std::fs::metadata(&nopic_path)
+            && meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age < std::time::Duration::from_secs(7 * 24 * 3600))
+        {
+            continue;
+        }
+
         // Strip device suffix (e.g., ":12@s.whatsapp.net" → "@s.whatsapp.net")
         let clean_id = if let (Some(colon), Some(at)) = (chat.id.find(':'), chat.id.find('@')) {
             if colon < at {
@@ -10221,7 +10235,10 @@ async fn fetch_profile_pictures(
                     Err(e) => log::warn!("Avatar join failed for {}: {e}", chat.id),
                 }
             }
-            Ok(None) => log::debug!("No profile picture for {}", chat.id),
+            Ok(None) => {
+                let _ = std::fs::write(&nopic_path, b"");
+                log::debug!("No profile picture for {}", chat.id);
+            }
             Err(e) => log::info!("get_profile_picture for {}: {e:#}", chat.id),
         }
 

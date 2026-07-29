@@ -110,6 +110,25 @@ still exists. It lives in the desktop crate, which upstream does not ship, so a 
 protocol-core replacement cannot delete the test along with the code — the exact failure
 mode that let this regression through CI. Verified to fail on genuine absence.
 
+## Hardening after the @call outage
+
+### unknown JID servers no longer take down all inbound
+Adding `Server::Call` fixed tonight's outage, but the underlying hazard remained: ANY
+server string this build doesn't know aborted the whole node decode, so the next type
+WhatsApp invents would be another silent total-inbound outage.
+- **wacore/binary/src/jid.rs**: `Server::Unknown` sentinel + `from_wire_lenient()`.
+- **wacore/binary/src/decoder.rs**: `read_jid_pair` uses the lenient path, so an unknown
+  server yields an inert JID (matches no routing predicate) and the rest of the batch is
+  still processed. `try_from` stays strict for validation/user input.
+- Tests: `unknown_server_decodes_inert_instead_of_failing`, `call_server_round_trips`.
+
+### avatar prefetch stops re-querying picture-less chats every reconnect
+Chats with no profile picture cached nothing, so all ~700 were re-queried on EVERY
+reconnect — round trips that starved the read loop and tripped the keepalive watchdog into
+a reconnect loop (20:04, 20:22, 20:56).
+- **desktop/src/ui/runtime.rs**: write a `.nopic` marker on `Ok(None)` and skip those chats
+  for 7 days.
+
 ## Inbound messages stopped entirely: unknown JID server `@call` killed every stanza batch
 
 WhatsApp rolled out a new JID server type (`@call`, call signalling). The binary decoder
