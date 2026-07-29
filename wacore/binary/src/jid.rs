@@ -177,6 +177,10 @@ pub enum Server {
     Interop = 8,
     Bot = 9,
     Legacy = 10,
+    /// Call-signalling server (`@call`). Rolled out by WhatsApp after this enum
+    /// was written; an unknown server aborts the whole node decode, so every
+    /// stanza batch containing one was dropped — including offline delivery.
+    Call = 11,
 }
 
 #[cfg(feature = "serde")]
@@ -209,6 +213,7 @@ impl Server {
             Self::Interop => "interop",
             Self::Bot => "bot",
             Self::Legacy => "c.us",
+            Self::Call => "call",
         }
     }
 
@@ -259,6 +264,7 @@ impl TryFrom<&str> for Server {
             "interop" => Ok(Self::Interop),
             "bot" => Ok(Self::Bot),
             "c.us" => Ok(Self::Legacy),
+            "call" => Ok(Self::Call),
             other => Err(JidError::InvalidFormat(format!("unknown server: {other}"))),
         }
     }
@@ -277,6 +283,7 @@ pub const HOSTED_LID_SERVER: &str = "hosted.lid";
 pub const MESSENGER_SERVER: &str = "msgr";
 pub const INTEROP_SERVER: &str = "interop";
 pub const BOT_SERVER: &str = "bot";
+pub const CALL_SERVER: &str = "call";
 pub const STATUS_BROADCAST_USER: &str = "status";
 
 pub type MessageId = String;

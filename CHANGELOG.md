@@ -110,6 +110,21 @@ still exists. It lives in the desktop crate, which upstream does not ship, so a 
 protocol-core replacement cannot delete the test along with the code — the exact failure
 mode that let this regression through CI. Verified to fail on genuine absence.
 
+## Inbound messages stopped entirely: unknown JID server `@call` killed every stanza batch
+
+WhatsApp rolled out a new JID server type (`@call`, call signalling). The binary decoder
+treats an unknown server as fatal and aborts the decode of the WHOLE node, so the read loop
+silently dropped every incoming batch containing one. Outbound kept working (we only encode
+known types), inbound went to zero, and the server re-queued forever because nothing was
+acked — the queue grew 341 -> 429 -> 448 while delivering 0.
+- **wacore/binary/src/jid.rs**: add `Server::Call` + string mapping + `CALL_SERVER`. Both
+  decode paths (`decoder.rs` read_jid_pair, `Jid::from_str` fallback) route through
+  `Server::try_from`, so the one addition covers both.
+- Verified live: unmarshal failures 5 -> 0, backlog drained, 132 messages routed.
+- Follow-up worth doing: an unknown server should degrade gracefully (keep the raw string,
+  keep the node) instead of dropping the batch — otherwise the next new server type is
+  another total inbound outage.
+
 ## Autocorrect: @mentions are untouchable
 
 The inline autocorrector was overwriting `@name` while the user was mid-mention (the AI
