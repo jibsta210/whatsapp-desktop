@@ -123,6 +123,15 @@ pub enum WaEvent {
         path: String,
         media_type: MediaType,
     },
+    /// Link-preview metadata fetched for a message whose sender didn't attach one.
+    LinkPreviewReady {
+        chat_id: String,
+        msg_id: String,
+        url: String,
+        title: Option<String>,
+        description: Option<String>,
+        thumbnail_url: Option<String>,
+    },
     /// A profile picture was downloaded and is ready to show on the avatar
     AvatarReady {
         chat_id: String,
@@ -1043,5 +1052,22 @@ mod persistence_regression {
             (m.id, m.text, m.timestamp),
             (back.id, back.text, back.timestamp)
         );
+    }
+}
+
+#[cfg(test)]
+mod td_2fa_tests {
+    use super::detect_two_factor_code;
+
+    #[test]
+    fn td_real_world_formats() {
+        let cases = [
+            ("If you DID NOT initiate contact with TD, do not share this code and call the number on the back of your TD Card. Your one-time passcode is 098757.", "098757"),
+            ("Please use 318078 as your TD security code to log in. We will never contact you for this code. Do not reveal it to anyone else.", "318078"),
+            ("TD will not send you sign-in links by text. Beware of scams. Do not reveal this code. We will not contact you for it. Your security code is 641333.", "641333"),
+        ];
+        for (body, want) in cases {
+            assert_eq!(detect_two_factor_code(body).as_deref(), Some(want), "body: {body}");
+        }
     }
 }

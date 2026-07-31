@@ -1220,13 +1220,26 @@ impl MainWindow {
                 // them into the clipboard with an OSD-style notification. Gated on
                 // `is_gm` — a WhatsApp message containing a "code"/"pin" keyword
                 // must NOT silently overwrite the clipboard.
+                // Relay delivery of an SMS can lag minutes behind its timestamp, and a
+                // stale OTP is still worth copying, so 2FA uses a wider window than
+                // notifications.
+                let is_recent_for_2fa = (now_secs - msg_ts_secs).abs() < 600;
                 let mut handled_as_2fa = false;
                 if !msg.is_from_me
-                    && is_recent
+                    && is_recent_for_2fa
                     && is_gm
                     && let Some(text) = msg.text.as_deref()
                 {
+                    if !is_recent {
+                        log::info!(
+                            "2FA scan: message is {}s old (outside the notification window)",
+                            now_secs - msg_ts_secs
+                        );
+                    }
                     if let Some(code) = detect_two_factor_code(text) {
+                        if !inner.settings.twofa_autocopy_enabled() {
+                            log::info!("2FA code detected but auto-copy is disabled in settings");
+                        }
                         if inner.settings.twofa_autocopy_enabled() {
                             let sender = inner
                                 .chat_list
@@ -1422,6 +1435,23 @@ impl MainWindow {
                 inner
                     .chat_view
                     .set_media_loaded(&msg_id, &chat_id, &path, &media_type);
+            }
+            WaEvent::LinkPreviewReady {
+                chat_id,
+                msg_id,
+                url,
+                title,
+                description,
+                thumbnail_url,
+            } => {
+                inner.chat_view.set_link_preview(
+                    &chat_id,
+                    &msg_id,
+                    &url,
+                    title.as_deref(),
+                    description.as_deref(),
+                    thumbnail_url.as_deref(),
+                );
             }
             WaEvent::AvatarReady { chat_id, path } => {
                 inner.chat_list.set_avatar(&chat_id, &path);

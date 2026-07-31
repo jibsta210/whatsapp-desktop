@@ -3635,6 +3635,20 @@ async fn handle_wa_event(
                         queue_lid_resolve(&lid_resolver_tx, &m.sender_id);
                     }
 
+                    // Senders often omit preview metadata, leaving a bare link.
+                    // Fetch it ourselves, off the message path so nothing blocks.
+                    if m.link_url.is_none()
+                        && let Some(url) = m.text.as_deref().and_then(first_http_url)
+                    {
+                        spawn_link_preview_fetch(
+                            tx.clone(),
+                            state.clone(),
+                            m.chat_id.clone(),
+                            m.id.clone(),
+                            url,
+                        );
+                    }
+
                     WaEvent::MessageReceived(Box::new(m))
                 }
                 None => return,
@@ -5258,129 +5272,12 @@ async fn handle_command(
                 .map(|s| s.to_string());
             let (og_title, og_desc, og_thumb) = if let Some(ref url) = link_url {
                 let u = url.clone();
-                tokio::task::spawn_blocking(move || {
-                    use std::io::Read;
-                    // Helper to fetch JSON from a URL
-                    let fetch_json = |url: &str| -> Option<serde_json::Value> {
-                        ureq::get(url)
-                            .call()
-                            .ok()
-                            .and_then(|r| r.into_string().ok())
-                            .and_then(|s| serde_json::from_str(&s).ok())
-                    };
-
-                    // 1. Try site-specific oEmbed (YouTube, Vimeo, etc.)
-                    let oembed_url = if u.contains("youtube.com") || u.contains("youtu.be") {
-                        Some(format!(
-                            "https://www.youtube.com/oembed?url={}&format=json",
-                            u
-                        ))
-                    } else if u.contains("vimeo.com") {
-                        Some(format!("https://vimeo.com/api/oembed.json?url={}", u))
-                    } else if u.contains("twitter.com") || u.contains("x.com") {
-                        Some(format!("https://publish.twitter.com/oembed?url={}", u))
-                    } else {
-                        None
-                    };
-
-                    if let Some(oembed) = oembed_url {
-                        if let Some(json) = fetch_json(&oembed) {
-                            let title = json
-                                .get("title")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            let desc = json
-                                .get("author_name")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            let thumb = json
-                                .get("thumbnail_url")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            if title.is_some() {
-                                log::info!("oEmbed OK: title={title:?} thumb={thumb:?}");
-                                return (title, desc, thumb);
-                            }
-                        }
-                    }
-
-                    // 2. Try noembed.com (supports many providers)
-                    if let Some(json) = fetch_json(&format!("https://noembed.com/embed?url={}", u))
-                    {
-                        if json.get("error").is_none() {
-                            let title = json
-                                .get("title")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            let desc = json
-                                .get("author_name")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            let thumb = json
-                                .get("thumbnail_url")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            if title.is_some() {
-                                log::info!("noembed OK: title={title:?}");
-                                return (title, desc, thumb);
-                            }
-                        }
-                    }
-
-                    // 3. Scrape with Facebook crawler UA (most sites serve OG to this)
-                    let req = ureq::get(&u).set(
-                        "User-Agent",
-                        "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-                    );
-                    match req.call() {
-                        Ok(resp) => {
-                            let mut bytes = Vec::new();
-                            resp.into_reader()
-                                .take(200_000)
-                                .read_to_end(&mut bytes)
-                                .ok();
-                            let body = String::from_utf8_lossy(&bytes);
-                            let extract = |tag: &str| -> Option<String> {
-                                // Search for property="og:X" content="..." in any order
-                                if let Some(pos) = body.find(tag) {
-                                    let region =
-                                        &body[pos.saturating_sub(100)..body.len().min(pos + 300)];
-                                    if let Some(c) = region.find("content=\"") {
-                                        let start = c + 9;
-                                        if let Some(end) = region[start..].find('"') {
-                                            let val = &region[start..start + end];
-                                            if !val.is_empty() {
-                                                return Some(val.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                                None
-                            };
-                            let title = extract("og:title").or_else(|| {
-                                body.split("<title>")
-                                    .nth(1)
-                                    .and_then(|s| s.split("</title>").next())
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty())
-                            });
-                            let desc = extract("og:description");
-                            let thumb = extract("og:image");
-                            log::info!("OG scrape: title={title:?}");
-                            (title, desc, thumb)
-                        }
-                        Err(e) => {
-                            log::warn!("OG fetch failed: {e}");
-                            (None, None, None)
-                        }
-                    }
-                })
-                .await
-                .unwrap_or((None, None, None))
+                tokio::task::spawn_blocking(move || fetch_link_preview_blocking(u))
+                    .await
+                    .unwrap_or((None, None, None))
             } else {
                 (None, None, None)
             };
-
             let og_title_clone = og_title.clone();
             let og_desc_clone = og_desc.clone();
             let link_url_clone = link_url.clone();
@@ -10851,5 +10748,201 @@ mod tenor_tests {
         }));
         let bytes = fetch_bounded_bytes(&results[0].mp4_url, TENOR_STICKER_SEND_MAX_BYTES).unwrap();
         validate_webp(&bytes).unwrap();
+    }
+}
+
+/// Fetch link-preview metadata (oEmbed → noembed → OpenGraph). Runs blocking I/O,
+/// so callers must wrap it. Shared by the send path and the incoming-message
+/// backfill, which is why it lives outside either.
+pub fn fetch_link_preview_blocking(u: String) -> (Option<String>, Option<String>, Option<String>) {
+
+                    use std::io::Read;
+                    // Helper to fetch JSON from a URL
+                    let fetch_json = |url: &str| -> Option<serde_json::Value> {
+                        ureq::get(url)
+                            .call()
+                            .ok()
+                            .and_then(|r| r.into_string().ok())
+                            .and_then(|s| serde_json::from_str(&s).ok())
+                    };
+
+                    // 1. Try site-specific oEmbed (YouTube, Vimeo, etc.)
+                    let oembed_url = if u.contains("youtube.com") || u.contains("youtu.be") {
+                        Some(format!(
+                            "https://www.youtube.com/oembed?url={}&format=json",
+                            u
+                        ))
+                    } else if u.contains("vimeo.com") {
+                        Some(format!("https://vimeo.com/api/oembed.json?url={}", u))
+                    } else if u.contains("twitter.com") || u.contains("x.com") {
+                        Some(format!("https://publish.twitter.com/oembed?url={}", u))
+                    } else {
+                        None
+                    };
+
+                    if let Some(oembed) = oembed_url {
+                        if let Some(json) = fetch_json(&oembed) {
+                            let title = json
+                                .get("title")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let desc = json
+                                .get("author_name")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let thumb = json
+                                .get("thumbnail_url")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            if title.is_some() {
+                                log::info!("oEmbed OK: title={title:?} thumb={thumb:?}");
+                                return (title, desc, thumb);
+                            }
+                        }
+                    }
+
+                    // 2. Try noembed.com (supports many providers)
+                    if let Some(json) = fetch_json(&format!("https://noembed.com/embed?url={}", u))
+                    {
+                        if json.get("error").is_none() {
+                            let title = json
+                                .get("title")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let desc = json
+                                .get("author_name")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let thumb = json
+                                .get("thumbnail_url")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            if title.is_some() {
+                                log::info!("noembed OK: title={title:?}");
+                                return (title, desc, thumb);
+                            }
+                        }
+                    }
+
+                    // 3. Scrape with Facebook crawler UA (most sites serve OG to this)
+                    let req = ureq::get(&u).set(
+                        "User-Agent",
+                        "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+                    );
+                    match req.call() {
+                        Ok(resp) => {
+                            let mut bytes = Vec::new();
+                            resp.into_reader()
+                                .take(200_000)
+                                .read_to_end(&mut bytes)
+                                .ok();
+                            let body = String::from_utf8_lossy(&bytes);
+                            let extract = |tag: &str| -> Option<String> {
+                                // Search for property="og:X" content="..." in any order
+                                if let Some(pos) = body.find(tag) {
+                                    let region =
+                                        &body[pos.saturating_sub(100)..body.len().min(pos + 300)];
+                                    if let Some(c) = region.find("content=\"") {
+                                        let start = c + 9;
+                                        if let Some(end) = region[start..].find('"') {
+                                            let val = &region[start..start + end];
+                                            if !val.is_empty() {
+                                                return Some(val.to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                                None
+                            };
+                            let title = extract("og:title").or_else(|| {
+                                body.split("<title>")
+                                    .nth(1)
+                                    .and_then(|s| s.split("</title>").next())
+                                    .map(|s| s.trim().to_string())
+                                    .filter(|s| !s.is_empty())
+                            });
+                            let desc = extract("og:description");
+                            let thumb = extract("og:image");
+                            log::info!("OG scrape: title={title:?}");
+                            (title, desc, thumb)
+                        }
+                        Err(e) => {
+                            log::warn!("OG fetch failed: {e}");
+                            (None, None, None)
+                        }
+                    }
+                
+}
+
+/// First http(s) URL in a message body, trimmed of trailing punctuation that
+/// commonly abuts a pasted link.
+fn first_http_url(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .find(|w| w.starts_with("http://") || w.starts_with("https://"))
+        .map(|w| w.trim_end_matches([',', '.', ')', ']', '>', '"', '\'']).to_string())
+        .filter(|u| u.len() > 10)
+}
+
+/// Fetch preview metadata for a link and, if anything came back, persist it onto
+/// the stored message and tell the UI. Fire-and-forget: a failed lookup leaves
+/// the plain link exactly as it renders today.
+fn spawn_link_preview_fetch(
+    tx: Sender<WaEvent>,
+    state: Arc<Mutex<RuntimeState>>,
+    chat_id: String,
+    msg_id: String,
+    url: String,
+) {
+    tokio::spawn(async move {
+        let u = url.clone();
+        let (title, description, thumbnail_url) =
+            match tokio::task::spawn_blocking(move || fetch_link_preview_blocking(u)).await {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+        if title.is_none() && description.is_none() && thumbnail_url.is_none() {
+            return;
+        }
+        {
+            let mut s = state.lock().unwrap();
+            if let Some(msgs) = s.history.get_mut(&chat_id)
+                && let Some(m) = msgs.iter_mut().find(|m| m.id == msg_id)
+            {
+                m.link_url = Some(url.clone());
+                m.link_title = title.clone();
+                m.link_description = description.clone();
+                m.link_thumbnail_path = thumbnail_url.clone();
+                s.queue_save_messages(&chat_id);
+            }
+        }
+        let _ = tx
+            .send(WaEvent::LinkPreviewReady {
+                chat_id,
+                msg_id,
+                url,
+                title,
+                description,
+                thumbnail_url,
+            })
+            .await;
+    });
+}
+
+#[cfg(test)]
+mod link_preview_tests {
+    use super::first_http_url;
+
+    #[test]
+    fn extracts_and_trims_urls() {
+        assert_eq!(
+            first_http_url("check https://www.bbc.com/news/articles/cx2kp639yx4o now").as_deref(),
+            Some("https://www.bbc.com/news/articles/cx2kp639yx4o")
+        );
+        // trailing punctuation must not become part of the URL
+        assert_eq!(
+            first_http_url("see https://example.com/a.").as_deref(),
+            Some("https://example.com/a")
+        );
+        assert_eq!(first_http_url("no link here"), None);
     }
 }

@@ -110,6 +110,32 @@ still exists. It lives in the desktop crate, which upstream does not ship, so a 
 protocol-core replacement cannot delete the test along with the code — the exact failure
 mode that let this regression through CI. Verified to fail on genuine absence.
 
+## Link previews for bare URLs (OpenGraph backfill)
+
+The bubble could already render a preview card, but only from metadata the SENDER attached
+— so a plain pasted link showed as bare blue text. The OpenGraph/oEmbed fetcher existed but
+was wired only to the send path.
+- **desktop/src/ui/runtime.rs**: extracted `fetch_link_preview_blocking` (oEmbed → noembed →
+  OpenGraph) out of the send path so both directions share it; incoming messages carrying a
+  URL with no preview now fetch it off the message path, persist it onto the stored message,
+  and emit `LinkPreviewReady`.
+- **desktop/src/ui/message_bubble.rs**: `build_link_preview_card` factored out of the
+  constructor; new `set_link_preview` inserts the card above the timestamp on an
+  already-rendered bubble.
+- **desktop/src/bridge.rs / window.rs / chat_view.rs**: `LinkPreviewReady` event plumbed to
+  the open chat.
+- Fire-and-forget: a failed lookup leaves the plain link exactly as before. Preview survives
+  restart (persisted). Test: `extracts_and_trims_urls`.
+
+## 2FA auto-copy missed TD codes
+
+TD codes were detected fine (the 2FA inbox reroute uses the same detector and fired for
+them), but the clipboard copy shares the 60s `is_recent` gate used for notifications, and
+SMS relay delivery can lag past it — so the copy was silently skipped.
+- **desktop/src/ui/window.rs**: 2FA now uses its own 10-minute window (a late OTP is still
+  worth copying) and logs when a code was detected but skipped, so a future miss says why
+  instead of being silent.
+
 ## SMS self-echo rendered twice when the relay omits tmp_id
 
 The Packet D fix re-keys the optimistic bubble off `MessageConfirmed`, but the relay

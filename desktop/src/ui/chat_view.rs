@@ -3759,6 +3759,24 @@ impl ChatViewPanel {
         Self::append_bubble_to_inner(&self.inner, msg);
     }
 
+    /// Attach a fetched link-preview card to an already-rendered bubble.
+    pub fn set_link_preview(
+        &self,
+        chat_id: &str,
+        msg_id: &str,
+        url: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        thumbnail_url: Option<&str>,
+    ) {
+        if self.inner.current_chat_id.borrow().as_deref() != Some(chat_id) {
+            return;
+        }
+        if let Some(bubble) = self.inner.bubbles.borrow().get(msg_id) {
+            bubble.set_link_preview(url, title, description, thumbnail_url);
+        }
+    }
+
     pub fn confirm_bubble(&self, tmp_id: &str, real_id: &str) {
         // Record tmp→real so bubble-menu closures (which froze the tmp id at
         // creation time) can resolve to the real server id for edit/star/etc.

@@ -60,6 +60,10 @@ pub struct MessageBubble {
     media_box: Option<Box>,
     media_type: Option<MediaType>,
     media_loaded: RefCell<bool>,
+    /// Meta row, kept so a late link-preview backfill inserts its card above the
+    /// timestamp instead of rebuilding the bubble.
+    meta_row: Option<Box>,
+    link_preview_shown: std::cell::Cell<bool>,
     /// Live on-disk media path — set at build and by MediaReady, so the context
     /// menu works even when the message clone it captured predates the download.
     media_path: RefCell<Option<String>>,
@@ -140,6 +144,8 @@ impl MessageBubble {
                 media_box: None,
                 media_type: None,
                 media_loaded: RefCell::new(false),
+                meta_row: None,
+                link_preview_shown: std::cell::Cell::new(false),
                 media_path: RefCell::new(None),
                 on_image_click: Rc::new(RefCell::new(None)),
                 on_quoted_click: Rc::new(RefCell::new(None)),
@@ -810,97 +816,12 @@ impl MessageBubble {
 
         // Link preview rendering
         if let Some(url) = &msg.link_url {
-            // Extract domain for fallback title
-            let domain = url
-                .split("//")
-                .nth(1)
-                .and_then(|s| s.split('/').next())
-                .unwrap_or(url);
-            let title = msg.link_title.as_deref().unwrap_or(domain);
-            let preview_box = Box::new(Orientation::Vertical, 2);
-            preview_box.add_css_class("reply-context");
-            preview_box.set_margin_top(4);
-
-            // Thumbnail image (async download)
-            if let Some(thumb_url) = &msg.link_thumbnail_path {
-                let pic = gtk4::Picture::new();
-                pic.set_size_request(-1, 140);
-                pic.set_content_fit(gtk4::ContentFit::Cover);
-                pic.set_can_shrink(true);
-                preview_box.append(&pic);
-                // Download thumbnail on background thread
-                let url_c = thumb_url.clone();
-                let pic_c = pic.clone();
-                let (tx_img, rx_img) = async_channel::bounded::<Vec<u8>>(1);
-                glib::MainContext::default().spawn_local(async move {
-                    if let Ok(bytes) = rx_img.recv().await {
-                        let gb = glib::Bytes::from(&bytes);
-                        if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&gb) {
-                            pic_c.set_paintable(Some(&tex));
-                        }
-                    }
-                });
-                std::thread::spawn(move || {
-                    use std::io::Read;
-                    if let Ok(resp) = ureq::get(&url_c).call() {
-                        let mut bytes = Vec::new();
-                        if resp.into_reader().read_to_end(&mut bytes).is_ok() {
-                            let _ = tx_img.send_blocking(bytes);
-                        }
-                    }
-                });
-            }
-
-            let title_lbl = Label::new(Some(title));
-            title_lbl.add_css_class("heading");
-            title_lbl.set_halign(Align::Start);
-            title_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            title_lbl.set_max_width_chars(50);
-            title_lbl.set_max_width_chars(50);
-            preview_box.append(&title_lbl);
-
-            if let Some(desc) = &msg.link_description {
-                let desc_lbl = Label::new(Some(desc));
-                desc_lbl.add_css_class("dim-label");
-                desc_lbl.add_css_class("caption");
-                desc_lbl.set_halign(Align::Start);
-                desc_lbl.set_wrap(true);
-                desc_lbl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
-                desc_lbl.set_max_width_chars(50);
-                desc_lbl.set_max_width_chars(50);
-                desc_lbl.set_lines(2);
-                desc_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                preview_box.append(&desc_lbl);
-            }
-
-            let url_lbl = Label::new(Some(url));
-            url_lbl.add_css_class("dim-label");
-            url_lbl.add_css_class("caption");
-            url_lbl.set_halign(Align::Start);
-            url_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-            url_lbl.set_max_width_chars(50);
-            url_lbl.set_max_width_chars(50);
-            preview_box.append(&url_lbl);
-
-            // Click to open URL — route through the same hardened launcher used
-            // for the text-label link path (setsid + null stdio + detached). The
-            // URL is sender-controlled, so `open_url` allowlists http/https only
-            // and rejects any other scheme before spawning xdg-open (mb-12).
-            let url_owned = url.clone();
-            let activate_link: Rc<dyn Fn()> = Rc::new(move || open_url(&url_owned));
-            let gesture = GestureClick::new();
-            gesture.set_button(1);
-            let activate_click = activate_link.clone();
-            gesture.connect_released(move |_, _, _, _| activate_click());
-            preview_box.add_controller(gesture);
-            preview_box.set_cursor_from_name(Some("pointer"));
-            install_keyboard_activation(
-                preview_box.upcast_ref(),
-                "Open link preview",
-                activate_link,
-            );
-
-            content.append(&preview_box);
+            content.append(&build_link_preview_card(
+                url,
+                msg.link_title.as_deref(),
+                msg.link_description.as_deref(),
+                msg.link_thumbnail_path.as_deref(),
+            ));
         }
 
         // Bottom row: time + receipt
@@ -1039,6 +960,8 @@ impl MessageBubble {
             media_box,
             media_type: msg.media_type.clone(),
             media_loaded: RefCell::new(media_exists_on_disk),
+            meta_row: Some(meta_row.clone()),
+            link_preview_shown: std::cell::Cell::new(msg.link_url.is_some()),
             media_path: RefCell::new(
                 existing_media_path_for_menu,
             ),
@@ -1376,6 +1299,27 @@ impl MessageBubble {
         }
         build_media_content(mb, path, mt, &self.on_image_click);
         *self.media_loaded.borrow_mut() = true;
+    }
+
+    /// Attach a link-preview card to an already-rendered bubble (the sender sent
+    /// a bare link and we fetched the metadata afterwards).
+    pub fn set_link_preview(
+        &self,
+        url: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        thumbnail_url: Option<&str>,
+    ) {
+        if self.link_preview_shown.get() {
+            return;
+        }
+        self.link_preview_shown.set(true);
+        let (Some(content), Some(meta_row)) = (&self.content_box, &self.meta_row) else {
+            return;
+        };
+        let card = build_link_preview_card(url, title, description, thumbnail_url);
+        content.append(&card);
+        content.reorder_child_after(meta_row, Some(&card));
     }
 
     /// On-disk media path if the file is present (live view — survives the
@@ -2628,4 +2572,107 @@ fn name_to_colour(name: &str) -> &'static str {
         .bytes()
         .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
     COLOURS[(hash as usize) % COLOURS.len()]
+}
+
+/// Build the link-preview card. Shared by bubble construction and the late
+/// backfill, which arrives after the sender-less link already rendered.
+fn build_link_preview_card(
+    url: &str,
+    link_title: Option<&str>,
+    link_description: Option<&str>,
+    link_thumbnail_path: Option<&str>,
+) -> Box {
+    let url_owned_outer = url.to_string();
+    let url = &url_owned_outer;
+
+            // Extract domain for fallback title
+            let domain = url
+                .split("//")
+                .nth(1)
+                .and_then(|s| s.split('/').next())
+                .unwrap_or(url);
+            let title = link_title.unwrap_or(domain);
+            let preview_box = Box::new(Orientation::Vertical, 2);
+            preview_box.add_css_class("reply-context");
+            preview_box.set_margin_top(4);
+
+            // Thumbnail image (async download)
+            if let Some(thumb_url) = link_thumbnail_path.map(str::to_string).as_ref() {
+                let pic = gtk4::Picture::new();
+                pic.set_size_request(-1, 140);
+                pic.set_content_fit(gtk4::ContentFit::Cover);
+                pic.set_can_shrink(true);
+                preview_box.append(&pic);
+                // Download thumbnail on background thread
+                let url_c = thumb_url.clone();
+                let pic_c = pic.clone();
+                let (tx_img, rx_img) = async_channel::bounded::<Vec<u8>>(1);
+                glib::MainContext::default().spawn_local(async move {
+                    if let Ok(bytes) = rx_img.recv().await {
+                        let gb = glib::Bytes::from(&bytes);
+                        if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&gb) {
+                            pic_c.set_paintable(Some(&tex));
+                        }
+                    }
+                });
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    if let Ok(resp) = ureq::get(&url_c).call() {
+                        let mut bytes = Vec::new();
+                        if resp.into_reader().read_to_end(&mut bytes).is_ok() {
+                            let _ = tx_img.send_blocking(bytes);
+                        }
+                    }
+                });
+            }
+
+            let title_lbl = Label::new(Some(title));
+            title_lbl.add_css_class("heading");
+            title_lbl.set_halign(Align::Start);
+            title_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            title_lbl.set_max_width_chars(50);
+            title_lbl.set_max_width_chars(50);
+            preview_box.append(&title_lbl);
+
+            if let Some(desc) = link_description {
+                let desc_lbl = Label::new(Some(desc));
+                desc_lbl.add_css_class("dim-label");
+                desc_lbl.add_css_class("caption");
+                desc_lbl.set_halign(Align::Start);
+                desc_lbl.set_wrap(true);
+                desc_lbl.set_wrap_mode(gtk4::pango::WrapMode::WordChar);
+                desc_lbl.set_max_width_chars(50);
+                desc_lbl.set_max_width_chars(50);
+                desc_lbl.set_lines(2);
+                desc_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                preview_box.append(&desc_lbl);
+            }
+
+            let url_lbl = Label::new(Some(url));
+            url_lbl.add_css_class("dim-label");
+            url_lbl.add_css_class("caption");
+            url_lbl.set_halign(Align::Start);
+            url_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            url_lbl.set_max_width_chars(50);
+            url_lbl.set_max_width_chars(50);
+            preview_box.append(&url_lbl);
+
+            // Click to open URL — route through the same hardened launcher used
+            // for the text-label link path (setsid + null stdio + detached). The
+            // URL is sender-controlled, so `open_url` allowlists http/https only
+            // and rejects any other scheme before spawning xdg-open (mb-12).
+            let url_owned = url.clone();
+            let activate_link: Rc<dyn Fn()> = Rc::new(move || open_url(&url_owned));
+            let gesture = GestureClick::new();
+            gesture.set_button(1);
+            let activate_click = activate_link.clone();
+            gesture.connect_released(move |_, _, _, _| activate_click());
+            preview_box.add_controller(gesture);
+            preview_box.set_cursor_from_name(Some("pointer"));
+            install_keyboard_activation(
+                preview_box.upcast_ref(),
+                "Open link preview",
+                activate_link,
+            );
+    preview_box
 }
