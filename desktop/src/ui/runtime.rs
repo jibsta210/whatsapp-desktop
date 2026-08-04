@@ -2144,6 +2144,11 @@ impl RuntimeState {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver<WaCommand>) {
+    // Heal any file still on a pre-media_download layout. load_messages migrates
+    // lazily, so a chat nobody opens (the verification-codes inbox) stays frozen
+    // and silently drops every new message.
+    migrate_legacy_message_files();
+
     // Fork the command stream: anything addressed to a `gm:` chat goes to
     // the gmessages runtime; everything else flows to the WhatsApp runtime.
     // If gmessages is disabled, we just forward everything to WhatsApp (the
@@ -10982,5 +10987,51 @@ mod legacy_message_decode_tests {
             assert!(decoded.is_ok(), "{name}: legacy decode failed");
             println!("{name}: recovered {} messages", decoded.unwrap().len());
         }
+    }
+}
+
+/// One-shot sweep: any message file that fails the current decode but parses as
+/// the pre-`media_download` layout is rewritten in the current format. Only
+/// touches files that are already broken, so healthy chats are never rewritten.
+fn migrate_legacy_message_files() {
+    let dir = messages_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let mut healed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("bin") {
+            continue;
+        }
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        if data.len() < 4 || data[..4] != BIN_HEADER {
+            continue;
+        }
+        if bincode::deserialize::<Vec<IncomingMessage>>(&data[4..]).is_ok() {
+            continue;
+        }
+        if let Ok(legacy) =
+            bincode::deserialize::<Vec<crate::bridge::LegacyIncomingMessageV2>>(&data[4..])
+        {
+            let msgs: Vec<IncomingMessage> = legacy.into_iter().map(Into::into).collect();
+            let mut buf = BIN_HEADER.to_vec();
+            if let Ok(encoded) = bincode::serialize(&msgs) {
+                buf.extend_from_slice(&encoded);
+                if atomic_write(&path, &buf).is_ok() {
+                    healed += 1;
+                    log::info!(
+                        "migrated {} ({} messages) from the pre-media_download layout",
+                        path.display(),
+                        msgs.len()
+                    );
+                }
+            }
+        }
+    }
+    if healed > 0 {
+        log::info!("startup migration: healed {healed} frozen message file(s)");
     }
 }
