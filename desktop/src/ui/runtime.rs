@@ -10971,25 +10971,42 @@ mod link_preview_tests {
 
 #[cfg(test)]
 mod legacy_message_decode_tests {
-    use crate::bridge::LegacyIncomingMessageV2;
+    use crate::bridge::{IncomingMessage, LegacyIncomingMessageV2};
 
-    /// The real frozen files on this machine must decode through the legacy shape.
+    /// A file written before `media_download` existed must still decode, and the
+    /// migrated result must round-trip through the current struct. Built from a
+    /// synthetic blob on purpose: asserting against the live data dir passes only
+    /// until the migration rewrites those files.
     #[test]
-    fn recovers_real_frozen_files() {
-        let home = std::env::var("HOME").unwrap();
-        for name in [
-            "gm_verification-codes.bin",
-            "120363408537845584_g.us.bin",
-            "120363259937959743_g.us.bin",
-        ] {
-            let p = format!("{home}/.local/share/whatsapp-desktop/wa_messages/{name}");
-            let Ok(data) = std::fs::read(&p) else { continue };
-            assert_eq!(&data[..4], b"WA02", "{name}: unexpected header");
-            let decoded =
-                bincode::deserialize::<Vec<LegacyIncomingMessageV2>>(&data[4..]);
-            assert!(decoded.is_ok(), "{name}: legacy decode failed");
-            println!("{name}: recovered {} messages", decoded.unwrap().len());
-        }
+    fn legacy_layout_decodes_and_migrates() {
+        let legacy_bytes = {
+            let current = IncomingMessage::outgoing(
+                "MSGID1".into(),
+                "gm:verification-codes".into(),
+                Some("Your security code is 641333.".into()),
+                1_750_000_000,
+            );
+            // The old layout is the current one minus the trailing media_download,
+            // so encoding the current struct and dropping that suffix reproduces it.
+            let full = bincode::serialize(&vec![current]).expect("encode");
+            let tail = bincode::serialize(&None::<crate::bridge::MediaDownloadKeys>).expect("tail");
+            full[..full.len() - tail.len()].to_vec()
+        };
+
+        let decoded = bincode::deserialize::<Vec<LegacyIncomingMessageV2>>(&legacy_bytes)
+            .expect("legacy layout must decode");
+        assert_eq!(decoded.len(), 1);
+
+        let migrated: Vec<IncomingMessage> = decoded.into_iter().map(Into::into).collect();
+        assert_eq!(migrated[0].text.as_deref(), Some("Your security code is 641333."));
+        assert!(migrated[0].media_download.is_none());
+
+        // and the migrated form must be readable by the current decoder
+        let re = bincode::serialize(&migrated).expect("re-encode");
+        assert_eq!(
+            bincode::deserialize::<Vec<IncomingMessage>>(&re).expect("current decode").len(),
+            1
+        );
     }
 }
 
