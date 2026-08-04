@@ -1997,7 +1997,7 @@ fn build_reaction_row(reactions: &[(String, String)], is_from_me: bool) -> Optio
                 if s.is_empty() {
                     "You".to_string()
                 } else {
-                    crate::ui::runtime::display_name_from_jid(s)
+                    crate::ui::runtime::display_name_for_jid_global(s)
                 }
             })
             .collect();

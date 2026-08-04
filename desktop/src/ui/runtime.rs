@@ -3172,6 +3172,7 @@ async fn handle_wa_event(
                         .unwrap_or_default();
                     let emoji = rm.text.clone().unwrap_or_default();
                     let sender = info.source.sender.to_string();
+                    let reactor_jid = sender.clone();
                     if !target_id.is_empty() {
                         // Persist reaction to message cache + capture the full
                         // updated reactions so the UI can rebuild (dedup/remove).
@@ -3203,10 +3204,12 @@ async fn handle_wa_event(
                             // Rendered live but never persisted — restart shows
                             // the underlying message text again (A6).
                             if is_latest && !emoji.is_empty() {
-                                state
-                                    .lock()
-                                    .unwrap()
-                                    .emit_row_ephemeral(&chat_id, &format!("Reacted {emoji}"));
+                                let mut st = state.lock().unwrap();
+                                let who = resolve_sender_name(&st, &reactor_jid);
+                                st.emit_row_ephemeral(
+                                    &chat_id,
+                                    &format!("{who} reacted {emoji}"),
+                                );
                             }
                             let _ = tx
                                 .send(WaEvent::ReactionUpdated {
@@ -6486,7 +6489,7 @@ async fn handle_command(
                         state
                             .lock()
                             .unwrap()
-                            .emit_row_ephemeral(&chat_id, &format!("Reacted {emoji}"));
+                            .emit_row_ephemeral(&chat_id, &format!("You reacted {emoji}"));
                     }
                     let _ = tx
                         .send(WaEvent::ReactionUpdated {
@@ -11034,4 +11037,23 @@ fn migrate_legacy_message_files() {
     if healed > 0 {
         log::info!("startup migration: healed {healed} frozen message file(s)");
     }
+}
+
+/// Resolve a reactor/sender JID to a display name from the shared contact
+/// directory. Widgets can't reach `RuntimeState`, and `display_name_from_jid`
+/// alone renders a LID as a bogus "+<15 digits>" phone number.
+pub fn display_name_for_jid_global(jid: &str) -> String {
+    let dir = crate::contacts::global();
+    if let Some(name) = dir.lookup(jid) {
+        return name;
+    }
+    if jid.ends_with("@lid")
+        && let Some(phone_jid) = dir.resolve_lid_to_phone(jid)
+    {
+        if let Some(name) = dir.lookup(&phone_jid) {
+            return name;
+        }
+        return display_name_from_jid(&phone_jid);
+    }
+    display_name_from_jid(jid)
 }

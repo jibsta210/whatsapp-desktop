@@ -123,6 +123,18 @@ codes look broken.
   the current format instead of quarantining it.
 - Verified against the real files: 49 verification codes, 13 + 22 group messages recovered.
 
+## Reactions: show WHO reacted
+
+The sidebar preview said only "Reacted 👍", and the reaction pill's tooltip ran the
+reactor's JID through `display_name_from_jid`, which formats digits as a phone number — so
+a LID reactor rendered as a bogus "+14942624078…" instead of their name.
+- **desktop/src/ui/runtime.rs**: incoming reactions resolve the reactor via
+  `resolve_sender_name` → "<Name> reacted 👍"; own reactions read "You reacted 👍".
+  New `display_name_for_jid_global` resolves a JID (including LID→phone) through the shared
+  contact directory for widgets that hold no RuntimeState.
+- **desktop/src/ui/message_bubble.rs**: the pill tooltip uses it instead of digit formatting.
+- **desktop/src/gmessages_runtime.rs**: same wording for SMS reactions.
+
 ## Link previews for bare URLs (OpenGraph backfill)
 
 The bubble could already render a preview card, but only from metadata the SENDER attached

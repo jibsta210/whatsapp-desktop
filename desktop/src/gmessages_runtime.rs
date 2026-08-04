@@ -2595,7 +2595,7 @@ async fn handle_command(
                     // runtime via TouchChatSummary with ephemeral:true so the
                     // visible WA row shows the reaction (correction 3).
                     if is_latest && !emoji.is_empty() {
-                        let ephem_preview = format!("Reacted {emoji}");
+                        let ephem_preview = format!("You reacted {emoji}");
                         let merged_target = merge_map.lock().await.get(&conv).cloned();
                         if let Some(wa_id) = merged_target {
                             let _ = wa_cmd_tx.send(WaCommand::TouchChatSummary {
