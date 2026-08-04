@@ -110,6 +110,19 @@ still exists. It lives in the desktop crate, which upstream does not ship, so a 
 protocol-core replacement cannot delete the test along with the code — the exact failure
 mode that let this regression through CI. Verified to fail on genuine absence.
 
+## Frozen message files recovered (verification codes + group chats)
+
+`media_download` was appended to `IncomingMessage` on 2026-06-16. bincode is positional, so
+any file last written before that commit no longer decoded — and the safety guard added
+later ("refusing to save — load returned empty but file is N bytes") then blocked every
+append, freezing those chats permanently. `gm_verification-codes.bin` had been stuck since
+Jun 16: every 2FA code since was neither persisted nor displayed, which is what made TD
+codes look broken.
+- **desktop/src/bridge.rs**: `LegacyIncomingMessageV2` (the pre-`media_download` layout).
+- **desktop/src/ui/runtime.rs**: `load_messages` decodes through it and rewrites the file in
+  the current format instead of quarantining it.
+- Verified against the real files: 49 verification codes, 13 + 22 group messages recovered.
+
 ## Link previews for bare URLs (OpenGraph backfill)
 
 The bubble could already render a preview card, but only from metadata the SENDER attached

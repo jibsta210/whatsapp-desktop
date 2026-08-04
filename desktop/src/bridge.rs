@@ -1071,3 +1071,83 @@ mod td_2fa_tests {
         }
     }
 }
+
+/// `IncomingMessage` as persisted before `media_download` was appended
+/// (2026-06-16). bincode is positional and ignores `#[serde(default)]`, so a file
+/// last written before that commit only decodes through this shape.
+#[derive(Deserialize)]
+pub struct LegacyIncomingMessageV2 {
+    pub id: String,
+    pub chat_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub text: Option<String>,
+    pub media_type: Option<MediaType>,
+    pub timestamp: i64,
+    pub is_from_me: bool,
+    pub quoted_msg_id: Option<String>,
+    pub quoted_text: Option<String>,
+    pub quoted_sender: Option<String>,
+    pub is_forwarded: bool,
+    pub forwarding_score: u32,
+    pub reactions: Vec<(String, String)>,
+    pub media_local_path: Option<String>,
+    pub media_filename: Option<String>,
+    pub media_caption: Option<String>,
+    pub contact_name: Option<String>,
+    pub contact_vcard: Option<String>,
+    pub link_title: Option<String>,
+    pub link_description: Option<String>,
+    pub link_url: Option<String>,
+    pub link_thumbnail_path: Option<String>,
+    pub quoted_media_path: Option<String>,
+    pub poll_question: Option<String>,
+    pub poll_options: Vec<String>,
+    pub poll_selectable: u32,
+    pub poll_secret: Vec<u8>,
+    pub poll_votes: Vec<(String, Vec<String>)>,
+    pub receipt_status: ReceiptStatus,
+    pub is_edited: bool,
+    pub is_system_message: bool,
+}
+
+impl From<LegacyIncomingMessageV2> for IncomingMessage {
+    fn from(m: LegacyIncomingMessageV2) -> Self {
+        Self {
+            id: m.id,
+            chat_id: m.chat_id,
+            sender_id: m.sender_id,
+            sender_name: m.sender_name,
+            text: m.text,
+            media_type: m.media_type,
+            timestamp: m.timestamp,
+            is_from_me: m.is_from_me,
+            quoted_msg_id: m.quoted_msg_id,
+            quoted_text: m.quoted_text,
+            quoted_sender: m.quoted_sender,
+            is_forwarded: m.is_forwarded,
+            forwarding_score: m.forwarding_score,
+            reactions: m.reactions,
+            media_local_path: m.media_local_path,
+            media_filename: m.media_filename,
+            media_caption: m.media_caption,
+            contact_name: m.contact_name,
+            contact_vcard: m.contact_vcard,
+            link_title: m.link_title,
+            link_description: m.link_description,
+            link_url: m.link_url,
+            link_thumbnail_path: m.link_thumbnail_path,
+            quoted_media_path: m.quoted_media_path,
+            poll_question: m.poll_question,
+            poll_options: m.poll_options,
+            poll_selectable: m.poll_selectable,
+            poll_secret: m.poll_secret,
+            poll_votes: m.poll_votes,
+            receipt_status: m.receipt_status,
+            is_edited: m.is_edited,
+            is_system_message: m.is_system_message,
+            media_download: None,
+        }
+    }
+}
+

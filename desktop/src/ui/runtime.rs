@@ -810,6 +810,20 @@ pub fn load_messages(chat_id: &str) -> Vec<IncomingMessage> {
     // old history. The `.corrupt` copy keeps it recoverable.
     if let Ok(data) = std::fs::read(&bin_path) {
         if data.len() >= 4 && data[..4] == BIN_HEADER {
+            // Pre-`media_download` layout (files last written before 2026-06-16).
+            // Without this the loader returned empty, the append guard then refused
+            // to save, and the chat stayed frozen forever.
+            if let Ok(legacy) =
+                bincode::deserialize::<Vec<crate::bridge::LegacyIncomingMessageV2>>(&data[4..])
+            {
+                let msgs: Vec<IncomingMessage> = legacy.into_iter().map(Into::into).collect();
+                log::info!(
+                    "load_messages({chat_id}): recovered {} message(s) from the pre-media_download layout; migrating",
+                    msgs.len()
+                );
+                save_messages(chat_id, &msgs);
+                return msgs;
+            }
             backup_corrupt_once(&bin_path);
             log::warn!(
                 "load_messages({chat_id}): current-format decode failed; preserved as .corrupt, showing empty"
@@ -10944,5 +10958,29 @@ mod link_preview_tests {
             Some("https://example.com/a")
         );
         assert_eq!(first_http_url("no link here"), None);
+    }
+}
+
+#[cfg(test)]
+mod legacy_message_decode_tests {
+    use crate::bridge::LegacyIncomingMessageV2;
+
+    /// The real frozen files on this machine must decode through the legacy shape.
+    #[test]
+    fn recovers_real_frozen_files() {
+        let home = std::env::var("HOME").unwrap();
+        for name in [
+            "gm_verification-codes.bin",
+            "120363408537845584_g.us.bin",
+            "120363259937959743_g.us.bin",
+        ] {
+            let p = format!("{home}/.local/share/whatsapp-desktop/wa_messages/{name}");
+            let Ok(data) = std::fs::read(&p) else { continue };
+            assert_eq!(&data[..4], b"WA02", "{name}: unexpected header");
+            let decoded =
+                bincode::deserialize::<Vec<LegacyIncomingMessageV2>>(&data[4..]);
+            assert!(decoded.is_ok(), "{name}: legacy decode failed");
+            println!("{name}: recovered {} messages", decoded.unwrap().len());
+        }
     }
 }
