@@ -60,6 +60,10 @@ pub struct MessageBubble {
     media_box: Option<Box>,
     media_type: Option<MediaType>,
     media_loaded: RefCell<bool>,
+    /// Text as currently displayed. `text` is fixed at construction, but autocorrect
+    /// rewrites the label after the fact, and the SMS echo arrives carrying the
+    /// CORRECTED string — dedup has to compare against what's on screen.
+    live_text: RefCell<Option<String>>,
     /// Meta row, kept so a late link-preview backfill inserts its card above the
     /// timestamp instead of rebuilding the bubble.
     meta_row: Option<Box>,
@@ -144,6 +148,7 @@ impl MessageBubble {
                 media_box: None,
                 media_type: None,
                 media_loaded: RefCell::new(false),
+                live_text: RefCell::new(msg.text.clone()),
                 meta_row: None,
                 link_preview_shown: std::cell::Cell::new(false),
                 media_path: RefCell::new(None),
@@ -960,6 +965,7 @@ impl MessageBubble {
             media_box,
             media_type: msg.media_type.clone(),
             media_loaded: RefCell::new(media_exists_on_disk),
+            live_text: RefCell::new(msg.text.clone().or_else(|| msg.media_caption.clone())),
             meta_row: Some(meta_row.clone()),
             link_preview_shown: std::cell::Cell::new(msg.link_url.is_some()),
             media_path: RefCell::new(
@@ -1012,6 +1018,7 @@ impl MessageBubble {
 
     /// Update the text of this bubble (for message edits) and show "(edited)" badge.
     pub fn update_text(&self, new_text: &str, show_edited: bool) {
+        *self.live_text.borrow_mut() = Some(new_text.to_string());
         let markup = format_whatsapp_markup(new_text);
         // If the bubble had no text label (a media-only / no-caption message
         // that just gained a caption via edit), lazily create one and append it
@@ -1320,6 +1327,11 @@ impl MessageBubble {
         let card = build_link_preview_card(url, title, description, thumbnail_url);
         content.append(&card);
         content.reorder_child_after(meta_row, Some(&card));
+    }
+
+    /// Text as currently rendered (autocorrect may have rewritten it post-send).
+    pub fn live_text(&self) -> Option<String> {
+        self.live_text.borrow().clone()
     }
 
     /// On-disk media path if the file is present (live view — survives the

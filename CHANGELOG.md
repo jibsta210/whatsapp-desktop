@@ -123,6 +123,17 @@ codes look broken.
   the current format instead of quarantining it.
 - Verified against the real files: 49 verification codes, 13 + 22 group messages recovered.
 
+## Duplicate SMS bubble, take 3: autocorrect broke the text match
+
+The content-match fallback compared `MessageBubble::text`, which is fixed at construction.
+Autocorrect rewrites the label AFTER the optimistic bubble is built and sends the CORRECTED
+string, so the echo's text never matched the bubble's stored text and a second bubble
+appeared — only for messages autocorrect actually changed, which is why it looked
+intermittent.
+- **desktop/src/ui/message_bubble.rs**: `live_text` tracks what's actually rendered
+  (updated by `update_text`); new `live_text()` accessor.
+- **desktop/src/ui/chat_view.rs**: the self-echo fallback compares against it.
+
 ## Reactions: show WHO reacted
 
 The sidebar preview said only "Reacted 👍", and the reaction pill's tooltip ran the

@@ -3830,7 +3830,7 @@ impl ChatViewPanel {
                     .iter()
                     .find(|(key, bubble)| {
                         (key.starts_with("tmp-") || key.starts_with("gm:tmp_"))
-                            && bubble.text.as_deref() == msg.text.as_deref()
+                            && bubble.live_text().as_deref() == msg.text.as_deref()
                     })
                     .map(|(key, _)| key.clone())
             };
