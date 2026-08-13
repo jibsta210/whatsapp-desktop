@@ -1,0 +1,2244 @@
+warning: method `send_remove_mutation` is never used
+   --> src/features/chat_actions.rs:649:14
+    |
+360 | impl<'a> ChatActions<'a> {
+    | ------------------------ method in this implementation
+...
+649 |     async fn send_remove_mutation(&self, collection: WAPatchName, index: &[u8]) -> Result<()> {
+    |              ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `whatsapp-rust` (lib) generated 1 warning
+warning: unused import: `Widget`
+ --> desktop/src/ui/chat_view.rs:9:79
+  |
+9 |     RevealerTransitionType, ScrolledWindow, SearchEntry, Separator, TextView, Widget,
+  |                                                                               ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Image`
+ --> desktop/src/ui/login.rs:4:24
+  |
+4 | use gtk4::{Align, Box, Image, Label, Orientation, Picture, Spinner};
+  |                        ^^^^^
+
+warning: unused imports: `ImageBuffer` and `Rgb`
+ --> desktop/src/ui/login.rs:5:13
+  |
+5 | use image::{ImageBuffer, Rgb};
+  |             ^^^^^^^^^^^  ^^^
+
+warning: unused import: `libadwaita as adw`
+ --> desktop/src/ui/login.rs:6:5
+  |
+6 | use libadwaita as adw;
+  |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `libadwaita::prelude::*`
+ --> desktop/src/ui/login.rs:7:5
+  |
+7 | use libadwaita::prelude::*;
+  |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `MessageSource`
+  --> desktop/src/ui/runtime.rs:23:51
+   |
+23 | use crate::bridge::{ChatSummary, IncomingMessage, MessageSource, ReceiptStatus, WaCommand, WaEvent};
+   |                                                   ^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> desktop/src/ui/settings.rs:6:5
+  |
+6 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `Switch`
+ --> desktop/src/ui/settings.rs:9:44
+  |
+9 | use gtk4::{Align, Box, Label, Orientation, Switch};
+  |                                            ^^^^^^
+
+warning: unused imports: `Paned`, `Spinner`, and `TextView`
+ --> desktop/src/ui/window.rs:7:31
+  |
+7 |     Box, Button, Orientation, Paned, Revealer, RevealerTransitionType, Spinner, Stack, TextView,
+  |                               ^^^^^                                    ^^^^^^^         ^^^^^^^^
+
+warning: use of deprecated struct `gtk4::FileChooserDialog`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4953:32
+     |
+4953 |             let dialog = gtk4::FileChooserDialog::new(
+     |                                ^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+
+warning: variable does not need to be mutable
+   --> desktop/src/gmessages_runtime.rs:367:17
+    |
+367 |             let mut feed = |contacts: Vec<gmessages_rust::gmproto::conversations::Contact>,
+    |                 ----^^^^
+    |                 |
+    |                 help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> desktop/src/gmessages_runtime.rs:387:17
+    |
+387 |             let mut feed_to_global = |contacts: Vec<gmessages_rust::gmproto::conversations::Contact>,
+    |                 ----^^^^^^^^^^^^^^
+    |                 |
+    |                 help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> desktop/src/ui/runtime.rs:7359:13
+     |
+7359 |         let mut phone_msgs = load_messages(&phone_jid);
+     |             ----^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> desktop/src/ui/runtime.rs:3725:21
+     |
+3725 |                 let mut ctx = wa::ContextInfo {
+     |                     ----^^^
+     |                     |
+     |                     help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> desktop/src/ui/runtime.rs:5192:17
+     |
+5192 |             let mut name = client.get_push_name().await;
+     |                 ----^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: use of deprecated method `gtk4::prelude::WidgetExt::translate_coordinates`: Since 4.12
+    --> desktop/src/ui/chat_view.rs:3621:46
+     |
+3621 |                 if let Some((_, y)) = widget.translate_coordinates(&inner_c.messages_box, 0.0, 0.0)
+     |                                              ^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated associated function `gtk4::file_chooser_dialog::<impl gtk4::FileChooserDialog>::new`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4953:51
+     |
+4953 |             let dialog = gtk4::FileChooserDialog::new(
+     |                                                   ^^^
+
+warning: use of deprecated method `gtk4::prelude::FileChooserExt::set_current_name`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4962:20
+     |
+4962 |             dialog.set_current_name(&clean_name);
+     |                    ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `gtk4::prelude::FileChooserExtManual::set_current_folder`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4966:36
+     |
+4966 |                     let _ = dialog.set_current_folder(Some(&gtk4::gio::File::for_path(&downloads)));
+     |                                    ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `gtk4::prelude::DialogExt::connect_response`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4970:20
+     |
+4970 |             dialog.connect_response(move |d, resp| {
+     |                    ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `gtk4::prelude::FileChooserExt::file`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4972:45
+     |
+4972 |                     if let Some(target) = d.file().and_then(|f| f.path()) {
+     |                                             ^^^^
+
+warning: use of deprecated method `gtk4::prelude::WidgetExt::show`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4982:20
+     |
+4982 |             dialog.show();
+     |                    ^^^^
+
+warning: unused import: `libadwaita::prelude`
+ --> desktop/src/app.rs:8:5
+  |
+8 | use libadwaita::prelude::*;
+  |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `libadwaita::prelude`
+  --> desktop/src/ui/chat_view.rs:12:5
+   |
+12 | use libadwaita::prelude::*;
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `suffix`
+    --> desktop/src/ui/autocorrect.rs:1824:54
+     |
+1824 | ...                   let (apply_text, suffix) = if current == original {
+     |                                        ^^^^^^ help: if this is intentional, prefix it with an underscore: `_suffix`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `modifier`
+    --> desktop/src/ui/autocorrect.rs:1670:52
+     |
+1670 |     key_ctrl.connect_key_released(move |_, key, _, modifier| {
+     |                                                    ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_modifier`
+
+warning: unused variable: `revert_ref`
+    --> desktop/src/ui/autocorrect.rs:1511:9
+     |
+1511 |     let revert_ref = revert_map.clone();
+     |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_revert_ref`
+
+warning: unused variable: `skip_ref`
+    --> desktop/src/ui/autocorrect.rs:1518:9
+     |
+1518 |     let skip_ref = skip_next.clone();
+     |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_skip_ref`
+
+warning: unused variable: `inner`
+   --> desktop/src/ui/chat_list.rs:429:13
+    |
+429 |         let inner = &self.inner;
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_inner`
+
+warning: unused variable: `colour_str`
+   --> desktop/src/ui/chat_view.rs:916:29
+    |
+916 |                         let colour_str = colour.to_string();
+    |                             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_colour_str`
+
+warning: unused variable: `msgs_box_for_send`
+    --> desktop/src/ui/chat_view.rs:2186:13
+     |
+2186 |         let msgs_box_for_send = inner.messages_box.clone();
+     |             ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_msgs_box_for_send`
+
+warning: unused variable: `chevron`
+    --> desktop/src/ui/chat_view.rs:2813:17
+     |
+2813 |             let chevron = bubble.chevron_button().clone();
+     |                 ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_chevron`
+
+warning: unused variable: `vbox`
+    --> desktop/src/ui/chat_view.rs:4487:9
+     |
+4487 |     let vbox = Box::new(Orientation::Vertical, 0);
+     |         ^^^^ help: if this is intentional, prefix it with an underscore: `_vbox`
+
+warning: unused variable: `g`
+    --> desktop/src/ui/chat_view.rs:5075:37
+     |
+5075 |     bg_click.connect_released(move |g, n_press, _, _| {
+     |                                     ^ help: if this is intentional, prefix it with an underscore: `_g`
+
+warning: unused variable: `img`
+   --> desktop/src/ui/login.rs:102:9
+    |
+102 |     let img = code.render::<qrcode::render::unicode::Dense1x2>().build();
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_img`
+
+warning: unused variable: `lower`
+    --> desktop/src/ui/runtime.rs:4834:29
+     |
+4834 |                         let lower = local_path.to_lowercase();
+     |                             ^^^^^ help: if this is intentional, prefix it with an underscore: `_lower`
+
+warning: unused variable: `preview`
+    --> desktop/src/ui/runtime.rs:5258:25
+     |
+5258 |                     let preview = format!("📊 *{question}*\n{opts_text}");
+     |                         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_preview`
+
+warning: unused variable: `s`
+    --> desktop/src/ui/runtime.rs:5481:25
+     |
+5481 |                     let s = state.lock().unwrap();
+     |                         ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `contact_vcard`
+    --> desktop/src/ui/runtime.rs:8048:24
+     |
+8048 |     let (contact_name, contact_vcard) = if let Some(cm) = &base.contact_message {
+     |                        ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_contact_vcard`
+
+warning: unused variable: `link_title`
+    --> desktop/src/ui/runtime.rs:8055:10
+     |
+8055 |     let (link_title, link_description, link_url) = if let Some(etm) = &base.extended_text_message {
+     |          ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_link_title`
+
+warning: unused variable: `link_description`
+    --> desktop/src/ui/runtime.rs:8055:22
+     |
+8055 |     let (link_title, link_description, link_url) = if let Some(etm) = &base.extended_text_message {
+     |                      ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_link_description`
+
+warning: unused variable: `link_url`
+    --> desktop/src/ui/runtime.rs:8055:40
+     |
+8055 |     let (link_title, link_description, link_url) = if let Some(etm) = &base.extended_text_message {
+     |                                        ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_link_url`
+
+warning: unused variable: `rows`
+    --> desktop/src/ui/window.rs:1053:21
+     |
+1053 |                 let rows = inner.chat_list.widget();
+     |                     ^^^^ help: if this is intentional, prefix it with an underscore: `_rows`
+
+warning: unused variable: `tv`
+    --> desktop/src/ui/window.rs:1215:33
+     |
+1215 |                     if let Some(tv) = child.downcast_ref::<adw::ToolbarView>() {
+     |                                 ^^ help: if this is intentional, prefix it with an underscore: `_tv`
+
+warning: unused variable: `pos`
+    --> desktop/src/ui/window.rs:1298:10
+     |
+1298 |     for (pos, chat) in ordered.iter().enumerate() {
+     |          ^^^ help: if this is intentional, prefix it with an underscore: `_pos`
+
+warning: unused variable: `rebuild_edit`
+    --> desktop/src/ui/window.rs:2244:21
+     |
+2244 |                 let rebuild_edit = Rc::clone(&{
+     |                     ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_rebuild_edit`
+
+warning: unused variable: `bridge_c`
+    --> desktop/src/ui/window.rs:2197:13
+     |
+2197 |         let bridge_c = bridge.clone();
+     |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bridge_c`
+
+warning: field `chat_name` is never read
+  --> desktop/src/bridge.rs:42:9
+   |
+40 |     HistoryMessages {
+   |     --------------- field in this variant
+41 |         chat_id: String,
+42 |         chat_name: String,
+   |         ^^^^^^^^^
+   |
+   = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `chat_id` is never read
+   --> desktop/src/bridge.rs:140:9
+    |
+139 |     MessageStarred {
+    |     -------------- field in this variant
+140 |         chat_id: String,
+    |         ^^^^^^^
+    |
+    = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `chat_id` is never read
+   --> desktop/src/bridge.rs:169:9
+    |
+168 |     GroupsInCommon {
+    |     -------------- field in this variant
+169 |         chat_id: String,
+    |         ^^^^^^^
+    |
+    = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `phone` is never read
+   --> desktop/src/bridge.rs:177:9
+    |
+175 |     ContactProfile {
+    |     -------------- field in this variant
+176 |         chat_id: String,
+177 |         phone: String,
+    |         ^^^^^
+    |
+    = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `chat_id` is never read
+   --> desktop/src/bridge.rs:202:9
+    |
+201 |     GroupInviteLink {
+    |     --------------- field in this variant
+202 |         chat_id: String,
+    |         ^^^^^^^
+    |
+    = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: variants `IncomingCall`, `CallEnded`, and `CallAccepted` are never constructed
+   --> desktop/src/bridge.rs:211:5
+    |
+ 11 | pub enum WaEvent {
+    |          ------- variants in this enum
+...
+211 |     IncomingCall {
+    |     ^^^^^^^^^^^^
+...
+216 |     CallEnded {
+    |     ^^^^^^^^^
+...
+220 |     CallAccepted {
+    |     ^^^^^^^^^^^^
+    |
+    = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `keywords` is never read
+   --> desktop/src/bridge.rs:256:9
+    |
+253 | pub struct QuickReplyData {
+    |            -------------- field in this struct
+...
+256 |     pub keywords: Vec<String>,
+    |         ^^^^^^^^
+    |
+    = note: `QuickReplyData` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: multiple variants are never constructed
+   --> desktop/src/bridge.rs:291:5
+    |
+268 | pub enum WaCommand {
+    |          --------- variants in this enum
+...
+291 |     ForwardMessage {
+    |     ^^^^^^^^^^^^^^
+...
+303 |     SetTyping {
+    |     ^^^^^^^^^
+...
+317 |     Logout,
+    |     ^^^^^^
+...
+431 |     SyncQuickReplies,
+    |     ^^^^^^^^^^^^^^^^
+...
+438 |     DeleteQuickReply {
+    |     ^^^^^^^^^^^^^^^^
+...
+531 |     EndCall {
+    |     ^^^^^^^
+...
+535 |     SearchAllMessages {
+    |     ^^^^^^^^^^^^^^^^^
+...
+545 |     MultiForward {
+    |     ^^^^^^^^^^^^
+    |
+    = note: `WaCommand` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: associated function `from_chat_id` is never used
+   --> desktop/src/bridge.rs:730:12
+    |
+728 | impl MessageSource {
+    | ------------------ associated function in this implementation
+729 |     /// Detect the source protocol from the chat ID prefix.
+730 |     pub fn from_chat_id(chat_id: &str) -> Self {
+    |            ^^^^^^^^^^^^
+
+warning: method `canonical_chat_id` is never used
+  --> desktop/src/contacts.rs:69:12
+   |
+61 | impl ContactEntry {
+   | ----------------- method in this implementation
+...
+69 |     pub fn canonical_chat_id(&self) -> Option<String> {
+   |            ^^^^^^^^^^^^^^^^^
+
+warning: associated items `new`, `canonical_chat_id`, and `is_empty` are never used
+   --> desktop/src/contacts.rs:146:12
+    |
+120 | impl ContactDirectory {
+    | --------------------- associated items in this implementation
+...
+146 |     pub fn new() -> Self {
+    |            ^^^
+...
+262 |     pub fn canonical_chat_id(&self, phone_key: &str) -> Option<String> {
+    |            ^^^^^^^^^^^^^^^^^
+...
+381 |     pub fn is_empty(&self) -> bool {
+    |            ^^^^^^^^
+
+warning: function `sender_phone_and_name` is never used
+    --> desktop/src/gmessages_runtime.rs:1195:4
+     |
+1195 | fn sender_phone_and_name(m: &GmMessage) -> (String, String) {
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `wait_for_correction_done` is never used
+    --> desktop/src/ui/autocorrect.rs:1185:8
+     |
+1185 | pub fn wait_for_correction_done(timeout_ms: u64) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `search_entry` is never read
+  --> desktop/src/ui/chat_list.rs:55:5
+   |
+31 | struct ChatListInner {
+   |        ------------- field in this struct
+...
+55 |     search_entry: SearchEntry,
+   |     ^^^^^^^^^^^^
+
+warning: methods `load_chats` and `set_auto_mark_read` are never used
+   --> desktop/src/ui/chat_list.rs:428:12
+    |
+ 58 | impl ChatListPanel {
+    | ------------------ methods in this implementation
+...
+428 |     pub fn load_chats(&self, chats: Vec<ChatSummary>) {
+    |            ^^^^^^^^^^
+...
+836 |     pub fn set_auto_mark_read(&self, chat_id: &str, enabled: bool) {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: enum `PickerResult` is never used
+  --> desktop/src/ui/chat_picker.rs:16:10
+   |
+16 | pub enum PickerResult {
+   |          ^^^^^^^^^^^^
+
+warning: variant `Prepend` is never constructed
+  --> desktop/src/ui/chat_view.rs:46:5
+   |
+44 | enum BubblePosition {
+   |      -------------- variant in this enum
+45 |     Append,
+46 |     Prepend,
+   |     ^^^^^^^
+   |
+   = note: `BubblePosition` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: field `bridge` is never read
+  --> desktop/src/ui/login.rs:18:5
+   |
+13 | pub struct LoginScreen {
+   |            ----------- field in this struct
+...
+18 |     bridge: Arc<Bridge>,
+   |     ^^^^^^
+   |
+   = note: `LoginScreen` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: method `show_loading` is never used
+  --> desktop/src/ui/login.rs:85:12
+   |
+21 | impl LoginScreen {
+   | ---------------- method in this implementation
+...
+85 |     pub fn show_loading(&self, msg: &str) {
+   |            ^^^^^^^^^^^^
+
+warning: fields `msg_id`, `sender_id`, `chat_id`, `poll_question`, `poll_selectable`, and `contact_msg_btn` are never read
+  --> desktop/src/ui/message_bubble.rs:30:5
+   |
+27 | pub struct MessageBubble {
+   |            ------------- fields in this struct
+...
+30 |     msg_id: String,
+   |     ^^^^^^
+...
+37 |     pub sender_id: String,
+   |         ^^^^^^^^^
+...
+42 |     pub chat_id: String,
+   |         ^^^^^^^
+...
+49 |     pub poll_question: Option<String>,
+   |         ^^^^^^^^^^^^^
+50 |     /// Poll selectable count (for forward-as-new-poll)
+51 |     pub poll_selectable: u32,
+   |         ^^^^^^^^^^^^^^^
+...
+55 |     contact_msg_btn: Option<Button>,
+   |     ^^^^^^^^^^^^^^^
+   |
+   = note: `MessageBubble` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: methods `contact_message_button` and `msg_id` are never used
+    --> desktop/src/ui/message_bubble.rs:1049:12
+     |
+  62 | impl MessageBubble {
+     | ------------------ methods in this implementation
+...
+1049 |     pub fn contact_message_button(&self) -> Option<&Button> {
+     |            ^^^^^^^^^^^^^^^^^^^^^^
+...
+1174 |     pub fn msg_id(&self) -> &str {
+     |            ^^^^^^
+
+warning: field `media_section` is never read
+  --> desktop/src/ui/profile_panel.rs:31:5
+   |
+20 | struct ProfileInner {
+   |        ------------ field in this struct
+...
+31 |     media_section: Box,
+   |     ^^^^^^^^^^^^^
+
+warning: function `make_outgoing_message` is never used
+    --> desktop/src/ui/runtime.rs:8168:4
+     |
+8168 | fn make_outgoing_message(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `uuid_v4_simple` is never used
+    --> desktop/src/ui/runtime.rs:8214:4
+     |
+8214 | fn uuid_v4_simple() -> String {
+     |    ^^^^^^^^^^^^^^
+
+warning: field `debug_revealer` is never read
+  --> desktop/src/ui/window.rs:42:5
+   |
+27 | struct MainWindowInner {
+   |        --------------- field in this struct
+...
+42 |     debug_revealer: Revealer,
+   |     ^^^^^^^^^^^^^^
+
+warning: `whatsapp-desktop` (bin "whatsapp-desktop") generated 72 warnings (run `cargo fix --bin "whatsapp-desktop" -p whatsapp-desktop` to apply 37 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.77s
+     Running `/home/jakes/.cache/cargo-target/debug/whatsapp-desktop`
+WhatsApp: applied UI scale 150% (GDK_DPI_SCALE=1.5000)
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:19:30.139: Theme parser error: <data>:69:5-24: No property named "-gtk-outline-radius"
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:19:30.139: Theme parser error: <data>:165:5-17: No property named "margin-start"
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:19:30.140: Theme parser error: <data>:170:5-17: No property named "margin-start"
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:19:30.140: Theme parser error: <data>:293:5-15: No property named "max-height"
+[2026-05-06T20:19:30Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: ENABLED — spawning runtime; data_dir=/home/jakes/.local/share/whatsapp-desktop
+[2026-05-06T20:19:30Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect enabled (key=AIzaSyA4...)
+[2026-05-06T20:19:30Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect enabled
+[2026-05-06T20:19:30Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: looking for auth file at /home/jakes/.local/share/whatsapp-desktop/gmessages-auth.json
+[2026-05-06T20:19:30Z WARN  whatsapp_desktop::gmessages_runtime] gmessages: auth file empty or missing — will run pairing flow now
+[2026-05-06T20:19:30Z INFO  whatsapp_desktop::ui::autocorrect] AI corrector thread started, waiting for requests...
+[2026-05-06T20:19:30Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: built phone→wa_chat index with 703 entries
+[2026-05-06T20:19:30Z WARN  whatsapp_desktop::gmessages_runtime] gmessages: PAIRING REQUIRED — a QR code will appear on stderr. Open Google Messages on your phone → Device pairing → QR code scanner.
+[2026-05-06T20:19:30Z INFO  gmessages_rust::pairing::qr] QR pair: posting RegisterPhoneRelay
+
+(whatsapp-desktop:92432): Gtk-CRITICAL **: 16:19:30.170: gtk_gesture_long_press_set_delay_factor: assertion 'delay_factor >= 0.5' failed
+[2026-05-06T20:19:30Z WARN  whatsapp_desktop::ui::window] Error toast: Google Messages: pairing required — see terminal for QR code
+[2026-05-06T20:19:30Z INFO  whatsapp_desktop::ui::runtime] Loaded 3999 contact names, 7287 LID→phone mappings from disk
+[2026-05-06T20:19:30Z INFO  whatsapp_rust::bot] Creating client...
+[2026-05-06T20:19:30Z INFO  gmessages_rust::pairing::qr] QR pair: got tachyon token + pairing key (61 bytes)
+[2026-05-06T20:19:30Z INFO  gmessages_rust::pairing::qr] QR pair: spawning long-poll loop
+[2026-05-06T20:19:30Z INFO  gmessages_rust::pairing::qr] QR pair: QR emitted, waiting up to 300s for phone scan
+
+=== Google Messages pairing — scan with phone ===
+
+█████████████████████████████████████████████████████████████████████
+█████████████████████████████████████████████████████████████████████
+████ ▄▄▄▄▄ █ ▄▄██▀ █▄▀▄ ▄▄▀▄ █▀█ ▄█▄▀█▀▀ ▄█ ██ ▄▀███▄▀█  █ ▄▄▄▄▄ ████
+████ █   █ █▀█▀ ▄ ▄▀█▀█ ▀ ▄ ▄▀▄ █ ███ ▀▀ ▀ ██ ▀▀▄▄▄▀▀▄ ▄ █ █   █ ████
+████ █▄▄▄█ ███▀█▀▀▀▀▀▄   ██▀▄██▄ ▄▄▄ ▄  ██  ▄▀██▀▄██▀  ▄██ █▄▄▄█ ████
+████▄▄▄▄▄▄▄█ █▄▀▄█▄█ █ █ █▄▀▄█▄▀ █▄█ ▀▄█ ▀▄▀ █▄█ ▀ █ ▀ █▄█▄▄▄▄▄▄▄████
+████ █▄▄▀▄▄▄▀▄ ██▄   ▄██▀ ▀▄██▀    ▄▄▄▄▀▀▀█▀ ▄▀████ █▀█▄█▀ ▀█ █  ████
+████ ▄█▄█▀▄▄█ ▀▀ ▄█▀▄▄█▀█▄▀▄█  ▀  █▄▄▄ █ ███▄    █▄█ ▄█▀█ █▄▀  ▀▀████
+████▄▀▄▄▀█▄▀▀ ▀ █▀██ ▀ █▄ █ ▀▄▀▄▄█▄█  █▄ ▀ ▀▀ █▄▀ █▀▄▀  ▄██▀█▄ █ ████
+████▀▀▄▄ █▄█▀▀ ▀ ▀█ ▄▀██ ▄█ █▀███ ▀▀██  ▀ █ ▀  ▀ ██▄█▀ ▀ ▀▀ ▀ ▄ ▀████
+█████▀▀▀██▄ █▄▄█▄ ▀ █▀▄█▀▄▀▀▀▄▄▀▄▄ █ ▀▀ █ ▄ ▀█▄ ▄▀▀█▀█▄▀ ▀█▄▄▄▄█▀████
+████  ▄▄  ▄██ ▄██  █▄█▀▄▀▀▀ █▀▀ ▄▀▄██ ▀█ ▀ ▀▀ ▀ █▄▄ █  ██   █ █▄ ████
+████▄▄█▄█▀▄█▀██▄▀▄██  ▄▀▄▀▀ █ █▄▀ ▄▀▀▄█ ▀█▄▀ █▀█▀██▄▀ ▄▄█ ▀▄▀ █ █████
+████▀▀▄ ▄▄▄██▀█▀  ███▄ █▀▄ █▄▄▀▄▀  ▀▄█ █▀▄▀██▄▄▀█▀██▀▀▀▄ █  ██  █████
+████▄█▀▀██▄█▀ ▄ ▄▀▀  ▀ ▀ ▄█ ▄▄████▄█▀██  ▄▀██▄▄▄█ ▄▄▄   ▄▀█ █ ▄█ ████
+████▀▀█▄ █▄▀█▄▄█▀█ █ ▄▀█ ▄ ▄▀  ██  █  ▄██ █▀▀▀█▀ █████▄ ▀█ ▀▀▀█ █████
+████  ██ ▄▄▄ ▀▄█▄    ▄▄█▄▄  █▄▄▄ ▄▄▄ ▄ ▀█▄▄ █ ▄█▄  ▀██▄█ ▄▄▄   ▄▀████
+████ ▄▄▀ █▄█ ▄▄█▄█▀▄▄█▀█ ▀█▄▄ ██ █▄█   ▀ ▄▄▄▀▀█▄█ ▄▄ ▄▄█ █▄█  ▄  ████
+████▄▀██▄ ▄▄▄ ██▀▄  ▄ █▄ █▀ ▀▀▀  ▄▄  ██ ▀█▄█▄▀▀▀▀▄▄▄█▀██▄ ▄▄▄▄▄▄█████
+████  ▀▀█▀▄▄ █ █▀▄██ █▀▄█  ▀▄▄ ██▀▀██▀▄▄██▀ ▄▀▄▄ ▄█▄▀▀▀█▄█▀ █▀▀██████
+████  ▀█▄▀▄▀▀██ ▀█ █   █▀▀███ █ ▀█ █▀ ▄ ▀  ▀▀██▀█ ▄▄▄▀ ▄▄██   ▄  ████
+█████▀▀ █▀▄ ▀ ▄▄▀█▄█▀▀▄█ ▀▄█ █ ▀ ▀  █▄▄▄▄█▀  ▀▄ ▄█   ██▀ ▀█▄██▄▄ ████
+████ █▀▄█▄▄█▄▀█▄█  █▀██▄█   ▀ ██▄███▄  ██▄▄ █▀▄   ▀▀████▀▄  █▄  ▀████
+████▀██▀ ▄▄  ██ █ ▄▀█▄ ███▀█▀   █▄▄▀  ▀ █▀█  █▀█▀█ ▄▄▄▀   ▄███▄ ▄████
+█████▄▀▀█▄▄▀▄▀▄█▄█▀█▀▀▀██▀   ▀▀▀ ▄▀▀▀█▀▄█  ▄   ▀▀▄▄ █ ▄█▀▀  ▄▄█▄ ████
+████ ▀▄▀▄█▄▄█ ▀▄▄█▀▀ ▄▀▄▀▄▀▀ ▀▄ █ █▄█▀█▄ ▀▄ ▄█▄▄▀▀███▀█▄██▀ ▀▀▀██████
+██████▄█▀▀▄▄▄▄ ▄ ▄▄▀█▄ █▄▄ █▄▄██ █▄ ▄█▄▄▄  ▄█▄██▀▀▄  ▀▀ ▄▄▀▄ ▀█▀ ████
+████▀▀ ▄ ▄▄▄▀▄▄▄▀█▄▀▀ ▀▄ ▄ ▀ ▄▄▀▀ ▀██ ▀█▄▀ ▀▀█ █ ██ █▄  ▀███▄▀▄ █████
+████▄▄▄▄██▄▄ ▀  █▄▄ ▀ █▄▄ ██▄ ▄▀ ▄▄▄ ▀ ▀▀▄█ █ ▄▄   ▀▀▄█▀ ▄▄▄ ▀▄▀ ████
+████ ▄▄▄▄▄ █  ▄▄ ▀█▄▀█▄▀█  ██ █▀ █▄█  ██▄▄▀█▄▀▄▄  ▀ █▄▀▀ █▄█  █▄▄████
+████ █   █ █▀ ▀█▄ ▄▄▄██▄ ▀█  ▄▀█▄   ▄▄█▀▀ ▄    ▀█▀█ █▀▄ ▄▄▄▄ ▄█▄▀████
+████ █▄▄▄█ █▄▀▄█▄    █  ▀ ▀▄██▄█▀▄▄█ ▀ ▄█▀ ▄█ █▀▄█ ▀▀ █▄█▄▄▄ ▀▀▄█████
+████▄▄▄▄▄▄▄█▄█▄█▄▄██▄▄████▄▄▄██████▄█▄█▄▄▄█▄█▄▄▄█▄█▄▄████▄█▄▄█▄▄▄████
+█████████████████████████████████████████████████████████████████████
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+(also: https://support.google.com/messages/?p=web_computer#?c=Cj0AfykVEoxeWL54O0rH3j6K/Yam0NjMf4G2DnfkPf2ofcV4S7FI6AXlzSwQiDjN/NNw6cOxoe/RJBdlNWdAEiAtRfGxFGPCsfT+n5ZORLvbPuTDBMpBZq8/e+b4g9ILexogDpiH5EUkEWw/uLq94lx5yykKa+rgMneniAK4uQOvGuo=)
+
+[2026-05-06T20:19:30Z INFO  whatsapp_rust::version] Fetched current Chrome version: 148.0.7778
+[2026-05-06T20:19:30Z INFO  gmessages_rust::longpoll] ReceiveMessages opened: status=200 OK content-type=Some("application/json+protobuf; charset=UTF-8")
+[2026-05-06T20:19:30Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: ignoring event during pair: Ready
+[2026-05-06T20:19:30Z DEBUG gmessages_rust::longpoll] long-poll: opening `[[` confirmed
+[2026-05-06T20:19:31Z DEBUG gmessages_rust::longpoll] got startup ack: skip_count=0
+[2026-05-06T20:19:31Z INFO  whatsapp_rust::handshake] Handshake complete, switching to encrypted communication
+[2026-05-06T20:19:31Z INFO  whatsapp_rust::client] Successfully authenticated with WhatsApp servers! (gen=1)
+[2026-05-06T20:19:32Z WARN  whatsapp_rust::prekeys] Pre-key ID counter at 16777216, wrapping back to 1 (was hitting 24-bit ceiling)
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::runtime] POST-SYNC: 0 pinned chats: []
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::runtime] POST-SYNC: refreshing UI with 1187 chats
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::runtime] Name stats: 3999 contact_names, 7287 lid_to_phone, 1187 chat_names
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::runtime] Chats with resolved names: 1181/1187
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::runtime] Own avatar: get_pn=Some("14164566960@s.whatsapp.net")
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::runtime] Own JIDs: phone=14164566960@s.whatsapp.net lid=248133263056915@lid
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::runtime] Connected — loaded 1187 chats, own_jid=14164566960@s.whatsapp.net, name=Jake Steinman
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14169186182:10@s.whatsapp.net — clean 14169186182@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14164000790:13@s.whatsapp.net — clean 14164000790@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 16479642559:35@s.whatsapp.net — clean 16479642559@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14168439263:11@s.whatsapp.net — clean 14168439263@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14167992936:13@s.whatsapp.net — clean 14167992936@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 16474672971:2@s.whatsapp.net — clean 16474672971@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14168576480:21@s.whatsapp.net — clean 14168576480@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14169301941:12@s.whatsapp.net — clean 14169301941@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14162714558:22@s.whatsapp.net — clean 14162714558@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 905455656377:16@s.whatsapp.net — clean 905455656377@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14162197373:2@s.whatsapp.net — clean 14162197373@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 19056016557:20@s.whatsapp.net — clean 19056016557@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 16479546727:12@s.whatsapp.net — clean 16479546727@s.whatsapp.net already kept
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: replacing 16479883883:17@s.whatsapp.net with 16479883883@s.whatsapp.net for phone 16479883883
+[2026-05-06T20:19:33Z INFO  whatsapp_desktop::ui::window] Dedup: removed 14 duplicate(s)
+[2026-05-06T20:19:34Z WARN  whatsapp_rust::prekeys] digestKey: hash mismatch (server=4fd78399135f425d368dcf72c090d2e781f10a28, local=13bb85c6b8ab378f7023f69655c33d1543e77338), skipping
+[2026-05-06T20:19:34Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:34Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:34Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:34Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:34Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=true
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Connected as Jake Steinman (14164566960@s.whatsapp.net)
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14169186182:10@s.whatsapp.net — clean 14169186182@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14164000790:13@s.whatsapp.net — clean 14164000790@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 16479642559:35@s.whatsapp.net — clean 16479642559@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14168439263:11@s.whatsapp.net — clean 14168439263@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14167992936:13@s.whatsapp.net — clean 14167992936@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 16474672971:2@s.whatsapp.net — clean 16474672971@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14168576480:21@s.whatsapp.net — clean 14168576480@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14169301941:12@s.whatsapp.net — clean 14169301941@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14162714558:22@s.whatsapp.net — clean 14162714558@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 905455656377:16@s.whatsapp.net — clean 905455656377@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14162197373:2@s.whatsapp.net — clean 14162197373@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 19056016557:20@s.whatsapp.net — clean 19056016557@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 16479546727:12@s.whatsapp.net — clean 16479546727@s.whatsapp.net already kept
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: replacing 16479883883:17@s.whatsapp.net with 16479883883@s.whatsapp.net for phone 16479883883
+[2026-05-06T20:19:36Z INFO  whatsapp_desktop::ui::window] Dedup: removed 14 duplicate(s)
+[2026-05-06T20:19:37Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:37Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:37Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:37Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=true
+[2026-05-06T20:19:37Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:38Z INFO  whatsapp_desktop::ui::runtime] Requesting resync of Regular collection...
+[2026-05-06T20:19:39Z INFO  whatsapp_desktop::ui::runtime] Requesting resync of RegularLow collection (read sync)...
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:19:39.301: Theme parser error: <data>:1:49-58: No property named "max-width"
+[2026-05-06T20:19:39Z INFO  whatsapp_desktop::ui::runtime] RegularLow collection resync completed
+[2026-05-06T20:19:39Z INFO  whatsapp_desktop::ui::runtime] Resolved 672/926 LID→phone mappings from client cache
+[2026-05-06T20:19:39Z INFO  whatsapp_desktop::ui::runtime] Resolving 254 @lid chat(s)…
+[2026-05-06T20:19:39Z INFO  whatsapp_desktop::ui::runtime] Fetching group names from server…
+[2026-05-06T20:19:43Z INFO  whatsapp_desktop::ui::runtime] Group name refresh complete (2081 groups, 0 new LID→phone from participants)
+[2026-05-06T20:19:43Z INFO  whatsapp_desktop::ui::runtime] Querying 9 unresolved group name(s) individually…
+[2026-05-06T20:19:47Z INFO  whatsapp_desktop::ui::runtime] POST-GROUP-REFRESH: refreshing UI with 1187 chats
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14169186182:10@s.whatsapp.net — clean 14169186182@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14164000790:13@s.whatsapp.net — clean 14164000790@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 16479642559:35@s.whatsapp.net — clean 16479642559@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14168439263:11@s.whatsapp.net — clean 14168439263@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14167992936:13@s.whatsapp.net — clean 14167992936@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 16474672971:2@s.whatsapp.net — clean 16474672971@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14168576480:21@s.whatsapp.net — clean 14168576480@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14169301941:12@s.whatsapp.net — clean 14169301941@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14162714558:22@s.whatsapp.net — clean 14162714558@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 905455656377:16@s.whatsapp.net — clean 905455656377@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 14162197373:2@s.whatsapp.net — clean 14162197373@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 19056016557:20@s.whatsapp.net — clean 19056016557@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: dropping 16479546727:12@s.whatsapp.net — clean 16479546727@s.whatsapp.net already kept
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: replacing 16479883883:17@s.whatsapp.net with 16479883883@s.whatsapp.net for phone 16479883883
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::window] Dedup: removed 14 duplicate(s)
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=true
+[2026-05-06T20:19:51Z INFO  whatsapp_desktop::ui::runtime] Group admin check: own_pn=14164566960@s.whatsapp.net own_number=14164566960 i_am_admin=false
+[2026-05-06T20:19:57Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=589264KB cache=0chats/0msgs contacts=3999
+[2026-05-06T20:20:07Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=593876KB cache=0chats/0msgs contacts=3999
+[2026-05-06T20:20:18Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=593688KB cache=0chats/0msgs contacts=3999
+[2026-05-06T20:20:28Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=592036KB cache=0chats/0msgs contacts=3999
+[2026-05-06T20:20:30Z WARN  gmessages_rust::longpoll] ditto ping failed: session expired or revoked; re-pair required
+[2026-05-06T20:20:38Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=595152KB cache=0chats/0msgs contacts=3999
+[2026-05-06T20:20:49Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=595152KB cache=0chats/0msgs contacts=3999
+[2026-05-06T20:20:51Z INFO  whatsapp_rust::client] APP_STATE_KIND: 'markChatAsRead' op=Set has_qr=false
+[2026-05-06T20:20:51Z INFO  whatsapp_rust::client] APP_STATE_KIND: 'markChatAsRead' has_value=true has_qr=false idx_len=2
+[2026-05-06T20:20:51Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 17806192880@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:20:51Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=17806192880@s.whatsapp.net msg=3ACBCB71675B7ED22FFD sender=None
+[2026-05-06T20:20:51Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:20:51Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 17806192880@s.whatsapp.net
+[2026-05-06T20:20:51Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:20:51Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB0A8A352F3470DEBEACF from_me=false chat=16479642559@s.whatsapp.net sender=16479642559:35@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:20:51Z INFO  wacore_libsignal::protocol::session_cipher] 109517538869270:35@lid.0 creating new chains.
+[2026-05-06T20:20:51Z INFO  wacore_libsignal::protocol::state::session] Trimming excessive receiver_chain for session with base key aa8bd28b28f0b4f18cef66a2d035ad5d39e46bf140fb1032589c2dc50ec73205, chain count: 6
+[2026-05-06T20:20:51Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB0A8A352F3470DEBEACF chat=16479642559@s.whatsapp.net raw_chat=16479642559@s.whatsapp.net from_me=false group=false sender=16479642559:35@s.whatsapp.net text="<media>"
+[2026-05-06T20:20:51Z INFO  whatsapp_desktop::ui::runtime] Media saved: /home/jakes/.local/share/whatsapp-desktop/wa_media/3EB0A8A3_INVOICE_SPREADSHEET_April_19th_-_May_02nd__2026.xlsx
+[2026-05-06T20:20:59Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=606484KB cache=2chats/1674msgs contacts=3999
+[2026-05-06T20:21:00Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'it c'
+[2026-05-06T20:21:01Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'It's okay.'
+[2026-05-06T20:21:01Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 2 vs current 16)
+[2026-05-06T20:21:03Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-1ca2127e
+[2026-05-06T20:21:03Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:21:03Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'it could just be his project is shit lol'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:03.490: GtkBox 0x55d46cc0c770 (box) reported min width -51, but sizes must be >= 0
+[2026-05-06T20:21:04Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'It could just be his project is shit lol.'
+[2026-05-06T20:21:04Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "it could just be his project is shit lol" → "It could just be his project is shit lol."
+[2026-05-06T20:21:10Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=605872KB cache=2chats/1675msgs contacts=3999
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.498: GtkBox 0x55d46a04f370 (box) reported min width -50, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.499: GtkBox 0x55d474f11960 (box) reported min width -60, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.500: GtkBox 0x55d46cb8c660 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.500: GtkBox 0x55d46c2e7420 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.501: GtkBox 0x55d46af3cf40 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.502: GtkBox 0x55d46a300a70 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.503: GtkBox 0x55d46c3bcf10 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.503: GtkBox 0x55d46cb2b850 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.503: GtkBox 0x55d47558d0e0 (box) reported min width -60, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.504: GtkBox 0x55d474161430 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.504: GtkBox 0x55d4737d6f10 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.504: GtkBox 0x55d46d3ab420 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.505: GtkBox 0x55d46d525b20 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.505: GtkBox 0x55d46e62bba0 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.505: GtkBox 0x55d4754cd010 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.505: GtkBox 0x55d46d89f470 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.505: GtkBox 0x55d474fd4920 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.505: GtkBox 0x55d4742f3fa0 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.506: GtkBox 0x55d46e291a90 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.506: GtkBox 0x55d474309ef0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.506: GtkBox 0x55d46e19a030 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.506: GtkBox 0x55d46c5324f0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.506: GtkBox 0x55d46da4b750 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.506: GtkBox 0x55d46e038af0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.506: GtkBox 0x55d46c030460 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.507: GtkBox 0x55d4750526e0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.507: GtkBox 0x55d47531d6c0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.508: GtkBox 0x55d474258190 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.508: GtkBox 0x55d474cc16b0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.508: GtkBox 0x55d474d2df80 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.509: GtkBox 0x55d474c59630 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.509: GtkBox 0x55d474c79ce0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.510: GtkBox 0x55d4751cad60 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.510: GtkBox 0x55d47500dfe0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.510: GtkBox 0x55d4753f0690 (box) reported min width -56, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.510: GtkBox 0x55d474e197b0 (box) reported min width -56, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.511: GtkBox 0x55d474b36af0 (box) reported min width -56, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.511: GtkBox 0x55d475077030 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.512: GtkBox 0x55d475150f70 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.512: GtkBox 0x55d474b13c50 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.512: GtkBox 0x55d4749fec30 (box) reported min width -49, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.513: GtkBox 0x55d4753c6500 (box) reported min width -46, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.513: GtkBox 0x55d4749fda60 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.513: GtkBox 0x55d4751be260 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.514: GtkBox 0x55d4742835f0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.514: GtkBox 0x55d474cd4840 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.514: GtkBox 0x55d4754cfc10 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.514: GtkBox 0x55d4752c3af0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.515: GtkBox 0x55d474c1f600 (box) reported min width -46, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:21:18.515: GtkBox 0x55d475272b50 (box) reported min width -69, but sizes must be >= 0
+[2026-05-06T20:21:19Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 16479642559@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:21:19Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=16479642559@s.whatsapp.net msg=3EB0A8A352F3470DEBEACF sender=None
+[2026-05-06T20:21:19Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 16479642559@s.whatsapp.net
+[2026-05-06T20:21:19Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:21:19Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:21:20Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=610132KB cache=2chats/1675msgs contacts=3999
+[2026-05-06T20:21:24Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB089174B10103BE6B517 from_me=false chat=120363168988062471@g.us sender=187054549897346:37@lid offline="" has_participants=false
+[2026-05-06T20:21:24Z INFO  wacore_libsignal::protocol::session_cipher] 187054549897346:37@lid.0 creating new chains.
+[2026-05-06T20:21:24Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB089174B10103BE6B517 chat=120363168988062471@g.us raw_chat=120363168988062471@g.us from_me=false group=true sender=187054549897346:37@lid text="they're working on lincoln"
+[2026-05-06T20:21:30Z WARN  gmessages_rust::longpoll] ditto ping failed: session expired or revoked; re-pair required
+[2026-05-06T20:21:30Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=613332KB cache=3chats/1718msgs contacts=4000
+[2026-05-06T20:21:41Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=612816KB cache=3chats/1718msgs contacts=4000
+[2026-05-06T20:21:50Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB09CF5492EC2EA780CEC from_me=false chat=120363168988062471@g.us sender=187054549897346:37@lid offline="" has_participants=false
+[2026-05-06T20:21:50Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB09CF5492EC2EA780CEC chat=120363168988062471@g.us raw_chat=120363168988062471@g.us from_me=false group=true sender=187054549897346:37@lid text="lanes closed around it and machine digging. looks like they are pouring concrete for the garage"
+[2026-05-06T20:21:51Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=611588KB cache=3chats/1719msgs contacts=4000
+[2026-05-06T20:22:02Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=611588KB cache=3chats/1719msgs contacts=4000
+[2026-05-06T20:22:12Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=611592KB cache=3chats/1719msgs contacts=4000
+[2026-05-06T20:22:18Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB0D7DB0ACBC0E7A5CCF9 from_me=false chat=120363168988062471@g.us sender=187054549897346:37@lid offline="" has_participants=false
+[2026-05-06T20:22:18Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB0D7DB0ACBC0E7A5CCF9 chat=120363168988062471@g.us raw_chat=120363168988062471@g.us from_me=false group=true sender=187054549897346:37@lid text="construction crew actively there whenever i drive by"
+[2026-05-06T20:22:22Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=611788KB cache=3chats/1720msgs contacts=4000
+[2026-05-06T20:22:30Z WARN  gmessages_rust::longpoll] ditto ping failed: session expired or revoked; re-pair required
+[2026-05-06T20:22:30Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: ignoring event during pair: PhoneNotResponding
+[2026-05-06T20:22:33Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=611788KB cache=3chats/1720msgs contacts=4000
+[2026-05-06T20:22:43Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=611788KB cache=3chats/1720msgs contacts=4000
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:22:50.563: Finalizing GtkButton 0x55d4755a45c0, but it still has children left:
+   - GtkPopover 0x55d47501a000
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:22:50.759: GtkBox 0x55d46c990c10 (box) reported min width -46, but sizes must be >= 0
+[2026-05-06T20:22:51Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 17806192880@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:22:51Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=17806192880@s.whatsapp.net msg=3EB0D94B9C47A4F4FACD1D sender=None
+[2026-05-06T20:22:51Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 17806192880@s.whatsapp.net
+[2026-05-06T20:22:51Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:22:51Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:22:54Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=611580KB cache=3chats/1720msgs contacts=4000
+[2026-05-06T20:23:04Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=611580KB cache=3chats/1720msgs contacts=4000
+[2026-05-06T20:23:15Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=611580KB cache=3chats/1720msgs contacts=4000
+[2026-05-06T20:23:23Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3AC9BB400F0C19A3BB4B from_me=false chat=178833965768871@lid sender=178833965768871@lid offline="" has_participants=false
+[2026-05-06T20:23:23Z INFO  wacore_libsignal::protocol::session_cipher] 178833965768871@lid.0 creating new chains.
+[2026-05-06T20:23:23Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3AC9BB400F0C19A3BB4B chat=178833965768871@lid raw_chat=178833965768871@lid from_me=false group=false sender=178833965768871@lid text="He saying no one can get 95%.. he is talking to Westrich about partnering and they aren’t even getting 95% more like 88"
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:23.907: GtkBox 0x55d47542e950 (box) reported min width -7, but sizes must be >= 0
+[2026-05-06T20:23:24Z INFO  whatsapp_desktop::ui::runtime] ReadSelf: clearing unread for chat=17806192880@s.whatsapp.net
+[2026-05-06T20:23:24Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:23:24Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 17806192880@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:23:24Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=17806192880@s.whatsapp.net msg=3AC9BB400F0C19A3BB4B sender=None
+[2026-05-06T20:23:24Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:23:24Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 17806192880@s.whatsapp.net
+[2026-05-06T20:23:24Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:23:24Z INFO  whatsapp_rust::message] DIAG msg arrival: id=A52BD1D7F300C06E3600FA4A14E7C377 from_me=true chat=178833965768871@lid sender=248133263056915@lid offline="" has_participants=false
+[2026-05-06T20:23:24Z INFO  wacore_libsignal::protocol::session_cipher] 248133263056915@lid.0 creating new chains.
+[2026-05-06T20:23:24Z INFO  wacore_libsignal::protocol::state::session] Trimming excessive receiver_chain for session with base key 581e1e208b1574d79f9dbcb24e0ffe559e05e4522db49394987de359c5fa2c2c, chain count: 6
+[2026-05-06T20:23:24Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=A52BD1D7F300C06E3600FA4A14E7C377 chat=178833965768871@lid raw_chat=178833965768871@lid from_me=true group=false sender=248133263056915@lid text="Drawings need and unit matrix"
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:24.802: GtkBox 0x55d46bf9ec00 (box) reported min width -55, but sizes must be >= 0
+[2026-05-06T20:23:25Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=614244KB cache=3chats/1722msgs contacts=4000
+[2026-05-06T20:23:30Z WARN  gmessages_rust::longpoll] ditto ping failed: session expired or revoked; re-pair required
+[2026-05-06T20:23:35Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=614100KB cache=3chats/1722msgs contacts=4000
+[2026-05-06T20:23:38Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3AC5D8EE0EC91DB37151 from_me=false chat=178833965768871@lid sender=178833965768871@lid offline="" has_participants=false
+[2026-05-06T20:23:38Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3AC5D8EE0EC91DB37151 chat=178833965768871@lid raw_chat=178833965768871@lid from_me=false group=false sender=178833965768871@lid text="Sorry I’m passing along information"
+[2026-05-06T20:23:38Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 17806192880@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:23:38Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=17806192880@s.whatsapp.net msg=3AC5D8EE0EC91DB37151 sender=None
+[2026-05-06T20:23:38Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 17806192880@s.whatsapp.net
+[2026-05-06T20:23:39Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:23:39Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:23:42Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-34fb8ada
+[2026-05-06T20:23:42Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:23:42Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'we got a 95% yesterday'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:42.901: GtkBox 0x55d474267fe0 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:23:44Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'We got a 95% yesterday.'
+[2026-05-06T20:23:44Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "we got a 95% yesterday" → "We got a 95% yesterday."
+[2026-05-06T20:23:46Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=613828KB cache=3chats/1724msgs contacts=4000
+[2026-05-06T20:23:52Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'his project probably too expenive '
+[2026-05-06T20:23:52Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'His project is probably too expensive.'
+[2026-05-06T20:23:52Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 98 vs current 103)
+[2026-05-06T20:23:53Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-164114ce
+[2026-05-06T20:23:53Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:23:53Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'his project probably too expenive is issue'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:53.405: GtkBox 0x55d4758c9c60 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:23:54Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'His project is probably too expensive, that's the issue.'
+[2026-05-06T20:23:54Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "his project probably too expenive is issue" → "His project is probably too expensive, that's the issue."
+[2026-05-06T20:23:55Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB0B2CEA4482B1F2E3D86 from_me=false chat=120363168988062471@g.us sender=180268484829416:3@lid offline="" has_participants=false
+[2026-05-06T20:23:55Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB0B2CEA4482B1F2E3D86 chat=120363168988062471@g.us raw_chat=120363168988062471@g.us from_me=false group=true sender=180268484829416:3@lid text="i hope they don;t cancel the rental guarantee"
+[2026-05-06T20:23:56Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=613632KB cache=3chats/1726msgs contacts=4000
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.265: GtkBox 0x55d46d5fc5a0 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.265: GtkBox 0x55d46c623790 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.265: GtkBox 0x55d46da4fe00 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.265: GtkBox 0x55d4742896f0 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.265: GtkBox 0x55d46c3bcf10 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.266: GtkBox 0x55d46d3b1910 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.266: GtkBox 0x55d47429b2a0 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.266: GtkBox 0x55d4758c9c60 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.267: GtkBox 0x55d46cbe38a0 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.268: GtkBox 0x55d46dff35f0 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.270: GtkBox 0x55d46e33b4f0 (box) reported min width -53, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.271: GtkBox 0x55d46be3f200 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.271: GtkBox 0x55d46d58caf0 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.272: GtkBox 0x55d46e4bd0c0 (box) reported min width -64, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.272: GtkBox 0x55d4753183e0 (box) reported min width -58, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.273: GtkBox 0x55d46df4c110 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.273: GtkBox 0x55d475357ab0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.274: GtkBox 0x55d46e9d8fa0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.274: GtkBox 0x55d46c8d07a0 (box) reported min width -75, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.274: GtkBox 0x55d467d3eea0 (box) reported min width -75, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.275: GtkBox 0x55d46e30bb60 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.275: GtkBox 0x55d46be02650 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.276: GtkBox 0x55d46dfa7670 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.276: GtkBox 0x55d468de7d70 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.276: GtkBox 0x55d475233a10 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.276: GtkBox 0x55d475b76d70 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.276: GtkBox 0x55d46bcea130 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.276: GtkBox 0x55d475b85150 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.277: GtkBox 0x55d474ab1810 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.277: GtkBox 0x55d475e211c0 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.277: GtkBox 0x55d475cbd040 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.278: GtkBox 0x55d475c25e80 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.278: GtkBox 0x55d475c84a70 (box) reported min width -66, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.279: GtkBox 0x55d475ca9150 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.279: GtkBox 0x55d475d609e0 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.279: GtkBox 0x55d475ed0600 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.279: GtkBox 0x55d475c374d0 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.280: GtkBox 0x55d475c5bae0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.280: GtkBox 0x55d475bd6c30 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.281: GtkBox 0x55d47584d240 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.282: GtkBox 0x55d475b123a0 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.282: GtkBox 0x55d475e31f60 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.282: GtkBox 0x55d475d693d0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.283: GtkBox 0x55d475b43f80 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.283: GtkBox 0x55d475b54c10 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:23:58.283: GtkBox 0x55d475a9cff0 (box) reported min width -70, but sizes must be >= 0
+[2026-05-06T20:23:59Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 120363168988062471@g.us read=true full_sync=false
+[2026-05-06T20:23:59Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=120363168988062471@g.us msg=3EB0B2CEA4482B1F2E3D86 sender=Some(Jid { user: "180268484829416", server: "lid", agent: 0, device: 3, integrator: 0 })
+[2026-05-06T20:23:59Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 120363168988062471@g.us
+[2026-05-06T20:23:59Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 120363168988062471@g.us
+[2026-05-06T20:23:59Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 120363168988062471@g.us
+[2026-05-06T20:24:07Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=614124KB cache=3chats/1726msgs contacts=4000
+[2026-05-06T20:24:17Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=613944KB cache=3chats/1726msgs contacts=4000
+[2026-05-06T20:24:20Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3A74EF6CCD694005E8E9 from_me=false chat=178833965768871@lid sender=178833965768871@lid offline="" has_participants=false
+[2026-05-06T20:24:20Z INFO  wacore_libsignal::protocol::session_cipher] 178833965768871@lid.0 creating new chains.
+[2026-05-06T20:24:20Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3A74EF6CCD694005E8E9 chat=178833965768871@lid raw_chat=178833965768871@lid from_me=false group=false sender=178833965768871@lid text="Ahhh makes sense"
+[2026-05-06T20:24:27Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=616088KB cache=3chats/1727msgs contacts=4000
+[2026-05-06T20:24:30Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3AEE53C676710CCCCF81 from_me=false chat=178833965768871@lid sender=178833965768871@lid offline="" has_participants=false
+[2026-05-06T20:24:30Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3AEE53C676710CCCCF81 chat=178833965768871@lid raw_chat=178833965768871@lid from_me=false group=false sender=178833965768871@lid text="I’ll get drawing and unit matrix for you"
+[2026-05-06T20:24:30Z WARN  gmessages_rust::longpoll] ditto ping failed: session expired or revoked; re-pair required
+[2026-05-06T20:24:36Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3A1CD42EDE1237EA43E4 from_me=false chat=178833965768871@lid sender=178833965768871@lid offline="" has_participants=false
+[2026-05-06T20:24:36Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3A1CD42EDE1237EA43E4 chat=178833965768871@lid raw_chat=178833965768871@lid from_me=false group=false sender=178833965768871@lid text="You prefer email or over whatsapp"
+[2026-05-06T20:24:38Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=615840KB cache=3chats/1729msgs contacts=4000
+[2026-05-06T20:24:45Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3ABEB75454227ED37586 from_me=false chat=178833965768871@lid sender=178833965768871@lid offline="" has_participants=false
+[2026-05-06T20:24:45Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3ABEB75454227ED37586 chat=178833965768871@lid raw_chat=178833965768871@lid from_me=false group=false sender=178833965768871@lid text="Is it new built?"
+[2026-05-06T20:24:48Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=615992KB cache=3chats/1730msgs contacts=4000
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:24:55.658: GtkBox 0x55d46dabbdc0 (box) reported min width -24, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:24:55.658: GtkBox 0x55d4753c3190 (box) reported min width -23, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:24:55.659: GtkBox 0x55d475c63cf0 (box) reported min width -23, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:24:55.659: GtkBox 0x55d474f3b6f0 (box) reported min width -23, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:24:55.659: GtkBox 0x55d473a36ec0 (box) reported min width -23, but sizes must be >= 0
+[2026-05-06T20:24:56Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 17806192880@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:24:56Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=17806192880@s.whatsapp.net msg=3ABEB75454227ED37586 sender=None
+[2026-05-06T20:24:56Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:24:56Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 17806192880@s.whatsapp.net
+[2026-05-06T20:24:56Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:24:59Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=618576KB cache=3chats/1730msgs contacts=4000
+[2026-05-06T20:24:59Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'whatsa'
+[2026-05-06T20:25:00Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'What's up?'
+[2026-05-06T20:25:00Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 112 vs current 119)
+[2026-05-06T20:25:00Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-1f220421
+[2026-05-06T20:25:00Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:25:00Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'whatsapp 4 life'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:25:00.533: GtkBox 0x55d4751441e0 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:25:01Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'WhatsApp 4 life'
+[2026-05-06T20:25:01Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "whatsapp 4 life" → "WhatsApp 4 life"
+[2026-05-06T20:25:07Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3ADF44CA543FB110A4E2 from_me=false chat=178833965768871@lid sender=178833965768871@lid offline="" has_participants=false
+[2026-05-06T20:25:07Z INFO  wacore_libsignal::protocol::session_cipher] 178833965768871@lid.0 creating new chains.
+[2026-05-06T20:25:07Z INFO  wacore_libsignal::protocol::state::session] Trimming excessive receiver_chain for session with base key 47ed25b2c9fd505af097387561ea6cb53ceb21799aeb56cc3daa6958e2fe1239, chain count: 6
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:25:08.018: GtkBox 0x55d474233060 adjusted size vertical min 11 natural 11 must not decrease below min 17 natural 17
+[2026-05-06T20:25:09Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=617568KB cache=3chats/1731msgs contacts=4000
+[2026-05-06T20:25:11Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3A57C5F80BBDADC16B89 from_me=false chat=178833965768871@lid sender=178833965768871@lid offline="" has_participants=false
+[2026-05-06T20:25:11Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3A57C5F80BBDADC16B89 chat=178833965768871@lid raw_chat=178833965768871@lid from_me=false group=false sender=178833965768871@lid text="Claudeeee baby"
+[2026-05-06T20:25:12Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 17806192880@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:25:12Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=17806192880@s.whatsapp.net msg=3A57C5F80BBDADC16B89 sender=None
+[2026-05-06T20:25:12Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:25:12Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 17806192880@s.whatsapp.net
+[2026-05-06T20:25:12Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:25:19Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=618016KB cache=3chats/1732msgs contacts=4000
+[2026-05-06T20:25:30Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=617608KB cache=3chats/1732msgs contacts=4000
+[2026-05-06T20:25:30Z WARN  gmessages_rust::longpoll] ditto ping failed: session expired or revoked; re-pair required
+[2026-05-06T20:25:34Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB00A6886454EDF319CB5 from_me=false chat=120363168988062471@g.us sender=187054549897346:37@lid offline="" has_participants=false
+[2026-05-06T20:25:34Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB00A6886454EDF319CB5 chat=120363168988062471@g.us raw_chat=120363168988062471@g.us from_me=false group=true sender=187054549897346:37@lid text="that area is high rent demand in general. but rent prices may have come down slightly from their rent guarantee numbers"
+[2026-05-06T20:25:40Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=616292KB cache=3chats/1733msgs contacts=4000
+[2026-05-06T20:25:51Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=616188KB cache=3chats/1733msgs contacts=4000
+[2026-05-06T20:26:01Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=616404KB cache=3chats/1733msgs contacts=4000
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.625: GtkBox 0x55d4696c24c0 (box) reported min width -50, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.625: GtkBox 0x55d46a7ffbc0 (box) reported min width -60, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.626: GtkBox 0x55d46d5fc5a0 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.627: GtkBox 0x55d46e5e6810 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.628: GtkBox 0x55d4754c8dd0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.630: GtkBox 0x55d473a36ec0 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.631: GtkBox 0x55d46bc43580 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.632: GtkBox 0x55d46be7a010 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.632: GtkBox 0x55d46e04fc60 (box) reported min width -60, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.634: GtkBox 0x55d47005cfc0 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.634: GtkBox 0x55d4753c3190 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.635: GtkBox 0x55d4741d54d0 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.635: GtkBox 0x55d46c85e7e0 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.635: GtkBox 0x55d467ab3d20 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.635: GtkBox 0x55d46d7fbd20 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.636: GtkBox 0x55d46d9a9e30 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.636: GtkBox 0x55d46c092c20 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.636: GtkBox 0x55d46ca86810 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.637: GtkBox 0x55d46e7d3510 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.637: GtkBox 0x55d46bddad10 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.637: GtkBox 0x55d4742896f0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.638: GtkBox 0x55d46c2d7d60 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.638: GtkBox 0x55d46e44f770 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.638: GtkBox 0x55d474bdc7d0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.639: GtkBox 0x55d4753c7290 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.639: GtkBox 0x55d46e6a6b00 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.640: GtkBox 0x55d46dd50330 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.643: GtkBox 0x55d46e77b4a0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.643: GtkBox 0x55d474ccb770 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.644: GtkBox 0x55d47537fb20 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.646: GtkBox 0x55d46bbf3fd0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.646: GtkBox 0x55d46db39d30 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.647: GtkBox 0x55d46d9f6ca0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.648: GtkBox 0x55d4753fd730 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.648: GtkBox 0x55d47534be10 (box) reported min width -56, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.649: GtkBox 0x55d474b44830 (box) reported min width -56, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.651: GtkBox 0x55d475e47110 (box) reported min width -56, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.651: GtkBox 0x55d47584e670 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.652: GtkBox 0x55d474c60ca0 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.653: GtkBox 0x55d47509dfe0 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.654: GtkBox 0x55d474aa1320 (box) reported min width -49, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.655: GtkBox 0x55d475dae3d0 (box) reported min width -46, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.655: GtkBox 0x55d475be98a0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.656: GtkBox 0x55d475ca1990 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.657: GtkBox 0x55d4756ee8a0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.658: GtkBox 0x55d475dfcbd0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.658: GtkBox 0x55d475e69ee0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.659: GtkBox 0x55d475cf1790 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.660: GtkBox 0x55d474bad4e0 (box) reported min width -46, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:01.661: GtkBox 0x55d474d8ea40 (box) reported min width -69, but sizes must be >= 0
+[2026-05-06T20:26:01Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=16479642559@s.whatsapp.net msg=3EB0A8A352F3470DEBEACF sender=None
+[2026-05-06T20:26:01Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 16479642559@s.whatsapp.net
+[2026-05-06T20:26:01Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:26:01Z INFO  whatsapp_desktop::ui::chat_view] Paste handler: Ctrl+V detected, checking clipboard
+[2026-05-06T20:26:01Z INFO  whatsapp_desktop::ui::chat_view] Paste: read_texture_async failed (No compatible transfer format found), trying raw bytes fallback
+[2026-05-06T20:26:01Z WARN  whatsapp_desktop::ui::chat_view] Paste fallback: no image MIME on clipboard
+[2026-05-06T20:26:01Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 16479642559@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:26:01Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:26:02Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'Truly missing — no last-name match in transactions (need invoices generated)
+    DogTotalGriffin Ebanks CRATE$270Rocky DeSilva$49'
+[2026-05-06T20:26:03Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-04b8e03d
+[2026-05-06T20:26:03Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:03.122: GtkBox 0x55d475dcb560 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:26:03Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Truly missing — no last-name match in transactions. Need invoices generated. DogTotalGriffin Ebanks CRATE $270. Rocky DeSilva $49.'
+[2026-05-06T20:26:03Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'Truly missing — no last-name match in transactions (need invoices generated)
+    DogTotalGriffin Ebanks CRATE$270Rocky DeSilva$49'
+[2026-05-06T20:26:04Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Truly missing — no last-name match in transactions. Need invoices generated. DogTotalGriffin Ebanks CRATE $270. Rocky DeSilva $49.'
+[2026-05-06T20:26:04Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "Truly missing — no last-name match in transactions (need invoices generated)\nDogTotalGriffin Ebanks CRATE$270Rocky DeSilva$49" → "Truly missing — no last-name match in transactions. Need invoices generated. DogTotalGriffin Ebanks CRATE $270. Rocky DeSilva $49."
+[2026-05-06T20:26:10Z INFO  whatsapp_desktop::ui::chat_view] Paste handler: Ctrl+V detected, checking clipboard
+[2026-05-06T20:26:10Z INFO  whatsapp_desktop::ui::chat_view] Paste: read_texture_async failed (No compatible transfer format found), trying raw bytes fallback
+[2026-05-06T20:26:10Z WARN  whatsapp_desktop::ui::chat_view] Paste fallback: no image MIME on clipboard
+[2026-05-06T20:26:10Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 16479642559@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:26:10Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=16479642559@s.whatsapp.net msg=3EB0A8A352F3470DEBEACF sender=None
+[2026-05-06T20:26:10Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 16479642559@s.whatsapp.net
+[2026-05-06T20:26:10Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:26:10Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:26:10Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending '
+    Claude finished the response
+    You said: compare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total th…
+    
+    3EB0A8A3_INVOICE_SPREADSHEET_April_19th_-_May_02nd__2026.xlsx
+    xlsx
+    
+    
+    Transaction export - 2026-05-06 4.18.52 PM.csv
+    csv
+    
+    compare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total they should not generate an invoice so provide the missing list both directions and note $0 dogs.
+    
+    16:22
+    Claude responded: Here's the comparison.
+    
+    Reconciled invoice and transaction records, identified discrepancies and naming patterns
+    Reconciled invoice and transaction records, identified discrepancies and naming patterns
+    Here's the comparison. One important observation up front: the two sheets use different naming conventions — the invoice spreadsheet lists dog name + owner last name ("Bentley Williams"), while the transaction export lists owner first name + last name ("Bryan Williams"). Matching purely on full name flags 19 dogs as "missing", but matching on last name narrows it to just a few true gaps.
+    
+    Counts
+    
+    Invoice spreadsheet: 111 dog rows
+    Transaction report: 110 invoices
+    Invoice rows with $0 total: 0 (every dog on the sheet has at least one billable day, so the $0-suppression rule doesn't exclude anyone this period)
+    Truly missing — no last-name match in transactions (need invoices generated)
+    Dog	Total
+    Griffin Ebanks CRATE	$270
+    Rocky DeSilva	$49
+    Truly missing — in transactions but no matching dog on the invoice sheet
+    Griffin Carthew
+    (Worth checking whether this is actually the same client as Griffin Ebanks — the first name "Griffin" matching is suspicious, possibly a contact-record mixup rather than two separate accounts.)
+    
+    Apparent mismatches that are likely the same client (dog name ↔ owner name, same last name)
+    These almost certainly don't need action, but worth a glance to confirm:
+    
+    Invoice sheet	Transaction report
+    Bentley Williams	Bryan Williams
+    Buddy Jurkiewicz	Craig Jurkiewicz
+    Conan Miller	Jordan Miller
+    Dexter De Leon	Karlo De Leon
+    Dobby & Ellie Daley	Dobby Daley
+    Edward (Eddie) & Lucio Antonijevic	Edward (Eddie) Antonijevic
+    Heath Heffernan	Carly Heffernan
+    Indie Baird	Matthew Baird
+    Jellybean Kenzie	Alison Kenzie
+    Kai Thomas	Amy Thomas
+    Kevin Scott	STEPHANIE SCOTT
+    Maisie Cutler	Gemma Cutler
+    Roy Ridout	Roy Harvey ridout
+    Sherman Winslow	Alex Winslow
+    Talyn Wint-Rose	Talyn & Talyn Wint-Rose
+    Teddy & Palmer Goutis	Teddy Goutis
+    Zoë MacMillan	Zoe MacMillan (note the missing diacritic)
+    A few of these are worth a sanity check anyway:
+    
+    Dobby & Ellie Daley ($296) vs "Dobby Daley" — make sure the invoice covers both dogs, not just Dobby
+    Edward (Eddie) & Lucio Antonijevic ($436) vs "Edward (Eddie) Antonijevic" — same concern
+    Teddy & Palmer Goutis ($441) vs "Teddy Goutis" — same concern
+    Want me to put this in a spreadsheet you can work through?
+    
+    
+    
+    
+    
+    
+    Claude is AI and can make mistakes. Please double-check responses.
+    
+    
+    '
+[2026-05-06T20:26:11Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-169d0c16
+[2026-05-06T20:26:11Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:11.491: GtkBox 0x55d475396a90 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:26:11Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=617372KB cache=3chats/1734msgs contacts=4000
+[2026-05-06T20:26:13Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Claude finished the response.
+    You said: compare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total th…
+    
+    3EB0A8A3_INVOICE_SPREADSHEET_April_19th_-_May_02nd__2026.xlsx
+    xlsx
+    
+    Transaction export - 2026-05-06 4.18.52 PM.csv
+    csv
+    
+    compare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total they should not generate an invoice so provide the missing list both directions and note $0 dogs.
+    
+    16:22
+    Claude responded: Here's the comparison.
+    
+    Reconciled invoice and transaction records, identified discrepancies and naming patterns
+    Reconciled invoice and transaction records, identified discrepancies and naming patterns
+    Here's the comparison. One important observation up front: the two sheets use different naming conventions — the invoice spreadsheet lists dog name + owner last name ("Bentley Williams"), while the transaction export lists owner first name + last name ("Bryan Williams"). Matching purely on full name flags 19 dogs as "missing", but matching on last name narrows it to just a few true gaps.
+    
+    Counts
+    
+    Invoice spreadsheet: 111 dog rows
+    Transaction report: 110 invoices
+    Invoice rows with $0 total: 0 (every dog on the sheet has at least one billable day, so the $0-suppression rule doesn't exclude anyone this period)
+    Truly missing — no last-name match in transactions (need invoices generated)
+    Dog	Total
+    Griffin Ebanks CRATE	$270
+    Rocky DeSilva	$49
+    Truly missing — in transactions but no matching dog on the invoice sheet
+    Griffin Carthew
+    (Worth checking whether this is actually the same client as Griffin Ebanks — the first name "Griffin" matching is suspicious, possibly a contact-record mixup rather than two separate accounts.)
+    
+    Apparent mismatches that are likely the same client (dog name ↔ owner name, same last name)
+    These almost certainly don't need action, but worth a glance to confirm:
+    
+    Invoice sheet	Transaction report
+    Bentley Williams	Bryan Williams
+    Buddy Jurkiewicz	Craig Jurkiewicz
+    Conan Miller	Jordan Miller
+    Dexter De Leon	Karlo De Leon
+    Dobby & Ellie Daley	Dobby Daley
+    Edward (Eddie) & Lucio Antonijevic	Edward (Eddie) Antonijevic
+    Heath Heffernan	Carly Heffernan
+    Indie Baird	Matthew Baird
+    Jellybean Kenzie	Alison Kenzie
+    Kai Thomas	Amy Thomas
+    Kevin Scott	STEPHANIE SCOTT
+    Maisie Cutler	Gemma Cutler
+    Roy Ridout	Roy Harvey ridout
+    Sherman Winslow	Alex Winslow
+    Talyn Wint-Rose	Talyn & Talyn Wint-Rose
+    Teddy & Palmer Goutis	Teddy Goutis
+    Zoë MacMillan	Zoe MacMillan (note the missing diacritic)
+    A few of these are worth a sanity check anyway:
+    
+    Dobby & Ellie Daley ($296) vs "Dobby Daley" — make sure the invoice covers both dogs, not just Dobby
+    Edward (Eddie) & Lucio Antonijevic ($436) vs "Edward (Eddie) Antonijevic" — same concern
+    Teddy & Palmer Goutis ($441) vs "Teddy Goutis" — same concern
+    Want me to put this in a spreadsheet you can work through?
+    
+    Claude is AI and can make mistakes. Please double-check responses.'
+[2026-05-06T20:26:13Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending '
+    Claude finished the response
+    You said: compare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total th…
+    
+    3EB0A8A3_INVOICE_SPREADSHEET_April_19th_-_May_02nd__2026.xlsx
+    xlsx
+    
+    
+    Transaction export - 2026-05-06 4.18.52 PM.csv
+    csv
+    
+    compare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total they should not generate an invoice so provide the missing list both directions and note $0 dogs.
+    
+    16:22
+    Claude responded: Here's the comparison.
+    
+    Reconciled invoice and transaction records, identified discrepancies and naming patterns
+    Reconciled invoice and transaction records, identified discrepancies and naming patterns
+    Here's the comparison. One important observation up front: the two sheets use different naming conventions — the invoice spreadsheet lists dog name + owner last name ("Bentley Williams"), while the transaction export lists owner first name + last name ("Bryan Williams"). Matching purely on full name flags 19 dogs as "missing", but matching on last name narrows it to just a few true gaps.
+    
+    Counts
+    
+    Invoice spreadsheet: 111 dog rows
+    Transaction report: 110 invoices
+    Invoice rows with $0 total: 0 (every dog on the sheet has at least one billable day, so the $0-suppression rule doesn't exclude anyone this period)
+    Truly missing — no last-name match in transactions (need invoices generated)
+    Dog	Total
+    Griffin Ebanks CRATE	$270
+    Rocky DeSilva	$49
+    Truly missing — in transactions but no matching dog on the invoice sheet
+    Griffin Carthew
+    (Worth checking whether this is actually the same client as Griffin Ebanks — the first name "Griffin" matching is suspicious, possibly a contact-record mixup rather than two separate accounts.)
+    
+    Apparent mismatches that are likely the same client (dog name ↔ owner name, same last name)
+    These almost certainly don't need action, but worth a glance to confirm:
+    
+    Invoice sheet	Transaction report
+    Bentley Williams	Bryan Williams
+    Buddy Jurkiewicz	Craig Jurkiewicz
+    Conan Miller	Jordan Miller
+    Dexter De Leon	Karlo De Leon
+    Dobby & Ellie Daley	Dobby Daley
+    Edward (Eddie) & Lucio Antonijevic	Edward (Eddie) Antonijevic
+    Heath Heffernan	Carly Heffernan
+    Indie Baird	Matthew Baird
+    Jellybean Kenzie	Alison Kenzie
+    Kai Thomas	Amy Thomas
+    Kevin Scott	STEPHANIE SCOTT
+    Maisie Cutler	Gemma Cutler
+    Roy Ridout	Roy Harvey ridout
+    Sherman Winslow	Alex Winslow
+    Talyn Wint-Rose	Talyn & Talyn Wint-Rose
+    Teddy & Palmer Goutis	Teddy Goutis
+    Zoë MacMillan	Zoe MacMillan (note the missing diacritic)
+    A few of these are worth a sanity check anyway:
+    
+    Dobby & Ellie Daley ($296) vs "Dobby Daley" — make sure the invoice covers both dogs, not just Dobby
+    Edward (Eddie) & Lucio Antonijevic ($436) vs "Edward (Eddie) Antonijevic" — same concern
+    Teddy & Palmer Goutis ($441) vs "Teddy Goutis" — same concern
+    Want me to put this in a spreadsheet you can work through?
+    
+    
+    
+    
+    
+    
+    Claude is AI and can make mistakes. Please double-check responses.
+    
+    
+    '
+[2026-05-06T20:26:16Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Claude finished the response.
+    You said: compare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total th…
+    
+    3EB0A8A3_INVOICE_SPREADSHEET_April_19th_-_May_02nd__2026.xlsx
+    xlsx
+    
+    Transaction export - 2026-05-06 4.18.52 PM.csv
+    csv
+    
+    compare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total they should not generate an invoice so provide the missing list both directions and note $0 dogs.
+    
+    16:22
+    Claude responded: Here's the comparison.
+    
+    Reconciled invoice and transaction records, identified discrepancies and naming patterns
+    Reconciled invoice and transaction records, identified discrepancies and naming patterns
+    Here's the comparison. One important observation up front: the two sheets use different naming conventions — the invoice spreadsheet lists dog name + owner last name ("Bentley Williams"), while the transaction export lists owner first name + last name ("Bryan Williams"). Matching purely on full name flags 19 dogs as "missing", but matching on last name narrows it to just a few true gaps.
+    
+    Counts
+    
+    Invoice spreadsheet: 111 dog rows
+    Transaction report: 110 invoices
+    Invoice rows with $0 total: 0 (every dog on the sheet has at least one billable day, so the $0-suppression rule doesn't exclude anyone this period)
+    Truly missing — no last-name match in transactions (need invoices generated)
+    Dog	Total
+    Griffin Ebanks CRATE	$270
+    Rocky DeSilva	$49
+    Truly missing — in transactions but no matching dog on the invoice sheet
+    Griffin Carthew
+    (Worth checking whether this is actually the same client as Griffin Ebanks — the first name "Griffin" matching is suspicious, possibly a contact-record mixup rather than two separate accounts.)
+    
+    Apparent mismatches that are likely the same client (dog name ↔ owner name, same last name)
+    These almost certainly don't need action, but worth a glance to confirm:
+    
+    Invoice sheet	Transaction report
+    Bentley Williams	Bryan Williams
+    Buddy Jurkiewicz	Craig Jurkiewicz
+    Conan Miller	Jordan Miller
+    Dexter De Leon	Karlo De Leon
+    Dobby & Ellie Daley	Dobby Daley
+    Edward (Eddie) & Lucio Antonijevic	Edward (Eddie) Antonijevic
+    Heath Heffernan	Carly Heffernan
+    Indie Baird	Matthew Baird
+    Jellybean Kenzie	Alison Kenzie
+    Kai Thomas	Amy Thomas
+    Kevin Scott	STEPHANIE SCOTT
+    Maisie Cutler	Gemma Cutler
+    Roy Ridout	Roy Harvey ridout
+    Sherman Winslow	Alex Winslow
+    Talyn Wint-Rose	Talyn & Talyn Wint-Rose
+    Teddy & Palmer Goutis	Teddy Goutis
+    Zoë MacMillan	Zoe MacMillan (note the missing diacritic)
+    A few of these are worth a sanity check anyway:
+    
+    Dobby & Ellie Daley ($296) vs "Dobby Daley" — make sure the invoice covers both dogs, not just Dobby
+    Edward (Eddie) & Lucio Antonijevic ($436) vs "Edward (Eddie) Antonijevic" — same concern
+    Teddy & Palmer Goutis ($441) vs "Teddy Goutis" — same concern
+    Want me to put this in a spreadsheet you can work through?
+    
+    Claude is AI and can make mistakes. Please double-check responses.'
+[2026-05-06T20:26:16Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "\nClaude finished the response\nYou said: compare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total th…\n\n3EB0A8A3_INVOICE_SPREADSHEET_April_19th_-_May_02nd__2026.xlsx\nxlsx\n\n\nTransaction export - 2026-05-06 4.18.52 PM.csv\ncsv\n\ncompare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total they should not generate an invoice so provide the missing list both directions and note $0 dogs.\n\n16:22\nClaude responded: Here's the comparison.\n\nReconciled invoice and transaction records, identified discrepancies and naming patterns\nReconciled invoice and transaction records, identified discrepancies and naming patterns\nHere's the comparison. One important observation up front: the two sheets use different naming conventions — the invoice spreadsheet lists dog name + owner last name (\"Bentley Williams\"), while the transaction export lists owner first name + last name (\"Bryan Williams\"). Matching purely on full name flags 19 dogs as \"missing\", but matching on last name narrows it to just a few true gaps.\n\nCounts\n\nInvoice spreadsheet: 111 dog rows\nTransaction report: 110 invoices\nInvoice rows with $0 total: 0 (every dog on the sheet has at least one billable day, so the $0-suppression rule doesn't exclude anyone this period)\nTruly missing — no last-name match in transactions (need invoices generated)\nDog\tTotal\nGriffin Ebanks CRATE\t$270\nRocky DeSilva\t$49\nTruly missing — in transactions but no matching dog on the invoice sheet\nGriffin Carthew\n(Worth checking whether this is actually the same client as Griffin Ebanks — the first name \"Griffin\" matching is suspicious, possibly a contact-record mixup rather than two separate accounts.)\n\nApparent mismatches that are likely the same client (dog name ↔ owner name, same last name)\nThese almost certainly don't need action, but worth a glance to confirm:\n\nInvoice sheet\tTransaction report\nBentley Williams\tBryan Williams\nBuddy Jurkiewicz\tCraig Jurkiewicz\nConan Miller\tJordan Miller\nDexter De Leon\tKarlo De Leon\nDobby & Ellie Daley\tDobby Daley\nEdward (Eddie) & Lucio Antonijevic\tEdward (Eddie) Antonijevic\nHeath Heffernan\tCarly Heffernan\nIndie Baird\tMatthew Baird\nJellybean Kenzie\tAlison Kenzie\nKai Thomas\tAmy Thomas\nKevin Scott\tSTEPHANIE SCOTT\nMaisie Cutler\tGemma Cutler\nRoy Ridout\tRoy Harvey ridout\nSherman Winslow\tAlex Winslow\nTalyn Wint-Rose\tTalyn & Talyn Wint-Rose\nTeddy & Palmer Goutis\tTeddy Goutis\nZoë MacMillan\tZoe MacMillan (note the missing diacritic)\nA few of these are worth a sanity check anyway:\n\nDobby & Ellie Daley ($296) vs \"Dobby Daley\" — make sure the invoice covers both dogs, not just Dobby\nEdward (Eddie) & Lucio Antonijevic ($436) vs \"Edward (Eddie) Antonijevic\" — same concern\nTeddy & Palmer Goutis ($441) vs \"Teddy Goutis\" — same concern\nWant me to put this in a spreadsheet you can work through?\n\n\n\n\n\n\nClaude is AI and can make mistakes. Please double-check responses.\n\n\n" → "Claude finished the response.\nYou said: compare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total th…\n\n3EB0A8A3_INVOICE_SPREADSHEET_April_19th_-_May_02nd__2026.xlsx\nxlsx\n\nTransaction export - 2026-05-06 4.18.52 PM.csv\ncsv\n\ncompare the invoice spreadsheet to the transaction report which dogs are missing from either sheet - but also note if any invoice sheet dogs have a $0 total they should not generate an invoice so provide the missing list both directions and note $0 dogs.\n\n16:22\nClaude responded: Here's the comparison.\n\nReconciled invoice and transaction records, identified discrepancies and naming patterns\nReconciled invoice and transaction records, identified discrepancies and naming patterns\nHere's the comparison. One important observation up front: the two sheets use different naming conventions — the invoice spreadsheet lists dog name + owner last name (\"Bentley Williams\"), while the transaction export lists owner first name + last name (\"Bryan Williams\"). Matching purely on full name flags 19 dogs as \"missing\", but matching on last name narrows it to just a few true gaps.\n\nCounts\n\nInvoice spreadsheet: 111 dog rows\nTransaction report: 110 invoices\nInvoice rows with $0 total: 0 (every dog on the sheet has at least one billable day, so the $0-suppression rule doesn't exclude anyone this period)\nTruly missing — no last-name match in transactions (need invoices generated)\nDog\tTotal\nGriffin Ebanks CRATE\t$270\nRocky DeSilva\t$49\nTruly missing — in transactions but no matching dog on the invoice sheet\nGriffin Carthew\n(Worth checking whether this is actually the same client as Griffin Ebanks — the first name \"Griffin\" matching is suspicious, possibly a contact-record mixup rather than two separate accounts.)\n\nApparent mismatches that are likely the same client (dog name ↔ owner name, same last name)\nThese almost certainly don't need action, but worth a glance to confirm:\n\nInvoice sheet\tTransaction report\nBentley Williams\tBryan Williams\nBuddy Jurkiewicz\tCraig Jurkiewicz\nConan Miller\tJordan Miller\nDexter De Leon\tKarlo De Leon\nDobby & Ellie Daley\tDobby Daley\nEdward (Eddie) & Lucio Antonijevic\tEdward (Eddie) Antonijevic\nHeath Heffernan\tCarly Heffernan\nIndie Baird\tMatthew Baird\nJellybean Kenzie\tAlison Kenzie\nKai Thomas\tAmy Thomas\nKevin Scott\tSTEPHANIE SCOTT\nMaisie Cutler\tGemma Cutler\nRoy Ridout\tRoy Harvey ridout\nSherman Winslow\tAlex Winslow\nTalyn Wint-Rose\tTalyn & Talyn Wint-Rose\nTeddy & Palmer Goutis\tTeddy Goutis\nZoë MacMillan\tZoe MacMillan (note the missing diacritic)\nA few of these are worth a sanity check anyway:\n\nDobby & Ellie Daley ($296) vs \"Dobby Daley\" — make sure the invoice covers both dogs, not just Dobby\nEdward (Eddie) & Lucio Antonijevic ($436) vs \"Edward (Eddie) Antonijevic\" — same concern\nTeddy & Palmer Goutis ($441) vs \"Teddy Goutis\" — same concern\nWant me to put this in a spreadsheet you can work through?\n\nClaude is AI and can make mistakes. Please double-check responses."
+[2026-05-06T20:26:22Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=619244KB cache=3chats/1735msgs contacts=4000
+[2026-05-06T20:26:30Z WARN  gmessages_rust::longpoll] ditto ping failed: session expired or revoked; re-pair required
+[2026-05-06T20:26:32Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=619244KB cache=3chats/1735msgs contacts=4000
+[2026-05-06T20:26:41Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB02C05392D22E3B96126 from_me=false chat=120363168988062471@g.us sender=187054549897346:37@lid offline="" has_participants=false
+[2026-05-06T20:26:41Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB02C05392D22E3B96126 chat=120363168988062471@g.us raw_chat=120363168988062471@g.us from_me=false group=true sender=187054549897346:37@lid text="still another year and half though, more time for ppl to escape ontario. and by then, alberta might be its own country"
+[2026-05-06T20:26:43Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=618272KB cache=3chats/1736msgs contacts=4000
+[2026-05-06T20:26:48Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB0A378C345DE4BF9A6D5 from_me=false chat=16476745958@s.whatsapp.net sender=16476745958:60@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:26:48Z WARN  whatsapp_rust::message] [msg:3EB0A378C345DE4BF9A6D5] No session found for msg message from 16476745958:60@s.whatsapp.net. Sending retry receipt to request session establishment.
+[2026-05-06T20:26:48Z WARN  whatsapp_rust::message] Message 3EB0A378C345DE4BF9A6D5 from 16476745958:60@s.whatsapp.net failed to decrypt and has no group content. Dispatching UndecryptableMessage event.
+[2026-05-06T20:26:48Z WARN  whatsapp_rust::retry] Sending retry receipt #2 for message 3EB0A378C345DE4BF9A6D5 from 16476745958:60@s.whatsapp.net (reason: NoSession)
+[2026-05-06T20:26:50Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-2669c569
+[2026-05-06T20:26:50Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:26:50Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'honestlyu we could probably build a whole new booking system with claude'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:50.671: GtkBox 0x55d46cb8f2a0 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:26:51Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Honestly, we could probably build a whole new booking system with Claude.'
+[2026-05-06T20:26:51Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "honestlyu we could probably build a whole new booking system with claude" → "Honestly, we could probably build a whole new booking system with Claude."
+[2026-05-06T20:26:53Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=617760KB cache=3chats/1737msgs contacts=4000
+[2026-05-06T20:26:56Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-0bbc5081
+[2026-05-06T20:26:56Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:26:56Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'i built my own custom whatsapp client'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:26:56.219: GtkBox 0x55d475ac5e00 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:26:56Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'I built my own custom WhatsApp client.'
+[2026-05-06T20:26:56Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "i built my own custom whatsapp client" → "I built my own custom WhatsApp client."
+[2026-05-06T20:26:58Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'im gonn'
+[2026-05-06T20:26:59Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'I'm gonna'
+[2026-05-06T20:26:59Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 244 vs current 248)
+[2026-05-06T20:27:00Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB0E5A238EED2018E6E0F from_me=false chat=16479642559@s.whatsapp.net sender=16479642559:35@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:27:00Z INFO  wacore_libsignal::protocol::session_cipher] 109517538869270:35@lid.0 creating new chains.
+[2026-05-06T20:27:00Z INFO  wacore_libsignal::protocol::state::session] Trimming excessive receiver_chain for session with base key 4f28355690283021aa68d66f249b5f86ae4dd60ac5e2af91ef55bf9e24944472, chain count: 6
+[2026-05-06T20:27:00Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB0E5A238EED2018E6E0F chat=16479642559@s.whatsapp.net raw_chat=16479642559@s.whatsapp.net from_me=false group=false sender=16479642559:35@s.whatsapp.net text="truly?"
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:00.801: GtkBox 0x55d46c1476e0 (box) reported min width -70, but sizes must be >= 0
+[2026-05-06T20:27:01Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 16479642559@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:27:01Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=16479642559@s.whatsapp.net msg=3EB0E5A238EED2018E6E0F sender=None
+[2026-05-06T20:27:01Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:01Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:01Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:02Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'once we move servers im g'
+[2026-05-06T20:27:03Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=616740KB cache=3chats/1739msgs contacts=4000
+[2026-05-06T20:27:03Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Once we move servers, I'm going.'
+[2026-05-06T20:27:03Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 270 vs current 271)
+[2026-05-06T20:27:03Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'once we move servers im g'
+[2026-05-06T20:27:04Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Once we move servers, I'm going.'
+[2026-05-06T20:27:05Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 271 vs current 273)
+[2026-05-06T20:27:05Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'bro'
+[2026-05-06T20:27:06Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Bro'
+[2026-05-06T20:27:09Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'Broi contributed to'
+[2026-05-06T20:27:09Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Bro, I contributed to'
+[2026-05-06T20:27:09Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 290 vs current 294)
+[2026-05-06T20:27:14Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=616808KB cache=3chats/1739msgs contacts=4000
+[2026-05-06T20:27:14Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'i solved a broken webcam driver that '
+[2026-05-06T20:27:14Z INFO  whatsapp_rust::message] DIAG msg arrival: id=2A574C219734DEF5A254 from_me=false chat=6876494352606@lid sender=6876494352606@lid offline="" has_participants=false
+[2026-05-06T20:27:14Z WARN  whatsapp_rust::message] [msg:2A574C219734DEF5A254] No session found for msg message from 6876494352606@lid. Sending retry receipt to request session establishment.
+[2026-05-06T20:27:14Z WARN  whatsapp_rust::message] Message 2A574C219734DEF5A254 from 6876494352606@lid failed to decrypt and has no group content. Dispatching UndecryptableMessage event.
+[2026-05-06T20:27:14Z WARN  whatsapp_rust::retry] Sending retry receipt #1 for message 2A574C219734DEF5A254 from 6876494352606@lid (reason: NoSession)
+[2026-05-06T20:27:14Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'I solved a broken webcam driver that'
+[2026-05-06T20:27:14Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 328 vs current 330)
+[2026-05-06T20:27:15Z INFO  whatsapp_rust::pdo] Sending PDO placeholder resend request for message 2A574C219734DEF5A254 from 6876494352606@lid in 6876494352606@lid to primary phone 14164566960@s.whatsapp.net
+[2026-05-06T20:27:15Z INFO  whatsapp_rust::message] DIAG msg arrival: id=A5DE84234D0D5A116EA8CBC490772324 from_me=true chat=14164566960@s.whatsapp.net sender=14164566960@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:27:15Z INFO  wacore_libsignal::protocol::session_cipher] 248133263056915@lid.0 creating new chains.
+[2026-05-06T20:27:15Z INFO  wacore_libsignal::protocol::state::session] Trimming excessive receiver_chain for session with base key 590336ec0fdce70a4d357feb02acf0c5fdd7c90490736cddd4a776cf2ca0af58, chain count: 6
+[2026-05-06T20:27:15Z INFO  whatsapp_rust::pdo] Received PDO placeholder response for message 2A574C219734DEF5A254 (took 0ms)
+[2026-05-06T20:27:15Z INFO  whatsapp_rust::pdo] Dispatching PDO-recovered message 2A574C219734DEF5A254 from 16474683238@s.whatsapp.net via phone
+[2026-05-06T20:27:15Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=2A574C219734DEF5A254 chat=16474683238@s.whatsapp.net raw_chat=16474683238@s.whatsapp.net from_me=false group=false sender=16474683238@s.whatsapp.net text="Are you going up keep me updated re landridge or how’s it gonna go from now"
+[2026-05-06T20:27:15Z WARN  whatsapp_desktop::ui::runtime] DROPPED message: id=A5DE84234D0D5A116EA8CBC490772324 chat=14164566960@s.whatsapp.net raw_chat=14164566960@s.whatsapp.net sender=14164566960@s.whatsapp.net from_me=true group=false edit=Empty — map_message returned None (no text/media/contact/poll)
+[2026-05-06T20:27:16Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB0CF38F74AAE22210974 from_me=false chat=120363168988062471@g.us sender=59373644697641:12@lid offline="" has_participants=false
+[2026-05-06T20:27:16Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB0CF38F74AAE22210974 chat=120363168988062471@g.us raw_chat=120363168988062471@g.us from_me=false group=true sender=59373644697641:12@lid text="https://www.facebook.com/share/p/18NmuecSc5/"
+[2026-05-06T20:27:17Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB00B4829B72161DF0513 from_me=false chat=16479642559@s.whatsapp.net sender=16479642559:35@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:27:17Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB00B4829B72161DF0513 chat=16479642559@s.whatsapp.net raw_chat=16479642559@s.whatsapp.net from_me=false group=false sender=16479642559:35@s.whatsapp.net text="are you saying griffin and rocky did not get invoices??"
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:18.012: GtkBox 0x55d475cd4ef0 (box) reported min width -70, but sizes must be >= 0
+[2026-05-06T20:27:18Z INFO  whatsapp_desktop::ui::runtime] Profile picture fetch done (1187 chats)
+[2026-05-06T20:27:18Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-28819957
+[2026-05-06T20:27:18Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:27:18Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'i solved a broken webcam driver that even intel didnt solve with claude'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:18.723: GtkBox 0x55d475834520 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:27:18Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 16479642559@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:27:18Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=16479642559@s.whatsapp.net msg=3EB00B4829B72161DF0513 sender=None
+[2026-05-06T20:27:18Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:18Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:18Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:19Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'I solved a broken webcam driver that even Intel didn't solve with Claude.'
+[2026-05-06T20:27:19Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "i solved a broken webcam driver that even intel didnt solve with claude" → "I solved a broken webcam driver that even Intel didn't solve with Claude."
+[2026-05-06T20:27:22Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-2f106956
+[2026-05-06T20:27:22Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:27:22Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'litteraly assembly language shit'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:22.823: GtkBox 0x55d475cf8fa0 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:27:23Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Literally assembly language shit.'
+[2026-05-06T20:27:23Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "litteraly assembly language shit" → "Literally assembly language shit."
+[2026-05-06T20:27:24Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB0E60D328623C2856E2D from_me=false chat=16479642559@s.whatsapp.net sender=16479642559:35@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:27:24Z INFO  wacore_libsignal::protocol::session_cipher] 109517538869270:35@lid.0 creating new chains.
+[2026-05-06T20:27:24Z INFO  wacore_libsignal::protocol::state::session] Trimming excessive receiver_chain for session with base key fcdf4f44ca2d42da798242d42927274ef4de2acaa3f69ab7415109c1eec2a719, chain count: 6
+[2026-05-06T20:27:24Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB0E60D328623C2856E2D chat=16479642559@s.whatsapp.net raw_chat=16479642559@s.whatsapp.net from_me=false group=false sender=16479642559:35@s.whatsapp.net text="who is truly?"
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:24.155: GtkBox 0x55d475d9dd90 (box) reported min width -70, but sizes must be >= 0
+[2026-05-06T20:27:24Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=618560KB cache=4chats/2008msgs contacts=4000
+[2026-05-06T20:27:24Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 16479642559@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:27:24Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=16479642559@s.whatsapp.net msg=3EB0E60D328623C2856E2D sender=None
+[2026-05-06T20:27:24Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:25Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:25Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:30Z WARN  gmessages_rust::longpoll] ditto ping failed: session expired or revoked; re-pair required
+[2026-05-06T20:27:32Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'these ar et'
+[2026-05-06T20:27:33Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'These are it.'
+[2026-05-06T20:27:33Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 404 vs current 411)
+[2026-05-06T20:27:34Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-11fe1076
+[2026-05-06T20:27:34Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:27:34Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'these ar ethe 2 it seems'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:34.326: GtkBox 0x55d473a2b790 (box) reported min width -48, but sizes must be >= 0
+[2026-05-06T20:27:34Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=618572KB cache=4chats/2008msgs contacts=4000
+[2026-05-06T20:27:35Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'These are the 2, it seems.'
+[2026-05-06T20:27:35Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "these ar ethe 2 it seems" → "These are the 2, it seems."
+[2026-05-06T20:27:37Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB0A93C01620C247B8F04 from_me=false chat=120363168988062471@g.us sender=59373644697641:12@lid offline="" has_participants=false
+[2026-05-06T20:27:37Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB0A93C01620C247B8F04 chat=120363168988062471@g.us raw_chat=120363168988062471@g.us from_me=false group=true sender=59373644697641:12@lid text="If they cancel Lincoln guarentees it will be a bloodbath"
+[2026-05-06T20:27:40Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 16479642559@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:27:40Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=16479642559@s.whatsapp.net msg=3EB0E60D328623C2856E2D sender=None
+[2026-05-06T20:27:40Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:40Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:40Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:27:45Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=618448KB cache=4chats/2010msgs contacts=4000
+[2026-05-06T20:27:46Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-07fa09ef
+[2026-05-06T20:27:46Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:27:46Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'the truly is ssaying slight naming mnismatch '
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:46.140: GtkBox 0x55d46bd92a40 (box) reported min width -49, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:46.146: GtkBox 0x55d46bd92a40 (box) reported min width -41, but sizes must be >= 0
+[2026-05-06T20:27:46Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'There is a slight naming mismatch.'
+[2026-05-06T20:27:46Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "the truly is ssaying slight naming mnismatch " → "There is a slight naming mismatch."
+[2026-05-06T20:27:47Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'but '
+[2026-05-06T20:27:48Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'But'
+[2026-05-06T20:27:48Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 467 vs current 472)
+[2026-05-06T20:27:51Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-304a9455
+[2026-05-06T20:27:51Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:27:51Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'but it is confident the vinoices were done'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:51.814: GtkBox 0x55d473b3af50 (box) reported min width -49, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:51.820: GtkBox 0x55d473b3af50 (box) reported min width -41, but sizes must be >= 0
+[2026-05-06T20:27:52Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'But it is confident the voices were done.'
+[2026-05-06T20:27:52Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "but it is confident the vinoices were done" → "But it is confident the voices were done."
+[2026-05-06T20:27:54Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'only rocky '
+[2026-05-06T20:27:55Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=619656KB cache=4chats/2012msgs contacts=4000
+[2026-05-06T20:27:55Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Only Rocky.'
+[2026-05-06T20:27:55Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 516 vs current 519)
+[2026-05-06T20:27:56Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-1effe6c9
+[2026-05-06T20:27:56Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:27:56Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'only rocky & griffin'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:56.530: GtkBox 0x55d474e89450 (box) reported min width -49, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:56.537: GtkBox 0x55d474e89450 (box) reported min width -8, but sizes must be >= 0
+[2026-05-06T20:27:57Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Only Rocky & Griffin.'
+[2026-05-06T20:27:57Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "only rocky & griffin" → "Only Rocky & Griffin."
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.171: GtkBox 0x55d46dd312a0 (box) reported min width -49, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.172: GtkBox 0x55d47556ba60 (box) reported min width -49, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.172: GtkBox 0x55d475b3bd70 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.172: GtkBox 0x55d46c0a1240 (box) reported min width -47, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.173: GtkBox 0x55d473995d10 (box) reported min width -47, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.173: GtkBox 0x55d46e0c5bd0 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.173: GtkBox 0x55d46e7d3510 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.173: GtkBox 0x55d46c2e7420 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.174: GtkBox 0x55d46ba7d380 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.174: GtkBox 0x55d47557b580 (box) reported min width -47, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.174: GtkBox 0x55d46d3e6040 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.175: GtkBox 0x55d474fdc370 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.175: GtkBox 0x55d46cc0c770 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.175: GtkBox 0x55d46db5f160 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.175: GtkBox 0x55d46c4d4bf0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.175: GtkBox 0x55d4752332b0 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.175: GtkBox 0x55d469715ac0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.176: GtkBox 0x55d46cb8c660 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.176: GtkBox 0x55d46f1368d0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.176: GtkBox 0x55d475f3d9a0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.176: GtkBox 0x55d475622870 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.177: GtkBox 0x55d4741bfe00 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.177: GtkBox 0x55d4751d6e40 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.177: GtkBox 0x55d46c990c10 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.178: GtkBox 0x55d4752d2390 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.179: GtkBox 0x55d475d7e270 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.179: GtkBox 0x55d474ebbdf0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.179: GtkBox 0x55d46e92e830 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.180: GtkBox 0x55d47542e950 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.181: GtkBox 0x55d475e47110 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.182: GtkBox 0x55d46d9c8560 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.183: GtkBox 0x55d46e338300 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.183: GtkBox 0x55d474fcd490 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.184: GtkBox 0x55d475101ae0 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.184: GtkBox 0x55d46cda93e0 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.185: GtkBox 0x55d473af49d0 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.185: GtkBox 0x55d475d97980 (box) reported min width -43, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.186: GtkBox 0x55d475f21050 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.186: GtkBox 0x55d46c08ee40 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.186: GtkBox 0x55d47505ad40 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.186: GtkBox 0x55d46e6ac850 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.186: GtkBox 0x55d4751aa300 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.187: GtkBox 0x55d47576bc90 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.187: GtkBox 0x55d4741b5b50 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.187: GtkBox 0x55d474a7fe20 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.187: GtkBox 0x55d475c66300 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.188: GtkBox 0x55d4758389c0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.188: GtkBox 0x55d46da3b6c0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.188: GtkBox 0x55d474d63000 (box) reported min width -58, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:27:59.188: GtkBox 0x55d46d8da710 (box) reported min width -70, but sizes must be >= 0
+[2026-05-06T20:27:59Z INFO  whatsapp_rust::message] DIAG msg arrival: id=2A3EE19F4DE09277B33F from_me=false chat=status@broadcast sender=14168233434@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:28:00Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 16474683238@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:28:00Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16474683238@s.whatsapp.net
+[2026-05-06T20:28:00Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=16474683238@s.whatsapp.net msg=2A574C219734DEF5A254 sender=None
+[2026-05-06T20:28:00Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 16474683238@s.whatsapp.net
+[2026-05-06T20:28:00Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16474683238@s.whatsapp.net
+[2026-05-06T20:28:02Z WARN  whatsapp_rust::retry] Failed to process key bundle from retry receipt: <keys> child missing from retry receipt. Checking for reg ID mismatch.
+[2026-05-06T20:28:03Z INFO  whatsapp_rust::retry] Marked 22041973534963:38@lid for fresh SKDM in group 120363145165574893@g.us due to retry receipt
+[2026-05-06T20:28:03Z INFO  whatsapp_rust::retry] Resending message 3EB0312B110D64EB247B39 to 120363145165574893@g.us (retry #2)
+[2026-05-06T20:28:05Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=620648KB cache=4chats/2013msgs contacts=4000
+[2026-05-06T20:28:08Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'we hav'
+[2026-05-06T20:28:09Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'We have'
+[2026-05-06T20:28:09Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 531 vs current 541)
+[2026-05-06T20:28:09Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'we have no info '
+[2026-05-06T20:28:10Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'We have no info.'
+[2026-05-06T20:28:10Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'we have no info '
+[2026-05-06T20:28:10Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 541 vs current 543)
+[2026-05-06T20:28:11Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'We have no info.'
+[2026-05-06T20:28:11Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 542 vs current 546)
+[2026-05-06T20:28:11Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'we have no info di'
+[2026-05-06T20:28:12Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'We have no info, di.'
+[2026-05-06T20:28:12Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'we have no info did'
+[2026-05-06T20:28:12Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 546 vs current 549)
+[2026-05-06T20:28:14Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'We have no info, did you?'
+[2026-05-06T20:28:14Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 549 vs current 557)
+[2026-05-06T20:28:15Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'did they i'
+[2026-05-06T20:28:15Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Did they?'
+[2026-05-06T20:28:15Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 562 vs current 566)
+[2026-05-06T20:28:16Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=620144KB cache=4chats/2013msgs contacts=4000
+[2026-05-06T20:28:21Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-265fe03b
+[2026-05-06T20:28:21Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:28:21Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'did they indicate any informatin rfegarding permits'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:21.656: GtkBox 0x55d474c542e0 (box) reported min width -49, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:21.676: GtkBox 0x55d474c542e0 (box) reported min width -8, but sizes must be >= 0
+[2026-05-06T20:28:22Z INFO  whatsapp_rust::message] DIAG msg arrival: id=2A04C138750DE10C44F2 from_me=false chat=status@broadcast sender=14168233434@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:28:22Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'Did they indicate any information regarding permits?'
+[2026-05-06T20:28:22Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "did they indicate any informatin rfegarding permits" → "Did they indicate any information regarding permits?"
+[2026-05-06T20:28:23Z INFO  wacore_libsignal::protocol::session] set_unacknowledged_pre_key_message for: 6876494352606@lid.0 with preKeyId: 3130
+[2026-05-06T20:28:24Z INFO  wacore_libsignal::protocol::session] set_unacknowledged_pre_key_message for: 6876494352606:40@lid.0 with preKeyId: 1767
+[2026-05-06T20:28:24Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'they '
+[2026-05-06T20:28:24Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'They'
+[2026-05-06T20:28:26Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=616836KB cache=4chats/2014msgs contacts=4000
+[2026-05-06T20:28:30Z WARN  gmessages_rust::longpoll] ditto ping failed: session expired or revoked; re-pair required
+[2026-05-06T20:28:36Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-13827985
+[2026-05-06T20:28:36Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:28:36Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'Theyonly seemt  respond on any specific thing that is infront of them like a dog looking at a tennis ball'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:36.339: GtkBox 0x55d4755eb300 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:28:36Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'They only seem to respond to anything that is in front of them, like a dog looking at a tennis ball.'
+[2026-05-06T20:28:37Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "Theyonly seemt  respond on any specific thing that is infront of them like a dog looking at a tennis ball" → "They only seem to respond to anything that is in front of them, like a dog looking at a tennis ball."
+[2026-05-06T20:28:37Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=616616KB cache=4chats/2015msgs contacts=4000
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.833: GtkBox 0x55d46cd079f0 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.834: GtkBox 0x55d46e1d5c90 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.834: GtkBox 0x55d474b3e7c0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.835: GtkBox 0x55d46bdffcb0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.835: GtkBox 0x55d46af3cf40 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.836: GtkBox 0x55d475d7e270 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.836: GtkBox 0x55d47562e960 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.837: GtkBox 0x55d4754c8dd0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.837: GtkBox 0x55d46e556ae0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.837: GtkBox 0x55d4752e9440 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.838: GtkBox 0x55d46c5c44e0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.838: GtkBox 0x55d46d579e60 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.839: GtkBox 0x55d46cbae320 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.840: GtkBox 0x55d46c1572a0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.842: GtkBox 0x55d474324020 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.842: GtkBox 0x55d4758c9a90 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.843: GtkBox 0x55d46c426f20 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.845: GtkBox 0x55d46dfdb9b0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.845: GtkBox 0x55d47547cf40 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.846: GtkBox 0x55d46803d510 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.846: GtkBox 0x55d4758a8940 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.846: GtkBox 0x55d46c4d2740 (box) reported min width -56, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.847: GtkBox 0x55d475049b60 (box) reported min width -56, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.849: GtkBox 0x55d4751737c0 (box) reported min width -56, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.850: GtkBox 0x55d46dec7e60 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.850: GtkBox 0x55d46c1ddda0 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.851: GtkBox 0x55d4750dd680 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.852: GtkBox 0x55d46bb1d900 (box) reported min width -49, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.853: GtkBox 0x55d46bf0d8f0 (box) reported min width -46, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.853: GtkBox 0x55d46c81e530 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.854: GtkBox 0x55d474d54f80 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.855: GtkBox 0x55d46c418600 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.856: GtkBox 0x55d474b3c630 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.856: GtkBox 0x55d46ddb7380 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.857: GtkBox 0x55d465335340 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.858: GtkBox 0x55d46cd36900 (box) reported min width -46, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.858: GtkBox 0x55d46cb4df60 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.860: GtkBox 0x55d474a7ac60 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.896: GtkBox 0x55d470818970 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.897: GtkBox 0x55d475290530 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.898: GtkBox 0x55d475d89390 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.898: GtkBox 0x55d4753d5160 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.899: GtkBox 0x55d46d5d9f70 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.900: GtkBox 0x55d4741abb50 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.900: GtkBox 0x55d475723f90 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.900: GtkBox 0x55d475786900 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.901: GtkBox 0x55d473a35820 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.902: GtkBox 0x55d474ad92a0 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.902: GtkBox 0x55d47560e9b0 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:38.902: GtkBox 0x55d475010380 (box) reported min width -44, but sizes must be >= 0
+[2026-05-06T20:28:39Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 16479642559@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:28:39Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=16479642559@s.whatsapp.net msg=3EB0114ACCE2C9B9921A22 sender=None
+[2026-05-06T20:28:39Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 16479642559@s.whatsapp.net
+[2026-05-06T20:28:39Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+[2026-05-06T20:28:39Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16479642559@s.whatsapp.net
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.784: GtkBox 0x55d475622870 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.785: GtkBox 0x55d46c5c44e0 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.785: GtkBox 0x55d469eea820 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.786: GtkBox 0x55d46c300bf0 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.786: GtkBox 0x55d473b3c880 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.787: GtkBox 0x55d46c3bcf10 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.788: GtkBox 0x55d47529a280 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.789: GtkBox 0x55d47576ca20 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.789: GtkBox 0x55d46a7ffbc0 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.790: GtkBox 0x55d4752332b0 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.793: GtkBox 0x55d46dc7f630 (box) reported min width -53, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.795: GtkBox 0x55d47545c630 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.796: GtkBox 0x55d47424eba0 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.798: GtkBox 0x55d4754c5fe0 (box) reported min width -64, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.798: GtkBox 0x55d474fd6270 (box) reported min width -58, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.799: GtkBox 0x55d46db25000 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.801: GtkBox 0x55d4752f9090 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.801: GtkBox 0x55d4754c8dd0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.803: GtkBox 0x55d47558ec50 (box) reported min width -75, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.803: GtkBox 0x55d46ddbe8b0 (box) reported min width -75, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.805: GtkBox 0x55d47556dfa0 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.805: GtkBox 0x55d46d5fc5a0 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.806: GtkBox 0x55d46c1d4c60 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.806: GtkBox 0x55d46dff35f0 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.807: GtkBox 0x55d46d561cb0 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.807: GtkBox 0x55d46df904f0 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.807: GtkBox 0x55d474195540 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.808: GtkBox 0x55d46e4e6910 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.809: GtkBox 0x55d4752013a0 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.809: GtkBox 0x55d46d577ad0 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.810: GtkBox 0x55d46bbdfd40 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.811: GtkBox 0x55d473997740 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.811: GtkBox 0x55d473b30000 (box) reported min width -66, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.812: GtkBox 0x55d46e9d1120 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.813: GtkBox 0x55d46be7d970 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.814: GtkBox 0x55d4754e0a00 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.815: GtkBox 0x55d469177240 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.815: GtkBox 0x55d46e8909c0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.815: GtkBox 0x55d465310200 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.817: GtkBox 0x55d47576f7d0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.818: GtkBox 0x55d4742a2ea0 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.818: GtkBox 0x55d46df7f920 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.819: GtkBox 0x55d474b82a70 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.820: GtkBox 0x55d475631d00 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.820: GtkBox 0x55d475cc99f0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.821: GtkBox 0x55d47542bcb0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.822: GtkBox 0x55d4751bfa20 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.823: GtkBox 0x55d46dcbcea0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.824: GtkBox 0x55d4758b4df0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:40.825: GtkBox 0x55d475ec98c0 (box) reported min width -70, but sizes must be >= 0
+[2026-05-06T20:28:41Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 120363168988062471@g.us read=true full_sync=false
+[2026-05-06T20:28:41Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=120363168988062471@g.us msg=3EB0A93C01620C247B8F04 sender=Some(Jid { user: "59373644697641", server: "lid", agent: 0, device: 12, integrator: 0 })
+[2026-05-06T20:28:41Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 120363168988062471@g.us
+[2026-05-06T20:28:41Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 120363168988062471@g.us
+[2026-05-06T20:28:41Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 120363168988062471@g.us
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:43.126: GtkBox 0x55d4751ec3e0 (box) reported min width -14, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:43.127: GtkBox 0x55d474b9cac0 (box) reported min width -7, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:43.128: GtkBox 0x55d46dd30c50 (box) reported min width -7, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:43.128: GtkBox 0x55d474bb5290 (box) reported min width -32, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:43.128: GtkBox 0x55d475561a90 (box) reported min width -32, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:43.129: GtkBox 0x55d46bbf1320 (box) reported min width -32, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:43.129: GtkBox 0x55d46c1508a0 (box) reported min width -51, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:43.130: GtkBox 0x55d46e7e0fb0 (box) reported min width -26, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:43.130: GtkBox 0x55d46cb6cc40 (box) reported min width -52, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:43.138: GtkBox 0x55d474ef7a80 adjusted size vertical min 28 natural 28 must not decrease below min 34 natural 34
+[2026-05-06T20:28:43Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 17806192880@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:28:43Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=17806192880@s.whatsapp.net msg=3A57C5F80BBDADC16B89 sender=None
+[2026-05-06T20:28:43Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 17806192880@s.whatsapp.net
+[2026-05-06T20:28:43Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:28:43Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 17806192880@s.whatsapp.net
+[2026-05-06T20:28:44Z INFO  whatsapp_rust::message] DIAG msg arrival: id=2A49C8D74EA563D25C20 from_me=false chat=status@broadcast sender=14168233434@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:28:46Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'lol '
+[2026-05-06T20:28:47Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=616372KB cache=4chats/2015msgs contacts=4000
+[2026-05-06T20:28:47Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'lol'
+[2026-05-06T20:28:48Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-20995569
+[2026-05-06T20:28:48Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:28:48Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'lol'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:48.578: GtkBox 0x55d47536b890 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:28:49Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'lol'
+[2026-05-06T20:28:50Z INFO  whatsapp_rust::message] DIAG msg arrival: id=2A165F2D27DE2C0C0D19 from_me=false chat=6876494352606@lid sender=6876494352606@lid offline="" has_participants=false
+[2026-05-06T20:28:50Z INFO  wacore_libsignal::protocol::session_cipher] 6876494352606@lid.0 creating new chains.
+[2026-05-06T20:28:50Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=2A165F2D27DE2C0C0D19 chat=6876494352606@lid raw_chat=6876494352606@lid from_me=false group=false sender=6876494352606@lid text="We haven’t had any contact as far as I know"
+[2026-05-06T20:28:52Z INFO  whatsapp_rust::message] DIAG msg arrival: id=2A8279BF08D2F4436B2B from_me=false chat=status@broadcast sender=14168233434@s.whatsapp.net offline="" has_participants=false
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.135: GtkBox 0x55d474256c60 (box) reported min width -47, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.136: GtkBox 0x55d46c4c2030 (box) reported min width -47, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.136: GtkBox 0x55d46e12e800 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.137: GtkBox 0x55d475d33250 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.137: GtkBox 0x55d46de05670 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.137: GtkBox 0x55d47576ca20 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.138: GtkBox 0x55d46e17ca30 (box) reported min width -47, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.138: GtkBox 0x55d474b66fe0 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.138: GtkBox 0x55d47584deb0 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.138: GtkBox 0x55d47543c4b0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.139: GtkBox 0x55d47592f2c0 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.139: GtkBox 0x55d46cb30be0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.139: GtkBox 0x55d46a8acd10 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.139: GtkBox 0x55d46e33b4f0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.139: GtkBox 0x55d4742befb0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.140: GtkBox 0x55d46bcaa870 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.140: GtkBox 0x55d46be3f200 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.140: GtkBox 0x55d475316d10 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.141: GtkBox 0x55d475398560 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.142: GtkBox 0x55d47559a630 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.142: GtkBox 0x55d46be27100 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.143: GtkBox 0x55d46a7ffbc0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.143: GtkBox 0x55d46c5f8590 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.144: GtkBox 0x55d46e38be00 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.144: GtkBox 0x55d475d35770 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.145: GtkBox 0x55d46e866eb0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.147: GtkBox 0x55d475597420 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.148: GtkBox 0x55d475156060 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.149: GtkBox 0x55d475d22150 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.149: GtkBox 0x55d4739da2a0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.150: GtkBox 0x55d46e43eda0 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.151: GtkBox 0x55d46c02e090 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.152: GtkBox 0x55d47504f900 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.152: GtkBox 0x55d46c1508a0 (box) reported min width -43, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.153: GtkBox 0x55d47424e270 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.153: GtkBox 0x55d47560d3f0 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.153: GtkBox 0x55d469ac1650 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.153: GtkBox 0x55d475dd2920 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.154: GtkBox 0x55d474228600 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.154: GtkBox 0x55d46e385b70 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.155: GtkBox 0x55d46e760d80 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.155: GtkBox 0x55d474fb60f0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.155: GtkBox 0x55d47591de60 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.155: GtkBox 0x55d475cae8f0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.155: GtkBox 0x55d475c5d030 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.155: GtkBox 0x55d475d57880 (box) reported min width -58, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.156: GtkBox 0x55d475e0b420 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.156: GtkBox 0x55d4756ea8f0 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.157: GtkBox 0x55d475b8de00 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:28:54.158: GtkBox 0x55d4756bbd00 (box) reported min width -70, but sizes must be >= 0
+[2026-05-06T20:28:54Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 16474683238@s.whatsapp.net read=true full_sync=false
+[2026-05-06T20:28:54Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=16474683238@s.whatsapp.net msg=2A165F2D27DE2C0C0D19 sender=None
+[2026-05-06T20:28:54Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 16474683238@s.whatsapp.net
+[2026-05-06T20:28:54Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16474683238@s.whatsapp.net
+[2026-05-06T20:28:54Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 16474683238@s.whatsapp.net
+[2026-05-06T20:28:57Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'so i wo'
+[2026-05-06T20:28:57Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=616836KB cache=4chats/2017msgs contacts=4000
+[2026-05-06T20:28:57Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'So I wo'
+[2026-05-06T20:28:57Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 730 vs current 739)
+[2026-05-06T20:29:01Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'so i would send them email once a week asking fr '
+[2026-05-06T20:29:02Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'So I would send them an email once a week asking for it.'
+[2026-05-06T20:29:03Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'So I would send them an email once a week asking for i'
+[2026-05-06T20:29:03Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'So I would send them an email once a week asking for it.'
+[2026-05-06T20:29:03Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: discarding stale response (gen 775 vs current 776)
+[2026-05-06T20:29:03Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3A600C9C6AE2C87CF818 from_me=false chat=120363422479992354@g.us sender=170312750633087@lid offline="" has_participants=false
+[2026-05-06T20:29:03Z WARN  whatsapp_rust::message] No sender key state for group message [msg:3A600C9C6AE2C87CF818] from 170312750633087@lid: no sender key record for group 120363422479992354@g.us sender 170312750633087@lid.0. Sending retry receipt.
+[2026-05-06T20:29:03Z WARN  whatsapp_rust::retry] Sending retry receipt #1 for message 3A600C9C6AE2C87CF818 from 170312750633087@lid (reason: NoSession)
+[2026-05-06T20:29:04Z INFO  whatsapp_rust::pdo] Sending PDO placeholder resend request for message 3A600C9C6AE2C87CF818 from 170312750633087@lid in 120363422479992354@g.us to primary phone 14164566960@s.whatsapp.net
+[2026-05-06T20:29:05Z INFO  whatsapp_rust::message] DIAG msg arrival: id=A5C9C2E468D8027C8A8E039B37266E59 from_me=true chat=14164566960@s.whatsapp.net sender=14164566960@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:29:05Z INFO  wacore_libsignal::protocol::session_cipher] 248133263056915@lid.0 creating new chains.
+[2026-05-06T20:29:05Z INFO  wacore_libsignal::protocol::state::session] Trimming excessive receiver_chain for session with base key e3a1465d11c083a12343c7f25c1d41a4b869cfe7d29cc98e6941c3b767def259, chain count: 6
+[2026-05-06T20:29:05Z INFO  whatsapp_rust::pdo] Received PDO placeholder response for message 3A600C9C6AE2C87CF818 (took 876ms)
+[2026-05-06T20:29:05Z INFO  whatsapp_rust::pdo] Dispatching PDO-recovered message 3A600C9C6AE2C87CF818 from 170312750633087@lid via phone
+[2026-05-06T20:29:05Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3A600C9C6AE2C87CF818 chat=120363422479992354@g.us raw_chat=120363422479992354@g.us from_me=false group=true sender=170312750633087@lid text="For the record I was not texting while driving"
+[2026-05-06T20:29:05Z WARN  whatsapp_desktop::ui::runtime] DROPPED message: id=A5C9C2E468D8027C8A8E039B37266E59 chat=14164566960@s.whatsapp.net raw_chat=14164566960@s.whatsapp.net sender=14164566960@s.whatsapp.net from_me=true group=false edit=Empty — map_message returned None (no text/media/contact/poll)
+[2026-05-06T20:29:05Z INFO  whatsapp_desktop::ui::chat_view] AC: applied pilafy class to bubble tmp-1221d925
+[2026-05-06T20:29:05Z INFO  whatsapp_desktop::ui::chat_view] AC delay: deferring send until AI correction completes
+[2026-05-06T20:29:05Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: sending 'So I would send them an email once a week asking for permit status'
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:29:05.553: GtkBox 0x55d4752af050 (box) reported min width -49, but sizes must be >= 0
+[2026-05-06T20:29:05Z INFO  whatsapp_desktop::ui::autocorrect] AI autocorrect: got 'So I would send them an email once a week asking for permit status.'
+[2026-05-06T20:29:06Z INFO  whatsapp_desktop::ui::chat_view] AC corrected message: "So I would send them an email once a week asking for permit status" → "So I would send them an email once a week asking for permit status."
+[2026-05-06T20:29:08Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=616744KB cache=5chats/2243msgs contacts=4000
+[2026-05-06T20:29:09Z INFO  whatsapp_rust::message] DIAG msg arrival: id=AC42DBB7DD802AA069DB4F576D222FDB from_me=false chat=273447800307806@lid sender=273447800307806@lid offline="" has_participants=false
+[2026-05-06T20:29:09Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=AC42DBB7DD802AA069DB4F576D222FDB chat=273447800307806@lid raw_chat=273447800307806@lid from_me=false group=false sender=273447800307806@lid text="but the builder has to qualify for the MLI benefits    ?"
+[2026-05-06T20:29:09Z INFO  whatsapp_desktop::ui::runtime] MarkChatAsReadUpdate: 120363422479992354@g.us read=true full_sync=false
+[2026-05-06T20:29:09Z INFO  whatsapp_desktop::ui::runtime] MarkRead: chat=120363422479992354@g.us msg=3A600C9C6AE2C87CF818 sender=Some(Jid { user: "170312750633087", server: "lid", agent: 0, device: 0, integrator: 0 })
+[2026-05-06T20:29:09Z INFO  whatsapp_desktop::ui::runtime] MarkRead succeeded for 120363422479992354@g.us
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:29:09.570: GtkBox 0x55d474ab4940 (box) reported min width -1, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:29:09.570: GtkBox 0x55d475c608e0 (box) reported min width -1, but sizes must be >= 0
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:29:09.578: GtkBox 0x55d46d5fc5a0 adjusted size vertical min 28 natural 28 must not decrease below min 34 natural 34
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:29:09.582: GtkBox 0x55d474ab2da0 adjusted size vertical min 28 natural 28 must not decrease below min 34 natural 34
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:29:09.582: GtkBox 0x55d475bab560 adjusted size vertical min 28 natural 28 must not decrease below min 34 natural 34
+
+(whatsapp-desktop:92432): Gtk-WARNING **: 16:29:09.582: GtkBox 0x55d4763e1330 adjusted size vertical min 28 natural 28 must not decrease below min 34 natural 34
+[2026-05-06T20:29:09Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 120363422479992354@g.us
+[2026-05-06T20:29:09Z INFO  whatsapp_desktop::ui::window] UI: Clearing unread badge for 120363422479992354@g.us
+[2026-05-06T20:29:18Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=726192KB cache=6chats/2440msgs contacts=4000
+[2026-05-06T20:29:19Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB03D0AE29DF670CFC656 from_me=false chat=16479642559@s.whatsapp.net sender=16479642559:35@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:29:19Z INFO  wacore_libsignal::protocol::session_cipher] 109517538869270:35@lid.0 creating new chains.
+[2026-05-06T20:29:19Z INFO  wacore_libsignal::protocol::state::session] Trimming excessive receiver_chain for session with base key c38373eafe8d108f9f8bf0062577823c597ce8227771f4e324d169d885c0d40b, chain count: 6
+[2026-05-06T20:29:19Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB03D0AE29DF670CFC656 chat=16479642559@s.whatsapp.net raw_chat=16479642559@s.whatsapp.net from_me=false group=false sender=16479642559:35@s.whatsapp.net text="omg wtf"
+[2026-05-06T20:29:25Z INFO  whatsapp_rust::message] DIAG msg arrival: id=3EB08D18A52F17871259C2 from_me=false chat=16479642559@s.whatsapp.net sender=16479642559:35@s.whatsapp.net offline="" has_participants=false
+[2026-05-06T20:29:25Z INFO  whatsapp_desktop::ui::runtime] MSG routed: id=3EB08D18A52F17871259C2 chat=16479642559@s.whatsapp.net raw_chat=16479642559@s.whatsapp.net from_me=false group=false sender=16479642559:35@s.whatsapp.net text="rocky hasnt received in months"
+[2026-05-06T20:29:29Z INFO  whatsapp_desktop::ui::runtime] MEM: RSS=729204KB cache=6chats/2442msgs contacts=4000
+[2026-05-06T20:29:30Z WARN  gmessages_rust::longpoll] ditto ping failed: session expired or revoked; re-pair required

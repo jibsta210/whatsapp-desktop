@@ -2267,12 +2267,48 @@ async fn handle_command(
                     // Server returns newest-first; iterate reversed so we
                     // append in chronological order. Dedupe by message_id
                     // against the disk cache.
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
                     for m in resp.messages.iter().rev() {
                         if have.contains(&m.message_id) {
                             continue;
                         }
                         if let Some(im) = message_to_incoming(m) {
                             have.insert(im.id.clone());
+                            // First sighting of this message, and it never came
+                            // through live push — scan it here or the code is
+                            // lost. Age-gated so opening a chat can't resurrect
+                            // a months-old OTP into the clipboard.
+                            let ts_secs = if im.timestamp > 10_000_000_000 {
+                                im.timestamp / 1000
+                            } else {
+                                im.timestamp
+                            };
+                            if !im.is_from_me
+                                && (now_secs - ts_secs).abs() < 600
+                                && let Some(text) = im.text.as_deref()
+                                && let Some(code) = detect_two_factor_code(text)
+                            {
+                                log::info!(
+                                    "gmessages: 2FA {} found on server-fetch path (msg {}, {}s old)",
+                                    code,
+                                    im.id,
+                                    now_secs - ts_secs
+                                );
+                                let _ = event_tx
+                                    .send(WaEvent::TwoFactorCodeDetected {
+                                        msg_id: im.id.clone(),
+                                        code,
+                                        sender: if im.sender_name.is_empty() {
+                                            chat_name.clone()
+                                        } else {
+                                            im.sender_name.clone()
+                                        },
+                                    })
+                                    .await;
+                            }
                             merged.push(im);
                         }
                     }

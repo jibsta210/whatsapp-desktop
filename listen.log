@@ -1,0 +1,62 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.08s
+     Running `/home/jakes/.cache/cargo-target/debug/examples/listen`
+[TRACE gmessages_rust::session] refresh_auth_token: skipping, token has 1421 minutes left
+[INFO  gmessages_rust::longpoll] ReceiveMessages opened: status=200 OK content-type=Some("application/json+protobuf; charset=UTF-8")
+[ready]
+[TRACE gmessages_rust::longpoll] long-poll: prelude chunk 1 bytes
+[TRACE gmessages_rust::longpoll] long-poll: prelude chunk 1 bytes
+[DEBUG gmessages_rust::longpoll] long-poll: opening `[[` confirmed
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 1)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +19 bytes (accum now 20)
+[TRACE gmessages_rust::longpoll] long-poll: parsed value of 20 bytes
+[TRACE gmessages_rust::longpoll] long-poll payload: data=false ack=true hb=false sr=false
+[DEBUG gmessages_rust::longpoll] got startup ack: skip_count=9
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1046 bytes (accum now 1046)
+[TRACE gmessages_rust::longpoll] long-poll: parsed value of 1045 bytes
+[TRACE gmessages_rust::longpoll] long-poll payload: data=true ack=false hb=false sr=false
+[DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=2222c58d-aa85-4e87-a9e4-ef347dc15ae6 message_data=578 bytes
+[TRACE gmessages_rust::longpoll] long-poll: chunk +9 bytes (accum now 9)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 10)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 11)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 12)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 13)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 14)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 15)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 16)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 17)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +3 bytes (accum now 20)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 21)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +393 bytes (accum now 414)
+[TRACE gmessages_rust::longpoll] long-poll: parsed value of 413 bytes
+[TRACE gmessages_rust::longpoll] long-poll payload: data=true ack=false hb=false sr=false
+[DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=fa49d186-00f3-4954-ba7f-294e9a6e0324 message_data=105 bytes
+[TRACE gmessages_rust::longpoll] long-poll: chunk +898 bytes (accum now 898)
+[TRACE gmessages_rust::longpoll] long-poll: parsed value of 897 bytes
+[TRACE gmessages_rust::longpoll] long-poll payload: data=true ack=false hb=false sr=false
+[DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=a800c510-2b4d-4e44-b008-3d4ad90a1a10 message_data=467 bytes
+[rcs status=100] 16 → conv=14 : Hi
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1716 bytes (accum now 1716)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +95 bytes (accum now 1811)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +2211 bytes (accum now 4022)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +103 bytes (accum now 4125)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1353 bytes (accum now 5478)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 5479)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +16 bytes (accum now 5495)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +6 bytes (accum now 5501)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 5502)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 5503)
+[INFO  gmessages_rust::session] set_active_session: new session_id=c8a1f33c-9271-4d8c-b721-9f71482fd9fe
+[INFO  gmessages_rust::client] post-connect: active session registered
+[TRACE gmessages_rust::longpoll] long-poll: chunk +309 bytes (accum now 5812)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +101 bytes (accum now 5913)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1042 bytes (accum now 6955)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +10 bytes (accum now 6965)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 6966)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +3 bytes (accum now 6969)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 6970)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +395 bytes (accum now 7365)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +12 bytes (accum now 7377)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +3 bytes (accum now 7380)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +15 bytes (accum now 7395)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +15 bytes (accum now 7410)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +15 bytes (accum now 7425)

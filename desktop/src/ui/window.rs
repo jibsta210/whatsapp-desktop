@@ -847,6 +847,9 @@ impl MainWindow {
             WaEvent::ErrorToast(msg) => format!("ErrorToast: {msg}"),
             WaEvent::InfoToast(msg) => format!("InfoToast: {msg}"),
             WaEvent::UpdateReadyToast(msg) => format!("UpdateReady: {msg}"),
+            WaEvent::TwoFactorCodeDetected { msg_id, .. } => {
+                format!("TwoFactorCodeDetected({msg_id})")
+            }
             WaEvent::GroupInviteLink { link, .. } => format!("InviteLink: {link}"),
             WaEvent::ForwardComplete { count, .. } => format!("Forwarded: {count} msgs"),
             WaEvent::ChatListForPicker(c) => format!("ChatListForPicker: {} chats", c.len()),
@@ -1240,7 +1243,9 @@ impl MainWindow {
                         if !inner.settings.twofa_autocopy_enabled() {
                             log::info!("2FA code detected but auto-copy is disabled in settings");
                         }
-                        if inner.settings.twofa_autocopy_enabled() {
+                        if inner.settings.twofa_autocopy_enabled()
+                            && twofa_mark_copied(&msg.id)
+                        {
                             let sender = inner
                                 .chat_list
                                 .chat_name(&msg.chat_id)
@@ -1583,6 +1588,18 @@ impl MainWindow {
             }
             WaEvent::InfoToast(msg) => {
                 show_toast_deduped(inner, &msg);
+            }
+            WaEvent::TwoFactorCodeDetected {
+                msg_id,
+                code,
+                sender,
+            } => {
+                if !inner.settings.twofa_autocopy_enabled() {
+                    log::info!("2FA code detected but auto-copy is disabled in settings");
+                } else if twofa_mark_copied(&msg_id) {
+                    let sender = inner.chat_list.chat_name(&sender).unwrap_or(sender);
+                    copy_2fa_code_with_osd(&inner.gtk_app, &code, &sender);
+                }
             }
             WaEvent::UpdateReadyToast(msg) => {
                 let toast = adw::Toast::new(&msg);
@@ -2373,6 +2390,28 @@ fn send_desktop_notification(app: &adw::Application, chat_id: &str, title: &str,
 // the gmessages_runtime needs it pre-routing so verification SMS go to
 // the dedicated "Verification Codes" inbox instead of a per-shortcode chat.
 pub use crate::bridge::detect_two_factor_code;
+
+thread_local! {
+    static TWOFA_COPIED: RefCell<std::collections::VecDeque<String>> =
+        const { RefCell::new(std::collections::VecDeque::new()) };
+}
+
+/// Claim `msg_id` for a 2FA copy, returning false if it was already claimed.
+/// The live-push and server-fetch paths can both surface the same message, and
+/// reopening a chat re-walks history — without this the clipboard would churn.
+fn twofa_mark_copied(msg_id: &str) -> bool {
+    TWOFA_COPIED.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        if seen.iter().any(|id| id == msg_id) {
+            return false;
+        }
+        seen.push_back(msg_id.to_string());
+        if seen.len() > 200 {
+            seen.pop_front();
+        }
+        true
+    })
+}
 
 /// Copy `text` to the system clipboard and show an OSD-style notification.
 /// On COSMIC and other freedesktop-spec compliant DEs, the notification

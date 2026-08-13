@@ -1,0 +1,68 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.24s
+     Running `/home/jakes/.cache/cargo-target/debug/examples/pair`
+[INFO  gmessages_rust::pairing::qr] QR pair: posting RegisterPhoneRelay
+[INFO  gmessages_rust::pairing::qr] QR pair: got tachyon token + pairing key (61 bytes)
+[INFO  gmessages_rust::pairing::qr] QR pair: spawning long-poll loop
+[INFO  gmessages_rust::pairing::qr] QR pair: QR emitted, waiting up to 300s for phone scan
+
+Scan this with Google Messages on your phone:
+
+█████████████████████████████████████████████████████████████████████
+█████████████████████████████████████████████████████████████████████
+████ ▄▄▄▄▄ ██  ▀▀▀ ▀▄▀▄  ▄█ ▄██▀  ▀▄█▀▀█▀▄▀▄█▄▄▄▄▀▀  ██  █ ▄▄▄▄▄ ████
+████ █   █ █ █▀▄▀▄█▄▄  ▀█▄▀ ▀ ▄▀  ▄▄█▀  ▀ ▀██▀  ▄▀█▀▀▀ ▄ █ █   █ ████
+████ █▄▄▄█ █ ▄▄▀▄▀ █▀ █▀ █▀▄▀▀ ▀ ▄▄▄ ▀▄██▀▀  ▄ ▄█▀▀  █ ▄██ █▄▄▄█ ████
+████▄▄▄▄▄▄▄█ █▄▀▄█ ▀▄▀ ▀▄█▄█ ▀ █ █▄█ █▄▀▄▀ ▀ ▀ █▄█ █ ▀▄█▄█▄▄▄▄▄▄▄████
+████▄▀▄  ▄▄█▀▄▄█▀ ██  ▀▄ ▄▄█▄▄█ ▄  ▄ ██▄  █▀█▄  ▀▄▄▄  █▄█▀  ▄▄▄██████
+█████ █▀▀ ▄▄▄█▀▄█▀▄▀█▄█▄▀▄▄▀█▀██▄▀▀▄██▄▄▄▀▄  ▀██▀ ▄█▄ ▄▀█▀   ▄█▄ ████
+████ ▀ ▄ ▄▄▄███▄ █▄▄  ▄█▀▄▀  ▄▀▀▀▀ █▄█▄ ▄▀▄█▀▀ ▄█▄▄█ ▀▄▄▄█ ▀▀█▀▀█████
+█████▄ ▀█ ▄█▀▀▀ ▀ █▄▀█▀▀▄▄▀ █  ▄█  ▄▀▀█  █ ▀ ▄    █  ▄ ▄▄ ▀█▀██  ████
+█████▄▄██ ▄ ▄▀ ▄  ██▄█ ▄▄▀▀▀▀▄█▄▄█▀▄█ █▀ ▀▄▀▀  ▄▀██ ▄▀█▄▄  ▀█▀ ▄▄████
+███████ ▄▀▄ ▄▄▄▀▄ ▄ █▀██▀█▀▄ ▀█▄▄ ▀ ▀█ ▀ ▀▄ ▀▀▄▀ ▄█ ▄ ▄▀█ █ ▀▄█ ▄████
+████▀█▄ ▄ ▄▄▄▄▄▄ ██▄▀ █ ▄   ▄▀██ ▀▄  █▄▄▄ ▄█▀▀  █▀▄▄  ▄█▄ ▀▀▀▀▄▄ ████
+████▄▄▄▄ █▄▀▀ ▀ ██  ▀█ ▀ ██▄▀  ▀█▀███ ▄█▄▀▀▀  ▄▄▀█  ▄▀ ▀▄▄▄█▄ ▄ ▄████
+████▀▄██▀▀▄  ▄█▀ ▄▄▀▄█▄▄ ▀ ▄ ▄▀▀█▀ ██▀█▄ ▄█▀█▀▀ ▀██▄▄█▄▀▄█▀ █▄▄█ ████
+████████▀█▄▀█▀▀▄▄█▀█▄   ▀██▄ ▄▄██ ▀▄ ▀█  ▀█▄▄ ▄ █▄█▀▄▄▄  █▀▀▀▄▄ ▄████
+█████▄ ▄ ▄▄▄ ▄ ▀ ▀ █▄▄▀ █▄▄▀ ▄█▄ ▄▄▄ ▀▄ ▄ ███▀▀▄██▄  ▀█▀ ▄▄▄ █▄  ████
+████▄▄▀█ █▄█ ▄▀▄ ▀▀ █▄▄▄  ▄ ▀ ▄  █▄█ ▄▄██▄  ▀█▀█▀ ▄ ▄▄ ▀ █▄█ █▄▄▄████
+█████ █▀▄ ▄▄▄▀▀█▀▄▄ ▀█▀██▀█▀ ▀▀▄ ▄▄  ██   ▄▄█▀  ▀██▄▄ █   ▄▄▄▄█▄▄████
+████▀██▀▀ ▄ ▀▄▀█▀█ ▄▄█▄▄██▄ ▀▄ ▄  ▀ █▄▄█ ▄ █   ▄▀  █ ▀▄▀▀▄▄▄▄█▄▄ ████
+████ ▄ ██ ▄▄ ▀█▄█▀▀▀▄▀█▄█▄▀ ▀ ▀   ▄██ █▄█▀███▀▀ ▀█▄▄▄▄█▄▀▄  ▄▄▄▄▄████
+████▀▄█ ▄▀▄ ▀▀█▀▄▄▄█ ▀██  █  ▄ ▄█▀▀ █▄▄▄█   ▀█▀ ▀▀▄█▄▄  ▀  ██▄█▄▀████
+████ █▄▄▄▄▄█▀▄▀█ ▄▀ █▄  ▄█▄▀▄▄▄  ▄ █ █▄ ▄ ▄██   ███ ▄ ▄ ██  █▀▄█ ████
+████ █▀▄▀▄▄█▄▀█▄▀█▀██  █▀ ▀▀█ ▄▄█ █▀▄█▀█▀▀ ██▄█▄▀▀▀▀▄▀▄▄  ▄▄▀▀▄ ▄████
+█████ ▀ ▀▀▄▀▀▀▄▀█▀ ▄ ▄▀ ▀▀▄▀  ▀ ▀▄ █▄▄  ▄▀ ██▀ ▄██▄▄ █▄▄ ▄ ▀▄▀▄▄▄████
+████▄▀█▄▀▀▄ ▄▄▀█  ▄▀▀█▄▄▄ ▄█▄▀▄█▀▀  ▄▄▀▄ ██▄▀█ ▀ ▄ ▄▀▄▄█▀  ▄██▄ ▄████
+████▄▄ ███▄▀██▀ ▄▄▀ █ ▄▄▀  ▀▀▄▀█▄▀   ▀▄   ▄██ ▀▀██▄▄▄▀█ ▄ █▀█▀▄▀█████
+████▀▀ ▄ ▄▄▀▀▄██ ▀▄▄▄ ▀▄██▄▄█▀▄▄█  ▄█▀ ▄▄▄ ▀▀▀▀▄▀▄▄ ▄█  ▀█▄▀██▄▄ ████
+████▄▄▄▄██▄▄▀▀▄  ▄▄ ▄███▀█   ▄█▀ ▄▄▄ ▄▄ ▄ ██▀   ▀▄█ ▄ ▄▄ ▄▄▄ ▄▀ ▄████
+████ ▄▄▄▄▄ █▀▀▄ ▀▄ ▄██ █▄  █▄█▀▄ █▄█ ▀▀▀ █▄█  ▄▄  █▄█ █  █▄█ ▄▄  ████
+████ █   █ █ █▀▀▀██▀▀█▄█▄█▀ ▀ ▀▄    ▄█▄▀  ▄███  ▀ ▄  ▀▄▄ ▄▄▄ ██▄ ████
+████ █▄▄▄█ █▄▄  █▄▀ ▀▄█ ▄███ ▀█▄█▀▀▀█▀ █▄  █▀▄█▀▀▀▄▄▄▀▄ ▀█▀ ▀▄██ ████
+████▄▄▄▄▄▄▄█▄█▄█▄▄██▄▄████▄▄▄████▄█▄███▄▄▄▄▄███▄█▄▄▄▄▄▄▄█▄█▄▄█▄▄▄████
+█████████████████████████████████████████████████████████████████████
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+(also: https://support.google.com/messages/?p=web_computer#?c=Cj0AfykVEpBAdE0SLPUUqXfkyeKTwUjRoFMwRVOLIhUtvXfstAD4R6Fhu6lruaKr8gaqFl1XjZhswDjp4+zVEiCGiqm9KgKgDWCAk5pqLQGkgcdug1RuuslQz5odgOokbRogYPXcOJ2QoNrxGGCMwnYU/TQj4N65bGTmKcgjqNXEqrg=)
+
+[INFO  gmessages_rust::longpoll] ReceiveMessages opened: status=200 OK content-type=Some("application/json+protobuf; charset=UTF-8")
+[long-poll connected, waiting for phone to scan QR…]
+[TRACE gmessages_rust::longpoll] long-poll: prelude chunk 21 bytes
+[DEBUG gmessages_rust::longpoll] long-poll: opening `[[` confirmed
+[TRACE gmessages_rust::longpoll] long-poll: parsed value of 19 bytes
+[TRACE gmessages_rust::longpoll] long-poll payload: data=false ack=true hb=false sr=false
+[DEBUG gmessages_rust::longpoll] got startup ack: skip_count=0
+[TRACE gmessages_rust::longpoll] long-poll: chunk +1 bytes (accum now 1)
+[TRACE gmessages_rust::longpoll] long-poll: chunk +24 bytes (accum now 25)
+[TRACE gmessages_rust::longpoll] long-poll: parsed value of 24 bytes
+[TRACE gmessages_rust::longpoll] long-poll payload: data=false ack=false hb=false sr=true
+[TRACE gmessages_rust::longpoll] start_read
+[TRACE gmessages_rust::longpoll] long-poll: chunk +484 bytes (accum now 484)
+[TRACE gmessages_rust::longpoll] long-poll: parsed value of 483 bytes
+[TRACE gmessages_rust::longpoll] long-poll payload: data=true ack=false hb=false sr=false
+[DEBUG gmessages_rust::event_handler] incoming RPC: route=PairEvent response_id=2adc5394-d7b3-4bb7-a55d-abb9cf4ea797 message_data=214 bytes
+[INFO  gmessages_rust::event_handler] PairEvent received from server, decoding RPCPairData
+[INFO  gmessages_rust::event_handler] PairEvent.Paired received; phone source_id=Some("+1-00FALCpnITOAo1IxGyS8lD0")
+[INFO  gmessages_rust::event_handler] PairEvent.Paired: handing PairedData to oneshot
+[INFO  gmessages_rust::pairing::qr] QR pair: complete; phone source_id=Some("+1-00FALCpnITOAo1IxGyS8lD0")
+[paired]
+wrote gmessages-auth.json (1820 bytes)

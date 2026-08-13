@@ -1,0 +1,960 @@
+warning: method `send_remove_mutation` is never used
+   --> src/features/chat_actions.rs:649:14
+    |
+360 | impl<'a> ChatActions<'a> {
+    | ------------------------ method in this implementation
+...
+649 |     async fn send_remove_mutation(&self, collection: WAPatchName, index: &[u8]) -> Result<()> {
+    |              ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `whatsapp-rust` (lib) generated 1 warning
+   Compiling gmessages-rust v0.1.0 (/home/jakes/Projects/Whatsapp/whatsapp-desktop/gmessages-rust)
+   Compiling whatsapp-desktop v0.1.0 (/home/jakes/Projects/Whatsapp/whatsapp-desktop/desktop)
+warning: unused import: `Widget`
+ --> desktop/src/ui/chat_view.rs:9:79
+  |
+9 |     RevealerTransitionType, ScrolledWindow, SearchEntry, Separator, TextView, Widget,
+  |                                                                               ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `Image`
+ --> desktop/src/ui/login.rs:4:24
+  |
+4 | use gtk4::{Align, Box, Image, Label, Orientation, Picture, Spinner};
+  |                        ^^^^^
+
+warning: unused imports: `ImageBuffer` and `Rgb`
+ --> desktop/src/ui/login.rs:5:13
+  |
+5 | use image::{ImageBuffer, Rgb};
+  |             ^^^^^^^^^^^  ^^^
+
+warning: unused import: `libadwaita as adw`
+ --> desktop/src/ui/login.rs:6:5
+  |
+6 | use libadwaita as adw;
+  |     ^^^^^^^^^^^^^^^^^
+
+warning: unused import: `libadwaita::prelude::*`
+ --> desktop/src/ui/login.rs:7:5
+  |
+7 | use libadwaita::prelude::*;
+  |     ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `MessageSource`
+  --> desktop/src/ui/runtime.rs:23:51
+   |
+23 | use crate::bridge::{ChatSummary, IncomingMessage, MessageSource, ReceiptStatus, WaCommand...
+   |                                                   ^^^^^^^^^^^^^
+
+warning: unused import: `std::sync::Arc`
+ --> desktop/src/ui/settings.rs:6:5
+  |
+6 | use std::sync::Arc;
+  |     ^^^^^^^^^^^^^^
+
+warning: unused import: `Switch`
+ --> desktop/src/ui/settings.rs:9:44
+  |
+9 | use gtk4::{Align, Box, Label, Orientation, Switch};
+  |                                            ^^^^^^
+
+warning: unused imports: `Paned`, `Spinner`, and `TextView`
+ --> desktop/src/ui/window.rs:7:31
+  |
+7 | ...ientation, Paned, Revealer, RevealerTransitionType, Spinner, Stack, TextView,
+  |               ^^^^^                                    ^^^^^^^         ^^^^^^^^
+
+warning: use of deprecated struct `gtk4::FileChooserDialog`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4953:32
+     |
+4953 |             let dialog = gtk4::FileChooserDialog::new(
+     |                                ^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+
+warning: variable does not need to be mutable
+   --> desktop/src/gmessages_runtime.rs:186:17
+    |
+186 |             let mut feed = |contacts: Vec<gmessages_rust::gmproto::conversations::Contact>,
+    |                 ----^^^^
+    |                 |
+    |                 help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> desktop/src/ui/runtime.rs:7306:13
+     |
+7306 |         let mut phone_msgs = load_messages(&phone_jid);
+     |             ----^^^^^^^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> desktop/src/ui/runtime.rs:3701:21
+     |
+3701 |                 let mut ctx = wa::ContextInfo {
+     |                     ----^^^
+     |                     |
+     |                     help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> desktop/src/ui/runtime.rs:5139:17
+     |
+5139 |             let mut name = client.get_push_name().await;
+     |                 ----^^^^
+     |                 |
+     |                 help: remove this `mut`
+
+warning: use of deprecated method `gtk4::prelude::WidgetExt::translate_coordinates`: Since 4.12
+    --> desktop/src/ui/chat_view.rs:3621:46
+     |
+3621 | ...   if let Some((_, y)) = widget.translate_coordinates(&inner_c.messages_box, 0.0, 0.0)
+     |                                    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated associated function `gtk4::file_chooser_dialog::<impl gtk4::FileChooserDialog>::new`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4953:51
+     |
+4953 |             let dialog = gtk4::FileChooserDialog::new(
+     |                                                   ^^^
+
+warning: use of deprecated method `gtk4::prelude::FileChooserExt::set_current_name`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4962:20
+     |
+4962 |             dialog.set_current_name(&clean_name);
+     |                    ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `gtk4::prelude::FileChooserExtManual::set_current_folder`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4966:36
+     |
+4966 | ...   let _ = dialog.set_current_folder(Some(&gtk4::gio::File::for_path(&downloads)));
+     |                      ^^^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `gtk4::prelude::DialogExt::connect_response`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4970:20
+     |
+4970 |             dialog.connect_response(move |d, resp| {
+     |                    ^^^^^^^^^^^^^^^^
+
+warning: use of deprecated method `gtk4::prelude::FileChooserExt::file`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4972:45
+     |
+4972 |                     if let Some(target) = d.file().and_then(|f| f.path()) {
+     |                                             ^^^^
+
+warning: use of deprecated method `gtk4::prelude::WidgetExt::show`: Since 4.10
+    --> desktop/src/ui/chat_view.rs:4982:20
+     |
+4982 |             dialog.show();
+     |                    ^^^^
+
+warning: unused import: `libadwaita::prelude`
+ --> desktop/src/app.rs:8:5
+  |
+8 | use libadwaita::prelude::*;
+  |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `libadwaita::prelude`
+  --> desktop/src/ui/chat_view.rs:12:5
+   |
+12 | use libadwaita::prelude::*;
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `suffix`
+    --> desktop/src/ui/autocorrect.rs:1824:54
+     |
+1824 | ...                   let (apply_text, suffix) = if current == original {
+     |                                        ^^^^^^ help: if this is intentional, prefix it with an underscore: `_suffix`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `modifier`
+    --> desktop/src/ui/autocorrect.rs:1670:52
+     |
+1670 |     key_ctrl.connect_key_released(move |_, key, _, modifier| {
+     |                                                    ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_modifier`
+
+warning: unused variable: `revert_ref`
+    --> desktop/src/ui/autocorrect.rs:1511:9
+     |
+1511 |     let revert_ref = revert_map.clone();
+     |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_revert_ref`
+
+warning: unused variable: `skip_ref`
+    --> desktop/src/ui/autocorrect.rs:1518:9
+     |
+1518 |     let skip_ref = skip_next.clone();
+     |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_skip_ref`
+
+warning: unused variable: `inner`
+   --> desktop/src/ui/chat_list.rs:429:13
+    |
+429 |         let inner = &self.inner;
+    |             ^^^^^ help: if this is intentional, prefix it with an underscore: `_inner`
+
+warning: unused variable: `colour_str`
+   --> desktop/src/ui/chat_view.rs:916:29
+    |
+916 |                         let colour_str = colour.to_string();
+    |                             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_colour_str`
+
+warning: unused variable: `msgs_box_for_send`
+    --> desktop/src/ui/chat_view.rs:2186:13
+     |
+2186 |         let msgs_box_for_send = inner.messages_box.clone();
+     |             ^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_msgs_box_for_send`
+
+warning: unused variable: `chevron`
+    --> desktop/src/ui/chat_view.rs:2813:17
+     |
+2813 |             let chevron = bubble.chevron_button().clone();
+     |                 ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_chevron`
+
+warning: unused variable: `vbox`
+    --> desktop/src/ui/chat_view.rs:4487:9
+     |
+4487 |     let vbox = Box::new(Orientation::Vertical, 0);
+     |         ^^^^ help: if this is intentional, prefix it with an underscore: `_vbox`
+
+warning: unused variable: `g`
+    --> desktop/src/ui/chat_view.rs:5075:37
+     |
+5075 |     bg_click.connect_released(move |g, n_press, _, _| {
+     |                                     ^ help: if this is intentional, prefix it with an underscore: `_g`
+
+warning: unused variable: `img`
+   --> desktop/src/ui/login.rs:102:9
+    |
+102 |     let img = code.render::<qrcode::render::unicode::Dense1x2>().build();
+    |         ^^^ help: if this is intentional, prefix it with an underscore: `_img`
+
+warning: unused variable: `lower`
+    --> desktop/src/ui/runtime.rs:4781:29
+     |
+4781 |                         let lower = local_path.to_lowercase();
+     |                             ^^^^^ help: if this is intentional, prefix it with an underscore: `_lower`
+
+warning: unused variable: `preview`
+    --> desktop/src/ui/runtime.rs:5205:25
+     |
+5205 |                     let preview = format!("📊 *{question}*\n{opts_text}");
+     |                         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_preview`
+
+warning: unused variable: `s`
+    --> desktop/src/ui/runtime.rs:5428:25
+     |
+5428 |                     let s = state.lock().unwrap();
+     |                         ^ help: if this is intentional, prefix it with an underscore: `_s`
+
+warning: unused variable: `contact_vcard`
+    --> desktop/src/ui/runtime.rs:7995:24
+     |
+7995 |     let (contact_name, contact_vcard) = if let Some(cm) = &base.contact_message {
+     |                        ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_contact_vcard`
+
+warning: unused variable: `link_title`
+    --> desktop/src/ui/runtime.rs:8002:10
+     |
+8002 |     let (link_title, link_description, link_url) = if let Some(etm) = &base.extended_te...
+     |          ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_link_title`
+
+warning: unused variable: `link_description`
+    --> desktop/src/ui/runtime.rs:8002:22
+     |
+8002 |     let (link_title, link_description, link_url) = if let Some(etm) = &base.extended_te...
+     |                      ^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_link_description`
+
+warning: unused variable: `link_url`
+    --> desktop/src/ui/runtime.rs:8002:40
+     |
+8002 | ...(link_title, link_description, link_url) = if let Some(etm) = &base.extended_text_me...
+     |                                   ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_link_url`
+
+warning: unused variable: `rows`
+   --> desktop/src/ui/window.rs:996:21
+    |
+996 |                 let rows = inner.chat_list.widget();
+    |                     ^^^^ help: if this is intentional, prefix it with an underscore: `_rows`
+
+warning: unused variable: `tv`
+    --> desktop/src/ui/window.rs:1158:33
+     |
+1158 |                     if let Some(tv) = child.downcast_ref::<adw::ToolbarView>() {
+     |                                 ^^ help: if this is intentional, prefix it with an underscore: `_tv`
+
+warning: unused variable: `pos`
+    --> desktop/src/ui/window.rs:1241:10
+     |
+1241 |     for (pos, chat) in ordered.iter().enumerate() {
+     |          ^^^ help: if this is intentional, prefix it with an underscore: `_pos`
+
+warning: unused variable: `rebuild_edit`
+    --> desktop/src/ui/window.rs:2053:21
+     |
+2053 |                 let rebuild_edit = Rc::clone(&{
+     |                     ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_rebuild_edit`
+
+warning: unused variable: `bridge_c`
+    --> desktop/src/ui/window.rs:2006:13
+     |
+2006 |         let bridge_c = bridge.clone();
+     |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bridge_c`
+
+warning: field `chat_id` is never read
+  --> desktop/src/bridge.rs:37:9
+   |
+35 |     MessageFailed {
+   |     ------------- field in this variant
+36 |         msg_id: String,
+37 |         chat_id: String,
+   |         ^^^^^^^
+   |
+   = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `chat_name` is never read
+  --> desktop/src/bridge.rs:42:9
+   |
+40 |     HistoryMessages {
+   |     --------------- field in this variant
+41 |         chat_id: String,
+42 |         chat_name: String,
+   |         ^^^^^^^^^
+   |
+   = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `chat_id` is never read
+   --> desktop/src/bridge.rs:140:9
+    |
+139 |     MessageStarred {
+    |     -------------- field in this variant
+140 |         chat_id: String,
+    |         ^^^^^^^
+    |
+    = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `chat_id` is never read
+   --> desktop/src/bridge.rs:169:9
+    |
+168 |     GroupsInCommon {
+    |     -------------- field in this variant
+169 |         chat_id: String,
+    |         ^^^^^^^
+    |
+    = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `phone` is never read
+   --> desktop/src/bridge.rs:177:9
+    |
+175 |     ContactProfile {
+    |     -------------- field in this variant
+176 |         chat_id: String,
+177 |         phone: String,
+    |         ^^^^^
+    |
+    = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `chat_id` is never read
+   --> desktop/src/bridge.rs:202:9
+    |
+201 |     GroupInviteLink {
+    |     --------------- field in this variant
+202 |         chat_id: String,
+    |         ^^^^^^^
+    |
+    = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: variants `IncomingCall`, `CallEnded`, and `CallAccepted` are never constructed
+   --> desktop/src/bridge.rs:211:5
+    |
+ 11 | pub enum WaEvent {
+    |          ------- variants in this enum
+...
+211 |     IncomingCall {
+    |     ^^^^^^^^^^^^
+...
+216 |     CallEnded {
+    |     ^^^^^^^^^
+...
+220 |     CallAccepted {
+    |     ^^^^^^^^^^^^
+    |
+    = note: `WaEvent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: field `keywords` is never read
+   --> desktop/src/bridge.rs:256:9
+    |
+253 | pub struct QuickReplyData {
+    |            -------------- field in this struct
+...
+256 |     pub keywords: Vec<String>,
+    |         ^^^^^^^^
+    |
+    = note: `QuickReplyData` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: multiple variants are never constructed
+   --> desktop/src/bridge.rs:291:5
+    |
+268 | pub enum WaCommand {
+    |          --------- variants in this enum
+...
+291 |     ForwardMessage {
+    |     ^^^^^^^^^^^^^^
+...
+303 |     SetTyping {
+    |     ^^^^^^^^^
+...
+317 |     Logout,
+    |     ^^^^^^
+...
+431 |     SyncQuickReplies,
+    |     ^^^^^^^^^^^^^^^^
+...
+438 |     DeleteQuickReply {
+    |     ^^^^^^^^^^^^^^^^
+...
+531 |     EndCall {
+    |     ^^^^^^^
+...
+535 |     SearchAllMessages {
+    |     ^^^^^^^^^^^^^^^^^
+...
+545 |     MultiForward {
+    |     ^^^^^^^^^^^^
+    |
+    = note: `WaCommand` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: function `wait_for_correction_done` is never used
+    --> desktop/src/ui/autocorrect.rs:1185:8
+     |
+1185 | pub fn wait_for_correction_done(timeout_ms: u64) -> bool {
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `search_entry` is never read
+  --> desktop/src/ui/chat_list.rs:55:5
+   |
+31 | struct ChatListInner {
+   |        ------------- field in this struct
+...
+55 |     search_entry: SearchEntry,
+   |     ^^^^^^^^^^^^
+
+warning: methods `load_chats` and `set_auto_mark_read` are never used
+   --> desktop/src/ui/chat_list.rs:428:12
+    |
+ 58 | impl ChatListPanel {
+    | ------------------ methods in this implementation
+...
+428 |     pub fn load_chats(&self, chats: Vec<ChatSummary>) {
+    |            ^^^^^^^^^^
+...
+832 |     pub fn set_auto_mark_read(&self, chat_id: &str, enabled: bool) {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: enum `PickerResult` is never used
+  --> desktop/src/ui/chat_picker.rs:16:10
+   |
+16 | pub enum PickerResult {
+   |          ^^^^^^^^^^^^
+
+warning: variant `Prepend` is never constructed
+  --> desktop/src/ui/chat_view.rs:46:5
+   |
+44 | enum BubblePosition {
+   |      -------------- variant in this enum
+45 |     Append,
+46 |     Prepend,
+   |     ^^^^^^^
+   |
+   = note: `BubblePosition` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: field `bridge` is never read
+  --> desktop/src/ui/login.rs:18:5
+   |
+13 | pub struct LoginScreen {
+   |            ----------- field in this struct
+...
+18 |     bridge: Arc<Bridge>,
+   |     ^^^^^^
+   |
+   = note: `LoginScreen` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: method `show_loading` is never used
+  --> desktop/src/ui/login.rs:85:12
+   |
+21 | impl LoginScreen {
+   | ---------------- method in this implementation
+...
+85 |     pub fn show_loading(&self, msg: &str) {
+   |            ^^^^^^^^^^^^
+
+warning: fields `msg_id`, `sender_id`, `chat_id`, `poll_question`, `poll_selectable`, and `contact_msg_btn` are never read
+  --> desktop/src/ui/message_bubble.rs:30:5
+   |
+27 | pub struct MessageBubble {
+   |            ------------- fields in this struct
+...
+30 |     msg_id: String,
+   |     ^^^^^^
+...
+37 |     pub sender_id: String,
+   |         ^^^^^^^^^
+...
+42 |     pub chat_id: String,
+   |         ^^^^^^^
+...
+49 |     pub poll_question: Option<String>,
+   |         ^^^^^^^^^^^^^
+50 |     /// Poll selectable count (for forward-as-new-poll)
+51 |     pub poll_selectable: u32,
+   |         ^^^^^^^^^^^^^^^
+...
+55 |     contact_msg_btn: Option<Button>,
+   |     ^^^^^^^^^^^^^^^
+   |
+   = note: `MessageBubble` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: methods `contact_message_button` and `msg_id` are never used
+    --> desktop/src/ui/message_bubble.rs:1048:12
+     |
+  62 | impl MessageBubble {
+     | ------------------ methods in this implementation
+...
+1048 |     pub fn contact_message_button(&self) -> Option<&Button> {
+     |            ^^^^^^^^^^^^^^^^^^^^^^
+...
+1173 |     pub fn msg_id(&self) -> &str {
+     |            ^^^^^^
+
+warning: field `media_section` is never read
+  --> desktop/src/ui/profile_panel.rs:31:5
+   |
+20 | struct ProfileInner {
+   |        ------------ field in this struct
+...
+31 |     media_section: Box,
+   |     ^^^^^^^^^^^^^
+
+warning: function `make_outgoing_message` is never used
+    --> desktop/src/ui/runtime.rs:8115:4
+     |
+8115 | fn make_outgoing_message(
+     |    ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `uuid_v4_simple` is never used
+    --> desktop/src/ui/runtime.rs:8161:4
+     |
+8161 | fn uuid_v4_simple() -> String {
+     |    ^^^^^^^^^^^^^^
+
+warning: field `debug_revealer` is never read
+  --> desktop/src/ui/window.rs:42:5
+   |
+27 | struct MainWindowInner {
+   |        --------------- field in this struct
+...
+42 |     debug_revealer: Revealer,
+   |     ^^^^^^^^^^^^^^
+
+warning: `whatsapp-desktop` (bin "whatsapp-desktop") generated 68 warnings (run `cargo fix --bin "whatsapp-desktop" -p whatsapp-desktop` to apply 36 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 12.29s
+     Running `/home/jakes/.cache/cargo-target/debug/whatsapp-desktop`
+WhatsApp: applied UI scale 150% (GDK_DPI_SCALE=1.5000)
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:07:42.327: Theme parser error: <data>:69:5-24: No property named "-gtk-outline-radius"
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:07:42.327: Theme parser error: <data>:165:5-17: No property named "margin-start"
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:07:42.327: Theme parser error: <data>:170:5-17: No property named "margin-start"
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:07:42.327: Theme parser error: <data>:293:5-15: No property named "max-height"
+[2026-05-05T03:07:42Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: ENABLED — spawning runtime; data_dir=/home/jakes/.local/share/whatsapp-desktop
+[2026-05-05T03:07:42Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: looking for auth file at /home/jakes/.local/share/whatsapp-desktop/gmessages-auth.json
+[2026-05-05T03:07:42Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: loaded auth (paired)
+[2026-05-05T03:07:42Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: connecting…
+[2026-05-05T03:07:42Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: connect() returned; long-poll task running in background
+
+(whatsapp-desktop:78501): Gtk-CRITICAL **: 23:07:42.338: gtk_gesture_long_press_set_delay_factor: assertion 'delay_factor >= 0.5' failed
+[2026-05-05T03:07:42Z INFO  gmessages_rust::longpoll] ReceiveMessages opened: status=200 OK content-type=Some("application/json+protobuf; charset=UTF-8")
+[2026-05-05T03:07:42Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: received Ready
+[2026-05-05T03:07:42Z DEBUG gmessages_rust::longpoll] long-poll: opening `[[` confirmed
+[2026-05-05T03:07:42Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: long-poll ready
+[2026-05-05T03:07:42Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: Ready consumed internally (no UI forward)
+[2026-05-05T03:07:42Z DEBUG gmessages_rust::longpoll] got startup ack: skip_count=0
+[2026-05-05T03:07:44Z INFO  gmessages_rust::session] set_active_session: new session_id=5de0f771-b4ef-4a61-9fee-50ea4bc30c1f
+[2026-05-05T03:07:44Z INFO  gmessages_rust::client] post-connect: active session registered
+[2026-05-05T03:07:44Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=acd82407-3c67-4115-bc45-6213da2e2cc6 message_data=105 bytes
+[2026-05-05T03:07:44Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=9fb3a1e5-e275-487f-afa3-addad9a42c3c message_data=578 bytes
+[2026-05-05T03:07:44Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=faeae9c2-d9c9-4f80-a116-006c4416ec1e message_data=105 bytes
+[2026-05-05T03:07:46Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=01c32e7a-f756-47ee-b585-710f679f3e31 message_data=9057 bytes
+[2026-05-05T03:07:46Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: ListContacts returned 50 contacts
+[2026-05-05T03:07:46Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: sample contact: name="?????Empress Stepha ~Neela~?????" pid="7519" num=Some(("14168187837", "+14168187837"))
+[2026-05-05T03:07:46Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: sample contact: name="???Chris" pid="7084" num=Some(("14379710315", "+14379710315"))
+[2026-05-05T03:07:46Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: sample contact: name="?Sonia Arya" pid="7663" num=Some(("+16478657970", "+16478657970"))
+[2026-05-05T03:07:46Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=eb264049-b229-4319-9535-615ec5fa368b message_data=704 bytes
+[2026-05-05T03:07:46Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: ListTopContacts returned 3 contacts
+[2026-05-05T03:07:46Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: contact map size = 364
+[2026-05-05T03:07:46Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: fetching conversation list to seed chat rows
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:07:47.515: Theme parser error: <data>:1:49-58: No property named "max-width"
+[2026-05-05T03:07:49Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=d4b8fa3f-069a-4329-96d4-5d91dd90f308 message_data=32435 bytes
+[2026-05-05T03:07:49Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: got 50 conversations
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 5945 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 43 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 167 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 857 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 1957 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 8 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 6051 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 24 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 6580 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 2141 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 1466 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 104 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 6577 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: name fallback to phone for conv 964 (no contact match)
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:14 "Alexandra Gauer")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:5945 "22767")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6101 "Jake Steinman")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:43 "22775")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6587 "(416) 835-0111")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6586 "+1 866-202-8716")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:387 "Saad Suleman")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:143 "Mike Conforti Rent")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:167 "66222")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:557 "Jerry Celenza")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:309 "(289) 210-7032")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:857 "100001")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:141 "(647) 957-9385")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:447 "Bilal Saleem")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6196 "Michael Jewish Guy Daniel. Weisberg")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:11 "Dave Anderson")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6584 "(647) 470-6356")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:1957 "99399")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:8 "83687")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6142 "John Rosgen Shorty")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6051 "266898")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:4 "Wade Grabeldinger")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:24 "27223")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6581 "Kevin Multiplex")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6 "+1 833-937-2112")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6583 "(647) 557-4712")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6565 "(587) 785-8345")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6582 "(416) 818-8842")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:41 "Bj Visser")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6170 "Craig Thompson")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6228 "(437) 455-6563")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:247 "Max Steinman")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6580 "92568")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6579 "(403) 471-2395")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:2141 "77598")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:1466 "73679")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:110 "Daniel Foch")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:104 "838383")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:17 "Hot Tub Bill")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:96 "Tyler Mcclay")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:25 "Brandon Longstaff")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:4816 "(289) 210-5151")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:56 "(416) 817-2422")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6216 "+1 844-618-2228")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:1 "+1 877-730-9264")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:3 "Tack Nick Lee")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6577 "22353")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:964 "22766")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:6086 "Ishwar Sohi")
+[2026-05-05T03:07:49Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ChatAdded(gm:532 "Ryan Anchorage")
+[2026-05-05T03:08:12Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=5f03cffc-2b69-4e13-bdb9-4851b23cb043 message_data=149 bytes
+[2026-05-05T03:08:12Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: received Typing
+[2026-05-05T03:08:12Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: forwarding TypingIndicator(chat_id=gm:14, on=false)
+[2026-05-05T03:08:12Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=d04d6c58-c08d-462d-b601-18d974c62dce message_data=497 bytes
+[2026-05-05T03:08:12Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: received Messages
+[2026-05-05T03:08:12Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: forwarding MessageReceived(chat_id=gm:14, from=16, body=None)
+[2026-05-05T03:08:13Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=ac48a5af-2578-4bc4-b291-39bae86c876d message_data=1311 bytes
+[2026-05-05T03:08:13Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: received Messages
+[2026-05-05T03:08:13Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: forwarding MessageReceived(chat_id=gm:14, from=16, body=None)
+[2026-05-05T03:08:13Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=cc521a7e-d354-4a38-a84d-61a10c2d19ad message_data=805 bytes
+[2026-05-05T03:08:13Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: received ConversationUpdate
+[2026-05-05T03:08:13Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: conversation updated 14
+[2026-05-05T03:08:13Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages → desktop: ConversationUpdate consumed internally (no UI forward)
+[2026-05-05T03:08:13Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=3912f31a-02a5-477a-a98b-dde324a1cce3 message_data=1321 bytes
+[2026-05-05T03:08:13Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: received Messages
+[2026-05-05T03:08:13Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: forwarding MessageReceived(chat_id=gm:14, from=16, body=None)
+[2026-05-05T03:08:14Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=4e6b2125-431e-40b7-903f-c9603d2d50c3 message_data=1419 bytes
+[2026-05-05T03:08:14Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: received Messages
+[2026-05-05T03:08:14Z INFO  whatsapp_desktop::gmessages_runtime] gmessages → desktop: forwarding MessageReceived(chat_id=gm:14, from=16, body=None)
+[2026-05-05T03:08:14Z DEBUG whatsapp_desktop::gmessages_runtime] gmessages: MarkRead for 14 — not yet implemented
+[2026-05-05T03:08:14Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: LoadChat for 14
+[2026-05-05T03:08:15Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=2da27a3f-52f7-4023-ba3c-6cb722609d9b message_data=38012 bytes
+[2026-05-05T03:08:15Z INFO  whatsapp_desktop::gmessages_runtime] gmessages: loaded 100 history messages
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.895: GtkBox 0x56495bc88740 (box) reported min width -28, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.895: GtkBox 0x56495bc9d720 (box) reported min width -29, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.895: GtkBox 0x56495bcb2680 (box) reported min width -32, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.895: GtkBox 0x56495bcc6cf0 (box) reported min width -28, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.895: GtkBox 0x56495bcdb9d0 (box) reported min width -5, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.896: GtkBox 0x56495bcf0960 (box) reported min width -31, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.896: GtkBox 0x56495bd05900 (box) reported min width -29, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.896: GtkBox 0x56495bd19d00 (box) reported min width -29, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.896: GtkBox 0x56495bd2e9f0 (box) reported min width -23, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.896: GtkBox 0x56495bd43970 (box) reported min width -28, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.896: GtkBox 0x56495bd588d0 (box) reported min width -26, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.896: GtkBox 0x56495bd6d830 (box) reported min width -31, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.896: GtkBox 0x56495bd82790 (box) reported min width -28, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.897: GtkBox 0x56495bd96e00 (box) reported min width -10, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.897: GtkBox 0x56495bdad8b0 (box) reported min width -13, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.897: GtkBox 0x56495bdc55c0 (box) reported min width -28, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.898: GtkBox 0x56495bddb000 (box) reported min width -29, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.898: GtkBox 0x56495bdef690 (box) reported min width -29, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.898: GtkBox 0x56495be03a80 (box) reported min width -28, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.899: GtkBox 0x56495be17ec0 (box) reported min width -7, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.899: GtkBox 0x56495be2bf80 (box) reported min width -29, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.899: GtkBox 0x56495be41560 (box) reported min width -51, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.899: GtkBox 0x56495be564f0 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.899: GtkBox 0x56495be6b4f0 (box) reported min width -53, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.899: GtkBox 0x56495be7f5b0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.899: GtkBox 0x56495be94ee0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.899: GtkBox 0x56495bea9e60 (box) reported min width -51, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.899: GtkBox 0x56495bebe200 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.899: GtkBox 0x56495bed3b30 (box) reported min width -69, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.899: GtkBox 0x56495bee8760 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.903: GtkBox 0x56495bda93d0 adjusted size vertical min 28 natural 28 must not decrease below min 34 natural 34
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:08:15.903: GtkBox 0x56495bdc0570 adjusted size vertical min 28 natural 28 must not decrease below min 34 natural 34
+[2026-05-05T03:08:42Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=592c9c8b-82c6-4814-a0ee-aa1eb2acb5af message_data=53 bytes
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.427: GtkBox 0x564952e45730 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.428: GtkBox 0x5649531c4550 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.428: GtkBox 0x564953d4b070 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.428: GtkBox 0x56495b5727e0 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.429: GtkBox 0x56495c0f9e90 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.429: GtkBox 0x564953aa5d40 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.429: GtkBox 0x56495c56d400 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.429: GtkBox 0x56495b362de0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.429: GtkBox 0x56495c01d9b0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.430: GtkBox 0x564953db41b0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.430: GtkBox 0x56495b7b3520 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.430: GtkBox 0x5649535e2070 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.430: GtkBox 0x564952eddbe0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.430: GtkBox 0x56495c52eef0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.431: GtkBox 0x564953b7f480 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.432: GtkBox 0x56495bf41790 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.432: GtkBox 0x56495c008090 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.433: GtkBox 0x56495c6857e0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.434: GtkBox 0x56495bcf5750 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.434: GtkBox 0x56495b9edee0 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.434: GtkBox 0x564953411170 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.435: GtkBox 0x56495bf6a4f0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.435: GtkBox 0x56495bfc99e0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.435: GtkBox 0x56495beecb40 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.436: GtkBox 0x56495b9b4670 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.437: GtkBox 0x56495baeb970 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.437: GtkBox 0x56495c075430 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.437: GtkBox 0x56495b33d740 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.438: GtkBox 0x56495c0e5d20 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.438: GtkBox 0x56495bf334f0 (box) reported min width -75, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.438: GtkBox 0x56495bd5dc60 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.438: GtkBox 0x564953843710 (box) reported min width -58, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.439: GtkBox 0x56495bf4eb90 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.439: GtkBox 0x56495bf6f650 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.439: GtkBox 0x564953b1c900 (box) reported min width -47, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.439: GtkBox 0x56495c074240 (box) reported min width -58, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.440: GtkBox 0x564953497570 (box) reported min width -58, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.440: GtkBox 0x564952ab22a0 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.441: GtkBox 0x56495b625f40 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.441: GtkBox 0x5649532f8250 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.441: GtkBox 0x56495c2f9080 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.441: GtkBox 0x56495bfae010 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.442: GtkBox 0x56495c03d960 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.442: GtkBox 0x564953226490 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.443: GtkBox 0x56495302a8c0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.443: GtkBox 0x56495b7097a0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.443: GtkBox 0x564953710dc0 (box) reported min width -46, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.443: GtkBox 0x564952e233d0 (box) reported min width -46, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:12.443: GtkBox 0x56495c301340 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:19.837: GtkBox 0x564953adf5a0 (box) reported min width -46, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:19.853: GtkBox 0x564953adf5a0 (box) reported min width -5, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:39.107: GtkBox 0x56495919e050 (box) reported min width -38, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.557: GtkBox 0x564952c7e060 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.557: GtkBox 0x56495b7c8ad0 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.557: GtkBox 0x56495b2a0240 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.558: GtkBox 0x564952f0f890 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.558: GtkBox 0x564952fa88a0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.558: GtkBox 0x5649538d64a0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.558: GtkBox 0x56495ca45940 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.559: GtkBox 0x56495c59c330 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.559: GtkBox 0x56495c70c6a0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.559: GtkBox 0x56495b7d5580 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.559: GtkBox 0x564953e49600 (box) reported min width -54, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.559: GtkBox 0x564953b6b1b0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.560: GtkBox 0x56495a31edc0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.561: GtkBox 0x56495b84ce80 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.561: GtkBox 0x56495bf59580 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.561: GtkBox 0x56495c0708c0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.563: GtkBox 0x56495c1b4d20 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.563: GtkBox 0x564953eb8220 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.563: GtkBox 0x5649535b4120 (box) reported min width -71, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.564: GtkBox 0x5649538005b0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.564: GtkBox 0x56495c223c80 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.564: GtkBox 0x564953f340b0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.565: GtkBox 0x56495c123ad0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.565: GtkBox 0x5649573a48f0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.566: GtkBox 0x5649530969d0 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.567: GtkBox 0x56495bc20c80 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.567: GtkBox 0x56495c068970 (box) reported min width -55, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.567: GtkBox 0x564952bb1080 (box) reported min width -57, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.567: GtkBox 0x564953855470 (box) reported min width -75, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.567: GtkBox 0x564952dfec80 (box) reported min width -73, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.567: GtkBox 0x564953bd7b80 (box) reported min width -58, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.568: GtkBox 0x564952d536d0 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.568: GtkBox 0x56495be41f20 (box) reported min width -72, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.568: GtkBox 0x56495b8f8150 (box) reported min width -47, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.569: GtkBox 0x5649531ea610 (box) reported min width -58, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.569: GtkBox 0x56495944cb90 (box) reported min width -58, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.569: GtkBox 0x56495bfbdb80 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.570: GtkBox 0x56495b7df150 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.570: GtkBox 0x56495c065ff0 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.570: GtkBox 0x564952c0e240 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.570: GtkBox 0x56495c310d80 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.571: GtkBox 0x5649530de170 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.571: GtkBox 0x56495b90d860 (box) reported min width -44, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.572: GtkBox 0x56495be2ca60 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.572: GtkBox 0x56495c1eeea0 (box) reported min width -70, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.572: GtkBox 0x564953bc2d50 (box) reported min width -46, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.572: GtkBox 0x564953501580 (box) reported min width -46, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.572: GtkBox 0x56495bf38a40 (box) reported min width -67, but sizes must be >= 0
+
+(whatsapp-desktop:78501): Gtk-WARNING **: 23:09:42.573: GtkBox 0x564953cd6f00 (box) reported min width -41, but sizes must be >= 0
+[2026-05-05T03:09:42Z DEBUG gmessages_rust::event_handler] incoming RPC: route=DataEvent response_id=5897772d-fa05-49d5-8e23-0eacb529ceeb message_data=53 bytes

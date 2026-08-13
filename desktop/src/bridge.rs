@@ -111,6 +111,15 @@ pub enum WaEvent {
     /// An update is staged. Rendered as a toast with a "Restart now" button so the
     /// user doesn't have to hunt for it in Settings.
     UpdateReadyToast(String),
+    /// A verification code found on a message that never crossed the live-push
+    /// path. The relay routinely lands an SMS on disk via the server-fetch merge
+    /// instead, and that route used to bypass 2FA scanning entirely — the code
+    /// was visible in the chat but never reached the clipboard.
+    TwoFactorCodeDetected {
+        msg_id: String,
+        code: String,
+        sender: String,
+    },
     /// A chat's display name was resolved/updated (group name fetch or push name)
     ChatNameUpdated {
         chat_id: String,
