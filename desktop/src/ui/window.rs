@@ -2339,39 +2339,59 @@ fn open_own_profile_window(
 ///
 /// All three are best-effort; failures are silent.
 fn set_clipboard_text(text: &str) {
-    // 1. GTK path (synchronous, sets ownership immediately).
-    if let Some(display) = gtk4::gdk::Display::default() {
-        display.clipboard().set_text(text);
-    }
-    // 2. wl-copy pipe (Wayland persists across focus loss).
     use std::io::Write;
-    if let Ok(mut child) = std::process::Command::new("wl-copy")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        if let Some(stdin) = child.stdin.as_mut() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
-        // Don't wait — wl-copy forks a daemon that owns the offer.
-        let _ = child.wait();
-    }
-    // 3. xclip fallback for X11.
-    if std::env::var("WAYLAND_DISPLAY").is_err()
-        && let Ok(mut child) = std::process::Command::new("xclip")
-            .arg("-selection")
-            .arg("clipboard")
+
+    fn pipe_to(cmd: &str, args: &[&str], text: &str) -> bool {
+        let Ok(mut child) = std::process::Command::new(cmd)
+            .args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-    {
+        else {
+            return false;
+        };
         if let Some(stdin) = child.stdin.as_mut() {
             let _ = stdin.write_all(text.as_bytes());
         }
-        let _ = child.wait();
+        // wl-copy daemonizes once stdin closes; the parent exits immediately.
+        drop(child.stdin.take());
+        matches!(child.wait(), Ok(s) if s.success())
     }
+
+    let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+
+    if wayland {
+        // GTK is deliberately NOT used here. `set_text` defers ownership to the
+        // next main-loop turn, so it lands AFTER wl-copy and, with the window
+        // unfocused, the compositor rejects the late set and drops the offer —
+        // the code was copied, then silently vanished before the user pasted.
+        // wl-copy's data-control offer survives focus loss; it is the only
+        // writer on Wayland.
+        let ok = pipe_to("wl-copy", &["--type", "text/plain"], text);
+        // Read back so a failure is visible in the log instead of looking like
+        // a detection bug.
+        let readback = std::process::Command::new("wl-paste")
+            .arg("-n")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        match readback.as_deref() {
+            Some(got) if got == text => log::info!("clipboard: verified"),
+            Some(got) => log::warn!(
+                "clipboard: wl-copy ok={ok} but readback mismatch (len {} vs {})",
+                got.len(),
+                text.len()
+            ),
+            None => log::warn!("clipboard: wl-copy ok={ok}, readback unavailable"),
+        }
+        return;
+    }
+
+    if let Some(display) = gtk4::gdk::Display::default() {
+        display.clipboard().set_text(text);
+    }
+    pipe_to("xclip", &["-selection", "clipboard"], text);
 }
 
 fn send_desktop_notification(app: &adw::Application, chat_id: &str, title: &str, body: &str) {
