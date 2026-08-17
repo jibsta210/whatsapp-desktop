@@ -695,6 +695,9 @@ impl MainWindow {
         {
             let inner_active = inner.clone();
             inner.window.connect_is_active_notify(move |win| {
+                if win.is_active() {
+                    reassert_2fa_clipboard();
+                }
                 if win.is_active()
                     && let Some(chat_id) = inner_active.chat_view.current_chat_id()
                 {
@@ -2362,29 +2365,20 @@ fn set_clipboard_text(text: &str) {
     let wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
 
     if wayland {
-        // GTK is deliberately NOT used here. `set_text` defers ownership to the
-        // next main-loop turn, so it lands AFTER wl-copy and, with the window
-        // unfocused, the compositor rejects the late set and drops the offer —
-        // the code was copied, then silently vanished before the user pasted.
-        // wl-copy's data-control offer survives focus loss; it is the only
-        // writer on Wayland.
-        let ok = pipe_to("wl-copy", &["--type", "text/plain"], text);
-        // Read back so a failure is visible in the log instead of looking like
-        // a detection bug.
-        let readback = std::process::Command::new("wl-paste")
-            .arg("-n")
-            .output()
-            .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        match readback.as_deref() {
-            Some(got) if got == text => log::info!("clipboard: verified"),
-            Some(got) => log::warn!(
-                "clipboard: wl-copy ok={ok} but readback mismatch (len {} vs {})",
-                got.len(),
-                text.len()
-            ),
-            None => log::warn!("clipboard: wl-copy ok={ok}, readback unavailable"),
+        // --trim-newline: a trailing \n rides along otherwise, and segmented
+        // OTP inputs (TD's is one) treat it as a submit or reject the paste.
+        // No --type: the default offer includes the charset variant that
+        // XWayland maps to UTF8_STRING, which browsers ask for.
+        let ok = pipe_to("wl-copy", &["--trim-newline"], text);
+        if !ok {
+            log::warn!("clipboard: wl-copy failed");
         }
+        // wl-copy writes via data-control, which wl-paste also reads — so a
+        // readback here proves nothing about what a normal client can paste.
+        // Regular clients read the seat selection, and KWin only syncs that
+        // from data-control on the next focus change, which is why a code can
+        // become pasteable minutes late. Re-assert through GTK the moment we
+        // own focus so the seat selection is current.
         return;
     }
 
@@ -2433,10 +2427,36 @@ fn twofa_mark_copied(msg_id: &str) -> bool {
     })
 }
 
+thread_local! {
+    /// Last auto-copied code, re-asserted when the window regains focus.
+    static LAST_2FA: RefCell<Option<(String, std::time::Instant)>> = const { RefCell::new(None) };
+}
+
+/// Re-publish the most recent OTP through GTK now that we hold focus. Wayland
+/// refuses clipboard writes from unfocused clients, so the wl-copy offer made
+/// at arrival time may not have reached the seat selection normal apps read.
+pub fn reassert_2fa_clipboard() {
+    let pending = LAST_2FA.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(_, at)| at.elapsed().as_secs() < 300)
+            .map(|(code, _)| code.clone())
+    });
+    if let Some(code) = pending
+        && let Some(display) = gtk4::gdk::Display::default()
+    {
+        display.clipboard().set_text(&code);
+        log::info!("clipboard: re-asserted OTP on focus");
+    }
+}
+
 /// Copy `text` to the system clipboard and show an OSD-style notification.
 /// On COSMIC and other freedesktop-spec compliant DEs, the notification
 /// renders as a transient OSD overlay.
 pub fn copy_2fa_code_with_osd(app: &adw::Application, code: &str, sender: &str) {
+    LAST_2FA.with(|c| {
+        *c.borrow_mut() = Some((code.to_string(), std::time::Instant::now()));
+    });
     set_clipboard_text(code);
     // Single GNotification under our real app-id (com.whatsapp.desktop), so it
     // groups with the app's other notifications and the user's per-app mute
