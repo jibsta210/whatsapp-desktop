@@ -11,9 +11,33 @@
 //!
 //! See `pkg/libgm/pair.go` and `pkg/libgm/pair_google.go` (mautrix-gmessages).
 
+use crate::gmproto::authentication::{BrowserDetails, BrowserType, DeviceType};
 use crate::{Client, Result};
 
 pub const USER_AGENT: &str = crate::headers::USER_AGENT;
+
+/// Identity we present to the relay when registering, shared by BOTH pairing
+/// flows.
+///
+/// `TABLET` is load-bearing, not cosmetic. Google allows only one *web*
+/// session per phone at a time, so registering as WEB (or PWA, which the
+/// server buckets with it) means this client and the user's own
+/// messages.google.com tab evict each other — whoever paired last wins.
+/// Registering as a tablet takes a separate slot, so the bridge and the
+/// user's browser session coexist. This mirrors `BrowserDetailsMessage` in
+/// mautrix-gmessages `pkg/libgm/util/config.go`, which is TABLET for the
+/// same reason.
+///
+/// The enum values are spelled out rather than hardcoded because the wire
+/// numbering is not the obvious one: WEB=1, TABLET=2, PWA=3.
+pub fn browser_details() -> BrowserDetails {
+    BrowserDetails {
+        user_agent: crate::headers::USER_AGENT.into(),
+        browser_type: BrowserType::Other as i32,
+        os: "libgm".into(),
+        device_type: DeviceType::Tablet as i32,
+    }
+}
 
 /// Device ID format for Gaia pairing: `messages-web-{uuid_no_dashes}`.
 pub fn make_device_id() -> String {
@@ -34,6 +58,35 @@ pub async fn start_qr_pairing(client: &Client) -> Result<()> {
 /// emoji appears on the phone. Returns when pairing fully completes.
 pub async fn start_gaia_pairing(client: &Client) -> Result<()> {
     gaia::run(client).await
+}
+
+#[cfg(test)]
+mod device_identity_tests {
+    use super::*;
+
+    // Google allows one web session per phone. If we register as WEB — or as
+    // PWA, which this client did for its whole life because the enum was
+    // read off by one — we evict the user's own messages.google.com tab and
+    // it evicts us back. TABLET is a separate slot. The wire numbering is
+    // WEB=1, TABLET=2, PWA=3, so assert the number, not just the name.
+    #[test]
+    fn registers_as_a_tablet_so_it_does_not_evict_the_users_web_session() {
+        let details = browser_details();
+        assert_eq!(details.device_type, 2, "must be TABLET on the wire");
+        assert_eq!(details.device_type, DeviceType::Tablet as i32);
+        assert_ne!(details.device_type, DeviceType::Web as i32);
+        assert_ne!(details.device_type, DeviceType::Pwa as i32);
+        assert_eq!(details.browser_type, BrowserType::Other as i32);
+        assert_eq!(details.os, "libgm");
+    }
+
+    // Both flows have to agree: pairing by QR and pairing by Google account
+    // must claim the same device slot, or which one you used decides whether
+    // the bridge fights the browser.
+    #[test]
+    fn both_pairing_flows_present_the_same_identity() {
+        assert_eq!(qr::browser_details(), browser_details());
+    }
 }
 
 pub mod qr {
@@ -60,22 +113,13 @@ pub mod qr {
     use crate::crypto::ecdsa::JwkPair;
     use crate::gmproto::authentication::UrlData;
     use crate::gmproto::authentication::{
-        AuthMessage, AuthenticationContainer, BrowserDetails, EcdsaKeys, KeyData,
-        RegisterPhoneRelayResponse, authentication_container,
+        AuthMessage, AuthenticationContainer, EcdsaKeys, KeyData, RegisterPhoneRelayResponse,
+        authentication_container,
     };
     use crate::http::ContentType;
     use crate::{Client, Error, Result, urls};
 
-    pub fn browser_details() -> BrowserDetails {
-        BrowserDetails {
-            user_agent: crate::headers::USER_AGENT.into(),
-            // BrowserType_OTHER = 1
-            browser_type: 1,
-            os: "libgm".into(),
-            // DeviceType_TABLET = 3 (per pair_google.go reference)
-            device_type: 3,
-        }
-    }
+    pub use super::browser_details;
 
     /// Wait up to this long for the phone to scan the QR and finalize.
     pub const PAIR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
