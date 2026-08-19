@@ -83,12 +83,13 @@ pub fn apply_cookie_auth(
     cookies: &std::collections::HashMap<String, String>,
     authuser: Option<u32>,
 ) {
-    // For Gaia (cookie-bearing) requests we ALWAYS prefer the live
-    // Firefox cookie jar over the in-memory snapshot — Firefox rotates
-    // `__Secure-1PSIDTS` and friends on its own schedule and the
-    // snapshot in `AuthData.cookies` goes stale. The cached live read
-    // has a 30s TTL so hot loops don't slam SQLite. If Firefox isn't
-    // running we fall back to the caller-supplied snapshot.
+    // For Gaia (cookie-bearing) requests we prefer the shared jar over the
+    // caller's snapshot. When we own the login that jar IS the session and
+    // Google's Set-Cookie responses rotate it in place; otherwise it is a
+    // 30s-TTL cache over the Firefox profile, which rotates
+    // `__Secure-1PSIDTS` and friends on its own schedule while the snapshot
+    // in `AuthData.cookies` goes stale. Either way, fall back to the
+    // caller-supplied snapshot when the jar has nothing.
     let live = crate::cookies::get_cached_firefox_cookies();
     let chosen_cookies = if !live.is_empty() { &live } else { cookies };
     if chosen_cookies.is_empty() {

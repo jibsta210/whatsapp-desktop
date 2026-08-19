@@ -265,6 +265,27 @@ impl Client {
         auth.cookies = cookies;
     }
 
+    /// Install cookies from a Google sign-in this application performed
+    /// itself, rather than ones scraped out of the user's Firefox profile.
+    ///
+    /// This is the difference between the bridge having a login and
+    /// borrowing one: an adopted session survives Firefox being absent,
+    /// signed into a different account, or logged out, and it is refreshed
+    /// in place by Google's own `Set-Cookie` responses. Prefer this over
+    /// [`set_cookies`](Self::set_cookies) for any new sign-in path.
+    ///
+    /// Errors if the supplied jar is not a usable Google session, so a
+    /// half-finished login cannot take ownership and strand the fallback.
+    pub async fn adopt_login_session(
+        &self,
+        cookies: std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        crate::cookies::adopt_login_session(cookies.clone())?;
+        let mut auth = self.inner.auth.lock().await;
+        auth.cookies = cookies;
+        Ok(())
+    }
+
     /// Caller's response to [`Event::PairingEmoji`]: `true` if the user
     /// confirmed the displayed emoji matches the one on the phone, `false`
     /// to abort pairing. Idempotent: only the first call has an effect.

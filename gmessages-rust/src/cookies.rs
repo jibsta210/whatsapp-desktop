@@ -255,10 +255,80 @@ pub fn rotating_cookie_max_age() -> Option<std::time::Duration> {
 /// Firefox to refresh — we want the very next request to pick up any
 /// new rotations FF just performed.
 pub fn invalidate_cookie_cache() {
-    if let Some(c) = COOKIE_CACHE.get() {
-        if let Ok(mut g) = c.lock() {
-            g.last_read = None;
+    if let Some(c) = COOKIE_CACHE.get()
+        && let Ok(mut g) = c.lock()
+    {
+        // Nothing to invalidate against when we own the session: the only
+        // source is us, and dropping `last_read` would just make the next
+        // read fall through to Firefox.
+        if g.session_owned {
+            return;
         }
+        g.last_read = None;
+    }
+}
+
+/// Install cookies from a sign-in this application performed itself, and
+/// take ownership of the session from that point on.
+///
+/// Before this existed the only way to get a Gaia session was to read the
+/// user's Firefox profile — which meant the bridge silently depended on
+/// Firefox being installed, signed into the right Google account, and not
+/// logged out. A session we obtained ourselves has none of those
+/// couplings, so once one is adopted we stop consulting the browser
+/// entirely and let Google's own `Set-Cookie` rotations keep it alive.
+///
+/// Filtered to [`GAIA_COOKIE_NAMES`] for the same reason
+/// [`merge_into_cache`] is: a login flow hands back a pile of consent and
+/// tracking cookies we have no business retaining. Adopting an empty set
+/// is refused, so a failed login cannot silently disable the fallback.
+pub fn adopt_login_session(cookies: HashMap<String, String>) -> Result<()> {
+    let kept: HashMap<String, String> = cookies
+        .into_iter()
+        .filter(|(k, _)| GAIA_COOKIE_NAMES.contains(&k.as_str()))
+        .collect();
+    if !kept.contains_key("__Secure-1PSID") || !kept.contains_key("SAPISID") {
+        return Err(Error::Pairing(
+            "login session is missing __Secure-1PSID/SAPISID; not adopting".into(),
+        ));
+    }
+    let cache = COOKIE_CACHE.get_or_init(|| {
+        std::sync::Mutex::new(CookieCache {
+            last_read: None,
+            cookies: HashMap::new(),
+            session_owned: false,
+        })
+    });
+    let mut guard = match cache.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    log::info!("cookies: adopting own login session ({} entries)", kept.len());
+    guard.cookies = kept;
+    guard.last_read = Some(std::time::Instant::now());
+    guard.session_owned = true;
+    Ok(())
+}
+
+/// Whether a session obtained by [`adopt_login_session`] is currently
+/// installed. Used by the desktop UI to decide whether to show the
+/// "sign in with Google" prompt or the legacy Firefox hint.
+pub fn has_owned_session() -> bool {
+    COOKIE_CACHE
+        .get()
+        .and_then(|c| c.lock().ok().map(|g| g.session_owned))
+        .unwrap_or(false)
+}
+
+/// Drop an adopted session and fall back to reading the browser profile.
+/// Used on sign-out and when the relay reports the session was revoked.
+pub fn clear_owned_session() {
+    if let Some(c) = COOKIE_CACHE.get()
+        && let Ok(mut g) = c.lock()
+    {
+        g.session_owned = false;
+        g.cookies.clear();
+        g.last_read = None;
     }
 }
 
@@ -280,6 +350,7 @@ pub fn merge_into_cache(updates: HashMap<String, String>) {
         std::sync::Mutex::new(CookieCache {
             last_read: None,
             cookies: HashMap::new(),
+            session_owned: false,
         })
     });
     if let Ok(mut g) = cache.lock() {
@@ -334,6 +405,11 @@ pub fn parse_set_cookie_headers<'a>(
 struct CookieCache {
     last_read: Option<std::time::Instant>,
     cookies: HashMap<String, String>,
+    /// Set once the caller has supplied cookies from a real sign-in of our
+    /// own (see [`adopt_login_session`]). While true, this jar IS the
+    /// session and Firefox is never consulted — the app owns its login
+    /// instead of borrowing the browser's.
+    session_owned: bool,
 }
 
 static COOKIE_CACHE: std::sync::OnceLock<std::sync::Mutex<CookieCache>> =
@@ -353,12 +429,21 @@ pub fn get_cached_firefox_cookies() -> HashMap<String, String> {
         std::sync::Mutex::new(CookieCache {
             last_read: None,
             cookies: HashMap::new(),
+            session_owned: false,
         })
     });
     let mut guard = match cache.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
+    // We own the login: this jar is the session. Google rotates it for us
+    // via Set-Cookie (see `merge_into_cache`), so there is nothing Firefox
+    // could tell us that we do not already know — and reading it here would
+    // overwrite our fresher values with whatever some browser profile last
+    // happened to persist.
+    if guard.session_owned {
+        return guard.cookies.clone();
+    }
     // Fast path: cache hit.
     if let Some(t) = guard.last_read
         && t.elapsed() < TTL
@@ -420,6 +505,74 @@ pub fn read_default_firefox_cookies() -> Result<HashMap<String, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn a_valid_session() -> HashMap<String, String> {
+        session(&[
+            ("__Secure-1PSID", "psid-value"),
+            ("SAPISID", "sapisid-value"),
+            ("SID", "sid-value"),
+        ])
+    }
+
+    // These four share the process-wide COOKIE_CACHE, so they run as one
+    // test: as separate #[test] fns they would race each other's ownership
+    // flag under cargo's thread-per-test default.
+    #[test]
+    fn owned_session_lifecycle() {
+        clear_owned_session();
+        assert!(!has_owned_session());
+
+        // A jar that is not a usable Google session must not take
+        // ownership — otherwise a failed login silently disables the
+        // Firefox fallback and the bridge just stops authenticating.
+        assert!(adopt_login_session(session(&[("NID", "n")])).is_err());
+        assert!(adopt_login_session(HashMap::new()).is_err());
+        assert!(!has_owned_session());
+
+        // Adopting keeps only the Google session cookies; a login flow
+        // hands back consent/tracking cookies we have no business storing.
+        let mut noisy = a_valid_session();
+        noisy.insert("_ga".into(), "tracking".into());
+        noisy.insert("CONSENT".into(), "yes".into());
+        adopt_login_session(noisy).unwrap();
+        assert!(has_owned_session());
+
+        let jar = get_cached_firefox_cookies();
+        assert_eq!(jar.get("__Secure-1PSID").map(String::as_str), Some("psid-value"));
+        assert!(!jar.contains_key("_ga"), "tracking cookie was retained");
+        assert!(!jar.contains_key("CONSENT"), "consent cookie was retained");
+
+        // Google rotates the session for us in flight; the new value must
+        // win, and must not be undone by a subsequent read.
+        merge_into_cache(session(&[("__Secure-1PSIDTS", "rotated")]));
+        assert_eq!(
+            get_cached_firefox_cookies()
+                .get("__Secure-1PSIDTS")
+                .map(String::as_str),
+            Some("rotated"),
+        );
+
+        // Invalidation is what would otherwise send us back to the browser
+        // profile mid-session, so it has to be inert while we own the login.
+        invalidate_cookie_cache();
+        assert!(has_owned_session());
+        assert_eq!(
+            get_cached_firefox_cookies()
+                .get("__Secure-1PSID")
+                .map(String::as_str),
+            Some("psid-value"),
+        );
+
+        clear_owned_session();
+        assert!(!has_owned_session());
+    }
 
     /// Build a fixture cookies.sqlite with a few Google cookies and
     /// verify `read_firefox_google_cookies` extracts them.
