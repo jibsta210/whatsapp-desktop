@@ -367,6 +367,9 @@ pub enum WaCommand {
     LoadOlderMessages {
         chat_id: String,
         before_timestamp: i64,
+        /// Page size. The view raises this when the user is scrolling fast so a
+        /// fling has more runway before it can outrun the loader.
+        limit: usize,
     },
     SetTyping {
         chat_id: String,

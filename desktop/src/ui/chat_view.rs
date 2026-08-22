@@ -58,6 +58,18 @@ pub struct ChatViewPanel {
     inner: Rc<ChatViewInner>,
 }
 
+/// Scroll-back prefetch tuning: distance above the top at which a fetch starts,
+/// and how far ahead of that to look based on scroll velocity.
+const PREFETCH_BASE_PX: f64 = 900.0;
+const PREFETCH_LEAD_SECS: f64 = 0.75;
+const PREFETCH_MAX_PX: f64 = 8000.0;
+
+/// Live bubble ceiling. Scrolling back far enough would otherwise keep every
+/// widget alive for the session; past the ceiling the oldest are dropped back
+/// to the target and re-fetched if the user returns to them.
+const LIVE_BUBBLE_MAX: usize = 400;
+const LIVE_BUBBLE_TARGET: usize = 200;
+
 struct ChatViewInner {
     root: Box,
     /// Message viewport + typing indicator. The header and composer deliberately
@@ -116,6 +128,12 @@ struct ChatViewInner {
     loading_older: Rc<Cell<bool>>,
     /// False once the top of the chat is reached.
     has_more_history: Rc<Cell<bool>>,
+    /// Rendered messages in display order (id, timestamp). Backs bubble
+    /// eviction — the map alone has no order, so it cannot say what is oldest.
+    rendered: RefCell<std::collections::VecDeque<(String, i64)>>,
+    /// Set while a scroll-back page is being inserted, so registration records
+    /// those messages at the front instead of the back.
+    prepending: Cell<bool>,
     /// "Go to latest" floating button
     goto_latest_btn: Button,
     // msg_id → bubble (for receipt updates)
@@ -1020,6 +1038,8 @@ impl ChatViewPanel {
             oldest_ts: Rc::new(Cell::new(0)),
             loading_older: Rc::new(Cell::new(false)),
             has_more_history: Rc::new(Cell::new(false)),
+            rendered: RefCell::new(std::collections::VecDeque::new()),
+            prepending: Cell::new(false),
             goto_latest_btn: goto_latest_btn.clone(),
             bubbles: RefCell::new(HashMap::new()),
             pending_message_jump: RefCell::new(None),
@@ -1109,26 +1129,39 @@ impl ChatViewPanel {
             inner.scroll.add_controller(sc);
         }
 
-        // Scroll-back paging: near the top, pull the next older page.
+        // Scroll-back paging. A fixed trigger distance is only ever right for
+        // one scroll speed, so the threshold tracks how fast the user is moving
+        // upward: the faster they go, the earlier the fetch starts and the
+        // bigger the page, so a fling has runway before it can outrun loading.
         {
             let inner_c = inner.clone();
+            let last_val = Cell::new(f64::NAN);
+            let last_t = Cell::new(std::time::Instant::now());
             inner.scroll.vadjustment().connect_value_changed(move |adj| {
-                if adj.value() > 400.0
-                    || !inner_c.has_more_history.get()
-                    || inner_c.loading_older.get()
-                {
+                let value = adj.value();
+                let now = std::time::Instant::now();
+                let prev = last_val.replace(value);
+                let dt = now.duration_since(last_t.replace(now)).as_secs_f64();
+                // Ignore the first sample and any gap long enough that the delta
+                // reflects a layout jump rather than a scroll gesture.
+                let up_speed = if prev.is_nan() || dt <= 0.0 || dt > 0.5 {
+                    0.0
+                } else {
+                    ((prev - value) / dt).max(0.0)
+                };
+
+                // Heading down and away from the top — safe to reclaim.
+                if up_speed == 0.0 && !prev.is_nan() && value > prev {
+                    Self::evict_offscreen_older(&inner_c);
+                }
+
+                if !inner_c.has_more_history.get() || inner_c.loading_older.get() {
                     return;
                 }
-                let Some(chat_id) = inner_c.current_chat_id.borrow().clone() else {
+                if value > PREFETCH_BASE_PX + (up_speed * PREFETCH_LEAD_SECS).min(PREFETCH_MAX_PX) {
                     return;
-                };
-                inner_c.loading_older.set(true);
-                inner_c
-                    .bridge
-                    .send_command(WaCommand::LoadOlderMessages {
-                        chat_id,
-                        before_timestamp: inner_c.oldest_ts.get(),
-                    });
+                }
+                Self::request_older(&inner_c, up_speed);
             });
         }
 
@@ -3504,6 +3537,7 @@ impl ChatViewPanel {
         // Clear message area and search/media state
         remove_all_children(&self.inner.messages_box);
         self.inner.bubbles.borrow_mut().clear();
+        self.inner.rendered.borrow_mut().clear();
         self.inner.search_texts.borrow_mut().clear();
         self.inner.id_remap.borrow_mut().clear();
         self.inner.media_items.borrow_mut().clear();
@@ -3613,6 +3647,98 @@ impl ChatViewPanel {
 
     /// Replace the loading placeholder with history messages (or a "no history" notice).
     /// Only applies if `chat_id` still matches the currently open chat.
+    /// Drop the oldest rendered bubbles once the ceiling is exceeded. Only
+    /// runs while the user is heading down and away from them; evicting above
+    /// the viewport while they scroll up would fight the loader.
+    fn evict_offscreen_older(inner: &Rc<ChatViewInner>) {
+        let total = inner.rendered.borrow().len();
+        if total <= LIVE_BUBBLE_MAX {
+            return;
+        }
+        let drop_count = total - LIVE_BUBBLE_TARGET;
+
+        let doomed: Vec<(String, i64)> = {
+            let rendered = inner.rendered.borrow();
+            rendered.iter().take(drop_count).cloned().collect()
+        };
+        let doomed_ids: std::collections::HashSet<&str> =
+            doomed.iter().map(|(id, _)| id.as_str()).collect();
+
+        // Address-keyed, because the widget tree is the only thing that knows
+        // where a bubble sits and it cannot be searched by message id.
+        let addr_to_id: HashMap<usize, String> = {
+            let bubbles = inner.bubbles.borrow();
+            bubbles
+                .iter()
+                .filter(|(id, _)| doomed_ids.contains(id.as_str()))
+                .map(|(id, b)| (b.widget().as_ptr() as usize, id.clone()))
+                .collect()
+        };
+
+        let adj = inner.scroll.vadjustment();
+        let before_upper = adj.upper();
+        let before_value = adj.value();
+
+        // Walk from the top, removing until every doomed bubble is gone. Date
+        // separators sit between bubbles and are not in the map; they belong to
+        // the removed span, so they go with it.
+        let mut remaining = doomed.len();
+        let mut child = inner.messages_box.first_child();
+        while let Some(widget) = child {
+            if remaining == 0 {
+                break;
+            }
+            child = widget.next_sibling();
+            if let Some(id) = addr_to_id.get(&(widget.as_ptr() as usize)) {
+                inner.bubbles.borrow_mut().remove(id);
+                inner.search_texts.borrow_mut().remove(id);
+                remaining -= 1;
+            }
+            inner.messages_box.remove(&widget);
+        }
+
+        {
+            let mut rendered = inner.rendered.borrow_mut();
+            for _ in 0..doomed.len() {
+                rendered.pop_front();
+            }
+        }
+
+        // Evicted messages are still on disk, so the top is no longer the top.
+        inner.has_more_history.set(true);
+        if let Some((_, ts)) = inner.rendered.borrow().front() {
+            inner.oldest_ts.set(*ts);
+        }
+
+        // Removing content above the viewport shrinks the scrollable area;
+        // without compensation the view jumps.
+        let shrank = before_upper - adj.upper();
+        if shrank > 0.0 {
+            adj.set_value((before_value - shrank).max(0.0));
+        }
+        log::debug!("evicted {} offscreen bubbles ({total} live)", doomed.len());
+    }
+
+    /// Ask for the next older page, sizing it to how fast the user is moving.
+    fn request_older(inner: &Rc<ChatViewInner>, up_speed: f64) {
+        let Some(chat_id) = inner.current_chat_id.borrow().clone() else {
+            return;
+        };
+        let limit = if up_speed > 4000.0 {
+            400
+        } else if up_speed > 1500.0 {
+            150
+        } else {
+            50
+        };
+        inner.loading_older.set(true);
+        inner.bridge.send_command(WaCommand::LoadOlderMessages {
+            chat_id,
+            before_timestamp: inner.oldest_ts.get(),
+            limit,
+        });
+    }
+
     /// Render a scroll-back page above the current content, holding the user's
     /// reading position steady.
     pub fn prepend_older(&self, chat_id: &str, messages: Vec<IncomingMessage>, has_more: bool) {
@@ -3644,9 +3770,11 @@ impl ChatViewPanel {
 
         // Reverse order: each insert goes to the top, so walking newest-first
         // leaves the page in chronological order above the existing content.
+        self.inner.prepending.set(true);
         for msg in messages.into_iter().rev() {
             Self::prepend_history_bubble_to_inner(&self.inner, msg);
         }
+        self.inner.prepending.set(false);
 
         // GTK4's GL renderer does not reliably paint widgets inserted at the
         // top — they stay invisible until something else damages the surface.
@@ -3664,6 +3792,12 @@ impl ChatViewPanel {
                 adj.set_value(before_value + grew);
             }
             inner_c.loading_older.set(false);
+            // A page can be shorter than the trigger distance (short messages,
+            // or a big fling). Keep filling until there is real runway above,
+            // otherwise the next scroll event stalls at the same wall.
+            if inner_c.has_more_history.get() && adj.value() <= PREFETCH_BASE_PX {
+                Self::request_older(&inner_c, 0.0);
+            }
         });
     }
 
@@ -4178,6 +4312,7 @@ impl ChatViewPanel {
                     inner_c.messages_box.remove(&child);
                 }
                 inner_c.bubbles.borrow_mut().clear();
+                inner_c.rendered.borrow_mut().clear();
                 inner_c.search_texts.borrow_mut().clear();
                 inner_c.id_remap.borrow_mut().clear();
                 inner_c.media_items.borrow_mut().clear();
@@ -4313,6 +4448,17 @@ impl ChatViewPanel {
         }
 
         inner.messages_box.append(bubble.widget());
+        if inner.prepending.get() {
+            inner
+                .rendered
+                .borrow_mut()
+                .push_front((msg.id.clone(), msg.timestamp));
+        } else {
+            inner
+                .rendered
+                .borrow_mut()
+                .push_back((msg.id.clone(), msg.timestamp));
+        }
         inner.bubbles.borrow_mut().insert(msg.id.clone(), bubble);
         inner
             .search_texts
@@ -4389,6 +4535,7 @@ impl ChatViewPanel {
         }
         remove_all_children(&self.inner.messages_box);
         self.inner.bubbles.borrow_mut().clear();
+        self.inner.rendered.borrow_mut().clear();
         let label = gtk4::Label::new(Some(
             "No message history yet — new messages will appear here.",
         ));
@@ -5714,6 +5861,7 @@ fn show_message_menu(
                 inner_c.header_subtitle.set_visible(false);
                 remove_all_children(&inner_c.messages_box);
                 inner_c.bubbles.borrow_mut().clear();
+                inner_c.rendered.borrow_mut().clear();
                 inner_c.search_texts.borrow_mut().clear();
                 inner_c.media_items.borrow_mut().clear();
                 *inner_c.last_msg_date.borrow_mut() = None;
@@ -5777,6 +5925,7 @@ fn show_message_menu(
                 inner_c.header_subtitle.set_visible(false);
                 remove_all_children(&inner_c.messages_box);
                 inner_c.bubbles.borrow_mut().clear();
+                inner_c.rendered.borrow_mut().clear();
                 inner_c
                     .bridge
                     .send_command(WaCommand::StartNewChat { jid: sid.clone() });

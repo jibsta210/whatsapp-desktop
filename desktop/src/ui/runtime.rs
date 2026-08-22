@@ -30,8 +30,10 @@ use crate::bridge::{ChatSummary, IncomingMessage, ReceiptStatus, WaCommand, WaEv
 /// Older messages arrive in pages via [`WaCommand::LoadOlderMessages`].
 const CHAT_HISTORY_RENDER_LIMIT: usize = 50;
 
-/// Batch size for scroll-back paging.
+/// Batch size for scroll-back paging, and the ceiling the view may request
+/// when the user is scrolling fast enough to outrun a 50-message page.
 const CHAT_HISTORY_PAGE: usize = 50;
+const CHAT_HISTORY_PAGE_MAX: usize = 400;
 
 /// Display-only name resolution, shared by the initial load and scroll-back
 /// paging so a message looks identical whichever path rendered it.
@@ -5684,7 +5686,9 @@ async fn handle_command(
         WaCommand::LoadOlderMessages {
             chat_id,
             before_timestamp,
+            limit,
         } => {
+            let page = limit.clamp(CHAT_HISTORY_PAGE, CHAT_HISTORY_PAGE_MAX);
             // Walk backwards from the cursor and clone only the page. Cloning
             // the whole history per page made deep scroll-back cost grow with
             // chat size, in both time and peak memory.
@@ -5692,7 +5696,7 @@ async fn handle_command(
                 m.text.is_some() || m.media_type.is_some() || m.media_caption.is_some()
             };
             // One extra tells us whether anything remains above this page.
-            let want = CHAT_HISTORY_PAGE + 1;
+            let want = page + 1;
 
             let mut older: Vec<IncomingMessage> = {
                 let s = state.lock().unwrap();
@@ -5743,9 +5747,9 @@ async fn handle_command(
             }
 
             older.sort_by_key(|m| m.timestamp);
-            let has_more = older.len() > CHAT_HISTORY_PAGE;
+            let has_more = older.len() > page;
             if has_more {
-                older = older.split_off(older.len() - CHAT_HISTORY_PAGE);
+                older = older.split_off(older.len() - page);
             }
             resolve_display_names(&mut older, &chat_id, &state);
             log::info!(
