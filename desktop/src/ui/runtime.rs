@@ -28,10 +28,10 @@ use crate::bridge::{ChatSummary, IncomingMessage, ReceiptStatus, WaCommand, WaEv
 /// Messages rendered when opening a chat. Every message is a real widget in a
 /// plain Box — there is no virtualization — so this bounds chat-switch cost.
 /// Older messages arrive in pages via [`WaCommand::LoadOlderMessages`].
-const CHAT_HISTORY_RENDER_LIMIT: usize = 300;
+const CHAT_HISTORY_RENDER_LIMIT: usize = 50;
 
 /// Batch size for scroll-back paging.
-const CHAT_HISTORY_PAGE: usize = 200;
+const CHAT_HISTORY_PAGE: usize = 50;
 
 /// Display-only name resolution, shared by the initial load and scroll-back
 /// paging so a message looks identical whichever path rendered it.
@@ -5685,44 +5685,63 @@ async fn handle_command(
             chat_id,
             before_timestamp,
         } => {
-            // Deliberately re-reads the whole history per page. Paging is a
-            // user-initiated scroll, not a hot path, and correctness beats
-            // maintaining a parallel cursor cache.
-            let cached = {
-                let s = state.lock().unwrap();
-                s.history.get(&chat_id).cloned()
+            // Walk backwards from the cursor and clone only the page. Cloning
+            // the whole history per page made deep scroll-back cost grow with
+            // chat size, in both time and peak memory.
+            let displayable = |m: &IncomingMessage| {
+                m.text.is_some() || m.media_type.is_some() || m.media_caption.is_some()
             };
-            let mut full = match cached {
-                Some(h) => h,
-                None => {
-                    let cid = chat_id.clone();
-                    tokio::task::spawn_blocking(move || load_messages(&cid))
-                        .await
-                        .unwrap_or_default()
+            // One extra tells us whether anything remains above this page.
+            let want = CHAT_HISTORY_PAGE + 1;
+
+            let mut older: Vec<IncomingMessage> = {
+                let s = state.lock().unwrap();
+                match s.history.get(&chat_id) {
+                    Some(h) => h
+                        .iter()
+                        .rev()
+                        .filter(|m| m.timestamp < before_timestamp && displayable(m))
+                        .take(want)
+                        .cloned()
+                        .collect(),
+                    None => Vec::new(),
                 }
             };
+            // Cache miss — the file is the only source.
+            if older.is_empty() && !state.lock().unwrap().history.contains_key(&chat_id) {
+                let cid = chat_id.clone();
+                let disk = tokio::task::spawn_blocking(move || load_messages(&cid))
+                    .await
+                    .unwrap_or_default();
+                older = disk
+                    .into_iter()
+                    .rev()
+                    .filter(|m| m.timestamp < before_timestamp && displayable(m))
+                    .take(want)
+                    .collect();
+            }
             // Merged SMS lives in its own file; without this, scrolling back in
             // a merged chat would silently drop the SMS half.
             if let Some(gm_chat_id) = crate::contacts::global().other_chat_id(&chat_id, "gmessages")
             {
-                let gm_msgs = {
-                    let cid = gm_chat_id.clone();
-                    tokio::task::spawn_blocking(move || load_messages(&cid))
-                        .await
-                        .unwrap_or_default()
-                };
+                let cid = gm_chat_id.clone();
+                let gm = tokio::task::spawn_blocking(move || load_messages(&cid))
+                    .await
+                    .unwrap_or_default();
                 let have: std::collections::HashSet<String> =
-                    full.iter().map(|m| m.id.clone()).collect();
-                full.extend(gm_msgs.into_iter().filter(|m| !have.contains(&m.id)));
+                    older.iter().map(|m| m.id.clone()).collect();
+                older.extend(
+                    gm.into_iter()
+                        .rev()
+                        .filter(|m| {
+                            m.timestamp < before_timestamp
+                                && displayable(m)
+                                && !have.contains(&m.id)
+                        })
+                        .take(want),
+                );
             }
 
-            let mut older: Vec<IncomingMessage> = full
-                .into_iter()
-                .filter(|m| m.timestamp < before_timestamp)
-                .filter(|m| {
-                    m.text.is_some() || m.media_type.is_some() || m.media_caption.is_some()
-                })
-                .collect();
             older.sort_by_key(|m| m.timestamp);
             let has_more = older.len() > CHAT_HISTORY_PAGE;
             if has_more {
