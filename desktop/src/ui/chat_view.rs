@@ -70,6 +70,10 @@ const PREFETCH_MAX_PX: f64 = 8000.0;
 const LIVE_BUBBLE_MAX: usize = 400;
 const LIVE_BUBBLE_TARGET: usize = 200;
 
+/// Bubbles built per idle turn while a scroll-back page is inserted. Small
+/// enough that a turn fits in a frame; the page just takes a few frames.
+const PREPEND_CHUNK: usize = 8;
+
 struct ChatViewInner {
     root: Box,
     /// Message viewport + typing indicator. The header and composer deliberately
@@ -3764,40 +3768,57 @@ impl ChatViewPanel {
             .oldest_ts
             .set(messages.first().map(|m| m.timestamp).unwrap_or(0));
 
-        let adj = self.inner.scroll.vadjustment();
-        let before_upper = adj.upper();
-        let before_value = adj.value();
-
-        // Reverse order: each insert goes to the top, so walking newest-first
+        // Widgets can only be built on the main thread, so a page of 400 built
+        // in one pass is a visible stall no matter where the data came from.
+        // Insert in small chunks and yield between them: each turn stays inside
+        // a frame, so scrolling keeps running while the page fills in.
+        //
+        // Reverse order: each insert goes to the top, so popping newest-first
         // leaves the page in chronological order above the existing content.
-        self.inner.prepending.set(true);
-        for msg in messages.into_iter().rev() {
-            Self::prepend_history_bubble_to_inner(&self.inner, msg);
-        }
-        self.inner.prepending.set(false);
-
-        // GTK4's GL renderer does not reliably paint widgets inserted at the
-        // top — they stay invisible until something else damages the surface.
-        // The hide/show cycle forces a full re-render; this is the same
-        // workaround the rest of the view uses.
-        self.inner.messages_box.set_visible(false);
-        self.inner.messages_box.set_visible(true);
-
-        // Restore the reading position once the new rows have been measured.
+        let queue: Rc<RefCell<Vec<IncomingMessage>>> =
+            Rc::new(RefCell::new(messages.into_iter().rev().collect()));
         let inner_c = self.inner.clone();
-        glib::idle_add_local_once(move || {
+        // Carries the pre-insert extent across ticks. Layout runs at a higher
+        // priority than default idle, so `upper` only reflects the previous
+        // chunk by the time the next tick starts — compensating there is what
+        // keeps the reading position still while content grows above it.
+        let anchor: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+
+        glib::idle_add_local(move || {
             let adj = inner_c.scroll.vadjustment();
-            let grew = adj.upper() - before_upper;
-            if grew > 0.0 {
-                adj.set_value(before_value + grew);
+
+            if let Some((prev_upper, prev_value)) = anchor.take() {
+                let grew = adj.upper() - prev_upper;
+                if grew > 0.0 {
+                    adj.set_value(prev_value + grew);
+                }
             }
-            inner_c.loading_older.set(false);
-            // A page can be shorter than the trigger distance (short messages,
-            // or a big fling). Keep filling until there is real runway above,
-            // otherwise the next scroll event stalls at the same wall.
-            if inner_c.has_more_history.get() && adj.value() <= PREFETCH_BASE_PX {
-                Self::request_older(&inner_c, 0.0);
+
+            if queue.borrow().is_empty() {
+                // GTK4's GL renderer does not reliably paint widgets inserted
+                // at the top — they stay invisible until something else damages
+                // the surface. The hide/show cycle forces a full re-render.
+                inner_c.messages_box.set_visible(false);
+                inner_c.messages_box.set_visible(true);
+                inner_c.loading_older.set(false);
+                // A page can be shorter than the trigger distance (short
+                // messages, or a big fling). Keep filling until there is real
+                // runway above, otherwise the next scroll stalls at the wall.
+                if inner_c.has_more_history.get() && adj.value() <= PREFETCH_BASE_PX {
+                    Self::request_older(&inner_c, 0.0);
+                }
+                return glib::ControlFlow::Break;
             }
+
+            anchor.set(Some((adj.upper(), adj.value())));
+            inner_c.prepending.set(true);
+            for _ in 0..PREPEND_CHUNK {
+                let next = queue.borrow_mut().pop();
+                let Some(msg) = next else { break };
+                Self::prepend_history_bubble_to_inner(&inner_c, msg);
+            }
+            inner_c.prepending.set(false);
+            glib::ControlFlow::Continue
         });
     }
 
