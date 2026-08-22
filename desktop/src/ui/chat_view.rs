@@ -110,6 +110,12 @@ struct ChatViewInner {
     scroll_pending: Rc<Cell<u32>>,
     /// True when user is at or near the bottom of the scroll
     at_bottom: Rc<Cell<bool>>,
+    /// Oldest rendered message timestamp — the cursor for scroll-back paging.
+    oldest_ts: Rc<Cell<i64>>,
+    /// A page request is in flight; suppresses duplicate requests per scroll.
+    loading_older: Rc<Cell<bool>>,
+    /// False once the top of the chat is reached.
+    has_more_history: Rc<Cell<bool>>,
     /// "Go to latest" floating button
     goto_latest_btn: Button,
     // msg_id → bubble (for receipt updates)
@@ -1011,6 +1017,9 @@ impl ChatViewPanel {
             all_typers: RefCell::new(HashMap::new()),
             scroll_pending: Rc::new(Cell::new(0)),
             at_bottom: Rc::new(Cell::new(true)),
+            oldest_ts: Rc::new(Cell::new(0)),
+            loading_older: Rc::new(Cell::new(false)),
+            has_more_history: Rc::new(Cell::new(false)),
             goto_latest_btn: goto_latest_btn.clone(),
             bubbles: RefCell::new(HashMap::new()),
             pending_message_jump: RefCell::new(None),
@@ -1098,6 +1107,29 @@ impl ChatViewPanel {
                 glib::Propagation::Proceed
             });
             inner.scroll.add_controller(sc);
+        }
+
+        // Scroll-back paging: near the top, pull the next older page.
+        {
+            let inner_c = inner.clone();
+            inner.scroll.vadjustment().connect_value_changed(move |adj| {
+                if adj.value() > 400.0
+                    || !inner_c.has_more_history.get()
+                    || inner_c.loading_older.get()
+                {
+                    return;
+                }
+                let Some(chat_id) = inner_c.current_chat_id.borrow().clone() else {
+                    return;
+                };
+                inner_c.loading_older.set(true);
+                inner_c
+                    .bridge
+                    .send_command(WaCommand::LoadOlderMessages {
+                        chat_id,
+                        before_timestamp: inner_c.oldest_ts.get(),
+                    });
+            });
         }
 
         // When content height changes (layout/image load/prepend), re-anchor
@@ -3581,6 +3613,60 @@ impl ChatViewPanel {
 
     /// Replace the loading placeholder with history messages (or a "no history" notice).
     /// Only applies if `chat_id` still matches the currently open chat.
+    /// Render a scroll-back page above the current content, holding the user's
+    /// reading position steady.
+    pub fn prepend_older(&self, chat_id: &str, messages: Vec<IncomingMessage>, has_more: bool) {
+        let is_current = self
+            .inner
+            .current_chat_id
+            .borrow()
+            .as_deref()
+            .map(|id| id == chat_id)
+            .unwrap_or(false);
+        if !is_current {
+            self.inner.loading_older.set(false);
+            return;
+        }
+
+        self.inner.has_more_history.set(has_more);
+        if messages.is_empty() {
+            self.inner.loading_older.set(false);
+            return;
+        }
+
+        self.inner
+            .oldest_ts
+            .set(messages.first().map(|m| m.timestamp).unwrap_or(0));
+
+        let adj = self.inner.scroll.vadjustment();
+        let before_upper = adj.upper();
+        let before_value = adj.value();
+
+        // Reverse order: each insert goes to the top, so walking newest-first
+        // leaves the page in chronological order above the existing content.
+        for msg in messages.into_iter().rev() {
+            Self::prepend_history_bubble_to_inner(&self.inner, msg);
+        }
+
+        // GTK4's GL renderer does not reliably paint widgets inserted at the
+        // top — they stay invisible until something else damages the surface.
+        // The hide/show cycle forces a full re-render; this is the same
+        // workaround the rest of the view uses.
+        self.inner.messages_box.set_visible(false);
+        self.inner.messages_box.set_visible(true);
+
+        // Restore the reading position once the new rows have been measured.
+        let inner_c = self.inner.clone();
+        glib::idle_add_local_once(move || {
+            let adj = inner_c.scroll.vadjustment();
+            let grew = adj.upper() - before_upper;
+            if grew > 0.0 {
+                adj.set_value(before_value + grew);
+            }
+            inner_c.loading_older.set(false);
+        });
+    }
+
     pub fn load_history(&self, chat_id: &str, messages: Vec<IncomingMessage>) {
         let is_current = self
             .inner
@@ -3620,6 +3706,13 @@ impl ChatViewPanel {
         //
         // Cost: ~100-300ms hitch on chat switch for 50 messages. Acceptable
         // tradeoff vs. the "messages don't paint until hover" bug.
+        // Seed the scroll-back cursor before the Vec is consumed.
+        self.inner
+            .oldest_ts
+            .set(messages.first().map(|m| m.timestamp).unwrap_or(0));
+        self.inner.has_more_history.set(true);
+        self.inner.loading_older.set(false);
+
         for msg in messages {
             Self::append_history_bubble_to_inner(&self.inner, msg);
         }
@@ -3810,6 +3903,33 @@ impl ChatViewPanel {
 
     fn append_history_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
         Self::append_bubble_to_inner_at(inner, msg, false);
+    }
+
+    /// Build via the normal append path, then move what it produced to the top.
+    /// Reusing the append path keeps bubble construction, dedup and grouping in
+    /// one place; one message can yield several widgets (date separator, bubble),
+    /// so everything added past the previous tail moves as a unit.
+    fn prepend_history_bubble_to_inner(inner: &Rc<ChatViewInner>, msg: IncomingMessage) {
+        let tail_before = inner.messages_box.last_child();
+        Self::append_bubble_to_inner_at(inner, msg, false);
+
+        let mut added = Vec::new();
+        let mut next = match &tail_before {
+            Some(t) => t.next_sibling(),
+            None => inner.messages_box.first_child(),
+        };
+        while let Some(widget) = next {
+            next = widget.next_sibling();
+            added.push(widget);
+        }
+
+        let mut prev: Option<gtk4::Widget> = None;
+        for widget in added {
+            inner
+                .messages_box
+                .reorder_child_after(&widget, prev.as_ref());
+            prev = Some(widget);
+        }
     }
 
     fn append_bubble_to_inner_at(inner: &Rc<ChatViewInner>, msg: IncomingMessage, animate: bool) {

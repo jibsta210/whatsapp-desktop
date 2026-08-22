@@ -1329,6 +1329,13 @@ impl MainWindow {
             } => {
                 inner.chat_view.load_history(&chat_id, messages);
             }
+            WaEvent::OlderMessages {
+                chat_id,
+                messages,
+                has_more,
+            } => {
+                inner.chat_view.prepend_older(&chat_id, messages, has_more);
+            }
             WaEvent::TypingIndicator {
                 chat_id,
                 sender_name,

@@ -50,6 +50,13 @@ pub enum WaEvent {
         chat_name: String,
         messages: Vec<IncomingMessage>,
     },
+    /// A scroll-back page, oldest-first. `has_more` is false once the top of
+    /// the chat is reached so the view stops asking.
+    OlderMessages {
+        chat_id: String,
+        messages: Vec<IncomingMessage>,
+        has_more: bool,
+    },
     /// Typing indicator for a chat
     TypingIndicator {
         chat_id: String,
@@ -354,6 +361,12 @@ pub enum WaCommand {
     LoadChat {
         chat_id: String,
         chat_name: String,
+    },
+    /// Scroll-back paging: fetch the batch immediately older than
+    /// `before_timestamp` for `chat_id`.
+    LoadOlderMessages {
+        chat_id: String,
+        before_timestamp: i64,
     },
     SetTyping {
         chat_id: String,

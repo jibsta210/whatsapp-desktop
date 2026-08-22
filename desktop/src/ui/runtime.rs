@@ -27,8 +27,58 @@ use crate::bridge::{ChatSummary, IncomingMessage, ReceiptStatus, WaCommand, WaEv
 
 /// Messages rendered when opening a chat. Every message is a real widget in a
 /// plain Box — there is no virtualization — so this bounds chat-switch cost.
-/// Full history stays on disk; this only limits what is drawn.
+/// Older messages arrive in pages via [`WaCommand::LoadOlderMessages`].
 const CHAT_HISTORY_RENDER_LIMIT: usize = 300;
+
+/// Batch size for scroll-back paging.
+const CHAT_HISTORY_PAGE: usize = 200;
+
+/// Display-only name resolution, shared by the initial load and scroll-back
+/// paging so a message looks identical whichever path rendered it.
+fn resolve_display_names(
+    msgs: &mut [IncomingMessage],
+    chat_id: &str,
+    state: &Arc<Mutex<RuntimeState>>,
+) {
+    let s = state.lock().unwrap();
+    let mut name_cache: HashMap<String, String> = HashMap::new();
+    let resolve_cached =
+        |jid: &str, cache: &mut HashMap<String, String>, s: &RuntimeState| -> String {
+            if let Some(cached) = cache.get(jid) {
+                return cached.clone();
+            }
+            let name = resolve_sender_name(s, jid);
+            cache.insert(jid.to_string(), name.clone());
+            name
+        };
+    for m in msgs.iter_mut() {
+        // Fix sender_id = group JID (old sync bug)
+        if m.sender_id == chat_id && chat_id.ends_with("@g.us") {
+            m.sender_id = String::new();
+        }
+        if m.sender_name.is_empty() && !m.sender_id.is_empty() && !m.is_from_me {
+            m.sender_name = resolve_cached(&m.sender_id, &mut name_cache, &s);
+        }
+        if let Some(qs) = &m.quoted_sender {
+            if qs.contains('@') {
+                m.quoted_sender = Some(resolve_cached(qs, &mut name_cache, &s));
+            } else if qs.starts_with('+') || qs.chars().all(|c| c.is_ascii_digit()) {
+                let num = qs.trim_start_matches('+');
+                let phone_jid = format!("{num}@s.whatsapp.net");
+                let resolved = resolve_cached(&phone_jid, &mut name_cache, &s);
+                if resolved != phone_jid {
+                    m.quoted_sender = Some(resolved);
+                }
+            }
+        }
+        for (sender, _) in &mut m.reactions {
+            if sender.contains('@') {
+                *sender = resolve_cached(sender, &mut name_cache, &s);
+            }
+        }
+        resolve_message_mentions(m, &s);
+    }
+}
 
 const CHATS_FILE: &str = "wa_chats.bin";
 const CONTACTS_FILE: &str = "wa_contacts.bin";
@@ -5631,6 +5681,66 @@ async fn handle_command(
             }
         }
 
+        WaCommand::LoadOlderMessages {
+            chat_id,
+            before_timestamp,
+        } => {
+            // Deliberately re-reads the whole history per page. Paging is a
+            // user-initiated scroll, not a hot path, and correctness beats
+            // maintaining a parallel cursor cache.
+            let cached = {
+                let s = state.lock().unwrap();
+                s.history.get(&chat_id).cloned()
+            };
+            let mut full = match cached {
+                Some(h) => h,
+                None => {
+                    let cid = chat_id.clone();
+                    tokio::task::spawn_blocking(move || load_messages(&cid))
+                        .await
+                        .unwrap_or_default()
+                }
+            };
+            // Merged SMS lives in its own file; without this, scrolling back in
+            // a merged chat would silently drop the SMS half.
+            if let Some(gm_chat_id) = crate::contacts::global().other_chat_id(&chat_id, "gmessages")
+            {
+                let gm_msgs = {
+                    let cid = gm_chat_id.clone();
+                    tokio::task::spawn_blocking(move || load_messages(&cid))
+                        .await
+                        .unwrap_or_default()
+                };
+                let have: std::collections::HashSet<String> =
+                    full.iter().map(|m| m.id.clone()).collect();
+                full.extend(gm_msgs.into_iter().filter(|m| !have.contains(&m.id)));
+            }
+
+            let mut older: Vec<IncomingMessage> = full
+                .into_iter()
+                .filter(|m| m.timestamp < before_timestamp)
+                .filter(|m| {
+                    m.text.is_some() || m.media_type.is_some() || m.media_caption.is_some()
+                })
+                .collect();
+            older.sort_by_key(|m| m.timestamp);
+            let has_more = older.len() > CHAT_HISTORY_PAGE;
+            if has_more {
+                older = older.split_off(older.len() - CHAT_HISTORY_PAGE);
+            }
+            resolve_display_names(&mut older, &chat_id, &state);
+            log::info!(
+                "LoadOlderMessages {chat_id}: {} older, has_more={has_more}",
+                older.len()
+            );
+            let _ = tx
+                .send(WaEvent::OlderMessages {
+                    chat_id,
+                    messages: older,
+                    has_more,
+                })
+                .await;
+        }
         WaCommand::LoadChat { chat_id, chat_name } => {
             // Fire presence subscribe in the background — chat switch must NOT
             // wait for a network round-trip. Typing notifications start working
@@ -5685,15 +5795,15 @@ async fn handle_command(
             // FAST PATH: only clone the last 50 messages from cache, not the
             // entire history. For a 5000-msg chat the previous code allocated
             // and copied a 5MB Vec on every chat switch.
-            let cached_last_50 = {
+            let cached_last_page = {
                 let s = state.lock().unwrap();
                 s.history.get(&chat_id).map(|h| {
-                    let start = h.len().saturating_sub(50);
+                    let start = h.len().saturating_sub(CHAT_HISTORY_RENDER_LIMIT);
                     h[start..].to_vec()
                 })
             };
 
-            let mut all_messages = if let Some(msgs) = cached_last_50 {
+            let mut all_messages = if let Some(msgs) = cached_last_page {
                 state.lock().unwrap().touch_history(&chat_id);
                 msgs
             } else {
@@ -5703,16 +5813,16 @@ async fn handle_command(
                     .await
                     .unwrap_or_default();
                 // Populate cache (full history kept) + take last 50 for display
-                let last_50 = {
+                let last_page = {
                     let mut s = state.lock().unwrap();
-                    let start = disk_msgs.len().saturating_sub(50);
-                    let last_50 = disk_msgs[start..].to_vec();
+                    let start = disk_msgs.len().saturating_sub(CHAT_HISTORY_RENDER_LIMIT);
+                    let last_page = disk_msgs[start..].to_vec();
                     s.history.insert(chat_id.clone(), disk_msgs);
                     s.touch_history(&chat_id);
                     s.evict_old_histories();
-                    last_50
+                    last_page
                 };
-                last_50
+                last_page
             };
 
             // Push_name learning — REMOVED from hot path. The startup scan in
@@ -5756,53 +5866,7 @@ async fn handle_command(
                     all_messages.split_off(all_messages.len() - CHAT_HISTORY_RENDER_LIMIT);
             }
 
-            // Fix group sender_ids and resolve names (display only)
-            // Use a local cache to avoid repeated lookups for the same JID.
-            // First, learn push_names from the messages themselves — if sender A
-            // has a name in message #5, use it for message #1 where it's missing.
-            {
-                let s = state.lock().unwrap();
-                let mut name_cache: HashMap<String, String> = HashMap::new();
-                let resolve_cached =
-                    |jid: &str, cache: &mut HashMap<String, String>, s: &RuntimeState| -> String {
-                        if let Some(cached) = cache.get(jid) {
-                            return cached.clone();
-                        }
-                        let name = resolve_sender_name(s, jid);
-                        cache.insert(jid.to_string(), name.clone());
-                        name
-                    };
-                for m in &mut all_messages {
-                    // Fix sender_id = group JID (old sync bug)
-                    if m.sender_id == chat_id && chat_id.ends_with("@g.us") {
-                        m.sender_id = String::new();
-                    }
-                    if m.sender_name.is_empty() && !m.sender_id.is_empty() && !m.is_from_me {
-                        m.sender_name = resolve_cached(&m.sender_id, &mut name_cache, &s);
-                    }
-                    // Also resolve quoted sender JID to name
-                    if let Some(qs) = &m.quoted_sender {
-                        if qs.contains('@') {
-                            m.quoted_sender = Some(resolve_cached(qs, &mut name_cache, &s));
-                        } else if qs.starts_with('+') || qs.chars().all(|c| c.is_ascii_digit()) {
-                            // Raw phone number — try constructing JID variants
-                            let num = qs.trim_start_matches('+');
-                            let phone_jid = format!("{num}@s.whatsapp.net");
-                            let resolved = resolve_cached(&phone_jid, &mut name_cache, &s);
-                            if resolved != phone_jid {
-                                m.quoted_sender = Some(resolved);
-                            }
-                        }
-                    }
-                    // Resolve reaction sender JIDs to display names
-                    for (sender, _) in &mut m.reactions {
-                        if sender.contains('@') {
-                            *sender = resolve_cached(sender, &mut name_cache, &s);
-                        }
-                    }
-                    resolve_message_mentions(m, &s);
-                }
-            }
+            resolve_display_names(&mut all_messages, &chat_id, &state);
 
             let messages = all_messages;
 
