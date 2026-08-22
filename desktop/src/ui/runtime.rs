@@ -25,6 +25,11 @@ use crate::bridge::{ChatSummary, IncomingMessage, ReceiptStatus, WaCommand, WaEv
 
 // ── Persistence (bincode binary format) ──────────────────────────────────────
 
+/// Messages rendered when opening a chat. Every message is a real widget in a
+/// plain Box — there is no virtualization — so this bounds chat-switch cost.
+/// Full history stays on disk; this only limits what is drawn.
+const CHAT_HISTORY_RENDER_LIMIT: usize = 300;
+
 const CHATS_FILE: &str = "wa_chats.bin";
 const CONTACTS_FILE: &str = "wa_contacts.bin";
 const LID_PHONE_FILE: &str = "wa_lid_phone.bin";
@@ -5746,8 +5751,9 @@ async fn handle_command(
                 m.text.is_some() || m.media_type.is_some() || m.media_caption.is_some()
             });
             all_messages.sort_by_key(|m| m.timestamp);
-            if all_messages.len() > 50 {
-                all_messages = all_messages.split_off(all_messages.len() - 50);
+            if all_messages.len() > CHAT_HISTORY_RENDER_LIMIT {
+                all_messages =
+                    all_messages.split_off(all_messages.len() - CHAT_HISTORY_RENDER_LIMIT);
             }
 
             // Fix group sender_ids and resolve names (display only)
