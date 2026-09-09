@@ -138,6 +138,13 @@ struct ChatViewInner {
     /// Set while a scroll-back page is being inserted, so registration records
     /// those messages at the front instead of the back.
     prepending: Cell<bool>,
+    /// True from the first chunk of a page to the last. While set, growth in
+    /// the scrollable extent is assumed to be above the viewport and the
+    /// value is shifted to match, and scroll events are not interpreted as
+    /// user intent.
+    inserting_page: Cell<bool>,
+    /// Extent as of the last `changed` signal, so growth can be measured.
+    last_upper: Cell<f64>,
     /// "Go to latest" floating button
     goto_latest_btn: Button,
     // msg_id → bubble (for receipt updates)
@@ -1044,6 +1051,8 @@ impl ChatViewPanel {
             has_more_history: Rc::new(Cell::new(false)),
             rendered: RefCell::new(std::collections::VecDeque::new()),
             prepending: Cell::new(false),
+            inserting_page: Cell::new(false),
+            last_upper: Cell::new(0.0),
             goto_latest_btn: goto_latest_btn.clone(),
             bubbles: RefCell::new(HashMap::new()),
             pending_message_jump: RefCell::new(None),
@@ -1154,6 +1163,14 @@ impl ChatViewPanel {
                     ((prev - value) / dt).max(0.0)
                 };
 
+                // Moves made by the page insert itself are not user intent:
+                // they would read as a downward scroll and trigger eviction
+                // against the very content being loaded. A chat switch is
+                // still settling its scroll-to-bottom; let it finish.
+                if inner_c.inserting_page.get() || inner_c.scroll_pending.get() > 0 {
+                    return;
+                }
+
                 // Heading down and away from the top — safe to reclaim.
                 if up_speed == 0.0 && !prev.is_nan() && value > prev {
                     Self::evict_offscreen_older(&inner_c);
@@ -1179,17 +1196,29 @@ impl ChatViewPanel {
         //      resizes without needing to guess a pulse count up front.
         // User-initiated scroll updates at_bottom via EventControllerScroll
         // above, so scrolling up cleanly disables the auto-snap.
+        //   3. Page insert: content grew above the viewport. Shift the value by
+        //      the growth, relative to wherever the user is NOW — not to a
+        //      position captured earlier. An absolute restore threw away any
+        //      scrolling that happened while the chunk was building, which
+        //      read as the view stuttering backwards on every chunk. Doing it
+        //      here, inside the layout pass, means the frame is never painted
+        //      at the wrong offset.
         {
             let sp = inner.scroll_pending.clone();
             let at_b = inner.at_bottom.clone();
+            let inner_c = inner.clone();
             let adj = inner.scroll.vadjustment();
             adj.connect_changed(move |a| {
+                let upper = a.upper();
+                let grew = upper - inner_c.last_upper.replace(upper);
                 let count = sp.get();
                 if count > 0 {
-                    a.set_value(a.upper() - a.page_size());
+                    a.set_value(upper - a.page_size());
                     sp.set(count - 1);
                 } else if at_b.get() {
-                    a.set_value(a.upper() - a.page_size());
+                    a.set_value(upper - a.page_size());
+                } else if inner_c.inserting_page.get() && grew > 0.0 {
+                    a.set_value(a.value() + grew);
                 }
             });
         }
@@ -3778,39 +3807,42 @@ impl ChatViewPanel {
         let queue: Rc<RefCell<Vec<IncomingMessage>>> =
             Rc::new(RefCell::new(messages.into_iter().rev().collect()));
         let inner_c = self.inner.clone();
-        // Carries the pre-insert extent across ticks. Layout runs at a higher
-        // priority than default idle, so `upper` only reflects the previous
-        // chunk by the time the next tick starts — compensating there is what
-        // keeps the reading position still while content grows above it.
-        let anchor: Rc<Cell<Option<(f64, f64)>>> = Rc::new(Cell::new(None));
+        // Position is held by the vadjustment `changed` handler, which shifts
+        // the value by each chunk's growth inside the layout pass. Nothing
+        // here touches the value directly.
+        let adj = self.inner.scroll.vadjustment();
+        self.inner.last_upper.set(adj.upper());
+        self.inner.inserting_page.set(true);
 
         glib::idle_add_local(move || {
             let adj = inner_c.scroll.vadjustment();
 
-            if let Some((prev_upper, prev_value)) = anchor.take() {
-                let grew = adj.upper() - prev_upper;
-                if grew > 0.0 {
-                    adj.set_value(prev_value + grew);
-                }
-            }
-
             if queue.borrow().is_empty() {
+                inner_c.inserting_page.set(false);
                 // GTK4's GL renderer does not reliably paint widgets inserted
                 // at the top — they stay invisible until something else damages
                 // the surface. The hide/show cycle forces a full re-render.
+                // Guard the value across it: if the collapse reaches the
+                // adjustment it clamps to zero, and that is a jump to the top.
+                let held = adj.value();
                 inner_c.messages_box.set_visible(false);
                 inner_c.messages_box.set_visible(true);
+                if (adj.value() - held).abs() > 0.5 {
+                    adj.set_value(held);
+                }
                 inner_c.loading_older.set(false);
                 // A page can be shorter than the trigger distance (short
                 // messages, or a big fling). Keep filling until there is real
                 // runway above, otherwise the next scroll stalls at the wall.
-                if inner_c.has_more_history.get() && adj.value() <= PREFETCH_BASE_PX {
+                if inner_c.has_more_history.get()
+                    && inner_c.scroll_pending.get() == 0
+                    && adj.value() <= PREFETCH_BASE_PX
+                {
                     Self::request_older(&inner_c, 0.0);
                 }
                 return glib::ControlFlow::Break;
             }
 
-            anchor.set(Some((adj.upper(), adj.value())));
             inner_c.prepending.set(true);
             for _ in 0..PREPEND_CHUNK {
                 let next = queue.borrow_mut().pop();
