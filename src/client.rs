@@ -2514,15 +2514,38 @@ impl Client {
 
     async fn fetch_app_state_with_retry_inner(&self, name: WAPatchName) -> anyhow::Result<()> {
         let mut attempt = 0u32;
+        let mut force_full = false;
         loop {
             attempt += 1;
             // full_sync=false lets process_app_state_sync_task auto-detect:
             // version 0 → snapshot (full sync), version > 0 → incremental patches.
             // Matches WA Web which only requests snapshot when version is undefined.
-            let res = self.process_app_state_sync_task(name, false).await;
+            let res = self.process_app_state_sync_task(name, force_full).await;
             match res {
                 Ok(()) => return Ok(()),
                 Err(e) => {
+                    // Local hash state has diverged from the server's. Patches
+                    // will never apply again from here, so every mutation the
+                    // phone makes in this collection (archive, read, pin…) is
+                    // lost until the state is thrown away and re-taken from a
+                    // snapshot. whatsmeow does the same on mismatch.
+                    let chain = format!("{e:#}");
+                    if !force_full && chain.contains("MAC mismatch") {
+                        warn!(
+                            target: "Client/AppState",
+                            "{name:?}: {chain}; resetting local state and re-syncing from snapshot"
+                        );
+                        let backend = self.persistence_manager.backend();
+                        if let Err(re) = backend
+                            .set_version(name.as_str(), Default::default())
+                            .await
+                        {
+                            warn!(target: "Client/AppState", "{name:?}: could not reset state: {re:#}");
+                            return Err(e);
+                        }
+                        force_full = true;
+                        continue;
+                    }
                     if e.downcast_ref::<crate::appstate_sync::AppStateSyncError>()
                         .is_some_and(|ase| {
                             matches!(ase, crate::appstate_sync::AppStateSyncError::KeyNotFound(_))

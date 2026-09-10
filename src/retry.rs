@@ -304,11 +304,32 @@ impl Client {
             .has_device(&info.requester.user, sender_device_id)
             .await
         {
-            warn!(
-                "handle_retry_receipt: device not found for device={}, user={}",
+            // The receipt itself proves the device exists; the registry is just
+            // behind (a phone or linked device added since we last synced).
+            // Returning here left the requester on "Waiting for this message"
+            // for good. The registry is served cache-first, so it has to be
+            // dropped before a refresh will actually hit the network.
+            self.invalidate_device_cache(&info.requester.user).await;
+            if let Err(e) = self.get_user_devices(&[info.requester.to_non_ad()]).await {
+                warn!(
+                    "handle_retry_receipt: device list refresh for {} failed: {e:#}",
+                    info.requester.user
+                );
+            }
+            if !self
+                .has_device(&info.requester.user, sender_device_id)
+                .await
+            {
+                warn!(
+                    "handle_retry_receipt: device={} for user={} unknown even after refresh; dropping retry",
+                    sender_device_id, info.requester.user
+                );
+                return Ok(());
+            }
+            info!(
+                "handle_retry_receipt: device={} for user={} learned via refresh; continuing",
                 sender_device_id, info.requester.user
             );
-            return Ok(());
         }
 
         // Check if this is a retry from our own device (peer).

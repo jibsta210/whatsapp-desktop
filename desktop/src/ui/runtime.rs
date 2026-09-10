@@ -4686,6 +4686,52 @@ async fn handle_wa_event(
             return;
         }
 
+        // The phone is where chats get archived; without this the desktop never
+        // learns and keeps showing them in the inbox as if they were live.
+        Event::ArchiveUpdate(update) => {
+            let raw_jid = update.jid.to_string();
+            let archived = update.action.archived.unwrap_or(false);
+            let stripped = if let (Some(colon), Some(at)) = (raw_jid.find(':'), raw_jid.find('@')) {
+                if colon < at {
+                    format!("{}{}", &raw_jid[..colon], &raw_jid[at..])
+                } else {
+                    raw_jid.clone()
+                }
+            } else {
+                raw_jid.clone()
+            };
+            let chat_id = {
+                let s = state.lock().unwrap();
+                if stripped.ends_with("@lid") {
+                    s.lid_to_phone.get(&stripped).cloned().unwrap_or(stripped)
+                } else {
+                    stripped
+                }
+            };
+            log::info!(
+                "ArchiveUpdate: {chat_id} archived={archived} full_sync={}",
+                update.from_full_sync
+            );
+            // Full sync is applied too, unlike pins: the server's archive set is
+            // the only source for phone-side archives, and desktop-side archives
+            // already round-trip through the server, so it cannot be stale.
+            let changed = {
+                let mut s = state.lock().unwrap();
+                match s.chats.iter_mut().find(|c| c.id == chat_id) {
+                    Some(c) if c.is_archived != archived => {
+                        c.is_archived = archived;
+                        let _ = s.save_tx.send(s.chats.clone());
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if changed {
+                let _ = tx.send(WaEvent::ChatArchived { chat_id, archived }).await;
+            }
+            return;
+        }
+
         // ── Group participant changes → system message + member list refresh ──
         Event::GroupUpdate(update) => {
             use wacore::stanza::groups::GroupNotificationAction;
