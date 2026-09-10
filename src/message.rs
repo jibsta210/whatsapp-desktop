@@ -1558,6 +1558,14 @@ impl Client {
                     fingerprint: components.fingerprint_bytes,
                     timestamp: components.timestamp,
                 };
+                if let Ok(Some(existing)) = key_store.get_sync_key(components.key_id).await {
+                    log::info!(
+                        target: "Client/AppState",
+                        "key share {}: stored bytes {} delivered bytes",
+                        hex::encode(components.key_id),
+                        if existing.key_data == new_key.key_data { "==" } else { "!=" }
+                    );
+                }
 
                 if let Err(e) = key_store.set_sync_key(components.key_id, new_key).await {
                     log::error!(

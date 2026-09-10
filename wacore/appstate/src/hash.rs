@@ -1,3 +1,4 @@
+use log::debug;
 use serde::{Deserialize, Serialize};
 use serde_big_array::BigArray;
 use std::collections::HashMap;
@@ -88,20 +89,44 @@ impl HashState {
     /// This is an optimized version for snapshots where all operations are SET
     /// and there are no previous values to look up.
     pub fn update_hash_from_records(&mut self, records: &[wa::SyncdRecord]) {
-        // Collect slices directly — no Vec<u8> allocation per MAC.
-        let added: Vec<&[u8]> = records
-            .iter()
-            .filter_map(|record| {
-                record
-                    .value
-                    .as_ref()
-                    .and_then(|v| v.blob.as_ref())
-                    .filter(|blob| blob.len() >= 32)
-                    .map(|blob| &blob[blob.len() - 32..])
-            })
-            .collect();
+        // A snapshot can carry several records for one index — later ones
+        // supersede earlier ones — and the server's MAC covers only the
+        // survivors. Adding every value MAC left superseded entries in the
+        // hash, so any collection with repeated same-index writes (regular_low:
+        // read markers for the same chat, over and over) never validated.
+        // Mirrors whatsmeow decodeSnapshot's getPrevSetValueMAC lookback.
+        let mut latest: std::collections::HashMap<&[u8], &[u8]> =
+            std::collections::HashMap::with_capacity(records.len());
+        let mut added: Vec<&[u8]> = Vec::with_capacity(records.len());
+        let mut removed: Vec<&[u8]> = Vec::new();
 
-        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &[] as &[&[u8]], &added);
+        for record in records {
+            let Some(value_mac) = record
+                .value
+                .as_ref()
+                .and_then(|v| v.blob.as_ref())
+                .filter(|blob| blob.len() >= 32)
+                .map(|blob| &blob[blob.len() - 32..])
+            else {
+                continue;
+            };
+            added.push(value_mac);
+            if let Some(index) = record.index.as_ref().and_then(|i| i.blob.as_deref())
+                && let Some(prev) = latest.insert(index, value_mac)
+            {
+                removed.push(prev);
+            }
+        }
+
+        if !removed.is_empty() {
+            debug!(
+                target: "AppState",
+                "snapshot: {} of {} records superseded by a later same-index record",
+                removed.len(),
+                records.len()
+            );
+        }
+        WAPATCH_INTEGRITY.subtract_then_add_in_place(&mut self.hash, &removed, &added);
     }
 
     pub fn generate_snapshot_mac(&self, name: &str, key: &[u8]) -> Vec<u8> {

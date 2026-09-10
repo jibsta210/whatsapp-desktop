@@ -1246,9 +1246,7 @@ impl MainWindow {
                         if !inner.settings.twofa_autocopy_enabled() {
                             log::info!("2FA code detected but auto-copy is disabled in settings");
                         }
-                        if inner.settings.twofa_autocopy_enabled()
-                            && twofa_mark_copied(&msg.id)
-                        {
+                        if inner.settings.twofa_autocopy_enabled() && twofa_mark_copied(&msg.id) {
                             let sender = inner
                                 .chat_list
                                 .chat_name(&msg.chat_id)
@@ -1618,9 +1616,7 @@ impl MainWindow {
                 let overlay = inner.toast_overlay.clone();
                 toast.connect_button_clicked(move |_| {
                     if let Err(error) = crate::updater::restart_to_apply() {
-                        overlay.add_toast(adw::Toast::new(&format!(
-                            "Could not restart: {error}"
-                        )));
+                        overlay.add_toast(adw::Toast::new(&format!("Could not restart: {error}")));
                     }
                 });
                 inner.toast_overlay.add_toast(toast);

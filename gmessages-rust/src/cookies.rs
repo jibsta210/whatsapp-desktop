@@ -303,7 +303,10 @@ pub fn adopt_login_session(cookies: HashMap<String, String>) -> Result<()> {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    log::info!("cookies: adopting own login session ({} entries)", kept.len());
+    log::info!(
+        "cookies: adopting own login session ({} entries)",
+        kept.len()
+    );
     guard.cookies = kept;
     guard.last_read = Some(std::time::Instant::now());
     guard.session_owned = true;
@@ -545,7 +548,10 @@ mod tests {
         assert!(has_owned_session());
 
         let jar = get_cached_firefox_cookies();
-        assert_eq!(jar.get("__Secure-1PSID").map(String::as_str), Some("psid-value"));
+        assert_eq!(
+            jar.get("__Secure-1PSID").map(String::as_str),
+            Some("psid-value")
+        );
         assert!(!jar.contains_key("_ga"), "tracking cookie was retained");
         assert!(!jar.contains_key("CONSENT"), "consent cookie was retained");
 

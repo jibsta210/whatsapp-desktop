@@ -1150,40 +1150,45 @@ impl ChatViewPanel {
             let inner_c = inner.clone();
             let last_val = Cell::new(f64::NAN);
             let last_t = Cell::new(std::time::Instant::now());
-            inner.scroll.vadjustment().connect_value_changed(move |adj| {
-                let value = adj.value();
-                let now = std::time::Instant::now();
-                let prev = last_val.replace(value);
-                let dt = now.duration_since(last_t.replace(now)).as_secs_f64();
-                // Ignore the first sample and any gap long enough that the delta
-                // reflects a layout jump rather than a scroll gesture.
-                let up_speed = if prev.is_nan() || dt <= 0.0 || dt > 0.5 {
-                    0.0
-                } else {
-                    ((prev - value) / dt).max(0.0)
-                };
+            inner
+                .scroll
+                .vadjustment()
+                .connect_value_changed(move |adj| {
+                    let value = adj.value();
+                    let now = std::time::Instant::now();
+                    let prev = last_val.replace(value);
+                    let dt = now.duration_since(last_t.replace(now)).as_secs_f64();
+                    // Ignore the first sample and any gap long enough that the delta
+                    // reflects a layout jump rather than a scroll gesture.
+                    let up_speed = if prev.is_nan() || dt <= 0.0 || dt > 0.5 {
+                        0.0
+                    } else {
+                        ((prev - value) / dt).max(0.0)
+                    };
 
-                // Moves made by the page insert itself are not user intent:
-                // they would read as a downward scroll and trigger eviction
-                // against the very content being loaded. A chat switch is
-                // still settling its scroll-to-bottom; let it finish.
-                if inner_c.inserting_page.get() || inner_c.scroll_pending.get() > 0 {
-                    return;
-                }
+                    // Moves made by the page insert itself are not user intent:
+                    // they would read as a downward scroll and trigger eviction
+                    // against the very content being loaded. A chat switch is
+                    // still settling its scroll-to-bottom; let it finish.
+                    if inner_c.inserting_page.get() || inner_c.scroll_pending.get() > 0 {
+                        return;
+                    }
 
-                // Heading down and away from the top — safe to reclaim.
-                if up_speed == 0.0 && !prev.is_nan() && value > prev {
-                    Self::evict_offscreen_older(&inner_c);
-                }
+                    // Heading down and away from the top — safe to reclaim.
+                    if up_speed == 0.0 && !prev.is_nan() && value > prev {
+                        Self::evict_offscreen_older(&inner_c);
+                    }
 
-                if !inner_c.has_more_history.get() || inner_c.loading_older.get() {
-                    return;
-                }
-                if value > PREFETCH_BASE_PX + (up_speed * PREFETCH_LEAD_SECS).min(PREFETCH_MAX_PX) {
-                    return;
-                }
-                Self::request_older(&inner_c, up_speed);
-            });
+                    if !inner_c.has_more_history.get() || inner_c.loading_older.get() {
+                        return;
+                    }
+                    if value
+                        > PREFETCH_BASE_PX + (up_speed * PREFETCH_LEAD_SECS).min(PREFETCH_MAX_PX)
+                    {
+                        return;
+                    }
+                    Self::request_older(&inner_c, up_speed);
+                });
         }
 
         // When content height changes (layout/image load/prepend), re-anchor
@@ -6030,9 +6035,8 @@ fn show_message_menu(
             let inner_c = inner.clone();
             let pop = popover.clone();
             btn.connect_clicked(move |_| {
-                let saved = crate::ui::message_bubble::save_to_downloads(
-                    std::path::Path::new(&path_c),
-                );
+                let saved =
+                    crate::ui::message_bubble::save_to_downloads(std::path::Path::new(&path_c));
                 if let Some(overlay) = ChatViewPanel::toast_overlay(&inner_c) {
                     let text = match &saved {
                         Some(p) => format!("Saved to {}", p.display()),

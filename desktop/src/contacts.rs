@@ -804,7 +804,8 @@ mod tests {
         // A group SMS thread was wrongly linked to her 1:1 row.
         dir.record_chat_id("14164000790", "gmessages", "gm:group-999");
         assert_eq!(
-            dir.other_chat_id("14164000790@s.whatsapp.net", "gmessages").as_deref(),
+            dir.other_chat_id("14164000790@s.whatsapp.net", "gmessages")
+                .as_deref(),
             Some("gm:group-999")
         );
         assert_eq!(dir.clear_chat_id("gmessages", "gm:group-999"), 1);
@@ -813,8 +814,11 @@ mod tests {
             None,
             "a healed group link must not keep routing her chat to the group"
         );
-        assert_eq!(dir.lookup("14164000790").as_deref(), Some("Alexandra"),
-            "healing the link must not drop the contact");
+        assert_eq!(
+            dir.lookup("14164000790").as_deref(),
+            Some("Alexandra"),
+            "healing the link must not drop the contact"
+        );
     }
 
     #[test]

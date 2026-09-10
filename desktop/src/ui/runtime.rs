@@ -2970,8 +2970,8 @@ async fn handle_wa_event(
                 } else {
                     info.source.sender_alt.as_ref()
                 }
-                    .filter(|a| a.to_string().ends_with("@s.whatsapp.net"))
-                    .map(|a| a.to_string());
+                .filter(|a| a.to_string().ends_with("@s.whatsapp.net"))
+                .map(|a| a.to_string());
                 let s = state.lock().unwrap();
                 // Try cached mapping first
                 let cached = s.lid_to_phone.get(&raw_chat_id).cloned();
@@ -3263,10 +3263,7 @@ async fn handle_wa_event(
                             if is_latest && !emoji.is_empty() {
                                 let mut st = state.lock().unwrap();
                                 let who = resolve_sender_name(&st, &reactor_jid);
-                                st.emit_row_ephemeral(
-                                    &chat_id,
-                                    &format!("{who} reacted {emoji}"),
-                                );
+                                st.emit_row_ephemeral(&chat_id, &format!("{who} reacted {emoji}"));
                             }
                             let _ = tx
                                 .send(WaEvent::ReactionUpdated {
@@ -10916,123 +10913,119 @@ mod tenor_tests {
 /// so callers must wrap it. Shared by the send path and the incoming-message
 /// backfill, which is why it lives outside either.
 pub fn fetch_link_preview_blocking(u: String) -> (Option<String>, Option<String>, Option<String>) {
+    use std::io::Read;
+    // Helper to fetch JSON from a URL
+    let fetch_json = |url: &str| -> Option<serde_json::Value> {
+        ureq::get(url)
+            .call()
+            .ok()
+            .and_then(|r| r.into_string().ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+    };
 
-                    use std::io::Read;
-                    // Helper to fetch JSON from a URL
-                    let fetch_json = |url: &str| -> Option<serde_json::Value> {
-                        ureq::get(url)
-                            .call()
-                            .ok()
-                            .and_then(|r| r.into_string().ok())
-                            .and_then(|s| serde_json::from_str(&s).ok())
-                    };
+    // 1. Try site-specific oEmbed (YouTube, Vimeo, etc.)
+    let oembed_url = if u.contains("youtube.com") || u.contains("youtu.be") {
+        Some(format!(
+            "https://www.youtube.com/oembed?url={}&format=json",
+            u
+        ))
+    } else if u.contains("vimeo.com") {
+        Some(format!("https://vimeo.com/api/oembed.json?url={}", u))
+    } else if u.contains("twitter.com") || u.contains("x.com") {
+        Some(format!("https://publish.twitter.com/oembed?url={}", u))
+    } else {
+        None
+    };
 
-                    // 1. Try site-specific oEmbed (YouTube, Vimeo, etc.)
-                    let oembed_url = if u.contains("youtube.com") || u.contains("youtu.be") {
-                        Some(format!(
-                            "https://www.youtube.com/oembed?url={}&format=json",
-                            u
-                        ))
-                    } else if u.contains("vimeo.com") {
-                        Some(format!("https://vimeo.com/api/oembed.json?url={}", u))
-                    } else if u.contains("twitter.com") || u.contains("x.com") {
-                        Some(format!("https://publish.twitter.com/oembed?url={}", u))
-                    } else {
-                        None
-                    };
+    if let Some(oembed) = oembed_url {
+        if let Some(json) = fetch_json(&oembed) {
+            let title = json
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let desc = json
+                .get("author_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let thumb = json
+                .get("thumbnail_url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if title.is_some() {
+                log::info!("oEmbed OK: title={title:?} thumb={thumb:?}");
+                return (title, desc, thumb);
+            }
+        }
+    }
 
-                    if let Some(oembed) = oembed_url {
-                        if let Some(json) = fetch_json(&oembed) {
-                            let title = json
-                                .get("title")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            let desc = json
-                                .get("author_name")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            let thumb = json
-                                .get("thumbnail_url")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            if title.is_some() {
-                                log::info!("oEmbed OK: title={title:?} thumb={thumb:?}");
-                                return (title, desc, thumb);
+    // 2. Try noembed.com (supports many providers)
+    if let Some(json) = fetch_json(&format!("https://noembed.com/embed?url={}", u)) {
+        if json.get("error").is_none() {
+            let title = json
+                .get("title")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let desc = json
+                .get("author_name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let thumb = json
+                .get("thumbnail_url")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if title.is_some() {
+                log::info!("noembed OK: title={title:?}");
+                return (title, desc, thumb);
+            }
+        }
+    }
+
+    // 3. Scrape with Facebook crawler UA (most sites serve OG to this)
+    let req = ureq::get(&u).set(
+        "User-Agent",
+        "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+    );
+    match req.call() {
+        Ok(resp) => {
+            let mut bytes = Vec::new();
+            resp.into_reader()
+                .take(200_000)
+                .read_to_end(&mut bytes)
+                .ok();
+            let body = String::from_utf8_lossy(&bytes);
+            let extract = |tag: &str| -> Option<String> {
+                // Search for property="og:X" content="..." in any order
+                if let Some(pos) = body.find(tag) {
+                    let region = &body[pos.saturating_sub(100)..body.len().min(pos + 300)];
+                    if let Some(c) = region.find("content=\"") {
+                        let start = c + 9;
+                        if let Some(end) = region[start..].find('"') {
+                            let val = &region[start..start + end];
+                            if !val.is_empty() {
+                                return Some(val.to_string());
                             }
                         }
                     }
-
-                    // 2. Try noembed.com (supports many providers)
-                    if let Some(json) = fetch_json(&format!("https://noembed.com/embed?url={}", u))
-                    {
-                        if json.get("error").is_none() {
-                            let title = json
-                                .get("title")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            let desc = json
-                                .get("author_name")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            let thumb = json
-                                .get("thumbnail_url")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                            if title.is_some() {
-                                log::info!("noembed OK: title={title:?}");
-                                return (title, desc, thumb);
-                            }
-                        }
-                    }
-
-                    // 3. Scrape with Facebook crawler UA (most sites serve OG to this)
-                    let req = ureq::get(&u).set(
-                        "User-Agent",
-                        "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
-                    );
-                    match req.call() {
-                        Ok(resp) => {
-                            let mut bytes = Vec::new();
-                            resp.into_reader()
-                                .take(200_000)
-                                .read_to_end(&mut bytes)
-                                .ok();
-                            let body = String::from_utf8_lossy(&bytes);
-                            let extract = |tag: &str| -> Option<String> {
-                                // Search for property="og:X" content="..." in any order
-                                if let Some(pos) = body.find(tag) {
-                                    let region =
-                                        &body[pos.saturating_sub(100)..body.len().min(pos + 300)];
-                                    if let Some(c) = region.find("content=\"") {
-                                        let start = c + 9;
-                                        if let Some(end) = region[start..].find('"') {
-                                            let val = &region[start..start + end];
-                                            if !val.is_empty() {
-                                                return Some(val.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                                None
-                            };
-                            let title = extract("og:title").or_else(|| {
-                                body.split("<title>")
-                                    .nth(1)
-                                    .and_then(|s| s.split("</title>").next())
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty())
-                            });
-                            let desc = extract("og:description");
-                            let thumb = extract("og:image");
-                            log::info!("OG scrape: title={title:?}");
-                            (title, desc, thumb)
-                        }
-                        Err(e) => {
-                            log::warn!("OG fetch failed: {e}");
-                            (None, None, None)
-                        }
-                    }
-                
+                }
+                None
+            };
+            let title = extract("og:title").or_else(|| {
+                body.split("<title>")
+                    .nth(1)
+                    .and_then(|s| s.split("</title>").next())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+            let desc = extract("og:description");
+            let thumb = extract("og:image");
+            log::info!("OG scrape: title={title:?}");
+            (title, desc, thumb)
+        }
+        Err(e) => {
+            log::warn!("OG fetch failed: {e}");
+            (None, None, None)
+        }
+    }
 }
 
 /// First http(s) URL in a message body, trimmed of trailing punctuation that
@@ -11040,7 +11033,10 @@ pub fn fetch_link_preview_blocking(u: String) -> (Option<String>, Option<String>
 fn first_http_url(text: &str) -> Option<String> {
     text.split_whitespace()
         .find(|w| w.starts_with("http://") || w.starts_with("https://"))
-        .map(|w| w.trim_end_matches([',', '.', ')', ']', '>', '"', '\'']).to_string())
+        .map(|w| {
+            w.trim_end_matches([',', '.', ')', ']', '>', '"', '\''])
+                .to_string()
+        })
         .filter(|u| u.len() > 10)
 }
 
@@ -11137,13 +11133,18 @@ mod legacy_message_decode_tests {
         assert_eq!(decoded.len(), 1);
 
         let migrated: Vec<IncomingMessage> = decoded.into_iter().map(Into::into).collect();
-        assert_eq!(migrated[0].text.as_deref(), Some("Your security code is 641333."));
+        assert_eq!(
+            migrated[0].text.as_deref(),
+            Some("Your security code is 641333.")
+        );
         assert!(migrated[0].media_download.is_none());
 
         // and the migrated form must be readable by the current decoder
         let re = bincode::serialize(&migrated).expect("re-encode");
         assert_eq!(
-            bincode::deserialize::<Vec<IncomingMessage>>(&re).expect("current decode").len(),
+            bincode::deserialize::<Vec<IncomingMessage>>(&re)
+                .expect("current decode")
+                .len(),
             1
         );
     }

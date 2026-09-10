@@ -64,7 +64,10 @@ fn local_protocol_customizations_survive_upstream_merges() {
     let mut lost = Vec::new();
     for g in GUARDS {
         if !read(g.file).contains(g.needle) {
-            lost.push(format!("  {} :: missing `{}`\n      why: {}", g.file, g.needle, g.why));
+            lost.push(format!(
+                "  {} :: missing `{}`\n      why: {}",
+                g.file, g.needle, g.why
+            ));
         }
     }
     assert!(

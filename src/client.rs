@@ -2536,9 +2536,8 @@ impl Client {
                             "{name:?}: {chain}; resetting local state and re-syncing from snapshot"
                         );
                         let backend = self.persistence_manager.backend();
-                        if let Err(re) = backend
-                            .set_version(name.as_str(), Default::default())
-                            .await
+                        if let Err(re) =
+                            backend.set_version(name.as_str(), Default::default()).await
                         {
                             warn!(target: "Client/AppState", "{name:?}: could not reset state: {re:#}");
                             return Err(e);
@@ -2921,6 +2920,12 @@ impl Client {
                     match self.download(ext).await {
                         Ok(bytes) => {
                             debug!(target: "Client/AppState", "Downloaded external snapshot ({} bytes)", bytes.len());
+                            // Diagnostic escape hatch: lets the decrypted snapshot be
+                            // re-verified by an independent implementation.
+                            if let Ok(dir) = std::env::var("WA_DUMP_SNAPSHOT") {
+                                let _ =
+                                    std::fs::write(format!("{dir}/{name:?}.snapshot.bin"), &bytes);
+                            }
                             pre_downloaded.insert(path.clone(), bytes);
                         }
                         Err(e) => {

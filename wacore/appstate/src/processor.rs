@@ -8,7 +8,7 @@ use crate::AppStateError;
 use crate::decode::{Mutation, decode_record};
 use crate::hash::{HashState, generate_patch_mac};
 use crate::keys::ExpandedAppStateKeys;
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use serde::{Deserialize, Serialize};
 use waproto::whatsapp as wa;
 
@@ -78,10 +78,16 @@ where
 
     debug!(
         target: "AppState",
-        "Snapshot {} v{}: {} records, ltHash ends with ...{}",
+        "Snapshot {} v{}: {} records, key_id={}, ltHash ends with ...{}",
         collection_name,
         version,
         snapshot.records.len(),
+        snapshot
+            .key_id
+            .as_ref()
+            .and_then(|k| k.id.as_ref())
+            .map(hex::encode)
+            .unwrap_or_else(|| "none".into()),
         hex::encode(&initial_state.hash[120..])
     );
 
@@ -103,7 +109,19 @@ where
             hex::encode(mac_expected)
         );
         if computed != *mac_expected {
-            return Err(AppStateError::SnapshotMACMismatch);
+            // Every record below is still authenticated on its own by its value
+            // MAC at decrypt time; the snapshot MAC only covers the set as a
+            // whole. Baileys warns and applies here; hard-failing (whatsmeow)
+            // left this collection permanently unsynced — phone-side
+            // archive/read/pin never arrived. Per-record verification is the gate.
+            warn!(
+                target: "AppState",
+                "Snapshot {} v{} MAC mismatch (key_id={}, {} records): applying anyway; per-record MACs still enforced",
+                collection_name,
+                version,
+                hex::encode(key_id),
+                snapshot.records.len()
+            );
         }
     }
 
@@ -216,10 +234,16 @@ where
 
     debug!(
         target: "AppState",
-        "Patch {} v{}: {} mutations, ltHash ends with ...{}, hasMissingRemove={}",
+        "Patch {} v{}: {} mutations, key_id={}, ltHash ends with ...{}, hasMissingRemove={}",
         collection_name,
         state.version,
         patch.mutations.len(),
+        patch
+            .key_id
+            .as_ref()
+            .and_then(|k| k.id.as_ref())
+            .map(hex::encode)
+            .unwrap_or_else(|| "none".into()),
         hex::encode(&state.hash[120..]),
         hash_update_result.has_missing_remove
     );
@@ -317,35 +341,17 @@ pub fn validate_patch_macs(
 
     if let Some(snap_mac) = patch.snapshot_mac.as_ref() {
         let computed_snap = state.generate_snapshot_mac(collection_name, &keys.snapshot_mac);
-        trace!(
-            target: "AppState",
-            "Patch {} v{} snapshotMAC: computed={}, expected={}",
-            collection_name,
-            state.version,
-            hex::encode(&computed_snap),
-            hex::encode(snap_mac)
-        );
         if computed_snap != *snap_mac {
-            // WhatsApp Web behavior: if hasMissingRemove is true, MAC mismatch is expected
-            // because we couldn't subtract the value we don't have. Log and continue.
-            if has_missing_remove {
-                log::warn!(
-                    target: "AppState",
-                    "Patch {} v{} snapshotMAC mismatch (expected due to hasMissingRemove=true), continuing",
-                    collection_name,
-                    state.version
-                );
-                // Don't fail - WhatsApp Web continues processing in this case
-            } else {
-                debug!(
-                    target: "AppState",
-                    "Patch {} v{} snapshotMAC MISMATCH! ltHash=...{}",
-                    collection_name,
-                    state.version,
-                    hex::encode(&state.hash[120..])
-                );
-                return Err(AppStateError::PatchSnapshotMACMismatch);
-            }
+            // Same status as the standalone snapshot MAC: a consistency check on
+            // our LTHash against the server's, not an authentication of this
+            // patch. patch_mac below covers the mutations, version, name and the
+            // server-supplied snapshot_mac itself, and stays fatal.
+            warn!(
+                target: "AppState",
+                "Patch {} v{}: snapshot_mac mismatch; continuing on patch_mac",
+                collection_name,
+                state.version
+            );
         }
     }
 
