@@ -786,6 +786,7 @@ impl MainWindow {
             WaEvent::QrCode(_) => "QrCode received".to_string(),
             WaEvent::Connected { .. } => "Connected".to_string(),
             WaEvent::Disconnected(r) => format!("Disconnected: {r}"),
+            WaEvent::LoggedOut(r) => format!("LoggedOut: {r}"),
             WaEvent::ChatsLoaded(c) => format!("ChatsLoaded: {} chats", c.len()),
             WaEvent::ChatAdded(c) => format!("ChatAdded: {} ({})", c.name, c.id),
             WaEvent::MessageReceived(m) => format!(
@@ -903,6 +904,11 @@ impl MainWindow {
                 inner
                     .login_screen
                     .show_status(&format!("Disconnected: {reason}"));
+            }
+            WaEvent::LoggedOut(reason) => {
+                log::warn!("LoggedOut: {}", reason);
+                inner.stack.set_visible_child_name("login");
+                inner.login_screen.show_loading(&reason);
             }
             WaEvent::ChatsLoaded(mut chats) => {
                 // Switch to main view now that we have data to show

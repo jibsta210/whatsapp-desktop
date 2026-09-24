@@ -2303,9 +2303,44 @@ pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver
         });
     }
 
-    if let Err(e) = run_inner(event_tx.clone(), &mut wa_cmd_rx).await {
-        log::error!("WhatsApp runtime error: {e:#}");
-        let _ = event_tx.send(WaEvent::Disconnected(e.to_string())).await;
+    loop {
+        if let Err(e) = run_inner(event_tx.clone(), &mut wa_cmd_rx).await {
+            log::error!("WhatsApp runtime error: {e:#}");
+            let _ = event_tx.send(WaEvent::Disconnected(e.to_string())).await;
+        }
+        // A logout ends run_inner. Previously that ended this task too, so the
+        // command channel closed and the UI could never reach a QR — a new
+        // phone left the app permanently stuck. The old identity cannot be
+        // reused; retire it and start over, which pairs from scratch.
+        if !WA_LOGGED_OUT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        retire_whatsapp_identity();
+        let _ = event_tx
+            .send(WaEvent::LoggedOut(
+                "Unlinked — scan the QR to relink".into(),
+            ))
+            .await;
+    }
+}
+
+/// Set by the LoggedOut translation; consumed by the runtime loop above.
+static WA_LOGGED_OUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Move the protocol store aside (cwd is the data dir). Chats, messages and
+/// contacts live in their own files and are untouched; only keys, sessions
+/// and the device identity go, which is exactly what a re-pair replaces.
+/// Kept as a timestamped .bak so nothing is destroyed.
+fn retire_whatsapp_identity() {
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    for f in ["whatsapp.db", "whatsapp.db-wal", "whatsapp.db-shm"] {
+        if std::path::Path::new(f).exists() {
+            let to = format!("{f}.loggedout-{ts}.bak");
+            match std::fs::rename(f, &to) {
+                Ok(()) => log::warn!("retired {f} → {to}"),
+                Err(e) => log::error!("could not retire {f}: {e}"),
+            }
+        }
     }
 }
 
@@ -2897,8 +2932,10 @@ async fn handle_wa_event(
             return;
         }
 
-        Event::Disconnected(_) | Event::LoggedOut(_) => {
-            WaEvent::Disconnected("Connection closed".to_string())
+        Event::Disconnected(_) => WaEvent::Disconnected("Connection closed".to_string()),
+        Event::LoggedOut(_) => {
+            WA_LOGGED_OUT.store(true, std::sync::atomic::Ordering::SeqCst);
+            WaEvent::LoggedOut("This device was unlinked (new phone?)".to_string())
         }
 
         Event::Message(msg, info) => {
@@ -6337,7 +6374,11 @@ async fn handle_command(
         }
 
         WaCommand::Logout => {
-            client.disconnect().await;
+            // Unlinks on the phone and dispatches LoggedOut, which retires the
+            // local identity and brings up a fresh QR.
+            if let Err(e) = client.logout().await {
+                log::warn!("logout failed: {e:#}");
+            }
         }
 
         WaCommand::GmessagesRepair => {

@@ -607,12 +607,12 @@ pub fn show_settings_window(
     let account_group = adw::PreferencesGroup::new();
     account_group.set_title("Account");
     let logout_row = adw::ActionRow::new();
-    logout_row.set_title("Disconnect this session");
+    logout_row.set_title("Unlink this device");
     logout_row.set_subtitle(
-        "Disconnects this desktop from WhatsApp for now. The device stays linked \
-         to your phone and reconnects on next launch — it is not unlinked.",
+        "Removes this desktop from your phone's linked devices and shows a new QR \
+         to relink. Use this after changing phones.",
     );
-    let logout_btn = gtk4::Button::with_label("Disconnect");
+    let logout_btn = gtk4::Button::with_label("Unlink & relink");
     logout_btn.set_valign(gtk4::Align::Center);
     logout_btn.add_css_class("destructive-action");
     {
@@ -627,25 +627,23 @@ pub fn show_settings_window(
             // next launch — a true unlink (remove-device IQ + local session
             // wipe) is not yet implemented (see runtime.rs Logout handler).
             let dialog = adw::AlertDialog::new(
-                Some("Disconnect this session?"),
+                Some("Unlink this device?"),
                 Some(
-                    "This disconnects the desktop from WhatsApp until you reopen \
-                     the app. The device stays linked to your phone — it is not \
-                     unlinked.",
+                    "This removes the desktop from your phone's linked devices \
+                     and shows a new QR code to relink. Chats and messages stay \
+                     on disk.",
                 ),
             );
             dialog.add_response("cancel", "Cancel");
-            dialog.add_response("logout", "Disconnect");
+            dialog.add_response("logout", "Unlink");
             dialog.set_response_appearance("logout", adw::ResponseAppearance::Destructive);
             dialog.set_close_response("cancel");
             let bridge = bridge.clone();
-            let window_weak = window.downgrade();
             dialog.connect_response(None, move |dlg, resp| {
                 if resp == "logout" {
                     bridge.send_command(crate::bridge::WaCommand::Logout);
-                    if let Some(window) = window_weak.upgrade() {
-                        window.close();
-                    }
+                    // Keep the settings window; the QR appears behind it in
+                    // the main window and closing would hide the context.
                 }
                 dlg.close();
             });

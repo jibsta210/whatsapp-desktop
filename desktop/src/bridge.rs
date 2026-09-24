@@ -18,6 +18,10 @@ pub enum WaEvent {
     },
     /// Connection dropped
     Disconnected(String),
+    /// The server ended this device's session for good (401 / device removed —
+    /// typically a new phone). Not a transient drop: the runtime retires the
+    /// local identity and starts a fresh pairing, so a QR follows.
+    LoggedOut(String),
     /// Chat list refreshed (batch, used for initial load)
     ChatsLoaded(Vec<ChatSummary>),
     /// Single chat appeared from history sync (incremental)
