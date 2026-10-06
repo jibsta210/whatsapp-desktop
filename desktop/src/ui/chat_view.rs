@@ -74,6 +74,12 @@ const LIVE_BUBBLE_TARGET: usize = 200;
 /// enough that a turn fits in a frame; the page just takes a few frames.
 const PREPEND_CHUNK: usize = 8;
 
+/// GTK's own deceleration constant (DECELERATION_FRICTION), so a fling we
+/// carry on feels the same as one GTK finishes; and the speed below which a
+/// fling is over.
+const FLING_FRICTION: f64 = 4.0;
+const FLING_MIN_SPEED: f64 = 20.0;
+
 struct ChatViewInner {
     root: Box,
     /// Message viewport + typing indicator. The header and composer deliberately
@@ -145,6 +151,16 @@ struct ChatViewInner {
     inserting_page: Cell<bool>,
     /// Extent as of the last `changed` signal, so growth can be measured.
     last_upper: Cell<f64>,
+    /// Set around our own position corrections so they are not read back as
+    /// scrolling (velocity, at-bottom, eviction, prefetch).
+    shifting: Cell<bool>,
+    /// GTK has started a kinetic deceleration and no input has arrived since.
+    fling_active: Cell<bool>,
+    /// When the view last moved, and how fast (px/s, negative = up).
+    last_motion: Cell<Option<std::time::Instant>>,
+    velocity: Cell<f64>,
+    /// Bumped to stop a momentum animation we are running ourselves.
+    momentum_gen: Cell<u64>,
     /// "Go to latest" floating button
     goto_latest_btn: Button,
     // msg_id → bubble (for receipt updates)
@@ -1053,6 +1069,11 @@ impl ChatViewPanel {
             prepending: Cell::new(false),
             inserting_page: Cell::new(false),
             last_upper: Cell::new(0.0),
+            shifting: Cell::new(false),
+            fling_active: Cell::new(false),
+            last_motion: Cell::new(None),
+            velocity: Cell::new(0.0),
+            momentum_gen: Cell::new(0),
             goto_latest_btn: goto_latest_btn.clone(),
             bubbles: RefCell::new(HashMap::new()),
             pending_message_jump: RefCell::new(None),
@@ -1127,17 +1148,23 @@ impl ChatViewPanel {
         // Detect user scroll via EventControllerScroll (mouse wheel / touchpad).
         // This is more reliable than vadjustment signals for tracking user intent.
         {
-            let at_bottom = inner.at_bottom.clone();
-            let btn = inner.goto_latest_btn.clone();
-            let scroll_ref = inner.scroll.clone();
-            let sc = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+            let sc = gtk4::EventControllerScroll::new(
+                gtk4::EventControllerScrollFlags::VERTICAL
+                    | gtk4::EventControllerScrollFlags::KINETIC,
+            );
+            // Real input always wins: it ends any fling, ours or GTK's, and
+            // cancels forced scroll-to-bottom pulses left over from a chat
+            // switch, which would otherwise yank the view down mid-scroll.
+            let inner_c = inner.clone();
             sc.connect_scroll(move |_, _, _| {
-                // User is actively scrolling — update at_bottom and chevron
-                let adj = scroll_ref.vadjustment();
-                let near = adj.value() >= adj.upper() - adj.page_size() - 60.0;
-                at_bottom.set(near);
-                btn.set_visible(!near && adj.upper() > adj.page_size());
+                inner_c.fling_active.set(false);
+                inner_c.momentum_gen.set(inner_c.momentum_gen.get() + 1);
+                inner_c.scroll_pending.set(0);
                 glib::Propagation::Proceed
+            });
+            let inner_c = inner.clone();
+            sc.connect_decelerate(move |_, _, vel_y| {
+                inner_c.fling_active.set(vel_y != 0.0);
             });
             inner.scroll.add_controller(sc);
         }
@@ -1160,16 +1187,41 @@ impl ChatViewPanel {
                     let dt = now.duration_since(last_t.replace(now)).as_secs_f64();
                     // Ignore the first sample and any gap long enough that the delta
                     // reflects a layout jump rather than a scroll gesture.
+                    // Our own corrections are not motion.
+                    if inner_c.shifting.get() {
+                        return;
+                    }
                     let up_speed = if prev.is_nan() || dt <= 0.0 || dt > 0.5 {
                         0.0
                     } else {
                         ((prev - value) / dt).max(0.0)
                     };
+                    // A deceleration moves every frame; a gap means it ended.
+                    if dt > 0.1 {
+                        inner_c.fling_active.set(false);
+                        inner_c.velocity.set(0.0);
+                    } else if !prev.is_nan() && dt > 0.0 {
+                        let v = (value - prev) / dt;
+                        inner_c.velocity.set(0.6 * v + 0.4 * inner_c.velocity.get());
+                    }
+                    inner_c.last_motion.set(Some(now));
 
-                    // Moves made by the page insert itself are not user intent:
-                    // they would read as a downward scroll and trigger eviction
-                    // against the very content being loaded. A chat switch is
-                    // still settling its scroll-to-bottom; let it finish.
+                    // Derived from where the view actually is, on every move.
+                    // It used to be sampled only on input events, so a flick
+                    // released within 60px of the bottom left it "at bottom"
+                    // while the deceleration carried the view far away — and
+                    // the next layout change (the page this very scroll had
+                    // just requested) snapped the view back down.
+                    let scrollable = adj.upper() > adj.page_size();
+                    if inner_c.scroll_pending.get() == 0 && scrollable {
+                        let near = value >= adj.upper() - adj.page_size() - 60.0;
+                        inner_c.at_bottom.set(near);
+                        inner_c.goto_latest_btn.set_visible(!near);
+                    }
+
+                    // A page insert is in progress, or a chat switch is still
+                    // settling its scroll-to-bottom; neither is a moment to
+                    // evict or to ask for more.
                     if inner_c.inserting_page.get() || inner_c.scroll_pending.get() > 0 {
                         return;
                     }
@@ -1223,7 +1275,10 @@ impl ChatViewPanel {
                 } else if at_b.get() {
                     a.set_value(upper - a.page_size());
                 } else if inner_c.inserting_page.get() && grew > 0.0 {
+                    Self::take_over_fling(&inner_c);
+                    inner_c.shifting.set(true);
                     a.set_value(a.value() + grew);
+                    inner_c.shifting.set(false);
                 }
             });
         }
@@ -3304,6 +3359,13 @@ impl ChatViewPanel {
     /// Force scroll-to-bottom (for chat switch, send, history load).
     /// Fires on the next N vadjustment `changed` signals.
     fn force_scroll_to_bottom(inner: &ChatViewInner, pulses: u32) {
+        // A fling still running from before would overwrite the pin frame by
+        // frame (GTK's) or carry on into the new content (ours).
+        inner.momentum_gen.set(inner.momentum_gen.get() + 1);
+        if inner.fling_active.replace(false) {
+            inner.scroll.set_kinetic_scrolling(false);
+            inner.scroll.set_kinetic_scrolling(true);
+        }
         inner.scroll_pending.set(pulses);
         inner.at_bottom.set(true);
         inner.goto_latest_btn.set_visible(false);
@@ -3752,9 +3814,71 @@ impl ChatViewPanel {
         // without compensation the view jumps.
         let shrank = before_upper - adj.upper();
         if shrank > 0.0 {
+            inner.shifting.set(true);
             adj.set_value((before_value - shrank).max(0.0));
+            inner.shifting.set(false);
         }
         log::debug!("evicted {} offscreen bubbles ({total} live)", doomed.len());
+    }
+
+    /// Replace GTK's kinetic deceleration with one that moves by deltas.
+    ///
+    /// GTK's writes an absolute position every frame, computed from where the
+    /// fling began (gtkscrolledwindow.c, scrolled_window_deceleration_cb), and
+    /// offers no way to re-base it. Content inserted above the viewport moves
+    /// the coordinate system under it, so each frame it put the view back at
+    /// the pre-insert offset and the content lurched by a chunk's height —
+    /// once per chunk, for as long as the fling lasted. Toggling the kinetic
+    /// property is the public route to cancelling it; the momentum is then
+    /// carried on here with the same friction, relative to wherever the view
+    /// is, so position corrections and the fling compose.
+    fn take_over_fling(inner: &Rc<ChatViewInner>) {
+        if !inner.fling_active.replace(false) {
+            return;
+        }
+        inner.scroll.set_kinetic_scrolling(false);
+        inner.scroll.set_kinetic_scrolling(true);
+
+        let still_moving = inner
+            .last_motion
+            .get()
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(60));
+        let velocity = inner.velocity.get();
+        if !still_moving || velocity.abs() < FLING_MIN_SPEED {
+            return;
+        }
+
+        let generation = inner.momentum_gen.get() + 1;
+        inner.momentum_gen.set(generation);
+        let inner_c = inner.clone();
+        let velocity = Cell::new(velocity);
+        let last_frame: Cell<Option<i64>> = Cell::new(None);
+        inner.scroll.add_tick_callback(move |_, clock| {
+            if inner_c.momentum_gen.get() != generation {
+                return glib::ControlFlow::Break;
+            }
+            let now = clock.frame_time();
+            let Some(prev) = last_frame.replace(Some(now)) else {
+                return glib::ControlFlow::Continue;
+            };
+            // Clamped so a stalled frame cannot fire the view across the chat.
+            let dt = ((now - prev) as f64 / 1_000_000.0).clamp(0.0, 0.05);
+            let v = velocity.get() * (-FLING_FRICTION * dt).exp();
+            velocity.set(v);
+
+            let adj = inner_c.scroll.vadjustment();
+            let floor = adj.lower();
+            let ceiling = (adj.upper() - adj.page_size()).max(floor);
+            let target = (adj.value() + v * dt).clamp(floor, ceiling);
+            adj.set_value(target);
+
+            let at_edge = (target <= floor && v < 0.0) || (target >= ceiling && v > 0.0);
+            if v.abs() < FLING_MIN_SPEED || at_edge {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
     }
 
     /// Ask for the next older page, sizing it to how fast the user is moving.
@@ -3830,11 +3954,13 @@ impl ChatViewPanel {
                 // Guard the value across it: if the collapse reaches the
                 // adjustment it clamps to zero, and that is a jump to the top.
                 let held = adj.value();
+                inner_c.shifting.set(true);
                 inner_c.messages_box.set_visible(false);
                 inner_c.messages_box.set_visible(true);
                 if (adj.value() - held).abs() > 0.5 {
                     adj.set_value(held);
                 }
+                inner_c.shifting.set(false);
                 inner_c.loading_older.set(false);
                 // A page can be shorter than the trigger distance (short
                 // messages, or a big fling). Keep filling until there is real
