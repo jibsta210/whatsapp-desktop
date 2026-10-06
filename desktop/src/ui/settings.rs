@@ -805,6 +805,8 @@ fn build_gmessages_page() -> adw::PreferencesPage {
     pair_row.set_title("Pairing");
     pair_row.set_subtitle(if qr_url.is_some() {
         "Pairing required — scan the QR code below with Google Messages on your phone"
+    } else if crate::gm_qr_state::needs_repair() {
+        "Disconnected — Google ended this session. Re-pair to resume SMS."
     } else if is_paired {
         "Paired — phone is relaying SMS to this desktop"
     } else {
@@ -814,12 +816,10 @@ fn build_gmessages_page() -> adw::PreferencesPage {
     pair_btn.set_valign(gtk4::Align::Center);
     pair_btn.add_css_class("suggested-action");
     pair_btn.connect_clicked(|_btn| {
-        // Wipe current auth and signal the runtime to enter pair flow.
-        // The runtime then publishes a fresh QR URL into gm_qr_state,
-        // which the polling loop above renders into the QR row in this
-        // same settings page.
-        let auth = std::path::PathBuf::from("gmessages-auth.json");
-        let _ = std::fs::remove_file(&auth);
+        // The auth file is left alone: a successful pair overwrites it, and
+        // deleting it first meant a failed attempt left nothing to fall
+        // back on. The runtime publishes a fresh QR URL into gm_qr_state,
+        // which the polling loop above renders into the QR row here.
         crate::gm_qr_state::request_repair();
     });
     pair_row.add_suffix(&pair_btn);
@@ -852,8 +852,6 @@ fn build_gmessages_page() -> adw::PreferencesPage {
     });
     gaia_btn.set_valign(gtk4::Align::Center);
     gaia_btn.connect_clicked(move |btn| {
-        let auth = std::path::PathBuf::from("gmessages-auth.json");
-        let _ = std::fs::remove_file(&auth);
         // Reset ALL stale gaia state from any previous attempt so the
         // dialog can't accidentally render a leftover Success / emoji /
         // account list from before. Without these resets, e.g. a prior

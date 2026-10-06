@@ -242,6 +242,18 @@ async fn run_long_poll(client: Client, connected: Arc<AtomicBool>) -> Result<()>
                 "ReceiveMessages got HTTP {status} (#{error_count}); body[..{}]={body_preview:?}; retrying in {secs}s",
                 body.len().min(256)
             );
+            // While pairing, nothing can succeed without this stream, and the
+            // pairing RPC would otherwise just time out with no hint why.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                && error_count == 1
+                && !client.inner.auth.lock().await.is_paired()
+            {
+                client.emit(Event::PairFailed {
+                    reason: "Google is rate-limiting this account (HTTP 429). Wait a while before \
+                             trying again, or pair with the QR code instead."
+                        .into(),
+                });
+            }
             tokio::select! {
                 _ = sleep(Duration::from_secs(secs as u64)) => {}
                 _ = shutdown.recv() => return Ok(()),

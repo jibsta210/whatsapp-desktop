@@ -85,6 +85,19 @@ pub fn get() -> Option<String> {
 /// Cross-thread signal: settings page → gm runtime to drop the current
 /// connection and re-run pairing. Set true from the UI; the runtime
 /// observes via `take_repair_request` and resets the flag.
+/// The stored session is dead and nothing is connected. The auth file still
+/// exists in this state (it is never deleted), so its presence alone cannot
+/// be what the settings page reports.
+static NEEDS_REPAIR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_needs_repair(v: bool) {
+    NEEDS_REPAIR.store(v, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn needs_repair() -> bool {
+    NEEDS_REPAIR.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 static REPAIR_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Settings UI calls this when the user clicks "Re-pair…".

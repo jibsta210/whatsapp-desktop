@@ -330,11 +330,23 @@ impl Client {
         // Post-connect activation. Run on a background task so connect()
         // returns promptly; mirrors Go's `postConnect` goroutine.
         let client = self.clone();
+        // Subscribed before spawning so a disconnect that lands during the
+        // sleep is not missed. Without this the task outlived its connection
+        // and reported AuthRevoked for a session nobody was using any more —
+        // straight into whatever pairing flow had started in the meantime.
+        let mut shutdown = self.inner.shutdown.subscribe();
         tokio::spawn(async move {
-            // Brief pause to let the long-poll establish before we start
-            // sending RPCs (matches Go's 2s sleep).
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match crate::session::set_active_session(&client).await {
+            let activate = async {
+                // Brief pause to let the long-poll establish before we start
+                // sending RPCs (matches Go's 2s sleep).
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                crate::session::set_active_session(&client).await
+            };
+            let result = tokio::select! {
+                r = activate => r,
+                _ = shutdown.recv() => return,
+            };
+            match result {
                 Ok(()) => log::info!("post-connect: active session registered"),
                 Err(Error::AuthRevoked) => {
                     log::warn!(

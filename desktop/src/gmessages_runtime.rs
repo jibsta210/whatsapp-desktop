@@ -801,7 +801,7 @@ async fn run(
     // If we don't have valid auth, run the pairing flow before connecting.
     // We render the QR to stderr so the user can scan it from the terminal.
     if !client.auth_snapshot().await.is_paired() {
-        run_pair_flow(&client, &auth_path, &mut events, &event_tx).await?;
+        pair_until_paired(&client, &auth_path, &mut events, &event_tx).await;
     }
 
     // Shared phone→name cache. Built up at startup from ListContacts +
@@ -901,7 +901,7 @@ async fn run(
                 // this explicitly: "why are you letting the auth file be
                 // deleted".
                 // Reset in-memory auth so is_paired() returns false.
-                run_pair_flow(&client, &auth_path, &mut events, &event_tx).await?;
+                pair_until_paired(&client, &auth_path, &mut events, &event_tx).await;
                 client
                     .connect()
                     .await
@@ -1415,6 +1415,7 @@ async fn run(
     }
 
     // Pump events + commands. select! lets us drive both directions.
+    let mut last_cookie_retry: Option<std::time::Instant> = None;
     loop {
         // Poll the cross-thread re-pair signals at the top of each loop
         // iteration. Putting them inside a `select!` sleep arm starves
@@ -1433,6 +1434,9 @@ async fn run(
                 log::warn!("gmessages: re-pair failed: {e}");
             } else if let Err(e) = client.connect().await {
                 log::warn!("gmessages: reconnect after re-pair failed: {e}");
+            } else {
+                crate::gm_qr_state::set_needs_repair(false);
+                last_cookie_retry = None;
             }
             continue;
         }
@@ -1457,6 +1461,8 @@ async fn run(
                             )),
                         );
                     } else {
+                        crate::gm_qr_state::set_needs_repair(false);
+                        last_cookie_retry = None;
                         crate::gm_qr_state::set_gaia_status(
                             crate::gm_qr_state::GaiaStatus::Success,
                         );
@@ -1477,6 +1483,9 @@ async fn run(
                 log::info!("gmessages → desktop: received {event_kind}");
 
                 if matches!(event, Event::AuthRevoked) {
+                    if crate::gm_qr_state::needs_repair() {
+                        continue;
+                    }
                     log::warn!("gmessages: AuthRevoked received — attempting recovery");
                     let _ = client.disconnect().await;
                     // First-line defense for Gaia sessions: Firefox may
@@ -1489,11 +1498,20 @@ async fn run(
                         .await
                         .gaia_authuser
                         .is_some();
+                    // connect() returns before the server has judged the
+                    // token, so "it connected" proves nothing. If the session
+                    // is revoked again soon after a cookie retry, the cookies
+                    // were never the problem — retrying forever spun this
+                    // loop ~3×/s for a day and starved every re-pair attempt.
+                    let cookie_retry_spent = last_cookie_retry
+                        .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(600));
                     let mut recovered = false;
                     if is_gaia
+                        && !cookie_retry_spent
                         && let Ok(fresh) =
                             gmessages_rust::cookies::read_default_firefox_cookies()
                     {
+                        last_cookie_retry = Some(std::time::Instant::now());
                         log::warn!(
                             "gmessages: AuthRevoked recovery — re-read {} FF cookies; retrying connect",
                             fresh.len()
@@ -1507,17 +1525,20 @@ async fn run(
                         }
                     }
                     if !recovered {
-                        log::warn!(
-                            "gmessages: AuthRevoked recovery failed — wiping auth and re-pairing"
-                        );
-                        // Intentionally NOT wiping the auth file — notify_auth_changed
-            // overwrites it with fresh contents on a successful re-pair,
-            // and if the new pair fails we'd rather keep the old (possibly
-            // recoverable) auth than be left with nothing. User asked for
-            // this explicitly: "why are you letting the auth file be
-            // deleted".
-                        run_pair_flow(&client, &auth_path, &mut events, &event_tx).await?;
-                        client.connect().await.context("gmessages: reconnect after re-pair")?;
+                        // Park, disconnected, until the user re-pairs from
+                        // Settings (the request flags are polled at the top
+                        // of this loop). Pairing needs the user's phone, so
+                        // starting it unprompted helps nobody, and a failed
+                        // attempt must not take the whole runtime down.
+                        // The auth file is deliberately left in place.
+                        log::warn!("gmessages: session is dead — waiting for a re-pair from Settings");
+                        drain_stale_events(&mut events);
+                        crate::gm_qr_state::set_needs_repair(true);
+                        let _ = event_tx
+                            .send(WaEvent::ErrorToast(
+                                "Google Messages disconnected — re-pair in Settings → SMS / Google Messages".into(),
+                            ))
+                            .await;
                     }
                     continue;
                 }
@@ -1945,6 +1966,9 @@ async fn run(
                         log::warn!("gmessages: re-pair failed: {e}");
                     } else if let Err(e) = client.connect().await {
                         log::warn!("gmessages: reconnect after re-pair failed: {e}");
+                    } else {
+                        crate::gm_qr_state::set_needs_repair(false);
+                        last_cookie_retry = None;
                     }
                     continue;
                 }
@@ -2892,7 +2916,46 @@ fn describe_wa_event(e: &WaEvent) -> String {
 /// Drive a fresh QR pairing flow. Renders the QR to stderr so the user can
 /// scan it from the terminal where they launched the desktop. Blocks until
 /// the phone confirms pairing or the flow fails.
+/// Set while the user has been told pairing is needed, so a QR attempt that
+/// times out and restarts does not raise a fresh never-dismiss notification
+/// every five minutes.
+static PAIR_ANNOUNCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Pair, however long it takes. A QR attempt gives up after five minutes, and
+/// returning that error out of the runtime ended it — leaving the Settings
+/// pairing buttons wired to nothing until the app was restarted.
+async fn pair_until_paired(
+    client: &Arc<Client>,
+    auth_path: &Path,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    event_tx: &Sender<WaEvent>,
+) {
+    loop {
+        match run_pair_flow(client, auth_path, events, event_tx).await {
+            Ok(()) => return,
+            Err(e) => {
+                log::warn!("gmessages: pairing attempt ended ({e:#}); starting another");
+                let _ = client.disconnect().await;
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            }
+        }
+    }
+}
+
 async fn run_pair_flow(
+    client: &Arc<Client>,
+    auth_path: &Path,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    event_tx: &Sender<WaEvent>,
+) -> Result<()> {
+    let result = run_pair_flow_once(client, auth_path, events, event_tx).await;
+    if result.is_ok() {
+        PAIR_ANNOUNCED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    result
+}
+
+async fn run_pair_flow_once(
     client: &Arc<Client>,
     auth_path: &Path,
     events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
@@ -2918,21 +2981,26 @@ async fn run_pair_flow(
     );
     // Fire a desktop notification too so the user sees it even when they
     // alt-tabbed away from the terminal.
-    let _ = std::process::Command::new("notify-send")
-        .arg("-u")
-        .arg("critical")
-        .arg("-t")
-        .arg("0") // never auto-dismiss
-        .arg("Google Messages: pairing required")
-        .arg("SMS will not arrive until you scan the QR code in the terminal.")
-        .spawn();
-    let _ = event_tx
-        .send(WaEvent::ErrorToast(
-            "Google Messages: scan the QR code in your terminal — SMS paused until then".into(),
-        ))
-        .await;
+    if !PAIR_ANNOUNCED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        let _ = std::process::Command::new("notify-send")
+            .arg("-u")
+            .arg("critical")
+            .arg("-t")
+            .arg("0") // never auto-dismiss
+            .arg("Google Messages: pairing required")
+            .arg("SMS will not arrive until you pair in Settings → SMS / Google Messages.")
+            .spawn();
+        let _ = event_tx
+            .send(WaEvent::ErrorToast(
+                "Google Messages: pair in Settings → SMS / Google Messages — SMS paused until then"
+                    .into(),
+            ))
+            .await;
+    }
 
     // Run the pairing handshake on a background task so we can pump events here.
+    drain_stale_events(events);
+    let flow_started = std::time::Instant::now();
     let pair_task = {
         let c = client.clone();
         tokio::spawn(async move { c.start_pairing().await })
@@ -2948,6 +3016,9 @@ async fn run_pair_flow(
             log::warn!("gmessages: QR pair flow aborting — Gaia pair requested");
             crate::gm_qr_state::set(None);
             pair_task.abort();
+            // The QR attempt's long-poll outlives its task; stop it so the
+            // Gaia flow starts from a clean connection.
+            let _ = client.disconnect().await;
             // Surface the Starting status immediately so the dialog
             // doesn't sit on whatever it was before.
             crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::Starting);
@@ -2987,6 +3058,9 @@ async fn run_pair_flow(
             Event::PairFailed { reason } => {
                 anyhow::bail!("gmessages: pair failed: {reason}");
             }
+            Event::AuthRevoked if flow_started.elapsed() < PAIR_STALE_REVOKE_GRACE => {
+                log::info!("gmessages: ignoring AuthRevoked left over from the old session");
+            }
             Event::AuthRevoked => {
                 anyhow::bail!("gmessages: auth revoked during pairing");
             }
@@ -3019,6 +3093,8 @@ async fn run_gaia_pair_flow(
     events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
     event_tx: &Sender<WaEvent>,
 ) -> Result<()> {
+    drain_stale_events(events);
+    let flow_started = std::time::Instant::now();
     log::info!("gmessages: gaia pair: reading Firefox cookies");
     crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::ReadingCookies);
     let cookies = match gmessages_rust::cookies::read_default_firefox_cookies() {
@@ -3187,6 +3263,11 @@ async fn run_gaia_pair_flow(
                 ));
                 anyhow::bail!("gaia pair failed: {reason}");
             }
+            Event::AuthRevoked if flow_started.elapsed() < PAIR_STALE_REVOKE_GRACE => {
+                log::info!(
+                    "gmessages: gaia pair: ignoring AuthRevoked left over from the old session"
+                );
+            }
             Event::AuthRevoked => {
                 crate::gm_qr_state::set_gaia_emoji(None);
                 crate::gm_qr_state::set_gaia_status(crate::gm_qr_state::GaiaStatus::Failed(
@@ -3205,6 +3286,24 @@ async fn run_gaia_pair_flow(
         .context("gmessages: start_gaia_pairing returned error")?;
     Ok(())
 }
+
+/// Discard events queued by a connection that has since been torn down. A
+/// pairing flow reads this same channel, and a leftover AuthRevoked from the
+/// old session would be taken as the new pairing failing.
+fn drain_stale_events(events: &mut tokio::sync::mpsc::UnboundedReceiver<Event>) {
+    let mut dropped = 0usize;
+    while events.try_recv().is_ok() {
+        dropped += 1;
+    }
+    if dropped > 0 {
+        log::info!("gmessages: dropped {dropped} stale event(s) from the previous session");
+    }
+}
+
+/// Belt to the drain's braces: anything still in flight from the old session
+/// when a pairing flow starts lands within moments, and a real revocation of
+/// a brand-new pairing cannot happen before the flow has contacted Google.
+const PAIR_STALE_REVOKE_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn load_auth(path: &Path) -> Result<AuthData> {
     if !path.exists() {
