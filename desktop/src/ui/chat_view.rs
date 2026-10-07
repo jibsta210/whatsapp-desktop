@@ -162,6 +162,14 @@ struct ChatViewInner {
     velocity: Cell<f64>,
     /// Bumped to stop a momentum animation we are running ourselves.
     momentum_gen: Cell<u64>,
+    momentum_running: Cell<bool>,
+    /// Last real scroll input. Paging speed is only believed while the user
+    /// (or a fling they started) is what is moving the view.
+    last_input: Cell<Option<std::time::Instant>>,
+    /// Bumped whenever the conversation is replaced. A page requested, or
+    /// still being inserted, for the previous contents must not land here.
+    view_epoch: Cell<u64>,
+    page_epoch: Cell<u64>,
     /// "Go to latest" floating button
     goto_latest_btn: Button,
     // msg_id → bubble (for receipt updates)
@@ -1075,6 +1083,10 @@ impl ChatViewPanel {
             last_motion: Cell::new(None),
             velocity: Cell::new(0.0),
             momentum_gen: Cell::new(0),
+            momentum_running: Cell::new(false),
+            last_input: Cell::new(None),
+            view_epoch: Cell::new(0),
+            page_epoch: Cell::new(0),
             goto_latest_btn: goto_latest_btn.clone(),
             bubbles: RefCell::new(HashMap::new()),
             pending_message_jump: RefCell::new(None),
@@ -1160,7 +1172,9 @@ impl ChatViewPanel {
             sc.connect_scroll(move |_, _, _| {
                 inner_c.fling_active.set(false);
                 inner_c.momentum_gen.set(inner_c.momentum_gen.get() + 1);
+                inner_c.momentum_running.set(false);
                 inner_c.scroll_pending.set(0);
+                inner_c.last_input.set(Some(std::time::Instant::now()));
                 glib::Propagation::Proceed
             });
             let inner_c = inner.clone();
@@ -1194,7 +1208,18 @@ impl ChatViewPanel {
                     }
                     // Capped: nothing a hand or a fling produces is faster,
                     // so anything above it is a jump, not a scroll.
-                    let up_speed = if prev.is_nan() || dt <= 0.0 || dt > 0.5 {
+                    // Position changes for many reasons that are not scrolling
+                    // (content replaced, clamped, re-laid out), and the time
+                    // since the previous sample is arbitrary, so a delta alone
+                    // can look like any speed at all. Speed is believed only
+                    // while input, or a fling it started, is driving.
+                    let user_driven = inner_c.fling_active.get()
+                        || inner_c.momentum_running.get()
+                        || inner_c
+                            .last_input
+                            .get()
+                            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(250));
+                    let up_speed = if !user_driven || prev.is_nan() || dt <= 0.0 || dt > 0.5 {
                         0.0
                     } else {
                         let v = (prev - value) / dt;
@@ -3379,6 +3404,7 @@ impl ChatViewPanel {
         // A fling still running from before would overwrite the pin frame by
         // frame (GTK's) or carry on into the new content (ours).
         inner.momentum_gen.set(inner.momentum_gen.get() + 1);
+        inner.momentum_running.set(false);
         if inner.fling_active.replace(false) {
             inner.scroll.set_kinetic_scrolling(false);
             inner.scroll.set_kinetic_scrolling(true);
@@ -3659,6 +3685,7 @@ impl ChatViewPanel {
         remove_all_children(&self.inner.messages_box);
         self.inner.bubbles.borrow_mut().clear();
         self.inner.rendered.borrow_mut().clear();
+        Self::reset_paging(&self.inner);
         self.inner.search_texts.borrow_mut().clear();
         self.inner.id_remap.borrow_mut().clear();
         self.inner.media_items.borrow_mut().clear();
@@ -3771,6 +3798,22 @@ impl ChatViewPanel {
     /// Drop the oldest rendered bubbles once the ceiling is exceeded. Only
     /// runs while the user is heading down and away from them; evicting above
     /// the viewport while they scroll up would fight the loader.
+    /// Called wherever the conversation is emptied. Paging state describes
+    /// the bubbles that were just removed; left in place it let the next
+    /// position change (the clamp to zero from emptying the view) request a
+    /// page for the incoming chat against the outgoing chat's cursor.
+    fn reset_paging(inner: &ChatViewInner) {
+        inner.view_epoch.set(inner.view_epoch.get() + 1);
+        inner.has_more_history.set(false);
+        inner.loading_older.set(false);
+        inner.inserting_page.set(false);
+        inner.prepending.set(false);
+        inner.oldest_ts.set(0);
+        inner.fling_active.set(false);
+        inner.momentum_gen.set(inner.momentum_gen.get() + 1);
+        inner.momentum_running.set(false);
+    }
+
     fn evict_offscreen_older(inner: &Rc<ChatViewInner>) {
         let total = inner.rendered.borrow().len();
         if total <= LIVE_BUBBLE_MAX {
@@ -3796,6 +3839,18 @@ impl ChatViewPanel {
                 .collect()
         };
 
+        // The order record can name bubbles that are gone (deleted, or
+        // re-keyed when a send was confirmed). With nothing to match, the
+        // walk below had no stopping point and removed every widget in the
+        // conversation. Forget the stale entries and leave the tree alone.
+        if addr_to_id.is_empty() {
+            let mut rendered = inner.rendered.borrow_mut();
+            for _ in 0..doomed.len() {
+                rendered.pop_front();
+            }
+            return;
+        }
+
         let adj = inner.scroll.vadjustment();
         let before_upper = adj.upper();
         let before_value = adj.value();
@@ -3803,7 +3858,7 @@ impl ChatViewPanel {
         // Walk from the top, removing until every doomed bubble is gone. Date
         // separators sit between bubbles and are not in the map; they belong to
         // the removed span, so they go with it.
-        let mut remaining = doomed.len();
+        let mut remaining = addr_to_id.len();
         let mut child = inner.messages_box.first_child();
         while let Some(widget) = child {
             if remaining == 0 {
@@ -3871,6 +3926,7 @@ impl ChatViewPanel {
 
         let generation = inner.momentum_gen.get() + 1;
         inner.momentum_gen.set(generation);
+        inner.momentum_running.set(true);
         let inner_c = inner.clone();
         let velocity = Cell::new(velocity);
         let last_frame: Cell<Option<i64>> = Cell::new(None);
@@ -3895,6 +3951,7 @@ impl ChatViewPanel {
 
             let at_edge = (target <= floor && v < 0.0) || (target >= ceiling && v > 0.0);
             if v.abs() < FLING_MIN_SPEED || at_edge {
+                inner_c.momentum_running.set(false);
                 glib::ControlFlow::Break
             } else {
                 glib::ControlFlow::Continue
@@ -3915,6 +3972,7 @@ impl ChatViewPanel {
             50
         };
         inner.loading_older.set(true);
+        inner.page_epoch.set(inner.view_epoch.get());
         inner.bridge.send_command(WaCommand::LoadOlderMessages {
             chat_id,
             before_timestamp: inner.oldest_ts.get(),
@@ -3934,6 +3992,12 @@ impl ChatViewPanel {
             .unwrap_or(false);
         if !is_current {
             self.inner.loading_older.set(false);
+            return;
+        }
+        // Same chat id is not enough: the chat may have been left and reopened
+        // while the page was in flight, and its cursor is from the old view.
+        if self.inner.page_epoch.get() != self.inner.view_epoch.get() {
+            log::debug!("dropping a scroll-back page requested for a previous view");
             return;
         }
 
@@ -3963,8 +4027,14 @@ impl ChatViewPanel {
         let adj = self.inner.scroll.vadjustment();
         self.inner.last_upper.set(adj.upper());
         self.inner.inserting_page.set(true);
+        let epoch = self.inner.view_epoch.get();
 
         glib::idle_add_local(move || {
+            // The conversation was replaced mid-insert; the rest of this page
+            // belongs to what was there before. reset_paging cleared the flags.
+            if inner_c.view_epoch.get() != epoch {
+                return glib::ControlFlow::Break;
+            }
             let adj = inner_c.scroll.vadjustment();
 
             if queue.borrow().is_empty() {
@@ -4520,6 +4590,7 @@ impl ChatViewPanel {
                 }
                 inner_c.bubbles.borrow_mut().clear();
                 inner_c.rendered.borrow_mut().clear();
+                Self::reset_paging(&inner_c);
                 inner_c.search_texts.borrow_mut().clear();
                 inner_c.id_remap.borrow_mut().clear();
                 inner_c.media_items.borrow_mut().clear();
@@ -4743,6 +4814,7 @@ impl ChatViewPanel {
         remove_all_children(&self.inner.messages_box);
         self.inner.bubbles.borrow_mut().clear();
         self.inner.rendered.borrow_mut().clear();
+        Self::reset_paging(&self.inner);
         let label = gtk4::Label::new(Some(
             "No message history yet — new messages will appear here.",
         ));
@@ -6069,6 +6141,7 @@ fn show_message_menu(
                 remove_all_children(&inner_c.messages_box);
                 inner_c.bubbles.borrow_mut().clear();
                 inner_c.rendered.borrow_mut().clear();
+                ChatViewPanel::reset_paging(&inner_c);
                 inner_c.search_texts.borrow_mut().clear();
                 inner_c.media_items.borrow_mut().clear();
                 *inner_c.last_msg_date.borrow_mut() = None;
@@ -6133,6 +6206,7 @@ fn show_message_menu(
                 remove_all_children(&inner_c.messages_box);
                 inner_c.bubbles.borrow_mut().clear();
                 inner_c.rendered.borrow_mut().clear();
+                ChatViewPanel::reset_paging(&inner_c);
                 inner_c
                     .bridge
                     .send_command(WaCommand::StartNewChat { jid: sid.clone() });
