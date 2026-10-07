@@ -77,6 +77,7 @@ const PREPEND_CHUNK: usize = 8;
 /// GTK's own deceleration constant (DECELERATION_FRICTION), so a fling we
 /// carry on feels the same as one GTK finishes; and the speed below which a
 /// fling is over.
+const MAX_REAL_SCROLL_SPEED: f64 = 30_000.0;
 const FLING_FRICTION: f64 = 4.0;
 const FLING_MIN_SPEED: f64 = 20.0;
 
@@ -1191,10 +1192,17 @@ impl ChatViewPanel {
                     if inner_c.shifting.get() {
                         return;
                     }
+                    // Capped: nothing a hand or a fling produces is faster,
+                    // so anything above it is a jump, not a scroll.
                     let up_speed = if prev.is_nan() || dt <= 0.0 || dt > 0.5 {
                         0.0
                     } else {
-                        ((prev - value) / dt).max(0.0)
+                        let v = (prev - value) / dt;
+                        if v > MAX_REAL_SCROLL_SPEED {
+                            0.0
+                        } else {
+                            v.max(0.0)
+                        }
                     };
                     // A deceleration moves every frame; a gap means it ended.
                     if dt > 0.1 {
@@ -1269,11 +1277,20 @@ impl ChatViewPanel {
                 let upper = a.upper();
                 let grew = upper - inner_c.last_upper.replace(upper);
                 let count = sp.get();
+                // Pins are flagged like any other correction. Unflagged, the
+                // jump from the previous chat's offset to this chat's bottom
+                // read as a scroll at hundreds of thousands of px/s, which
+                // "anticipated" a 400-message page on every chat open and
+                // churned the view while it was inserted.
                 if count > 0 {
+                    inner_c.shifting.set(true);
                     a.set_value(upper - a.page_size());
+                    inner_c.shifting.set(false);
                     sp.set(count - 1);
                 } else if at_b.get() {
+                    inner_c.shifting.set(true);
                     a.set_value(upper - a.page_size());
+                    inner_c.shifting.set(false);
                 } else if inner_c.inserting_page.get() && grew > 0.0 {
                     Self::take_over_fling(&inner_c);
                     inner_c.shifting.set(true);
@@ -3370,7 +3387,9 @@ impl ChatViewPanel {
         inner.at_bottom.set(true);
         inner.goto_latest_btn.set_visible(false);
         let adj = inner.scroll.vadjustment();
+        inner.shifting.set(true);
         adj.set_value(adj.upper() - adj.page_size());
+        inner.shifting.set(false);
     }
 
     /// Auto-scroll only if user is already at the bottom (for incoming messages).
@@ -3378,7 +3397,9 @@ impl ChatViewPanel {
         if inner.at_bottom.get() {
             inner.scroll_pending.set(3);
             let adj = inner.scroll.vadjustment();
+            inner.shifting.set(true);
             adj.set_value(adj.upper() - adj.page_size());
+            inner.shifting.set(false);
         }
     }
 
@@ -4060,10 +4081,12 @@ impl ChatViewPanel {
                 let Some(inner) = inner_w.upgrade() else {
                     return;
                 };
+                inner.shifting.set(true);
                 inner.messages_box.set_visible(false);
                 inner.messages_box.set_visible(true);
                 let adj = inner.scroll.vadjustment();
                 adj.set_value(adj.upper() - adj.page_size());
+                inner.shifting.set(false);
                 inner.scroll_pending.set(2);
             });
         }
