@@ -1248,8 +1248,24 @@ impl ChatViewPanel {
                     let scrollable = adj.upper() > adj.page_size();
                     if inner_c.scroll_pending.get() == 0 && scrollable {
                         let near = value >= adj.upper() - adj.page_size() - 60.0;
-                        inner_c.at_bottom.set(near);
+                        if inner_c.at_bottom.replace(near) != near {
+                            Self::strace(
+                                &inner_c,
+                                format_args!("at_bottom -> {near} (user_driven={user_driven})"),
+                            );
+                        }
                         inner_c.goto_latest_btn.set_visible(!near);
+                    }
+                    if !prev.is_nan() && (value - prev).abs() > 250.0 {
+                        Self::strace(
+                            &inner_c,
+                            format_args!(
+                                "JUMP {:+.0} in {:.0}ms user_driven={user_driven} fling={}",
+                                value - prev,
+                                dt * 1000.0,
+                                inner_c.fling_active.get()
+                            ),
+                        );
                     }
 
                     // A page insert is in progress, or a chat switch is still
@@ -1307,20 +1323,41 @@ impl ChatViewPanel {
                 // read as a scroll at hundreds of thousands of px/s, which
                 // "anticipated" a 400-message page on every chat open and
                 // churned the view while it was inserted.
+                let before = a.value();
                 if count > 0 {
                     inner_c.shifting.set(true);
                     a.set_value(upper - a.page_size());
                     inner_c.shifting.set(false);
                     sp.set(count - 1);
+                    if (a.value() - before).abs() > 40.0 {
+                        Self::strace(
+                            &inner_c,
+                            format_args!(
+                                "PIN(pulse) moved {:+.0} grew {grew:+.0}",
+                                a.value() - before
+                            ),
+                        );
+                    }
                 } else if at_b.get() {
                     inner_c.shifting.set(true);
                     a.set_value(upper - a.page_size());
                     inner_c.shifting.set(false);
+                    if (a.value() - before).abs() > 40.0 {
+                        Self::strace(
+                            &inner_c,
+                            format_args!(
+                                "PIN(at_bottom) moved {:+.0} grew {grew:+.0}",
+                                a.value() - before
+                            ),
+                        );
+                    }
                 } else if inner_c.inserting_page.get() && grew > 0.0 {
                     Self::take_over_fling(&inner_c);
                     inner_c.shifting.set(true);
                     a.set_value(a.value() + grew);
                     inner_c.shifting.set(false);
+                } else if grew.abs() > 40.0 {
+                    Self::strace(&inner_c, format_args!("LAYOUT unpinned grew {grew:+.0}"));
                 }
             });
         }
@@ -3802,7 +3839,29 @@ impl ChatViewPanel {
     /// the bubbles that were just removed; left in place it let the next
     /// position change (the clamp to zero from emptying the view) request a
     /// page for the incoming chat against the outgoing chat's cursor.
+    /// One line of scroll state per notable event, greppable as SCROLLTRACE.
+    /// The view's position is moved from a dozen places; when it misbehaves
+    /// this is the only record of which one did it.
+    fn strace(inner: &ChatViewInner, what: std::fmt::Arguments) {
+        let adj = inner.scroll.vadjustment();
+        log::info!(
+            "SCROLLTRACE {what} | v={:.0} bottom={:.0} upper={:.0} page={:.0} pend={} atb={} more={} loading={} ins={} live={} ep={}",
+            adj.value(),
+            (adj.upper() - adj.page_size()).max(0.0),
+            adj.upper(),
+            adj.page_size(),
+            inner.scroll_pending.get(),
+            inner.at_bottom.get(),
+            inner.has_more_history.get(),
+            inner.loading_older.get(),
+            inner.inserting_page.get(),
+            inner.rendered.borrow().len(),
+            inner.view_epoch.get(),
+        );
+    }
+
     fn reset_paging(inner: &ChatViewInner) {
+        Self::strace(inner, format_args!("reset_paging"));
         inner.view_epoch.set(inner.view_epoch.get() + 1);
         inner.has_more_history.set(false);
         inner.loading_older.set(false);
@@ -3894,7 +3953,14 @@ impl ChatViewPanel {
             adj.set_value((before_value - shrank).max(0.0));
             inner.shifting.set(false);
         }
-        log::debug!("evicted {} offscreen bubbles ({total} live)", doomed.len());
+        Self::strace(
+            inner,
+            format_args!(
+                "EVICT {} of {total} (matched {})",
+                doomed.len(),
+                addr_to_id.len()
+            ),
+        );
     }
 
     /// Replace GTK's kinetic deceleration with one that moves by deltas.
@@ -3971,6 +4037,10 @@ impl ChatViewPanel {
         } else {
             50
         };
+        Self::strace(
+            inner,
+            format_args!("REQUEST older limit={limit} speed={up_speed:.0}"),
+        );
         inner.loading_older.set(true);
         inner.page_epoch.set(inner.view_epoch.get());
         inner.bridge.send_command(WaCommand::LoadOlderMessages {
@@ -4001,6 +4071,10 @@ impl ChatViewPanel {
             return;
         }
 
+        Self::strace(
+            &self.inner,
+            format_args!("PAGE arrived n={} has_more={has_more}", messages.len()),
+        );
         self.inner.has_more_history.set(has_more);
         if messages.is_empty() {
             self.inner.loading_older.set(false);
@@ -4039,6 +4113,7 @@ impl ChatViewPanel {
 
             if queue.borrow().is_empty() {
                 inner_c.inserting_page.set(false);
+                Self::strace(&inner_c, format_args!("PAGE inserted"));
                 // GTK4's GL renderer does not reliably paint widgets inserted
                 // at the top — they stay invisible until something else damages
                 // the surface. The hide/show cycle forces a full re-render.
@@ -4133,6 +4208,7 @@ impl ChatViewPanel {
         // connect_changed handler will keep the scroll anchored to the
         // bottom while at_bottom remains true.
         Self::force_scroll_to_bottom(&self.inner, 4);
+        Self::strace(&self.inner, format_args!("OPEN {chat_id} history rendered"));
 
         // History rows are constructed synchronously above. Starting the
         // frame-clock animation only now guarantees that its first frame is
@@ -4151,6 +4227,7 @@ impl ChatViewPanel {
                 let Some(inner) = inner_w.upgrade() else {
                     return;
                 };
+                Self::strace(&inner, format_args!("REPAINT(120ms) before"));
                 inner.shifting.set(true);
                 inner.messages_box.set_visible(false);
                 inner.messages_box.set_visible(true);
