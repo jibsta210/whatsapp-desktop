@@ -61,8 +61,8 @@ pub struct ChatViewPanel {
 /// Scroll-back prefetch tuning: distance above the top at which a fetch starts,
 /// and how far ahead of that to look based on scroll velocity.
 const PREFETCH_BASE_PX: f64 = 900.0;
-const PREFETCH_LEAD_SECS: f64 = 0.75;
-const PREFETCH_MAX_PX: f64 = 8000.0;
+const PREFETCH_LEAD_SECS: f64 = 0.4;
+const PREFETCH_MAX_PX: f64 = 2500.0;
 
 /// Live bubble ceiling. Scrolling back far enough would otherwise keep every
 /// widget alive for the session; past the ceiling the oldest are dropped back
@@ -170,6 +170,8 @@ struct ChatViewInner {
     /// still being inserted, for the previous contents must not land here.
     view_epoch: Cell<u64>,
     page_epoch: Cell<u64>,
+    /// Net position correction applied during the current page, for the trace.
+    page_shift: Cell<f64>,
     /// "Go to latest" floating button
     goto_latest_btn: Button,
     // msg_id → bubble (for receipt updates)
@@ -1087,6 +1089,7 @@ impl ChatViewPanel {
             last_input: Cell::new(None),
             view_epoch: Cell::new(0),
             page_epoch: Cell::new(0),
+            page_shift: Cell::new(0.0),
             goto_latest_btn: goto_latest_btn.clone(),
             bubbles: RefCell::new(HashMap::new()),
             pending_message_jump: RefCell::new(None),
@@ -1335,11 +1338,18 @@ impl ChatViewPanel {
                     // rules below are never needed here, and letting them run
                     // was the fight in the trace: a pin to the bottom and the
                     // fling's own position alternating frame by frame.
-                    if grew > 0.0 {
+                    // Both directions. Bubbles are measured twice — once at a
+                    // provisional width, then at their real one — so a chunk's
+                    // height first overshoots and then settles back. Following
+                    // only the growth left every overshoot in the position, and
+                    // the view crept toward the bottom over a page (the trace
+                    // shows it arriving there from 360px above).
+                    if grew != 0.0 {
                         Self::take_over_fling(&inner_c, false);
                         inner_c.shifting.set(true);
-                        a.set_value(before + grew);
+                        a.set_value((before + grew).max(0.0));
                         inner_c.shifting.set(false);
+                        inner_c.page_shift.set(inner_c.page_shift.get() + grew);
                     }
                 } else if count > 0 {
                     inner_c.shifting.set(true);
@@ -3997,7 +4007,8 @@ impl ChatViewPanel {
         // decelerating comes from an input signal and has proved not to be a
         // complete record, and a deceleration that survives into the insert
         // is the worst case. Cancelling when there is none costs nothing.
-        if !inner.fling_active.replace(false) && !force {
+        let was_flinging = inner.fling_active.replace(false);
+        if !was_flinging && !force {
             return;
         }
         if inner.momentum_running.get() {
@@ -4005,6 +4016,12 @@ impl ChatViewPanel {
         }
         inner.scroll.set_kinetic_scrolling(false);
         inner.scroll.set_kinetic_scrolling(true);
+        // Only a fling is carried on. With fingers still on the pad, or after
+        // a wheel notch, there is no momentum to preserve, and inventing some
+        // sent the view gliding on its own.
+        if !was_flinging {
+            return;
+        }
 
         let still_moving = inner
             .last_motion
@@ -4129,6 +4146,7 @@ impl ChatViewPanel {
         self.inner.at_bottom.set(near_bottom);
         Self::take_over_fling(&self.inner, true);
         self.inner.inserting_page.set(true);
+        self.inner.page_shift.set(0.0);
         let epoch = self.inner.view_epoch.get();
 
         glib::idle_add_local(move || {
@@ -4140,8 +4158,10 @@ impl ChatViewPanel {
             let adj = inner_c.scroll.vadjustment();
 
             if queue.borrow().is_empty() {
-                inner_c.inserting_page.set(false);
-                Self::strace(&inner_c, format_args!("PAGE inserted"));
+                Self::strace(
+                    &inner_c,
+                    format_args!("PAGE inserted shift={:+.0}", inner_c.page_shift.get()),
+                );
                 // GTK4's GL renderer does not reliably paint widgets inserted
                 // at the top — they stay invisible until something else damages
                 // the surface. The hide/show cycle forces a full re-render.
@@ -4155,16 +4175,35 @@ impl ChatViewPanel {
                     adj.set_value(held);
                 }
                 inner_c.shifting.set(false);
-                inner_c.loading_older.set(false);
-                // A page can be shorter than the trigger distance (short
-                // messages, or a big fling). Keep filling until there is real
-                // runway above, otherwise the next scroll stalls at the wall.
-                if inner_c.has_more_history.get()
-                    && inner_c.scroll_pending.get() == 0
-                    && adj.value() <= PREFETCH_BASE_PX
-                {
-                    Self::request_older(&inner_c, 0.0);
-                }
+                // The re-render above re-measures every bubble, and the page's
+                // heights go on settling for a few frames (the trace shows
+                // +96 to +538px arriving after the insert). That is still
+                // movement above the viewport, so keep following it until it
+                // has had time to finish before handing position back.
+                let inner_s = inner_c.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+                    if inner_s.view_epoch.get() != epoch {
+                        return;
+                    }
+                    inner_s.inserting_page.set(false);
+                    inner_s.loading_older.set(false);
+                    let adj = inner_s.scroll.vadjustment();
+                    let near = adj.value() >= adj.upper() - adj.page_size() - 60.0;
+                    inner_s.at_bottom.set(near);
+                    Self::strace(
+                        &inner_s,
+                        format_args!("PAGE settled shift={:+.0}", inner_s.page_shift.get()),
+                    );
+                    // A page can be shorter than the trigger distance.
+                    // Keep filling until there is real runway above,
+                    // otherwise the next scroll stalls at the wall.
+                    if inner_s.has_more_history.get()
+                        && inner_s.scroll_pending.get() == 0
+                        && adj.value() <= PREFETCH_BASE_PX
+                    {
+                        Self::request_older(&inner_s, 0.0);
+                    }
+                });
                 return glib::ControlFlow::Break;
             }
 
