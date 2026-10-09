@@ -61,17 +61,10 @@ fn resolve_display_names(
         if m.sender_name.is_empty() && !m.sender_id.is_empty() && !m.is_from_me {
             m.sender_name = resolve_cached(&m.sender_id, &mut name_cache, &s);
         }
-        if let Some(qs) = &m.quoted_sender {
-            if qs.contains('@') {
-                m.quoted_sender = Some(resolve_cached(qs, &mut name_cache, &s));
-            } else if qs.starts_with('+') || qs.chars().all(|c| c.is_ascii_digit()) {
-                let num = qs.trim_start_matches('+');
-                let phone_jid = format!("{num}@s.whatsapp.net");
-                let resolved = resolve_cached(&phone_jid, &mut name_cache, &s);
-                if resolved != phone_jid {
-                    m.quoted_sender = Some(resolved);
-                }
-            }
+        if let Some(qs) = &m.quoted_sender
+            && let Some(name) = resolve_quoted_sender(&s, chat_id, qs)
+        {
+            m.quoted_sender = Some(name);
         }
         for (sender, _) in &mut m.reactions {
             if sender.contains('@') {
@@ -1471,6 +1464,53 @@ fn resolve_mention_token(jid_part: &str, s: &RuntimeState) -> Option<String> {
 ///
 /// `media_caption` was missing here, so an @mention written on an image/video
 /// rendered as raw LID digits forever (the renderer does no resolution of its own).
+/// Name for the author shown above a quoted reply. `qs` is whatever was
+/// stored: a JID, a bare number, or a number an earlier pass already
+/// formatted — which may be a LID dressed up as "+digits", so a bare number
+/// is tried as both. Returns None when `qs` is already a name.
+fn resolve_quoted_sender(s: &RuntimeState, chat_id: &str, qs: &str) -> Option<String> {
+    let candidates: Vec<String> = if qs.contains('@') {
+        vec![qs.to_string()]
+    } else if !qs.is_empty()
+        && qs
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '(' | ')' | '-'))
+    {
+        let digits: String = qs.chars().filter(char::is_ascii_digit).collect();
+        if digits.len() < 5 {
+            return None;
+        }
+        vec![format!("{digits}@lid"), format!("{digits}@s.whatsapp.net")]
+    } else {
+        return None;
+    };
+    let user = candidates[0].split('@').next().unwrap_or_default();
+    let user = user.split(':').next().unwrap_or(user);
+
+    // Quoting yourself. You are not in your own contacts, so this used to
+    // surface as your own phone number.
+    let own = |jid: &str| !jid.is_empty() && jid.split('@').next() == Some(user);
+    if own(&s.own_lid) || own(&s.own_phone) {
+        return Some("You".to_string());
+    }
+    for jid in &candidates {
+        let name = resolve_sender_name(s, jid);
+        if is_valid_contact_name(&name, jid) {
+            return Some(name);
+        }
+    }
+    // In a one-to-one chat there are two people; a quoted author who is not
+    // you is the other one, whether or not their LID has been mapped yet.
+    if !chat_id.ends_with("@g.us")
+        && !chat_id.starts_with("gm:")
+        && let Some(name) = s.chat_names.get(chat_id)
+        && is_valid_contact_name(name, chat_id)
+    {
+        return Some(name.clone());
+    }
+    qs.contains('@').then(|| resolve_sender_name(s, qs))
+}
+
 fn resolve_message_mentions(m: &mut crate::bridge::IncomingMessage, s: &RuntimeState) {
     for field in [&mut m.text, &mut m.quoted_text, &mut m.media_caption] {
         if let Some(current) = field.as_deref() {
@@ -3659,18 +3699,10 @@ async fn handle_wa_event(
                                 }
                             }
                         }
-                        if let Some(qs) = &m.quoted_sender {
-                            if qs.contains('@') {
-                                m.quoted_sender = Some(resolve_sender_name(&s, qs));
-                            } else if qs.starts_with('+') || qs.chars().all(|c| c.is_ascii_digit())
-                            {
-                                let num = qs.trim_start_matches('+');
-                                let phone_jid = format!("{num}@s.whatsapp.net");
-                                let resolved = resolve_sender_name(&s, &phone_jid);
-                                if resolved != phone_jid {
-                                    m.quoted_sender = Some(resolved);
-                                }
-                            }
+                        if let Some(qs) = &m.quoted_sender
+                            && let Some(name) = resolve_quoted_sender(&s, &m.chat_id, qs)
+                        {
+                            m.quoted_sender = Some(name);
                         }
                         // Resolve reaction sender JIDs to display names
                         for (sender, _) in &mut m.reactions {
@@ -4318,6 +4350,11 @@ async fn handle_wa_event(
                     let mut m = m.clone();
                     {
                         let s = state.lock().unwrap();
+                        if let Some(qs) = &m.quoted_sender
+                            && let Some(name) = resolve_quoted_sender(&s, &m.chat_id, qs)
+                        {
+                            m.quoted_sender = Some(name);
+                        }
                         resolve_message_mentions(&mut m, &s);
                     }
                     let _ = tx.send(WaEvent::MessageReceived(Box::new(m))).await;

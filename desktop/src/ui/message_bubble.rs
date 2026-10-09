@@ -2527,6 +2527,72 @@ fn open_with_xdg(path: &str) {
     });
 }
 
+/// Put a media file on the clipboard. Images go on as `image/png` whatever
+/// their format on disk, since that is the one type every paste target takes;
+/// anything else goes on as a file reference, which file managers and upload
+/// fields accept. Returns what was copied, for the confirmation.
+///
+/// wl-copy rather than the GTK clipboard: its offer survives the window
+/// losing focus, and losing focus is the next thing that happens when the
+/// user switches to wherever they mean to paste.
+pub(crate) fn copy_media_to_clipboard(path: &str) -> Result<&'static str, String> {
+    use std::io::Write;
+    let lower = path.to_lowercase();
+    let is_image = [
+        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".tiff",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext));
+
+    let (mime, bytes, what): (&str, Vec<u8>, &'static str) = if is_image {
+        let texture = gtk4::gdk::Texture::from_filename(path)
+            .map_err(|e| format!("could not read image: {e}"))?;
+        (
+            "image/png",
+            texture.save_to_png_bytes().to_vec(),
+            "Image copied",
+        )
+    } else {
+        let abs = std::fs::canonicalize(path).map_err(|e| e.to_string())?;
+        let uri = gtk4::gio::File::for_path(&abs).uri();
+        (
+            "text/uri-list",
+            format!("{uri}\r\n").into_bytes(),
+            "File copied",
+        )
+    };
+
+    match std::process::Command::new("wl-copy")
+        .args(["--type", mime])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            // A full-size photo is megabytes; write it off the UI thread.
+            std::thread::spawn(move || {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(&bytes);
+                }
+                let _ = child.wait();
+            });
+            Ok(what)
+        }
+        Err(_) => {
+            // No wl-clipboard (X11 session): GTK's clipboard is what there is.
+            let display = gtk4::gdk::Display::default().ok_or("no display")?;
+            if is_image {
+                let texture = gtk4::gdk::Texture::from_filename(path).map_err(|e| e.to_string())?;
+                display.clipboard().set_texture(&texture);
+            } else {
+                display.clipboard().set_text(path);
+            }
+            Ok(what)
+        }
+    }
+}
+
 /// Copy a downloaded media file into ~/Downloads under a clean, human-readable
 /// name (our `<8hex>_` download prefix stripped, percent-decoded). Returns the
 /// destination path. Idempotent: a same-name, same-size file is reused; a name

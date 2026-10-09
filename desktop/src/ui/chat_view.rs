@@ -6396,6 +6396,23 @@ fn show_message_menu(
                     .clone()
                     .filter(|p| std::path::Path::new(p).exists())
             });
+        if let Some(path) = media_path.clone() {
+            let btn = menu_btn!("Copy media");
+            let inner_c = inner.clone();
+            let pop = popover.clone();
+            btn.connect_clicked(move |_| {
+                let result = crate::ui::message_bubble::copy_media_to_clipboard(&path);
+                if let Some(overlay) = ChatViewPanel::toast_overlay(&inner_c) {
+                    let text = match &result {
+                        Ok(what) => (*what).to_string(),
+                        Err(e) => format!("Could not copy: {e}"),
+                    };
+                    overlay.add_toast(adw::Toast::new(&text));
+                }
+                pop.popdown();
+            });
+            vbox.append(&btn);
+        }
         if let Some(path) = media_path {
             let btn = menu_btn!("Save to Downloads");
             let path_c = path.clone();
@@ -7551,6 +7568,82 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
     });
 
     top_bar.append(&counter);
+    let copy_btn = Button::from_icon_name("edit-copy-symbolic");
+    copy_btn.add_css_class("flat");
+    copy_btn.set_tooltip_text(Some("Copy to clipboard (Ctrl+C)"));
+    let copy_current: Rc<dyn Fn()> = {
+        let items_ref = items.clone();
+        let car = carousel.clone();
+        let btn = copy_btn.clone();
+        Rc::new(move || {
+            let idx = car.position().round() as usize;
+            let Some((_, path)) = items_ref.get(idx) else {
+                return;
+            };
+            // The viewer has no toast layer; the button itself confirms.
+            let icon = match crate::ui::message_bubble::copy_media_to_clipboard(path) {
+                Ok(_) => "object-select-symbolic",
+                Err(e) => {
+                    log::warn!("Copy media failed: {e}");
+                    "dialog-error-symbolic"
+                }
+            };
+            btn.set_icon_name(icon);
+            let btn = btn.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1200), move || {
+                btn.set_icon_name("edit-copy-symbolic");
+            });
+        })
+    };
+    {
+        let copy_current = copy_current.clone();
+        copy_btn.connect_clicked(move |_| copy_current());
+    }
+    {
+        let menu = gtk4::Popover::new();
+        menu.set_parent(&carousel);
+        menu.set_has_arrow(false);
+        let item = Button::with_label("Copy to clipboard");
+        item.add_css_class("flat");
+        menu.set_child(Some(&item));
+        {
+            let copy_current = copy_current.clone();
+            let menu = menu.clone();
+            item.connect_clicked(move |_| {
+                copy_current();
+                menu.popdown();
+            });
+        }
+        let right_click = GestureClick::new();
+        right_click.set_button(3);
+        let menu_c = menu.clone();
+        right_click.connect_pressed(move |_, _, x, y| {
+            menu_c.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            menu_c.popup();
+        });
+        carousel.add_controller(right_click);
+        // A popover parented by hand must be unparented by hand.
+        let menu_d = menu.clone();
+        window.connect_close_request(move |_| {
+            menu_d.unparent();
+            glib::Propagation::Proceed
+        });
+
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let copy_current = copy_current.clone();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            if state.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+                && matches!(key, gtk4::gdk::Key::c | gtk4::gdk::Key::C)
+            {
+                copy_current();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        window.add_controller(keys);
+    }
+    top_bar.append(&copy_btn);
     top_bar.append(&save_btn);
     top_bar.append(&close_btn);
     overlay.add_overlay(&top_bar);
