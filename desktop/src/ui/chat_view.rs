@@ -1246,7 +1246,10 @@ impl ChatViewPanel {
                     // the next layout change (the page this very scroll had
                     // just requested) snapped the view back down.
                     let scrollable = adj.upper() > adj.page_size();
-                    if inner_c.scroll_pending.get() == 0 && scrollable {
+                    if inner_c.scroll_pending.get() == 0
+                        && scrollable
+                        && !inner_c.inserting_page.get()
+                    {
                         let near = value >= adj.upper() - adj.page_size() - 60.0;
                         if inner_c.at_bottom.replace(near) != near {
                             Self::strace(
@@ -1324,7 +1327,21 @@ impl ChatViewPanel {
                 // "anticipated" a 400-message page on every chat open and
                 // churned the view while it was inserted.
                 let before = a.value();
-                if count > 0 {
+                if inner_c.inserting_page.get() {
+                    // Everything added during a page insert goes above the
+                    // viewport, so the only correct response is to move with
+                    // it. Shifting keeps the distance to the bottom, which is
+                    // also right when the view IS at the bottom — so the pin
+                    // rules below are never needed here, and letting them run
+                    // was the fight in the trace: a pin to the bottom and the
+                    // fling's own position alternating frame by frame.
+                    if grew > 0.0 {
+                        Self::take_over_fling(&inner_c, false);
+                        inner_c.shifting.set(true);
+                        a.set_value(before + grew);
+                        inner_c.shifting.set(false);
+                    }
+                } else if count > 0 {
                     inner_c.shifting.set(true);
                     a.set_value(upper - a.page_size());
                     inner_c.shifting.set(false);
@@ -1351,11 +1368,6 @@ impl ChatViewPanel {
                             ),
                         );
                     }
-                } else if inner_c.inserting_page.get() && grew > 0.0 {
-                    Self::take_over_fling(&inner_c);
-                    inner_c.shifting.set(true);
-                    a.set_value(a.value() + grew);
-                    inner_c.shifting.set(false);
                 } else if grew.abs() > 40.0 {
                     Self::strace(&inner_c, format_args!("LAYOUT unpinned grew {grew:+.0}"));
                 }
@@ -3457,6 +3469,12 @@ impl ChatViewPanel {
 
     /// Auto-scroll only if user is already at the bottom (for incoming messages).
     fn scroll_if_at_bottom(inner: &ChatViewInner) {
+        // Shared by live messages and by scroll-back pages (which are built
+        // through the same append path). Only a live message is "new at the
+        // bottom"; a page of history is not.
+        if inner.inserting_page.get() || inner.prepending.get() {
+            return;
+        }
         if inner.at_bottom.get() {
             inner.scroll_pending.set(3);
             let adj = inner.scroll.vadjustment();
@@ -3974,8 +3992,15 @@ impl ChatViewPanel {
     /// property is the public route to cancelling it; the momentum is then
     /// carried on here with the same friction, relative to wherever the view
     /// is, so position corrections and the fling compose.
-    fn take_over_fling(inner: &Rc<ChatViewInner>) {
-        if !inner.fling_active.replace(false) {
+    fn take_over_fling(inner: &Rc<ChatViewInner>, force: bool) {
+        // `force` at the start of a page: the flag that says GTK is
+        // decelerating comes from an input signal and has proved not to be a
+        // complete record, and a deceleration that survives into the insert
+        // is the worst case. Cancelling when there is none costs nothing.
+        if !inner.fling_active.replace(false) && !force {
+            return;
+        }
+        if inner.momentum_running.get() {
             return;
         }
         inner.scroll.set_kinetic_scrolling(false);
@@ -4030,13 +4055,10 @@ impl ChatViewPanel {
         let Some(chat_id) = inner.current_chat_id.borrow().clone() else {
             return;
         };
-        let limit = if up_speed > 4000.0 {
-            400
-        } else if up_speed > 1500.0 {
-            150
-        } else {
-            50
-        };
+        // Small tranches. A 400-message page took nine seconds to insert and
+        // kept the view unsettled for all of it; anticipation comes from
+        // starting early and chaining, not from one huge page.
+        let limit = if up_speed > 3000.0 { 100 } else { 50 };
         Self::strace(
             inner,
             format_args!("REQUEST older limit={limit} speed={up_speed:.0}"),
@@ -4100,6 +4122,12 @@ impl ChatViewPanel {
         // here touches the value directly.
         let adj = self.inner.scroll.vadjustment();
         self.inner.last_upper.set(adj.upper());
+        // Leftover scroll-to-bottom pulses belong to whatever happened before
+        // this page; where the view is now is what counts.
+        self.inner.scroll_pending.set(0);
+        let near_bottom = adj.value() >= adj.upper() - adj.page_size() - 60.0;
+        self.inner.at_bottom.set(near_bottom);
+        Self::take_over_fling(&self.inner, true);
         self.inner.inserting_page.set(true);
         let epoch = self.inner.view_epoch.get();
 

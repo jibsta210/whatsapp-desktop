@@ -1408,6 +1408,19 @@ fn resolve_mention_token(jid_part: &str, s: &RuntimeState) -> Option<String> {
         return None;
     }
 
+    // A mention of the account owner. Nobody is in their own contact list,
+    // so this fell through to the phone-number fallback below — and a new
+    // phone means a new LID, which dropped whatever mapping used to cover it.
+    let user = jid_part.split('@').next().unwrap_or(jid_part);
+    let own = |jid: &str| !jid.is_empty() && jid.split('@').next() == Some(user);
+    if own(&s.own_lid) || own(&s.own_phone) {
+        return Some(if s.own_name.trim().is_empty() {
+            "You".to_string()
+        } else {
+            s.own_name.clone()
+        });
+    }
+
     // Candidate JID formats to try for a real name.
     let candidates = if jid_part.contains('@') {
         vec![jid_part.to_string()]
@@ -1560,6 +1573,7 @@ struct RuntimeState {
     /// Own JIDs for identifying self-reads in group receipts
     own_phone: String,
     own_lid: String,
+    own_name: String,
     connect_count: u32,
     /// True once the proactive phone→LID prewarm sweep has run this session.
     did_phone_lid_sweep: bool,
@@ -1647,6 +1661,7 @@ impl RuntimeState {
             msg_save_tx,
             own_phone: String::new(),
             own_lid: String::new(),
+            own_name: String::new(),
             connect_count: 0,
             did_phone_lid_sweep: false,
             read_watermarks,
@@ -2535,6 +2550,7 @@ async fn run_inner(
         if let Some(lid) = device.lid.as_ref() {
             s.own_lid = strip(lid.to_string());
         }
+        s.own_name = device.push_name.clone();
         log::info!(
             "Seeded own identity pre-run: phone={} lid={}",
             s.own_phone,
@@ -2845,6 +2861,7 @@ async fn handle_wa_event(
                 let device = client.persistence_manager().get_device_snapshot().await;
                 let mut s = state.lock().unwrap();
                 s.own_phone = own_phone.clone();
+                s.own_name = own_name.clone();
                 if let Some(lid) = &device.lid {
                     let lid_str = lid.to_string();
                     let stripped =
