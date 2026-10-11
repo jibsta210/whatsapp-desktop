@@ -2266,8 +2266,25 @@ async fn handle_command(
                     // sender_participant on outgoing messages would
                     // rename the chat to the user's own name otherwise.
                     let contacts = contact_cache.lock().await.clone();
+                    // A sender's name is the chat's name only when the chat is
+                    // one person. In a group it titled the open conversation
+                    // after whoever spoke last, while the list (which refuses
+                    // the downgrade) went on showing the group's real name.
+                    // More than one distinct sender also counts, for a group
+                    // the cache has not been told about.
+                    let cached_group = gm_load_chats_cache(gm_chats_cache_path)
+                        .iter()
+                        .any(|c| c.id == chat_id && c.is_group);
+                    let senders: std::collections::HashSet<String> = resp
+                        .messages
+                        .iter()
+                        .filter(|m| !gm_message_is_from_me(m))
+                        .filter_map(|m| m.sender_participant.as_ref())
+                        .filter_map(|sp| participant_display_name(sp, &contacts))
+                        .collect();
+                    let is_group = cached_group || senders.len() > 1;
                     for m in &resp.messages {
-                        if gm_message_is_from_me(m) {
+                        if is_group || gm_message_is_from_me(m) {
                             continue;
                         }
                         if let Some(sp) = &m.sender_participant {
