@@ -387,6 +387,15 @@ fn stage_update(data_dir: &Path, manifest: &UpdateManifest) -> anyhow::Result<Pa
     Ok(staged)
 }
 
+fn release_predates_local_source(manifest: &UpdateManifest) -> bool {
+    let local: i64 = env!("SOURCE_COMMIT_UNIX").parse().unwrap_or(0);
+    let Ok(published) = chrono::DateTime::parse_from_rfc3339(&manifest.published_at) else {
+        // Unknown age: refuse rather than risk a downgrade.
+        return local > 0;
+    };
+    local > 0 && published.timestamp() < local
+}
+
 /// Check and stage an update on a worker thread. `force` controls whether a
 /// no-update/failure result is surfaced to the user as a toast.
 pub fn check_for_updates(
@@ -410,6 +419,19 @@ pub fn check_for_updates(
                 // A locally-built binary reports build 0, so EVERY channel release
                 // looks newer and would silently replace a build that is actually
                 // ahead of the release. Only do that when explicitly asked.
+                // Forcing it is not enough when the release is older than the
+                // source this binary was built from. On Oct 18 that put the
+                // July stable release over a build months ahead of it, and
+                // every fix since then silently disappeared.
+                if current_build() == 0 && release_predates_local_source(&manifest) {
+                    log::warn!(
+                        "Update {} (build {}, published {}) is older than this build's source — not installing it",
+                        manifest.version,
+                        manifest.build,
+                        manifest.published_at
+                    );
+                    return Ok(None);
+                }
                 if current_build() == 0 && !force {
                     log::info!(
                         "Update {} (build {}) available, but this is a local build — \

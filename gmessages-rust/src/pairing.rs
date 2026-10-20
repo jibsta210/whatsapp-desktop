@@ -1321,16 +1321,25 @@ pub mod gaia {
             .device_data
             .as_ref()
             .ok_or_else(|| Error::Pairing("SignInGaia: no device_data".into()))?;
-        let primary = dev_data
-            .unknown_items2
-            .iter()
-            .find(|d| d.unknown_int4 == 1)
-            .ok_or_else(|| Error::Pairing("SignInGaia: no primary device found".into()))?;
-        let dest_reg_uuid = primary.dest_or_source_uuid.clone();
-        log::info!("gaia: chose dest_reg_id={dest_reg_uuid}");
-        {
-            let mut auth = client.inner.auth.lock().await;
-            auth.dest_reg_id = Some(dest_reg_uuid.clone());
+        // Every phone the account has ever paired Messages on is listed, with
+        // nothing to say which is current. Taking the first one picked a
+        // retired phone after a phone change, and the pairing init then went
+        // unanswered until it timed out. Each candidate is now tried in turn;
+        // the one that answers is the phone in the user's hand.
+        let mut candidates: Vec<String> = Vec::new();
+        for d in &dev_data.unknown_items2 {
+            log::info!(
+                "gaia: device {} kind={} lang={}",
+                d.dest_or_source_uuid,
+                d.unknown_int4,
+                d.language_code
+            );
+            if d.unknown_int4 == 1 && !candidates.contains(&d.dest_or_source_uuid) {
+                candidates.push(d.dest_or_source_uuid.clone());
+            }
+        }
+        if candidates.is_empty() {
+            return Err(Error::Pairing("SignInGaia: no primary device found".into()));
         }
 
         // Step 2: spawn long-poll so we can receive responses.
@@ -1354,15 +1363,46 @@ pub mod gaia {
         let mut init_buf = Vec::with_capacity(init_container.encoded_len());
         init_container.encode(&mut init_buf)?;
 
-        log::info!("gaia: sending CREATE_GAIA_PAIRING_CLIENT_INIT");
-        let init_resp_bytes = crate::session::send_unencrypted_rpc(
-            client,
-            ActionType::CreateGaiaPairingClientInit,
-            MessageType::Gaia2,
-            &init_buf,
-            std::time::Duration::from_secs(20),
-        )
-        .await?;
+        let mut answered = None;
+        let mut last_err = None;
+        for (i, dest) in candidates.iter().enumerate() {
+            {
+                let mut auth = client.inner.auth.lock().await;
+                auth.dest_reg_id = Some(dest.clone());
+            }
+            log::info!(
+                "gaia: sending CREATE_GAIA_PAIRING_CLIENT_INIT to {dest} ({}/{})",
+                i + 1,
+                candidates.len()
+            );
+            match crate::session::send_unencrypted_rpc(
+                client,
+                ActionType::CreateGaiaPairingClientInit,
+                MessageType::Gaia2,
+                &init_buf,
+                std::time::Duration::from_secs(12),
+            )
+            .await
+            {
+                Ok(bytes) => {
+                    log::info!("gaia: phone {dest} answered");
+                    answered = Some(bytes);
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("gaia: no answer from {dest}: {e}");
+                    last_err = Some(e);
+                }
+            }
+        }
+        let init_resp_bytes = match answered {
+            Some(b) => b,
+            None => {
+                return Err(
+                    last_err.unwrap_or_else(|| Error::Pairing("no paired phone answered".into()))
+                );
+            }
+        };
 
         let server_init = GaiaPairingResponseContainer::decode(&*init_resp_bytes)
             .map_err(|e| Error::Pairing(format!("decode server init container: {e}")))?;
