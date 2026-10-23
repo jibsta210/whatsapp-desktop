@@ -2022,6 +2022,10 @@ impl ChatViewPanel {
                 if entry_focused {
                     return gtk4::glib::Propagation::Proceed;
                 }
+                // Window-wide now, so only when there is a chat to paste into.
+                if inner_c.current_chat_id.borrow().is_none() {
+                    return gtk4::glib::Propagation::Proceed;
+                }
                 log::info!("Paste: Ctrl+V — reading clipboard via wl-paste");
                 paste_via_wl_clipboard(iv_paste.clone(), inner_c.clone());
                 // We handled it — never let the (broken) native paste run.
@@ -2034,7 +2038,25 @@ impl ChatViewPanel {
             // From the root, capture phase sees the keypress for any focused
             // descendant of the chat view, so paste-into-message works wherever
             // focus happens to be.
-            inner.root.add_controller(paste_ctrl);
+            // On the toplevel window, not the chat-view root. A controller on
+            // the root only sees keys while focus is inside the chat view, and
+            // after clicking a chat in the sidebar — or bringing the window
+            // forward from the app you copied in — focus is in the sidebar or
+            // nowhere, so Ctrl+V never arrived and nothing was logged.
+            // Text entries anywhere keep their own paste (checked above).
+            let pending = std::cell::RefCell::new(Some(paste_ctrl));
+            let attach = move |root: &gtk4::Box| {
+                if let Some(window) = root.root().and_then(|r| r.downcast::<gtk4::Window>().ok())
+                    && let Some(ctrl) = pending.borrow_mut().take()
+                {
+                    window.add_controller(ctrl);
+                }
+            };
+            if inner.root.root().is_some() {
+                attach(&inner.root);
+            } else {
+                inner.root.connect_realize(move |root| attach(root));
+            }
         }
 
         // ── Buffer changed: trigger @ mention and / quick reply popovers ──
