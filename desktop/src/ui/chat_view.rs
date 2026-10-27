@@ -7451,13 +7451,28 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
             })
             .collect(),
     );
-    for pic in carousel_pictures.iter() {
-        pic.set_can_shrink(true);
-        pic.set_content_fit(gtk4::ContentFit::Contain);
-        pic.set_hexpand(true);
-        pic.set_vexpand(true);
-        carousel.append(pic);
-    }
+    // Each picture sits in its own scroller. Zoom enlarges the picture and
+    // the scroller pans it; it used to enlarge the carousel page itself, and
+    // a carousel lays pages out from their left edge, so a zoomed page grew
+    // off to the right instead of around the pointer.
+    let carousel_scrollers: Rc<Vec<gtk4::ScrolledWindow>> = Rc::new(
+        carousel_pictures
+            .iter()
+            .map(|pic| {
+                pic.set_can_shrink(true);
+                pic.set_content_fit(gtk4::ContentFit::Contain);
+                pic.set_hexpand(true);
+                pic.set_vexpand(true);
+                let sw = gtk4::ScrolledWindow::new();
+                sw.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
+                sw.set_hexpand(true);
+                sw.set_vexpand(true);
+                sw.set_child(Some(pic));
+                carousel.append(&sw);
+                sw
+            })
+            .collect(),
+    );
 
     // Keep only the current full-resolution carousel image decoded. The old
     // implementation eagerly decoded every image in the conversation; a dozen
@@ -7488,20 +7503,77 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
     {
         let zl = zoom_level.clone();
         let car = carousel.clone();
+        let scrollers = carousel_scrollers.clone();
+        let pictures = carousel_pictures.clone();
+        let pointer = Rc::new(Cell::new((0.0f64, 0.0f64)));
+        {
+            let motion = gtk4::EventControllerMotion::new();
+            let pointer = pointer.clone();
+            motion.connect_motion(move |_, x, y| pointer.set((x, y)));
+            carousel.add_controller(motion);
+        }
         let sc = gtk4::EventControllerScroll::new(gtk4::EventControllerScrollFlags::VERTICAL);
+        // Capture: the scroller would otherwise take the wheel as a pan.
+        sc.set_propagation_phase(gtk4::PropagationPhase::Capture);
         sc.connect_scroll(move |_, _, dy| {
-            let mut z = zl.get();
-            z *= if dy < 0.0 { 1.15 } else { 0.87 }; // Scroll up = zoom in
-            z = z.clamp(0.5, 5.0);
-            zl.set(z);
-            // Apply zoom to current page's picture
-            let idx = car.position().round() as u32;
-            let page = car.nth_page(idx);
-            // Use CSS transform for zoom
-            page.set_size_request((900.0 * z) as i32, (700.0 * z) as i32);
+            let idx = car.position().round() as usize;
+            let (Some(sw), Some(pic)) = (scrollers.get(idx), pictures.get(idx)) else {
+                return glib::Propagation::Stop;
+            };
+            let old = zl.get();
+            // Below 1 there is nothing to gain: the picture already fits.
+            let new = (old * if dy < 0.0 { 1.15 } else { 1.0 / 1.15 }).clamp(1.0, 8.0);
+            if (new - old).abs() < f64::EPSILON {
+                return glib::Propagation::Stop;
+            }
+            zl.set(new);
+            let (vw, vh) = (sw.width() as f64, sw.height() as f64);
+            let (hadj, vadj) = (sw.hadjustment(), sw.vadjustment());
+            if new <= 1.0 + 1e-6 {
+                pic.set_size_request(-1, -1);
+                car.set_interactive(true);
+                return glib::Propagation::Stop;
+            }
+            // Keep the image point under the pointer where it is. Content
+            // coordinate of the pointer at the old scale, mapped to the new.
+            let (px, py) = pointer.get();
+            let cx = (hadj.value() + px) / old;
+            let cy = (vadj.value() + py) / old;
+            let (w, h) = (vw * new, vh * new);
+            pic.set_size_request(w as i32, h as i32);
+            // The scroller only learns the new extent at its next layout; set
+            // it now so the offsets below are not clamped to the old one.
+            hadj.set_upper(w.max(vw));
+            vadj.set_upper(h.max(vh));
+            hadj.set_value((cx * new - px).clamp(0.0, (w - vw).max(0.0)));
+            vadj.set_value((cy * new - py).clamp(0.0, (h - vh).max(0.0)));
+            // Dragging pans a zoomed image; it must not also swipe pages.
+            car.set_interactive(false);
             glib::Propagation::Stop
         });
         carousel.add_controller(sc);
+
+        // Drag to pan while zoomed.
+        for sw in carousel_scrollers.iter() {
+            let drag = gtk4::GestureDrag::new();
+            let start = Rc::new(Cell::new((0.0f64, 0.0f64)));
+            let sw_c = sw.clone();
+            let zl_c = zoom_level.clone();
+            let start_c = start.clone();
+            drag.connect_drag_begin(move |_, _, _| {
+                start_c.set((sw_c.hadjustment().value(), sw_c.vadjustment().value()));
+            });
+            let sw_c = sw.clone();
+            drag.connect_drag_update(move |_, dx, dy| {
+                if zl_c.get() <= 1.0 {
+                    return;
+                }
+                let (h0, v0) = start.get();
+                sw_c.hadjustment().set_value(h0 - dx);
+                sw_c.vadjustment().set_value(v0 - dy);
+            });
+            sw.add_controller(drag);
+        }
     }
 
     // Jump to the clicked image without animation
@@ -7710,8 +7782,16 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
     {
         let total = items.len();
         let load_page = load_carousel_page.clone();
-        carousel.connect_page_changed(move |_, idx| {
+        let zl = zoom_level.clone();
+        let pictures = carousel_pictures.clone();
+        carousel.connect_page_changed(move |car, idx| {
             counter.set_text(&format!("{} / {}", idx + 1, total));
+            // Each image opens fitted, not at the previous one's zoom.
+            zl.set(1.0);
+            for pic in pictures.iter() {
+                pic.set_size_request(-1, -1);
+            }
+            car.set_interactive(true);
             load_page(idx as usize);
         });
     }
