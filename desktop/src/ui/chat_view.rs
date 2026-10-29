@@ -2026,6 +2026,34 @@ impl ChatViewPanel {
                 if inner_c.current_chat_id.borrow().is_none() {
                     return gtk4::glib::Propagation::Proceed;
                 }
+                // Images: read through GTK first. That is the same protocol
+                // every other app pastes with, and with the window focused (it
+                // is — this is a keypress) it works on KDE. wl-paste goes
+                // through data-control, which has handed back the previous
+                // screenshot while every other app already had the new one —
+                // pasting it somewhere else first was what made it appear.
+                // wl-paste remains the fallback when GTK sees no image.
+                if let Some(display) = gtk4::gdk::Display::default() {
+                    let clipboard = display.clipboard();
+                    let formats = clipboard.formats();
+                    let has_image = [
+                        "image/png",
+                        "image/jpeg",
+                        "image/webp",
+                        "image/gif",
+                        "image/bmp",
+                    ]
+                    .iter()
+                    .any(|m| formats.contain_mime_type(m));
+                    log::info!(
+                        "Paste: Ctrl+V — GTK sees {}; image={has_image}",
+                        formats.to_str()
+                    );
+                    if has_image {
+                        paste_clipboard_image(clipboard, inner_c.clone(), 0);
+                        return gtk4::glib::Propagation::Stop;
+                    }
+                }
                 log::info!("Paste: Ctrl+V — reading clipboard via wl-paste");
                 paste_via_wl_clipboard(iv_paste.clone(), inner_c.clone());
                 // We handled it — never let the (broken) native paste run.
@@ -5984,7 +6012,10 @@ fn paste_clipboard_image(clipboard: gtk4::gdk::Clipboard, inner: Rc<ChatViewInne
                                     paste_clipboard_image(cb_for_bytes, inner_fb, attempt + 1);
                                 });
                             } else {
-                                log::warn!("Paste: image read exhausted retries");
+                                log::warn!(
+                                    "Paste: GTK image read exhausted retries — trying wl-paste"
+                                );
+                                paste_via_wl_clipboard(inner_fb.input_view.clone(), inner_fb);
                             }
                             return;
                         };
