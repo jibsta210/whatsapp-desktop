@@ -650,6 +650,10 @@ pub enum WaCommand {
     MultiSend {
         chat_ids: Vec<String>,
         text: String,
+        /// Random pause between sends, in seconds (min, max). Identical text
+        /// fired at many people in quick succession is what spam detection
+        /// looks for; the list owner sets how cautious to be.
+        delay_secs: (u32, u32),
     },
     /// Forward a message to multiple chats with randomised delays
     MultiForward {

@@ -328,6 +328,26 @@ impl MainWindow {
         );
         sidebar_stack.add_named(&send_groups_panel, Some("send-groups"));
 
+        // Group members → individual-message list.
+        {
+            let chat_view_l = chat_view.clone();
+            let stack_l = sidebar_stack.clone();
+            let revealer_l = profile_revealer.clone();
+            let bridge_l = bridge.clone();
+            profile_panel.set_on_add_to_list(move |parent, group_name, members| {
+                let cv = chat_view_l.clone();
+                let stack = stack_l.clone();
+                let revealer = revealer_l.clone();
+                let bridge = bridge_l.clone();
+                show_member_list_dialog(parent, &group_name, members, move |sg| {
+                    cv.open_send_group(&sg.name, sg.chat_ids.clone(), sg.delay_secs);
+                    bridge.send_command(WaCommand::SetActiveChat { chat_id: None });
+                    stack.set_visible_child_name("chats");
+                    revealer.set_reveal_child(false);
+                });
+            });
+        }
+
         sidebar_stack.set_visible_child_name("chats");
 
         let settings = SettingsHandle::new();
@@ -2854,6 +2874,7 @@ pub fn show_multi_send_window(
         br.send_command(WaCommand::MultiSend {
             chat_ids: selected,
             text,
+            delay_secs: DEFAULT_SEND_DELAY,
         });
         if let Some(window) = window_weak.upgrade() {
             window.close();
@@ -2869,10 +2890,20 @@ pub fn show_multi_send_window(
 
 const SEND_GROUPS_FILE: &str = "wa_send_groups.json";
 
+/// Pause between individual sends, in seconds, unless a list says otherwise.
+const DEFAULT_SEND_DELAY: (u32, u32) = (2, 6);
+
+fn default_send_delay() -> (u32, u32) {
+    DEFAULT_SEND_DELAY
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SendGroup {
     name: String,
     chat_ids: Vec<String>,
+    /// Defaulted so lists saved before this field existed still load.
+    #[serde(default = "default_send_delay")]
+    delay_secs: (u32, u32),
 }
 
 fn load_send_groups() -> Vec<SendGroup> {
@@ -2992,12 +3023,13 @@ fn build_send_groups_panel(
                 send_btn.set_tooltip_text(Some("Compose message"));
                 let chat_ids = sg.chat_ids.clone();
                 let sg_name = sg.name.clone();
+                let sg_delay = sg.delay_secs;
                 let cv = chat_view_c.clone();
                 let stack_send = sidebar_stack_c.clone();
                 let bridge_send = bridge_c.clone();
                 let profile_send = profile_revealer_c.clone();
                 send_btn.connect_clicked(move |_| {
-                    cv.open_send_group(&sg_name, chat_ids.clone());
+                    cv.open_send_group(&sg_name, chat_ids.clone(), sg_delay);
                     bridge_send.send_command(WaCommand::SetActiveChat { chat_id: None });
                     stack_send.set_visible_child_name("chats");
                     profile_send.set_reveal_child(false);
@@ -3127,6 +3159,7 @@ fn build_send_groups_panel(
                         gr2.borrow_mut().push(SendGroup {
                             name: name2.clone(),
                             chat_ids,
+                            delay_secs: DEFAULT_SEND_DELAY,
                         });
                         save_send_groups(&gr2.borrow());
                         (rb2)();
@@ -3155,6 +3188,222 @@ fn build_send_groups_panel(
     });
 
     root
+}
+
+/// Pick which members of a group go on a send list. Every member starts
+/// checked; the list is saved under a name (merging into a list of the same
+/// name) with its own pause range, then handed to `on_saved` to open.
+fn show_member_list_dialog(
+    parent: &gtk4::Widget,
+    group_name: &str,
+    members: Vec<crate::bridge::GroupMember>,
+    on_saved: impl Fn(SendGroup) + 'static,
+) {
+    use gtk4::{Align, CheckButton, Label, ListBox, Orientation, ScrolledWindow, SpinButton};
+
+    let dialog = adw::Dialog::new();
+    dialog.set_title("Message members individually");
+    dialog.set_content_width(460);
+    dialog.set_content_height(640);
+
+    let body = Box::new(Orientation::Vertical, 10);
+    body.set_margin_top(12);
+    body.set_margin_bottom(12);
+    body.set_margin_start(16);
+    body.set_margin_end(16);
+
+    let name_entry = gtk4::Entry::new();
+    name_entry.set_text(&format!("{group_name} members"));
+    name_entry.set_placeholder_text(Some("List name"));
+    body.append(
+        &Label::builder()
+            .label("List name")
+            .halign(Align::Start)
+            .css_classes(["heading"])
+            .build(),
+    );
+    body.append(&name_entry);
+
+    let search = gtk4::SearchEntry::new();
+    search.set_placeholder_text(Some("Search members"));
+    body.append(&search);
+
+    let toolbar = Box::new(Orientation::Horizontal, 6);
+    let select_all = Button::with_label("Select all");
+    let select_none = Button::with_label("Deselect all");
+    let count = Label::new(None);
+    count.set_hexpand(true);
+    count.set_halign(Align::End);
+    count.add_css_class("dim-label");
+    toolbar.append(&select_all);
+    toolbar.append(&select_none);
+    toolbar.append(&count);
+    body.append(&toolbar);
+
+    let list = ListBox::new();
+    list.add_css_class("boxed-list");
+    list.set_selection_mode(gtk4::SelectionMode::None);
+    let checks: Rc<Vec<(String, String, CheckButton)>> = Rc::new(
+        members
+            .iter()
+            .map(|m| {
+                let cb = CheckButton::with_label(&m.name);
+                cb.set_active(true);
+                cb.set_margin_top(4);
+                cb.set_margin_bottom(4);
+                cb.set_margin_start(8);
+                list.append(&cb);
+                (m.jid.clone(), m.name.to_lowercase(), cb)
+            })
+            .collect(),
+    );
+    let scroll = ScrolledWindow::new();
+    scroll.set_vexpand(true);
+    scroll.set_child(Some(&list));
+    body.append(&scroll);
+
+    // Pause range between sends.
+    let delays = Box::new(Orientation::Horizontal, 6);
+    let min_spin = SpinButton::with_range(1.0, 600.0, 1.0);
+    let max_spin = SpinButton::with_range(1.0, 600.0, 1.0);
+    min_spin.set_value(f64::from(DEFAULT_SEND_DELAY.0));
+    max_spin.set_value(f64::from(DEFAULT_SEND_DELAY.1));
+    delays.append(&Label::new(Some("Wait between messages")));
+    delays.append(&min_spin);
+    delays.append(&Label::new(Some("to")));
+    delays.append(&max_spin);
+    delays.append(&Label::new(Some("seconds")));
+    body.append(&delays);
+    let estimate = Label::new(None);
+    estimate.set_halign(Align::Start);
+    estimate.set_wrap(true);
+    estimate.add_css_class("dim-label");
+    body.append(&estimate);
+
+    let save = Button::with_label("Save list and compose");
+    save.add_css_class("suggested-action");
+    save.add_css_class("pill");
+    body.append(&save);
+
+    let refresh: Rc<dyn Fn()> = {
+        let checks = checks.clone();
+        let count = count.clone();
+        let estimate = estimate.clone();
+        let save = save.clone();
+        let (min_spin, max_spin) = (min_spin.clone(), max_spin.clone());
+        Rc::new(move || {
+            let n = checks.iter().filter(|(_, _, cb)| cb.is_active()).count();
+            count.set_text(&format!("{n} of {} selected", checks.len()));
+            save.set_sensitive(n > 0);
+            let (lo, hi) = (min_spin.value(), max_spin.value().max(min_spin.value()));
+            let secs = (n.saturating_sub(1) as f64) * (lo + hi) / 2.0;
+            estimate.set_text(&format!(
+                "Each person gets their own private message. {n} sends take about {} min.{}",
+                (secs / 60.0).ceil() as u64,
+                if n > 50 {
+                    " Sending the same text to many people at once is what WhatsApp's spam \
+                     detection looks for — consider smaller batches or longer pauses."
+                } else {
+                    ""
+                }
+            ));
+        })
+    };
+    for (_, _, cb) in checks.iter() {
+        let r = refresh.clone();
+        cb.connect_toggled(move |_| r());
+    }
+    {
+        let r = refresh.clone();
+        min_spin.connect_value_changed(move |_| r());
+        let r = refresh.clone();
+        max_spin.connect_value_changed(move |_| r());
+    }
+    {
+        let checks_all = checks.clone();
+        let search_all = search.clone();
+        let checks = checks.clone();
+        let search = search.clone();
+        select_all.connect_clicked(move |_| {
+            let q = search.text().to_lowercase();
+            // With a search active, "all" means all that are shown.
+            for (_, name, cb) in checks.iter() {
+                if q.is_empty() || name.contains(&q) {
+                    cb.set_active(true);
+                }
+            }
+        });
+        let checks = checks_all.clone();
+        let search = search_all.clone();
+        select_none.connect_clicked(move |_| {
+            let q = search.text().to_lowercase();
+            for (_, name, cb) in checks.iter() {
+                if q.is_empty() || name.contains(&q) {
+                    cb.set_active(false);
+                }
+            }
+        });
+    }
+    {
+        let checks = checks.clone();
+        search.connect_search_changed(move |s| {
+            let q = s.text().to_lowercase();
+            for (_, name, cb) in checks.iter() {
+                cb.set_visible(q.is_empty() || name.contains(&q));
+            }
+        });
+    }
+    refresh();
+
+    {
+        let dialog_c = dialog.clone();
+        let checks = checks.clone();
+        save.connect_clicked(move |_| {
+            let name = name_entry.text().trim().to_string();
+            if name.is_empty() {
+                name_entry.grab_focus();
+                return;
+            }
+            let chosen: Vec<String> = checks
+                .iter()
+                .filter(|(_, _, cb)| cb.is_active())
+                .map(|(jid, _, _)| jid.clone())
+                .collect();
+            let lo = min_spin.value() as u32;
+            let hi = (max_spin.value() as u32).max(lo);
+            let mut groups = load_send_groups();
+            let sg = match groups.iter_mut().find(|g| g.name == name) {
+                Some(existing) => {
+                    for id in chosen {
+                        if !existing.chat_ids.contains(&id) {
+                            existing.chat_ids.push(id);
+                        }
+                    }
+                    existing.delay_secs = (lo, hi);
+                    existing.clone()
+                }
+                None => {
+                    let sg = SendGroup {
+                        name,
+                        chat_ids: chosen,
+                        delay_secs: (lo, hi),
+                    };
+                    groups.push(sg.clone());
+                    sg
+                }
+            };
+            save_send_groups(&groups);
+            dialog_c.close();
+            on_saved(sg);
+        });
+    }
+
+    let header = adw::HeaderBar::new();
+    let tv = adw::ToolbarView::new();
+    tv.add_top_bar(&header);
+    tv.set_content(Some(&body));
+    dialog.set_child(Some(&tv));
+    dialog.present(Some(parent));
 }
 
 // show_send_group_compose removed — send groups now use the main ChatViewPanel

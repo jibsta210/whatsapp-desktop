@@ -255,6 +255,8 @@ struct ChatViewInner {
     drafts: RefCell<HashMap<String, String>>,
     /// When Some, current "chat" is a send group — do_send fires MultiSend instead of SendText
     send_group_ids: RefCell<Option<Vec<String>>>,
+    /// Pause range between sends for the open send group, in seconds.
+    send_group_delay: Cell<(u32, u32)>,
     /// Message ids the user has starred this session. Lets the context menu
     /// offer Star ↔ Unstar as a real toggle (the backend supports both, but
     /// IncomingMessage carries no starred flag from history, so this is a
@@ -1140,6 +1142,7 @@ impl ChatViewPanel {
             ac_delay_send,
             drafts: RefCell::new(HashMap::new()),
             send_group_ids: RefCell::new(None),
+            send_group_delay: Cell::new((2, 6)),
             starred_msgs: RefCell::new(HashSet::new()),
         });
 
@@ -2878,6 +2881,7 @@ impl ChatViewPanel {
             inner.bridge.send_command(WaCommand::MultiSend {
                 chat_ids: group_ids,
                 text,
+                delay_secs: inner.send_group_delay.get(),
             });
         } else {
             inner.bridge.send_command(WaCommand::SendText {
@@ -3148,6 +3152,7 @@ impl ChatViewPanel {
 
         // Snapshot send group state — if Some, we'll dispatch MultiSend instead of SendText
         let send_group_snapshot = inner.send_group_ids.borrow().clone();
+        let send_group_delay = inner.send_group_delay.get();
 
         // Closure that applies mention replacement and sends the network command.
         // Called immediately (AC off) or after AI correction returns (AC on).
@@ -3201,6 +3206,7 @@ impl ChatViewPanel {
                 bridge.send_command(WaCommand::MultiSend {
                     chat_ids: group_ids.clone(),
                     text: send_text,
+                    delay_secs: send_group_delay,
                 });
             } else if let Some((quoted_msg_id, quoted_sender)) = reply_info {
                 let routed = ChatViewPanel::resolve_send_target(&chat_id);
@@ -3873,7 +3879,8 @@ impl ChatViewPanel {
 
     /// Open a send group as a virtual chat in the existing message pane.
     /// Messages typed here are dispatched via MultiSend to all group members.
-    pub fn open_send_group(&self, group_name: &str, chat_ids: Vec<String>) {
+    pub fn open_send_group(&self, group_name: &str, chat_ids: Vec<String>, delay_secs: (u32, u32)) {
+        self.inner.send_group_delay.set(delay_secs);
         let virtual_id = format!("sendgroup::{}", group_name);
         let n = chat_ids.len();
         // open_chat resets the UI and clears send_group_ids, so we set AFTER.

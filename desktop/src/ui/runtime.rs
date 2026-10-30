@@ -9058,7 +9058,47 @@ async fn handle_command(
         }
 
         // ── Multi-send with anti-ban delays ─────────────────────────────────
-        WaCommand::MultiSend { chat_ids, text } => {
+        WaCommand::MultiSend {
+            chat_ids,
+            text,
+            delay_secs,
+        } => {
+            // Lists built from a group's members carry LIDs. Send to the phone
+            // JID where one is known so the message lands in the existing chat
+            // with that person instead of opening a second, LID-keyed one; and
+            // never message yourself.
+            let (own_phone, own_lid) = {
+                let s = state.lock().unwrap();
+                (s.own_phone.clone(), s.own_lid.clone())
+            };
+            let user_of = |j: &str| {
+                j.split('@')
+                    .next()
+                    .unwrap_or("")
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            };
+            let (own_p, own_l) = (user_of(&own_phone), user_of(&own_lid));
+            let mut seen = std::collections::HashSet::new();
+            let chat_ids: Vec<String> = chat_ids
+                .into_iter()
+                .map(|cid| {
+                    if cid.ends_with("@lid") {
+                        lid_to_canonical_phone_jid(&cid).unwrap_or(cid)
+                    } else {
+                        cid
+                    }
+                })
+                .filter(|cid| {
+                    let u = user_of(cid);
+                    !u.is_empty() && u != own_p && u != own_l
+                })
+                .filter(|cid| seen.insert(cid.clone()))
+                .collect();
+            let min_delay = delay_secs.0.max(1);
+            let max_delay = delay_secs.1.max(min_delay);
             let total = chat_ids.len() as u32;
             let mut sent = 0u32;
             let mut failed = 0u32;
@@ -9076,7 +9116,8 @@ async fn handle_command(
                             .unwrap_or_default()
                             .as_millis()
                             .hash(&mut h);
-                        (h.finish() % 4000 + 2000) as u64
+                        let span = u64::from(max_delay - min_delay) * 1000 + 1;
+                        h.finish() % span + u64::from(min_delay) * 1000
                     };
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }

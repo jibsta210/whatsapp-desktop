@@ -41,6 +41,9 @@ struct ProfileInner {
     members_search: SearchEntry,
     members_list: ListBox,
     members_add_btn: Button,
+    members_list_btn: Button,
+    #[allow(clippy::type_complexity)]
+    on_add_to_list: RefCell<Option<Rc<dyn Fn(&gtk4::Widget, String, Vec<GroupMember>)>>>,
     leave_group_btn: Button,
     invite_section: Box,
     invite_label: Label,
@@ -304,6 +307,12 @@ impl ProfilePanel {
 
         members_header.append(&members_heading);
         members_header.append(&members_add_btn);
+        let members_list_btn = Button::with_label("Add to list");
+        members_list_btn.add_css_class("flat");
+        members_list_btn.set_tooltip_text(Some(
+            "Pick members to message individually, one private message each",
+        ));
+        members_header.append(&members_list_btn);
 
         let members_search = SearchEntry::new();
         members_search.set_placeholder_text(Some("Search members"));
@@ -373,6 +382,8 @@ impl ProfilePanel {
             members_search,
             members_list,
             members_add_btn,
+            members_list_btn: members_list_btn.clone(),
+            on_add_to_list: RefCell::new(None),
             leave_group_btn,
             invite_section,
             invite_label,
@@ -1050,6 +1061,33 @@ impl ProfilePanel {
             row.set_cursor_from_name(Some("pointer"));
             list.append(&row);
         }
+    }
+
+    /// Handler for the members section's "Add to list" button: receives the
+    /// group's name and its members as currently loaded.
+    pub fn set_on_add_to_list(
+        &self,
+        f: impl Fn(&gtk4::Widget, String, Vec<GroupMember>) + 'static,
+    ) {
+        *self.inner.on_add_to_list.borrow_mut() = Some(Rc::new(f));
+        let weak = Rc::downgrade(&self.inner);
+        self.inner.members_list_btn.connect_clicked(move |btn| {
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            let Some(chat_id) = inner.current_chat_id.borrow().clone() else {
+                return;
+            };
+            let Some((subject, _, members, _)) =
+                inner.cached_group_profiles.borrow().get(&chat_id).cloned()
+            else {
+                return;
+            };
+            let handler = inner.on_add_to_list.borrow().clone();
+            if let Some(h) = handler {
+                h(btn.upcast_ref(), subject, members);
+            }
+        });
     }
 
     pub fn set_group_profile(
