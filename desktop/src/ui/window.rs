@@ -3243,20 +3243,49 @@ fn show_member_list_dialog(
     let list = ListBox::new();
     list.add_css_class("boxed-list");
     list.set_selection_mode(gtk4::SelectionMode::None);
+    // Admins first, and marked, so they are easy to keep or leave out.
+    let mut members = members;
+    members.sort_by_key(|m| !m.is_admin);
+    let admin_count = members.iter().filter(|m| m.is_admin).count();
     let checks: Rc<Vec<(String, String, CheckButton)>> = Rc::new(
         members
             .iter()
             .map(|m| {
+                let row = Box::new(Orientation::Horizontal, 8);
+                row.set_margin_top(4);
+                row.set_margin_bottom(4);
+                row.set_margin_start(8);
+                row.set_margin_end(8);
                 let cb = CheckButton::with_label(&m.name);
                 cb.set_active(true);
-                cb.set_margin_top(4);
-                cb.set_margin_bottom(4);
-                cb.set_margin_start(8);
-                list.append(&cb);
+                cb.set_hexpand(true);
+                row.append(&cb);
+                if m.is_admin {
+                    let badge = Label::new(Some("Admin"));
+                    badge.add_css_class("accent");
+                    badge.add_css_class("caption-heading");
+                    row.append(&badge);
+                }
+                list.append(&row);
                 (m.jid.clone(), m.name.to_lowercase(), cb)
             })
             .collect(),
     );
+    let admins: Rc<Vec<bool>> = Rc::new(members.iter().map(|m| m.is_admin).collect());
+    if admin_count > 0 {
+        let admins_btn = Button::with_label(&format!("Skip admins ({admin_count})"));
+        admins_btn.set_tooltip_text(Some("Untick the group's admins"));
+        let checks = checks.clone();
+        let admins = admins.clone();
+        admins_btn.connect_clicked(move |_| {
+            for ((_, _, cb), is_admin) in checks.iter().zip(admins.iter()) {
+                if *is_admin {
+                    cb.set_active(false);
+                }
+            }
+        });
+        toolbar.insert_child_after(&admins_btn, Some(&select_none));
+    }
     let scroll = ScrolledWindow::new();
     scroll.set_vexpand(true);
     scroll.set_child(Some(&list));
@@ -3349,7 +3378,9 @@ fn show_member_list_dialog(
         search.connect_search_changed(move |s| {
             let q = s.text().to_lowercase();
             for (_, name, cb) in checks.iter() {
-                cb.set_visible(q.is_empty() || name.contains(&q));
+                if let Some(row) = cb.parent() {
+                    row.set_visible(q.is_empty() || name.contains(&q));
+                }
             }
         });
     }
