@@ -2358,6 +2358,7 @@ pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver
         });
     }
 
+    let mut pause = std::time::Duration::from_secs(30);
     loop {
         if let Err(e) = run_inner(event_tx.clone(), &mut wa_cmd_rx).await {
             log::error!("WhatsApp runtime error: {e:#}");
@@ -2367,15 +2368,31 @@ pub async fn run_wa_runtime(event_tx: Sender<WaEvent>, cmd_rx: UnboundedReceiver
         // command channel closed and the UI could never reach a QR — a new
         // phone left the app permanently stuck. The old identity cannot be
         // reused; retire it and start over, which pairs from scratch.
-        if !WA_LOGGED_OUT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        if event_tx.is_closed() {
             break;
         }
-        retire_whatsapp_identity();
+        if WA_LOGGED_OUT.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            retire_whatsapp_identity();
+            let _ = event_tx
+                .send(WaEvent::LoggedOut(
+                    "Unlinked — scan the QR to relink".into(),
+                ))
+                .await;
+            continue;
+        }
+        // Otherwise the session ended on its own, most often because every QR
+        // code in it expired unscanned. That also used to end this task, which
+        // left a dead QR on screen: scanning it could only fail. Start another,
+        // spaced out — this repeats for as long as nobody scans, and repeated
+        // link sessions are not something to press WhatsApp with.
         let _ = event_tx
-            .send(WaEvent::LoggedOut(
-                "Unlinked — scan the QR to relink".into(),
-            ))
+            .send(WaEvent::LoggedOut(format!(
+                "QR code expired — a new one will appear in {}s",
+                pause.as_secs()
+            )))
             .await;
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(std::time::Duration::from_secs(600));
     }
 }
 
