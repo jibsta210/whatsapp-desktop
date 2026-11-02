@@ -1834,6 +1834,7 @@ impl Client {
             .stanza_router
             .dispatch(self.clone(), Arc::clone(&node), &mut cancelled)
             .await
+            && nr.tag.as_ref() != "status"
         {
             warn!(
                 "Received unknown top-level node: {}",
@@ -1849,9 +1850,15 @@ impl Client {
 
     /// Determine if a node should be acknowledged with <ack/>.
     fn should_ack(&self, node: &wacore_binary::NodeRef<'_>) -> bool {
+        // "status" carries status (stories) updates as their own top-level
+        // stanza. Unacked, the server redelivers it on every reconnect and
+        // eventually closes the stream naming the ack it wanted
+        // (<stream:error><ack class="status" type="media" .../>) — and the
+        // offline queue behind it never drains, so later messages stop
+        // arriving at all.
         matches!(
             node.tag.as_ref(),
-            "message" | "receipt" | "notification" | "call"
+            "message" | "receipt" | "notification" | "call" | "status"
         ) && node.get_attr("id").is_some()
             && node.get_attr("from").is_some()
     }
@@ -5649,6 +5656,40 @@ mod tests {
         assert!(
             !is_encrypt_identity_notification(&node.as_node_ref()),
             "device notification is not an encrypt+identity notification"
+        );
+    }
+
+    #[test]
+    fn test_build_ack_node_for_status_matches_what_the_server_asks_for() {
+        // Shape taken from the server's own stream:error:
+        // <ack class="status" type="media" id="..."/>, addressed back to the
+        // broadcast with the poster as participant.
+        let incoming = NodeBuilder::new("status")
+            .attr("from", "status@broadcast")
+            .attr("type", "media")
+            .attr("id", "AC00000000000000000000000000TEST")
+            .attr("participant", "100000000000001@lid")
+            .build();
+        let ack = build_ack_node(&incoming.as_node_ref(), None).expect("ack");
+        assert_eq!(ack.tag, "ack");
+        assert_eq!(
+            ack.attrs.get("class").map(|v| v.to_string()).as_deref(),
+            Some("status")
+        );
+        assert_eq!(
+            ack.attrs.get("type").map(|v| v.to_string()).as_deref(),
+            Some("media")
+        );
+        assert_eq!(
+            ack.attrs.get("to").map(|v| v.to_string()).as_deref(),
+            Some("status@broadcast")
+        );
+        assert_eq!(
+            ack.attrs
+                .get("participant")
+                .map(|v| v.to_string())
+                .as_deref(),
+            Some("100000000000001@lid")
         );
     }
 
