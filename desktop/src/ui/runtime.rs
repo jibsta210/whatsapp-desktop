@@ -58,8 +58,11 @@ fn resolve_display_names(
         if m.sender_id == chat_id && chat_id.ends_with("@g.us") {
             m.sender_id = String::new();
         }
-        if m.sender_name.is_empty() && !m.sender_id.is_empty() && !m.is_from_me {
-            m.sender_name = resolve_cached(&m.sender_id, &mut name_cache, &s);
+        if !m.sender_id.is_empty() && !m.is_from_me {
+            let saved = resolve_cached(&m.sender_id, &mut name_cache, &s);
+            if m.sender_name.is_empty() || is_valid_contact_name(&saved, &m.sender_id) {
+                m.sender_name = saved;
+            }
         }
         if let Some(qs) = &m.quoted_sender
             && let Some(name) = resolve_quoted_sender(&s, chat_id, qs)
@@ -3702,6 +3705,16 @@ async fn handle_wa_event(
                     // Resolve sender name, quoted sender, and @mentions in text
                     {
                         let s = state.lock().unwrap();
+                        // The message carries the sender's own profile name;
+                        // the phone shows the name they are saved under, so
+                        // that wins whenever one exists.
+                        if !m.sender_id.is_empty()
+                            && !m.is_from_me
+                            && let saved = resolve_sender_name(&s, &m.sender_id)
+                            && is_valid_contact_name(&saved, &m.sender_id)
+                        {
+                            m.sender_name = saved;
+                        }
                         if m.sender_name.is_empty() && !m.sender_id.is_empty() && !m.is_from_me {
                             m.sender_name = resolve_sender_name(&s, &m.sender_id);
                             // DM fallback: if sender is unresolved LID, use chat name
@@ -4283,8 +4296,13 @@ async fn handle_wa_event(
                 {
                     let s = state.lock().unwrap();
                     for m in &mut sync_messages {
-                        if m.sender_name.is_empty() && !m.sender_id.is_empty() && !m.is_from_me {
-                            m.sender_name = resolve_sender_name(&s, &m.sender_id);
+                        if !m.sender_id.is_empty() && !m.is_from_me {
+                            let saved = resolve_sender_name(&s, &m.sender_id);
+                            if m.sender_name.is_empty()
+                                || is_valid_contact_name(&saved, &m.sender_id)
+                            {
+                                m.sender_name = saved;
+                            }
                         }
                     }
                 }
