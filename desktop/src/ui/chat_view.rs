@@ -4133,9 +4133,48 @@ impl ChatViewPanel {
             list_name,
             rows,
             move |not_sent| {
+                let cfg = load_list_config(&group_c);
+                // A message sent before variations existed has no stored
+                // wordings, so "same as before" would mean the identical text
+                // to everyone. Reword it first when the list has AI on.
+                if cfg.ai_variations && initial.variants.is_empty() {
+                    let limit = cfg.batch_limit as usize;
+                    let batch: Vec<String> = if limit > 0 {
+                        not_sent.iter().take(limit).cloned().collect()
+                    } else {
+                        not_sent.clone()
+                    };
+                    let inner_cc = inner_c.clone();
+                    let group_cc = group_c.clone();
+                    let ts = initial.timestamp;
+                    crate::ui::campaign::show_compose_dialog(
+                        inner_c.root.upcast_ref(),
+                        "Continue",
+                        &initial.text,
+                        batch.len(),
+                        true,
+                        cfg.variation_count as usize,
+                        move |text, variants| {
+                            // Recorded on the original entry so Progress still
+                            // counts these people as sent.
+                            add_wordings_to_entry(&group_cc, ts, &text, &variants);
+                            inner_cc.bridge.send_command(WaCommand::MultiSend {
+                                chat_ids: batch.clone(),
+                                text,
+                                delay_secs: load_list_config(&group_cc).delay,
+                                variants,
+                            });
+                        },
+                    );
+                    return;
+                }
                 // Same message, same wordings, to whoever has not had it.
-                let limit = load_list_config(&group_c).batch_limit as usize;
-                let n = if limit > 0 { not_sent.len().min(limit) } else { not_sent.len() };
+                let limit = cfg.batch_limit as usize;
+                let n = if limit > 0 {
+                    not_sent.len().min(limit)
+                } else {
+                    not_sent.len()
+                };
                 let confirm = adw::AlertDialog::new(
                     Some("Continue sending?"),
                     Some(&format!(
@@ -8382,6 +8421,23 @@ fn save_send_group_delay(group_name: &str, delay: (u32, u32)) {
     }
     if let Ok(data) = serde_json::to_string_pretty(&groups) {
         let _ = std::fs::write(FILE, data);
+    }
+}
+
+/// Add wordings to the entry sent at `ts`, so status matching recognises a
+/// recipient who received any of them.
+fn add_wordings_to_entry(group_name: &str, ts: i64, text: &str, variants: &[String]) {
+    let mut entries = load_send_group_entries(group_name);
+    let Some(e) = entries.iter_mut().find(|e| e.timestamp == ts) else {
+        return;
+    };
+    for w in std::iter::once(text.to_string()).chain(variants.iter().cloned()) {
+        if w != e.text && !e.variants.contains(&w) {
+            e.variants.push(w);
+        }
+    }
+    if let Ok(data) = serde_json::to_string_pretty(&entries) {
+        let _ = std::fs::write(send_group_history_path(group_name), data);
     }
 }
 
