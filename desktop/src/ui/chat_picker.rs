@@ -165,68 +165,118 @@ pub fn show_chat_picker_with_chats(
     bottom_bar.append(&count_label);
     bottom_bar.append(&send_btn);
 
-    for chat in chats {
-        if chat.id.contains("@broadcast") {
-            continue;
-        }
-        let row = ListBoxRow::new();
-        row.set_size_request(-1, 72);
-        let hbox = Box::new(Orientation::Horizontal, 12);
-        hbox.set_margin_start(12);
-        hbox.set_margin_end(12);
-        hbox.set_margin_top(12);
-        hbox.set_margin_bottom(12);
+    // Rows are built in batches on idle and photos decoded after that. Doing
+    // all of it up front — ~3,700 rows, each decoding a JPEG from disk — held
+    // the window back for seconds every time it opened.
+    let photos: Rc<RefCell<std::collections::VecDeque<(adw::Avatar, std::path::PathBuf)>>> =
+        Rc::default();
+    let make_row: Rc<dyn Fn(&ChatSummary)> = {
+        let list = list.clone();
+        let selected = selected.clone();
+        let count_label = count_label.clone();
+        let send_btn = send_btn.clone();
+        let pre_selected = pre_selected.to_vec();
+        let photos = photos.clone();
+        Rc::new(move |chat: &ChatSummary| {
+            let row = ListBoxRow::new();
+            row.set_size_request(-1, 72);
+            let hbox = Box::new(Orientation::Horizontal, 12);
+            hbox.set_margin_start(12);
+            hbox.set_margin_end(12);
+            hbox.set_margin_top(12);
+            hbox.set_margin_bottom(12);
 
-        if multi_select {
-            let check = gtk4::CheckButton::new();
-            // Pre-select if this chat was in the pre_selected list
-            if pre_selected.contains(&chat.id) {
-                check.set_active(true);
-            }
-            let chat_id = chat.id.clone();
-            let sel = selected.clone();
-            let lbl_ref = count_label.clone();
-            let btn_ref = send_btn.clone();
-            check.connect_toggled(move |cb| {
-                let mut s = sel.borrow_mut();
-                if cb.is_active() {
-                    if !s.contains(&chat_id) {
-                        s.push(chat_id.clone());
-                    }
-                } else {
-                    s.retain(|id| id != &chat_id);
+            if multi_select {
+                let check = gtk4::CheckButton::new();
+                if pre_selected.contains(&chat.id) {
+                    check.set_active(true);
                 }
-                let n = s.len();
-                let text = if n == 0 {
-                    "Select chats".to_string()
-                } else {
-                    format!("{n} selected")
-                };
-                lbl_ref.set_text(&text);
-                btn_ref.set_sensitive(n > 0);
-            });
-            hbox.append(&check);
-        }
-
-        let av = adw::Avatar::new(52, Some(&chat.name), true);
-        let safe = chat.id.replace(['/', '\\', '@', ':'], "_");
-        let av_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
-        if av_path.exists() {
-            if let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&av_path, 96) {
-                av.set_custom_image(Some(&tex));
+                let chat_id = chat.id.clone();
+                let sel = selected.clone();
+                let lbl_ref = count_label.clone();
+                let btn_ref = send_btn.clone();
+                check.connect_toggled(move |cb| {
+                    let mut s = sel.borrow_mut();
+                    if cb.is_active() {
+                        if !s.contains(&chat_id) {
+                            s.push(chat_id.clone());
+                        }
+                    } else {
+                        s.retain(|id| id != &chat_id);
+                    }
+                    let n = s.len();
+                    let text = if n == 0 {
+                        "Select chats".to_string()
+                    } else {
+                        format!("{n} selected")
+                    };
+                    lbl_ref.set_text(&text);
+                    btn_ref.set_sensitive(n > 0);
+                });
+                hbox.append(&check);
             }
-        }
 
-        let name_lbl = Label::new(Some(&chat.name));
-        name_lbl.set_hexpand(true);
-        name_lbl.set_halign(Align::Start);
-        name_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            let av = adw::Avatar::new(52, Some(&chat.name), true);
+            let safe = chat.id.replace(['/', '\\', '@', ':'], "_");
+            let av_path = std::path::PathBuf::from("wa_avatars").join(format!("{safe}.jpg"));
+            photos.borrow_mut().push_back((av.clone(), av_path));
 
-        hbox.append(&av);
-        hbox.append(&name_lbl);
-        row.set_child(Some(&hbox));
-        row.set_widget_name(&chat.id);
-        list.append(&row);
+            let name_lbl = Label::new(Some(&chat.name));
+            name_lbl.set_hexpand(true);
+            name_lbl.set_halign(Align::Start);
+            name_lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+
+            hbox.append(&av);
+            hbox.append(&name_lbl);
+            row.set_child(Some(&hbox));
+            row.set_widget_name(&chat.id);
+            list.append(&row);
+        })
+    };
+    let mut queue: std::collections::VecDeque<ChatSummary> = chats
+        .iter()
+        .filter(|c| !c.id.contains("@broadcast"))
+        .cloned()
+        .collect();
+    // Enough to fill the window on first paint.
+    for _ in 0..30 {
+        let Some(chat) = queue.pop_front() else {
+            break;
+        };
+        make_row(&chat);
+    }
+    {
+        let queue = RefCell::new(queue);
+        let photos = photos.clone();
+        let list_weak = list.downgrade();
+        glib::idle_add_local(move || {
+            if list_weak.upgrade().is_none() {
+                return glib::ControlFlow::Break;
+            }
+            let mut q = queue.borrow_mut();
+            if !q.is_empty() {
+                for _ in 0..200 {
+                    let Some(chat) = q.pop_front() else {
+                        break;
+                    };
+                    make_row(&chat);
+                }
+                return glib::ControlFlow::Continue;
+            }
+            // Rows done; photos next, a few per turn.
+            let mut p = photos.borrow_mut();
+            for _ in 0..25 {
+                let Some((av, path)) = p.pop_front() else {
+                    return glib::ControlFlow::Break;
+                };
+                if path.exists()
+                    && let Some(tex) = crate::ui::texture_cache::texture_thumbnail(&path, 96)
+                {
+                    av.set_custom_image(Some(&tex));
+                }
+            }
+            glib::ControlFlow::Continue
+        });
     }
 
     // Search filter

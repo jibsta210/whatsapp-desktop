@@ -89,12 +89,6 @@ pub fn generate_variations(text: &str, n: usize) -> Result<Vec<String>, String> 
     Ok(list)
 }
 
-/// Variants to generate for a send: enough that consecutive recipients differ,
-/// not so many that reviewing them is a chore.
-fn variant_count(recipients: usize) -> usize {
-    recipients.clamp(2, 8) - 1
-}
-
 /// Compose a campaign message with optional AI variants, then hand
 /// `(text, variants)` to `on_send`. `variants` is empty when the user chose to
 /// send the text as is; otherwise it includes the original.
@@ -103,6 +97,8 @@ pub fn show_compose_dialog(
     title: &str,
     prefill: &str,
     recipients: usize,
+    reword_default: bool,
+    variation_count: usize,
     on_send: impl Fn(String, Vec<String>) + 'static,
 ) {
     let dialog = adw::Dialog::new();
@@ -130,7 +126,7 @@ pub fn show_compose_dialog(
     body.append(&text_frame);
 
     let reword = CheckButton::with_label("Reword it for each person with AI (lowers spam risk)");
-    reword.set_active(true);
+    reword.set_active(reword_default);
     body.append(&reword);
 
     let gen_row = Box::new(Orientation::Horizontal, 8);
@@ -192,7 +188,7 @@ pub fn show_compose_dialog(
             btn.set_sensitive(false);
             gen_status.set_text("Asking the AI for variations…");
             let (tx, rx) = async_channel::bounded(1);
-            let n = variant_count(recipients);
+            let n = variation_count.clamp(1, 15).min(recipients.max(2) - 1);
             std::thread::spawn(move || {
                 let _ = tx.send_blocking(generate_variations(&text, n).map(|v| (text, v)));
             });

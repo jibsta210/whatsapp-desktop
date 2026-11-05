@@ -2908,6 +2908,24 @@ struct SendGroup {
     /// Defaulted so lists saved before this field existed still load.
     #[serde(default = "default_send_delay")]
     delay_secs: (u32, u32),
+    // Edited from the list's settings in the chat view (chat_view.rs
+    // ListConfig); declared here so saving the list keeps them.
+    #[serde(default = "default_true")]
+    ai_variations: bool,
+    #[serde(default = "default_variation_count")]
+    variation_count: u32,
+    /// Most messages one send may go to; 0 = no limit. The rest wait for
+    /// Progress → Continue.
+    #[serde(default)]
+    batch_limit: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_variation_count() -> u32 {
+    7
 }
 
 fn load_send_groups() -> Vec<SendGroup> {
@@ -3164,6 +3182,9 @@ fn build_send_groups_panel(
                             name: name2.clone(),
                             chat_ids,
                             delay_secs: DEFAULT_SEND_DELAY,
+                            ai_variations: true,
+                            variation_count: default_variation_count(),
+                            batch_limit: 0,
                         });
                         save_send_groups(&gr2.borrow());
                         (rb2)();
@@ -3422,6 +3443,9 @@ fn show_member_list_dialog(
                         name,
                         chat_ids: chosen,
                         delay_secs: (lo, hi),
+                        ai_variations: true,
+                        variation_count: default_variation_count(),
+                        batch_limit: 0,
                     };
                     groups.push(sg.clone());
                     sg

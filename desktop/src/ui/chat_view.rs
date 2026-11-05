@@ -107,6 +107,8 @@ struct ChatViewInner {
     favorite_button: Button,
     /// Send-group view only: opens campaign progress.
     campaign_button: Button,
+    /// Send-group view only: per-list send settings.
+    list_settings_button: Button,
     favorite_chats: RefCell<HashSet<String>>,
     pin_banner: Box,
     bridge: Arc<Bridge>,
@@ -566,6 +568,12 @@ impl ChatViewPanel {
         ));
         campaign_button.set_visible(false);
         header.pack_end(&campaign_button);
+        let list_settings_button = Button::from_icon_name("emblem-system-symbolic");
+        list_settings_button.add_css_class("flat");
+        list_settings_button
+            .set_tooltip_text(Some("List settings — timing, AI variations, batch size"));
+        list_settings_button.set_visible(false);
+        header.pack_end(&list_settings_button);
 
         // Label dropdown
         let label_button = Button::from_icon_name("tag-symbolic");
@@ -1075,6 +1083,7 @@ impl ChatViewPanel {
             send_mode_btn: send_mode_btn.clone(),
             favorite_button: fav_button.clone(),
             campaign_button: campaign_button.clone(),
+            list_settings_button: list_settings_button.clone(),
             favorite_chats: RefCell::new(HashSet::new()),
             pin_banner,
             bridge,
@@ -1471,6 +1480,10 @@ impl ChatViewPanel {
                     inner_c.campaign_button.connect_clicked(move |_| {
                         ChatViewPanel::request_campaign_status(&inner_cb)
                     });
+                    let inner_cb = inner_c.clone();
+                    inner_c
+                        .list_settings_button
+                        .connect_clicked(move |_| ChatViewPanel::show_list_settings(&inner_cb));
                 }
                 fav_button.connect_clicked(move |_| {
                     if let Some(cid) = inner_c.current_chat_id.borrow().clone() {
@@ -3676,6 +3689,7 @@ impl ChatViewPanel {
         self.inner.input_bar.set_sensitive(true);
         // open_send_group turns it back on after this returns.
         self.inner.campaign_button.set_visible(false);
+        self.inner.list_settings_button.set_visible(false);
         // If this chat is already displayed, just update the header and skip reload
         let already_open = self.inner.current_chat_id.borrow().as_deref() == Some(&chat_id);
         if already_open {
@@ -3905,7 +3919,26 @@ impl ChatViewPanel {
         text: &str,
         kind: &'static str,
     ) {
+        let cfg = load_list_config(group_name);
+        // Over the batch limit, this send covers the first part of the list;
+        // Progress → Continue picks up the rest later.
+        let total = chat_ids.len();
+        let chat_ids: Vec<String> = if cfg.batch_limit > 0 {
+            chat_ids
+                .into_iter()
+                .take(cfg.batch_limit as usize)
+                .collect()
+        } else {
+            chat_ids
+        };
         let n = chat_ids.len();
+        if n < total
+            && let Some(overlay) = Self::toast_overlay(inner)
+        {
+            overlay.add_toast(adw::Toast::new(&format!(
+                "Batch limit: this send goes to {n} of {total}. Use Progress → Continue for the rest."
+            )));
+        }
         let title = if kind == "follow_up" {
             "Follow up"
         } else {
@@ -3918,16 +3951,138 @@ impl ChatViewPanel {
             title,
             text,
             n,
+            cfg.ai_variations,
+            cfg.variation_count as usize,
             move |text, variants| {
                 save_send_group_entry(&group, &text, kind, variants.clone());
                 inner_c.bridge.send_command(WaCommand::MultiSend {
                     chat_ids: chat_ids.clone(),
                     text,
-                    delay_secs: inner_c.send_group_delay.get(),
+                    delay_secs: load_list_config(&group).delay,
                     variants,
                 });
             },
         );
+    }
+
+    fn show_list_settings(inner: &Rc<ChatViewInner>) {
+        let Some(group) = inner
+            .current_chat_id
+            .borrow()
+            .as_deref()
+            .and_then(|c| c.strip_prefix("sendgroup::"))
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let cfg = load_list_config(&group);
+        let size = inner.send_group_ids.borrow().as_ref().map_or(0, Vec::len);
+
+        let page = adw::PreferencesPage::new();
+        let timing = adw::PreferencesGroup::new();
+        timing.set_title("Timing");
+        timing.set_description(Some(
+            "A random pause in this range separates each message. Longer pauses look \
+             less like a broadcast.",
+        ));
+        let min_row = adw::SpinRow::with_range(1.0, 3600.0, 1.0);
+        min_row.set_title("Shortest pause (seconds)");
+        min_row.set_value(f64::from(cfg.delay.0));
+        let max_row = adw::SpinRow::with_range(1.0, 3600.0, 1.0);
+        max_row.set_title("Longest pause (seconds)");
+        max_row.set_value(f64::from(cfg.delay.1));
+        timing.add(&min_row);
+        timing.add(&max_row);
+        page.add(&timing);
+
+        let ai = adw::PreferencesGroup::new();
+        ai.set_title("AI variations");
+        let ai_row = adw::SwitchRow::new();
+        ai_row.set_title("Reword for each person by default");
+        ai_row.set_subtitle("Uses the AI provider set in Settings → AI Autocorrect");
+        ai_row.set_active(cfg.ai_variations);
+        let count_row = adw::SpinRow::with_range(1.0, 15.0, 1.0);
+        count_row.set_title("Number of variations");
+        count_row.set_subtitle("Rotated across recipients, plus your original");
+        count_row.set_value(f64::from(cfg.variation_count));
+        ai.add(&ai_row);
+        ai.add(&count_row);
+        page.add(&ai);
+
+        let batch = adw::PreferencesGroup::new();
+        batch.set_title("Batch size");
+        batch.set_description(Some(
+            "Most messages a single send goes to. The rest wait for Progress → Continue. \
+             0 sends to everyone at once.",
+        ));
+        let batch_row = adw::SpinRow::with_range(0.0, 1000.0, 1.0);
+        batch_row.set_title(&format!("Per send (list has {size})"));
+        batch_row.set_value(f64::from(cfg.batch_limit));
+        batch.add(&batch_row);
+        page.add(&batch);
+
+        let estimate = Label::new(None);
+        estimate.add_css_class("dim-label");
+        estimate.set_wrap(true);
+        estimate.set_margin_bottom(12);
+        estimate.set_margin_start(24);
+        estimate.set_margin_end(24);
+        let update = {
+            let (min_row, max_row, batch_row, estimate) = (
+                min_row.clone(),
+                max_row.clone(),
+                batch_row.clone(),
+                estimate.clone(),
+            );
+            Rc::new(move || {
+                let n = match batch_row.value() as usize {
+                    0 => size,
+                    b => b.min(size),
+                };
+                let avg = (min_row.value() + max_row.value().max(min_row.value())) / 2.0;
+                let mins = (n.saturating_sub(1) as f64 * avg / 60.0).ceil();
+                estimate.set_text(&format!("Each send: {n} messages, about {mins} min."));
+            })
+        };
+        update();
+        for row in [&min_row, &max_row, &batch_row] {
+            let u = update.clone();
+            row.connect_value_notify(move |_| u());
+        }
+
+        let dialog = adw::Dialog::new();
+        dialog.set_title(&format!("{group} — settings"));
+        dialog.set_content_width(520);
+        dialog.set_content_height(640);
+        let save = Button::with_label("Save");
+        save.add_css_class("suggested-action");
+        let header = adw::HeaderBar::new();
+        header.pack_end(&save);
+        let body = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        page.set_vexpand(true);
+        body.append(&page);
+        body.append(&estimate);
+        let tv = adw::ToolbarView::new();
+        tv.add_top_bar(&header);
+        tv.set_content(Some(&body));
+        dialog.set_child(Some(&tv));
+        {
+            let dialog_c = dialog.clone();
+            let inner_c = inner.clone();
+            save.connect_clicked(move |_| {
+                let lo = min_row.value() as u32;
+                let cfg = ListConfig {
+                    delay: (lo, (max_row.value() as u32).max(lo)),
+                    ai_variations: ai_row.is_active(),
+                    variation_count: count_row.value() as u32,
+                    batch_limit: batch_row.value() as u32,
+                };
+                save_list_config(&group, cfg);
+                inner_c.send_group_delay.set(cfg.delay);
+                dialog_c.close();
+            });
+        }
+        dialog.present(Some(&inner.root));
     }
 
     /// Ask the runtime where the open list's campaign stands; the answer comes
@@ -3972,13 +4127,15 @@ impl ChatViewPanel {
         let inner_c = self.inner.clone();
         let inner_f = self.inner.clone();
         let group = list_name.to_string();
+        let group_c = group.clone();
         crate::ui::campaign::show_status_dialog(
             self.inner.root.upcast_ref(),
             list_name,
             rows,
             move |not_sent| {
                 // Same message, same wordings, to whoever has not had it.
-                let n = not_sent.len();
+                let limit = load_list_config(&group_c).batch_limit as usize;
+                let n = if limit > 0 { not_sent.len().min(limit) } else { not_sent.len() };
                 let confirm = adw::AlertDialog::new(
                     Some("Continue sending?"),
                     Some(&format!(
@@ -3986,6 +4143,41 @@ impl ChatViewPanel {
                          with the same pauses and wordings as before."
                     )),
                 );
+                // Pause range for this run, saved back to the list.
+                let (lo, hi) = inner_c.send_group_delay.get();
+                let pause_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+                pause_row.set_halign(gtk4::Align::Center);
+                let min_spin = gtk4::SpinButton::with_range(1.0, 3600.0, 1.0);
+                let max_spin = gtk4::SpinButton::with_range(1.0, 3600.0, 1.0);
+                min_spin.set_value(f64::from(lo));
+                max_spin.set_value(f64::from(hi));
+                pause_row.append(&Label::new(Some("Wait")));
+                pause_row.append(&min_spin);
+                pause_row.append(&Label::new(Some("to")));
+                pause_row.append(&max_spin);
+                pause_row.append(&Label::new(Some("seconds between messages")));
+                let estimate = Label::new(None);
+                estimate.add_css_class("dim-label");
+                let extra = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+                extra.append(&pause_row);
+                extra.append(&estimate);
+                let update_estimate = {
+                    let (min_spin, max_spin, estimate) =
+                        (min_spin.clone(), max_spin.clone(), estimate.clone());
+                    move || {
+                        let avg = (min_spin.value() + max_spin.value().max(min_spin.value())) / 2.0;
+                        let mins = (n.saturating_sub(1) as f64 * avg / 60.0).ceil();
+                        estimate.set_text(&format!("About {mins} min for {n} messages"));
+                    }
+                };
+                update_estimate();
+                {
+                    let u = update_estimate.clone();
+                    min_spin.connect_value_changed(move |_| u());
+                    let u = update_estimate.clone();
+                    max_spin.connect_value_changed(move |_| u());
+                }
+                confirm.set_extra_child(Some(&extra));
                 confirm.add_response("cancel", "Cancel");
                 confirm.add_response("send", &format!("Send to {n}"));
                 confirm.set_response_appearance("send", adw::ResponseAppearance::Suggested);
@@ -3993,14 +4185,25 @@ impl ChatViewPanel {
                 let root = inner_c.root.clone();
                 let inner_c = inner_c.clone();
                 let initial = initial.clone();
+                let group_c = group_c.clone();
                 confirm.connect_response(None, move |_, resp| {
                     if resp != "send" {
                         return;
                     }
+                    let lo = min_spin.value() as u32;
+                    let hi = (max_spin.value() as u32).max(lo);
+                    inner_c.send_group_delay.set((lo, hi));
+                    save_send_group_delay(&group_c, (lo, hi));
+                    let limit = load_list_config(&group_c).batch_limit as usize;
+                    let batch: Vec<String> = if limit > 0 {
+                        not_sent.iter().take(limit).cloned().collect()
+                    } else {
+                        not_sent.clone()
+                    };
                     inner_c.bridge.send_command(WaCommand::MultiSend {
-                        chat_ids: not_sent.clone(),
+                        chat_ids: batch,
                         text: initial.text.clone(),
-                        delay_secs: inner_c.send_group_delay.get(),
+                        delay_secs: (lo, hi),
                         variants: initial.variants.clone(),
                     });
                 });
@@ -4020,6 +4223,7 @@ impl ChatViewPanel {
         let switched_chat = self.open_chat(virtual_id, group_name);
         *self.inner.send_group_ids.borrow_mut() = Some(chat_ids);
         self.inner.campaign_button.set_visible(true);
+        self.inner.list_settings_button.set_visible(true);
 
         self.inner
             .header_subtitle
@@ -8098,6 +8302,87 @@ fn load_send_group_history(group_name: &str) -> Vec<crate::bridge::IncomingMessa
             msg
         })
         .collect()
+}
+
+/// Per-list send settings, stored alongside the list in wa_send_groups.json.
+#[derive(Clone, Copy)]
+struct ListConfig {
+    delay: (u32, u32),
+    ai_variations: bool,
+    variation_count: u32,
+    batch_limit: u32,
+}
+
+fn load_list_config(group_name: &str) -> ListConfig {
+    let mut cfg = ListConfig {
+        delay: (2, 6),
+        ai_variations: true,
+        variation_count: 7,
+        batch_limit: 0,
+    };
+    let groups: Vec<serde_json::Value> = std::fs::read_to_string("wa_send_groups.json")
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_default();
+    if let Some(g) = groups
+        .iter()
+        .find(|g| g["name"].as_str() == Some(group_name))
+    {
+        if let (Some(a), Some(b)) = (g["delay_secs"][0].as_u64(), g["delay_secs"][1].as_u64()) {
+            cfg.delay = (a as u32, b as u32);
+        }
+        if let Some(v) = g["ai_variations"].as_bool() {
+            cfg.ai_variations = v;
+        }
+        if let Some(v) = g["variation_count"].as_u64() {
+            cfg.variation_count = v as u32;
+        }
+        if let Some(v) = g["batch_limit"].as_u64() {
+            cfg.batch_limit = v as u32;
+        }
+    }
+    cfg
+}
+
+fn save_list_config(group_name: &str, cfg: ListConfig) {
+    const FILE: &str = "wa_send_groups.json";
+    let Some(mut groups) = std::fs::read_to_string(FILE)
+        .ok()
+        .and_then(|d| serde_json::from_str::<Vec<serde_json::Value>>(&d).ok())
+    else {
+        return;
+    };
+    for g in &mut groups {
+        if g["name"].as_str() == Some(group_name) {
+            g["delay_secs"] = serde_json::json!([cfg.delay.0, cfg.delay.1]);
+            g["ai_variations"] = serde_json::json!(cfg.ai_variations);
+            g["variation_count"] = serde_json::json!(cfg.variation_count);
+            g["batch_limit"] = serde_json::json!(cfg.batch_limit);
+        }
+    }
+    if let Ok(data) = serde_json::to_string_pretty(&groups) {
+        let _ = std::fs::write(FILE, data);
+    }
+}
+
+/// Store a list's pause range in the send-groups file (owned by window.rs;
+/// edited as plain JSON here so other fields survive untouched).
+fn save_send_group_delay(group_name: &str, delay: (u32, u32)) {
+    const FILE: &str = "wa_send_groups.json";
+    let Some(mut groups) = std::fs::read_to_string(FILE)
+        .ok()
+        .and_then(|d| serde_json::from_str::<Vec<serde_json::Value>>(&d).ok())
+    else {
+        return;
+    };
+    for g in &mut groups {
+        if g["name"].as_str() == Some(group_name) {
+            g["delay_secs"] = serde_json::json!([delay.0, delay.1]);
+        }
+    }
+    if let Ok(data) = serde_json::to_string_pretty(&groups) {
+        let _ = std::fs::write(FILE, data);
+    }
 }
 
 fn save_send_group_entry(group_name: &str, text: &str, kind: &str, variants: Vec<String>) {
