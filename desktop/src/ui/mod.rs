@@ -1,4 +1,5 @@
 pub mod autocorrect;
+pub mod campaign;
 pub mod chat_list;
 pub mod chat_picker;
 pub mod chat_view;

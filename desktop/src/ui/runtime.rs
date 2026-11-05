@@ -1458,6 +1458,87 @@ fn resolve_mention_token(jid_part: &str, s: &RuntimeState) -> Option<String> {
     Some(format!("+{bare}"))
 }
 
+/// Work out a campaign's progress per recipient from the chats themselves, so
+/// it holds for sends made before any tracking existed and for anything done
+/// from the phone. A recipient counts as sent when their chat has an outgoing
+/// message with one of the campaign's texts at or after the campaign started;
+/// as replied when anything arrives from them after that.
+async fn campaign_status(
+    state: &Arc<Mutex<RuntimeState>>,
+    chat_ids: &[String],
+    initial_texts: &[String],
+    initial_ts: i64,
+    followup_texts: &[String],
+    followup_ts: Option<i64>,
+) -> Vec<crate::bridge::CampaignRow> {
+    fn norm(t: &str) -> String {
+        t.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+    let initial: std::collections::HashSet<String> =
+        initial_texts.iter().map(|t| norm(t)).collect();
+    let followup: std::collections::HashSet<String> =
+        followup_texts.iter().map(|t| norm(t)).collect();
+    // Clocks differ a little between the send and the stored timestamp.
+    const SLACK: i64 = 120;
+    let secs = |ts: i64| if ts > 10_000_000_000 { ts / 1000 } else { ts };
+
+    let mut rows = Vec::with_capacity(chat_ids.len());
+    for cid in chat_ids {
+        // The same person can be filed under their phone JID or their LID.
+        let (ids, name) = {
+            let s = state.lock().unwrap();
+            let mut ids = vec![cid.clone()];
+            if cid.ends_with("@lid")
+                && let Some(p) = lid_to_canonical_phone_jid(cid)
+            {
+                ids.push(p);
+            }
+            if let Some(l) = s.phone_to_lid.get(cid) {
+                ids.push(l.clone());
+            }
+            (ids, resolve_sender_name(&s, cid))
+        };
+        let mut msgs: Vec<IncomingMessage> = Vec::new();
+        for id in &ids {
+            let cached = state.lock().unwrap().history.get(id).cloned();
+            match cached {
+                Some(h) => msgs.extend(h),
+                None => {
+                    let id = id.clone();
+                    msgs.extend(
+                        tokio::task::spawn_blocking(move || load_messages(&id))
+                            .await
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        let outgoing_match = |set: &std::collections::HashSet<String>, from: i64| {
+            msgs.iter()
+                .filter(|m| m.is_from_me && secs(m.timestamp) >= from - SLACK)
+                .filter(|m| m.text.as_deref().is_some_and(|t| set.contains(&norm(t))))
+                .map(|m| secs(m.timestamp))
+                .min()
+        };
+        let sent_at = outgoing_match(&initial, initial_ts);
+        let replied_at = sent_at.and_then(|sent| {
+            msgs.iter()
+                .filter(|m| !m.is_from_me && !m.is_system_message && secs(m.timestamp) > sent)
+                .map(|m| secs(m.timestamp))
+                .min()
+        });
+        let followed_up_at = followup_ts.and_then(|ts| outgoing_match(&followup, ts));
+        rows.push(crate::bridge::CampaignRow {
+            chat_id: cid.clone(),
+            name,
+            sent_at,
+            replied_at,
+            followed_up_at,
+        });
+    }
+    rows
+}
+
 /// Replace @JID mentions in message text with @DisplayName.
 ///
 /// Walks the text token-by-token (preserving original whitespace) instead of
@@ -9093,10 +9174,30 @@ async fn handle_command(
         }
 
         // ── Multi-send with anti-ban delays ─────────────────────────────────
+        WaCommand::CampaignStatus {
+            list_name,
+            chat_ids,
+            initial_texts,
+            initial_ts,
+            followup_texts,
+            followup_ts,
+        } => {
+            let rows = campaign_status(
+                &state,
+                &chat_ids,
+                &initial_texts,
+                initial_ts,
+                &followup_texts,
+                followup_ts,
+            )
+            .await;
+            let _ = tx.send(WaEvent::CampaignStatus { list_name, rows }).await;
+        }
         WaCommand::MultiSend {
             chat_ids,
             text,
             delay_secs,
+            variants,
         } => {
             // Lists built from a group's members carry LIDs. Send to the phone
             // JID where one is known so the message lands in the existing chat
@@ -9170,6 +9271,11 @@ async fn handle_command(
                         failed += 1;
                         continue;
                     }
+                };
+                let text = if variants.is_empty() {
+                    text.clone()
+                } else {
+                    variants[i % variants.len()].clone()
                 };
                 let msg = wa::Message {
                     conversation: Some(text.clone()),

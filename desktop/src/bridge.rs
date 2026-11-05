@@ -296,6 +296,10 @@ pub enum WaEvent {
         sent: u32,
         failed: u32,
     },
+    CampaignStatus {
+        list_name: String,
+        rows: Vec<CampaignRow>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -654,12 +658,38 @@ pub enum WaCommand {
         /// fired at many people in quick succession is what spam detection
         /// looks for; the list owner sets how cautious to be.
         delay_secs: (u32, u32),
+        /// Reworded versions of `text`. When non-empty, recipient i gets
+        /// `variants[i % len]` so no two consecutive sends are identical.
+        variants: Vec<String>,
+    },
+    /// Where a send-list campaign stands for each recipient, worked out from
+    /// the chats themselves: who got it, who replied, who got the follow-up.
+    CampaignStatus {
+        list_name: String,
+        chat_ids: Vec<String>,
+        /// Every text the opening message went out as (original + variants).
+        initial_texts: Vec<String>,
+        initial_ts: i64,
+        /// Same, for the latest follow-up, if there has been one.
+        followup_texts: Vec<String>,
+        followup_ts: Option<i64>,
     },
     /// Forward a message to multiple chats with randomised delays
     MultiForward {
         chat_ids: Vec<String>,
         original_msg_id: String,
     },
+}
+
+/// One recipient's progress through a send-list campaign. `chat_id` is the id
+/// as stored in the list, so the UI can hand it straight back to MultiSend.
+#[derive(Debug, Clone)]
+pub struct CampaignRow {
+    pub chat_id: String,
+    pub name: String,
+    pub sent_at: Option<i64>,
+    pub replied_at: Option<i64>,
+    pub followed_up_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

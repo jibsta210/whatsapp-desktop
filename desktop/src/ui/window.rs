@@ -1811,6 +1811,9 @@ impl MainWindow {
             } => {
                 log::info!("MultiSend progress: {sent}/{total} (sending to {current_chat})");
             }
+            WaEvent::CampaignStatus { list_name, rows } => {
+                inner.chat_view.show_campaign_status(&list_name, rows);
+            }
             WaEvent::MultiSendComplete { sent, failed } => {
                 let msg = if failed == 0 {
                     format!("Sent to all {sent} chats")
@@ -2875,6 +2878,7 @@ pub fn show_multi_send_window(
             chat_ids: selected,
             text,
             delay_secs: DEFAULT_SEND_DELAY,
+            variants: Vec::new(),
         });
         if let Some(window) = window_weak.upgrade() {
             window.close();

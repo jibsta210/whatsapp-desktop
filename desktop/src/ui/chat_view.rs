@@ -105,6 +105,8 @@ struct ChatViewInner {
     /// Favourite state is stored explicitly per chat. The header icon is only
     /// a presentation of this state and is never used as the source of truth.
     favorite_button: Button,
+    /// Send-group view only: opens campaign progress.
+    campaign_button: Button,
     favorite_chats: RefCell<HashSet<String>>,
     pin_banner: Box,
     bridge: Arc<Bridge>,
@@ -557,6 +559,13 @@ impl ChatViewPanel {
         fav_button.add_css_class("flat");
         fav_button.set_tooltip_text(Some("Add to favourites"));
         header.pack_end(&fav_button);
+        let campaign_button = Button::with_label("Progress");
+        campaign_button.add_css_class("flat");
+        campaign_button.set_tooltip_text(Some(
+            "Who got the message, who replied — continue or follow up",
+        ));
+        campaign_button.set_visible(false);
+        header.pack_end(&campaign_button);
 
         // Label dropdown
         let label_button = Button::from_icon_name("tag-symbolic");
@@ -1065,6 +1074,7 @@ impl ChatViewPanel {
             header_subtitle,
             send_mode_btn: send_mode_btn.clone(),
             favorite_button: fav_button.clone(),
+            campaign_button: campaign_button.clone(),
             favorite_chats: RefCell::new(HashSet::new()),
             pin_banner,
             bridge,
@@ -1456,6 +1466,12 @@ impl ChatViewPanel {
             // Favourite button
             {
                 let inner_c = inner.clone();
+                {
+                    let inner_cb = inner_c.clone();
+                    inner_c.campaign_button.connect_clicked(move |_| {
+                        ChatViewPanel::request_campaign_status(&inner_cb)
+                    });
+                }
                 fav_button.connect_clicked(move |_| {
                     if let Some(cid) = inner_c.current_chat_id.borrow().clone() {
                         let new_fav = !inner_c.favorite_chats.borrow().contains(&cid);
@@ -2877,12 +2893,7 @@ impl ChatViewPanel {
                 .strip_prefix("sendgroup::")
                 .unwrap_or(&chat_id)
                 .to_string();
-            save_send_group_message(&group_name, &text);
-            inner.bridge.send_command(WaCommand::MultiSend {
-                chat_ids: group_ids,
-                text,
-                delay_secs: inner.send_group_delay.get(),
-            });
+            Self::compose_send_group(inner, &group_name, group_ids, &text, "initial");
         } else {
             inner.bridge.send_command(WaCommand::SendText {
                 chat_id: ChatViewPanel::resolve_send_target(&chat_id),
@@ -3153,6 +3164,7 @@ impl ChatViewPanel {
         // Snapshot send group state — if Some, we'll dispatch MultiSend instead of SendText
         let send_group_snapshot = inner.send_group_ids.borrow().clone();
         let send_group_delay = inner.send_group_delay.get();
+        let inner_for_group = inner.clone();
 
         // Closure that applies mention replacement and sends the network command.
         // Called immediately (AC off) or after AI correction returns (AC on).
@@ -3202,12 +3214,14 @@ impl ChatViewPanel {
                     .strip_prefix("sendgroup::")
                     .unwrap_or(&chat_id)
                     .to_string();
-                save_send_group_message(&group_name, &send_text);
-                bridge.send_command(WaCommand::MultiSend {
-                    chat_ids: group_ids.clone(),
-                    text: send_text,
-                    delay_secs: send_group_delay,
-                });
+                let _ = (&bridge, send_group_delay);
+                ChatViewPanel::compose_send_group(
+                    &inner_for_group,
+                    &group_name,
+                    group_ids.clone(),
+                    &send_text,
+                    "initial",
+                );
             } else if let Some((quoted_msg_id, quoted_sender)) = reply_info {
                 let routed = ChatViewPanel::resolve_send_target(&chat_id);
                 bridge.send_command(WaCommand::SendReply {
@@ -3660,6 +3674,8 @@ impl ChatViewPanel {
         // A chat is now selected — enable the compose bar (disabled at startup so
         // typing/Send/attach don't silently no-op on the "Select a chat" pane).
         self.inner.input_bar.set_sensitive(true);
+        // open_send_group turns it back on after this returns.
+        self.inner.campaign_button.set_visible(false);
         // If this chat is already displayed, just update the header and skip reload
         let already_open = self.inner.current_chat_id.borrow().as_deref() == Some(&chat_id);
         if already_open {
@@ -3879,6 +3895,123 @@ impl ChatViewPanel {
 
     /// Open a send group as a virtual chat in the existing message pane.
     /// Messages typed here are dispatched via MultiSend to all group members.
+    /// Every send to a list goes through the compose dialog, where the text
+    /// can be reworded per person by AI before anything leaves. `kind` is
+    /// "initial" or "follow_up".
+    fn compose_send_group(
+        inner: &Rc<ChatViewInner>,
+        group_name: &str,
+        chat_ids: Vec<String>,
+        text: &str,
+        kind: &'static str,
+    ) {
+        let n = chat_ids.len();
+        let title = if kind == "follow_up" {
+            "Follow up"
+        } else {
+            "Send to list"
+        };
+        let inner_c = inner.clone();
+        let group = group_name.to_string();
+        crate::ui::campaign::show_compose_dialog(
+            inner.root.upcast_ref(),
+            title,
+            text,
+            n,
+            move |text, variants| {
+                save_send_group_entry(&group, &text, kind, variants.clone());
+                inner_c.bridge.send_command(WaCommand::MultiSend {
+                    chat_ids: chat_ids.clone(),
+                    text,
+                    delay_secs: inner_c.send_group_delay.get(),
+                    variants,
+                });
+            },
+        );
+    }
+
+    /// Ask the runtime where the open list's campaign stands; the answer comes
+    /// back as WaEvent::CampaignStatus → show_campaign_status.
+    fn request_campaign_status(inner: &Rc<ChatViewInner>) {
+        let Some(group) = inner
+            .current_chat_id
+            .borrow()
+            .as_deref()
+            .and_then(|c| c.strip_prefix("sendgroup::"))
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let Some(ids) = inner.send_group_ids.borrow().clone() else {
+            return;
+        };
+        let Some((initial, follow)) = current_campaign(&group) else {
+            if let Some(overlay) = Self::toast_overlay(inner) {
+                overlay.add_toast(adw::Toast::new("Nothing has been sent from this list yet"));
+            }
+            return;
+        };
+        inner.bridge.send_command(WaCommand::CampaignStatus {
+            list_name: group,
+            chat_ids: ids,
+            initial_texts: texts_of(&initial),
+            initial_ts: initial.timestamp,
+            followup_texts: follow.as_ref().map(texts_of).unwrap_or_default(),
+            followup_ts: follow.map(|f| f.timestamp),
+        });
+    }
+
+    pub fn show_campaign_status(&self, list_name: &str, rows: Vec<crate::bridge::CampaignRow>) {
+        let open = self.inner.current_chat_id.borrow().clone();
+        if open.as_deref() != Some(&format!("sendgroup::{list_name}")) {
+            return;
+        }
+        let Some((initial, _)) = current_campaign(list_name) else {
+            return;
+        };
+        let inner_c = self.inner.clone();
+        let inner_f = self.inner.clone();
+        let group = list_name.to_string();
+        crate::ui::campaign::show_status_dialog(
+            self.inner.root.upcast_ref(),
+            list_name,
+            rows,
+            move |not_sent| {
+                // Same message, same wordings, to whoever has not had it.
+                let n = not_sent.len();
+                let confirm = adw::AlertDialog::new(
+                    Some("Continue sending?"),
+                    Some(&format!(
+                        "Sends the original message to the {n} people who have not had it yet, \
+                         with the same pauses and wordings as before."
+                    )),
+                );
+                confirm.add_response("cancel", "Cancel");
+                confirm.add_response("send", &format!("Send to {n}"));
+                confirm.set_response_appearance("send", adw::ResponseAppearance::Suggested);
+                confirm.set_close_response("cancel");
+                let root = inner_c.root.clone();
+                let inner_c = inner_c.clone();
+                let initial = initial.clone();
+                confirm.connect_response(None, move |_, resp| {
+                    if resp != "send" {
+                        return;
+                    }
+                    inner_c.bridge.send_command(WaCommand::MultiSend {
+                        chat_ids: not_sent.clone(),
+                        text: initial.text.clone(),
+                        delay_secs: inner_c.send_group_delay.get(),
+                        variants: initial.variants.clone(),
+                    });
+                });
+                confirm.present(Some(&root));
+            },
+            move |no_reply| {
+                Self::compose_send_group(&inner_f, &group, no_reply, "", "follow_up");
+            },
+        );
+    }
+
     pub fn open_send_group(&self, group_name: &str, chat_ids: Vec<String>, delay_secs: (u32, u32)) {
         self.inner.send_group_delay.set(delay_secs);
         let virtual_id = format!("sendgroup::{}", group_name);
@@ -3886,6 +4019,7 @@ impl ChatViewPanel {
         // open_chat resets the UI and clears send_group_ids, so we set AFTER.
         let switched_chat = self.open_chat(virtual_id, group_name);
         *self.inner.send_group_ids.borrow_mut() = Some(chat_ids);
+        self.inner.campaign_button.set_visible(true);
 
         self.inner
             .header_subtitle
@@ -7901,6 +8035,41 @@ fn open_carousel(items: Vec<(String, String)>, start_idx: usize) {
 struct SendGroupHistoryEntry {
     text: String,
     timestamp: i64,
+    /// "follow_up" for a follow-up; anything else is an opening message.
+    #[serde(default)]
+    kind: String,
+    /// Every wording actually sent (original + AI variants); empty when the
+    /// text went out unchanged.
+    #[serde(default)]
+    variants: Vec<String>,
+}
+
+fn load_send_group_entries(group_name: &str) -> Vec<SendGroupHistoryEntry> {
+    std::fs::read_to_string(send_group_history_path(group_name))
+        .ok()
+        .and_then(|d| serde_json::from_str(&d).ok())
+        .unwrap_or_default()
+}
+
+/// The campaign the progress view describes: the latest opening message and,
+/// if one followed it, the latest follow-up.
+fn current_campaign(
+    group_name: &str,
+) -> Option<(SendGroupHistoryEntry, Option<SendGroupHistoryEntry>)> {
+    let entries = load_send_group_entries(group_name);
+    let initial_idx = entries.iter().rposition(|e| e.kind != "follow_up")?;
+    let follow = entries[initial_idx + 1..]
+        .iter()
+        .rev()
+        .find(|e| e.kind == "follow_up")
+        .cloned();
+    Some((entries[initial_idx].clone(), follow))
+}
+
+fn texts_of(e: &SendGroupHistoryEntry) -> Vec<String> {
+    let mut v = vec![e.text.clone()];
+    v.extend(e.variants.iter().cloned());
+    v
 }
 
 fn send_group_history_path(group_name: &str) -> String {
@@ -7931,7 +8100,7 @@ fn load_send_group_history(group_name: &str) -> Vec<crate::bridge::IncomingMessa
         .collect()
 }
 
-fn save_send_group_message(group_name: &str, text: &str) {
+fn save_send_group_entry(group_name: &str, text: &str, kind: &str, variants: Vec<String>) {
     let path = send_group_history_path(group_name);
     let mut entries: Vec<SendGroupHistoryEntry> = std::fs::read_to_string(&path)
         .ok()
@@ -7943,6 +8112,8 @@ fn save_send_group_message(group_name: &str, text: &str) {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64,
+        kind: kind.to_string(),
+        variants,
     });
     if let Ok(data) = serde_json::to_string_pretty(&entries) {
         let _ = std::fs::write(path, data);
