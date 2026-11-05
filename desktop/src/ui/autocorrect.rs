@@ -1623,7 +1623,8 @@ pub fn install_on_textview(view: &gtk4::TextView) {
                 bs_flag.set(true);
             }
             // Ctrl+Z: skip next AI pass
-            if key == gtk4::gdk::Key::z && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+            if key.to_lower() == gtk4::gdk::Key::z
+                && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
             {
                 bs_flag.set(true); // treat Ctrl+Z like backspace for revert purposes
             }

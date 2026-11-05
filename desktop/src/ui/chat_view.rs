@@ -1991,7 +1991,7 @@ impl ChatViewPanel {
                 }
 
                 // Ctrl+A: select all text
-                if key == gtk4::gdk::Key::a
+                if key.to_lower() == gtk4::gdk::Key::a
                     && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
                 {
                     let buf = iv.buffer();
@@ -2034,7 +2034,10 @@ impl ChatViewPanel {
             let paste_ctrl = gtk4::EventControllerKey::new();
             paste_ctrl.set_propagation_phase(gtk4::PropagationPhase::Capture);
             paste_ctrl.connect_key_pressed(move |_, key, _, modifier| {
-                if !(key == gtk4::gdk::Key::v
+                // to_lower: with Caps Lock (or Shift) on, Ctrl+V arrives as an
+                // uppercase V. Matching only `v` let it fall through to GTK's
+                // own paste, which takes text only — the image never arrived.
+                if !(key.to_lower() == gtk4::gdk::Key::v
                     && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK))
                 {
                     return gtk4::glib::Propagation::Proceed;
