@@ -1342,7 +1342,45 @@ impl ChatViewPanel {
             let at_b = inner.at_bottom.clone();
             let inner_c = inner.clone();
             let adj = inner.scroll.vadjustment();
+            let last_page = Cell::new(0.0f64);
             adj.connect_changed(move |a| {
+                // The viewport itself changing height (something above or below
+                // the message list appearing/disappearing) moves the content
+                // with no scroll involved. Name what changed size.
+                let page = a.page_size();
+                let old_page = last_page.replace(page);
+                if old_page > 0.0 && (page - old_page).abs() > 20.0 {
+                    let mut sizes = Vec::new();
+                    let mut w = inner_c.scroll.parent();
+                    for _ in 0..3 {
+                        let Some(parent) = w else { break };
+                        let mut c = parent.first_child();
+                        while let Some(child) = c {
+                            if child.is_visible() && child.height() > 0 {
+                                sizes.push(format!(
+                                    "{}{}={}",
+                                    child.type_().name(),
+                                    child
+                                        .css_classes()
+                                        .first()
+                                        .map(|c| format!(".{c}"))
+                                        .unwrap_or_default(),
+                                    child.height()
+                                ));
+                            }
+                            c = child.next_sibling();
+                        }
+                        sizes.push("|".into());
+                        w = parent.parent();
+                    }
+                    Self::strace(
+                        &inner_c,
+                        format_args!(
+                            "VIEWPORT {old_page:.0}->{page:.0} siblings: {}",
+                            sizes.join(" ")
+                        ),
+                    );
+                }
                 let upper = a.upper();
                 let grew = upper - inner_c.last_upper.replace(upper);
                 let count = sp.get();
