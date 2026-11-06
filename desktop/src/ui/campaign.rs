@@ -144,6 +144,10 @@ pub fn show_compose_dialog(
     let variants_box = Box::new(Orientation::Vertical, 8);
     let scroll = ScrolledWindow::new();
     scroll.set_vexpand(true);
+    // No horizontal scrolling: with it allowed, the boxes were measured at
+    // their unwrapped one-line width and so given one line of height, then
+    // wrapped into the real width — showing a clipped sliver of each.
+    scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
     scroll.set_child(Some(&variants_box));
     body.append(&scroll);
     let variant_views: Rc<std::cell::RefCell<Vec<TextView>>> = Rc::default();
