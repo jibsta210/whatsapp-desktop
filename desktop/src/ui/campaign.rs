@@ -278,6 +278,7 @@ pub fn show_status_dialog(
     rows: Vec<CampaignRow>,
     on_continue: impl Fn(Vec<String>) + 'static,
     on_follow_up: impl Fn(Vec<String>) + 'static,
+    on_continue_follow_up: impl Fn(Vec<String>) + 'static,
 ) {
     let total = rows.len();
     let not_sent: Vec<String> = rows
@@ -288,6 +289,13 @@ pub fn show_status_dialog(
     let no_reply: Vec<String> = rows
         .iter()
         .filter(|r| r.sent_at.is_some() && r.replied_at.is_none())
+        .map(|r| r.chat_id.clone())
+        .collect();
+    // No reply and the latest follow-up has not reached them yet: a batched
+    // follow-up still in progress.
+    let follow_pending: Vec<String> = rows
+        .iter()
+        .filter(|r| r.sent_at.is_some() && r.replied_at.is_none() && r.followed_up_at.is_none())
         .map(|r| r.chat_id.clone())
         .collect();
     let replied = rows.iter().filter(|r| r.replied_at.is_some()).count();
@@ -368,13 +376,25 @@ pub fn show_status_dialog(
     let continue_btn = Button::with_label(&format!("Continue — {} not sent", not_sent.len()));
     continue_btn.set_sensitive(!not_sent.is_empty());
     continue_btn.add_css_class("pill");
-    let follow_btn = Button::with_label(&format!("Follow up — {} no reply", no_reply.len()));
+    let follow_btn = Button::with_label(&format!("New follow-up — {} no reply", no_reply.len()));
+    follow_btn.set_tooltip_text(Some(
+        "Write another follow-up to everyone who has not replied, including anyone \
+         who already got the last one",
+    ));
     follow_btn.set_sensitive(!no_reply.is_empty());
     follow_btn.add_css_class("pill");
-    follow_btn.add_css_class("suggested-action");
     actions.append(&continue_btn);
     actions.append(&follow_btn);
     body.append(&actions);
+    // Shown only while a follow-up has reached some non-repliers but not all.
+    let continue_follow_btn = Button::with_label(&format!(
+        "Continue follow-up — {} still to get it",
+        follow_pending.len()
+    ));
+    continue_follow_btn.add_css_class("pill");
+    continue_follow_btn.add_css_class("suggested-action");
+    continue_follow_btn.set_visible(followed > 0 && !follow_pending.is_empty());
+    body.append(&continue_follow_btn);
 
     {
         let dialog_c = dialog.clone();
@@ -388,6 +408,13 @@ pub fn show_status_dialog(
         follow_btn.connect_clicked(move |_| {
             dialog_c.close();
             on_follow_up(no_reply.clone());
+        });
+    }
+    {
+        let dialog_c = dialog.clone();
+        continue_follow_btn.connect_clicked(move |_| {
+            dialog_c.close();
+            on_continue_follow_up(follow_pending.clone());
         });
     }
 

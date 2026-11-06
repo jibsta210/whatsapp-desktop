@@ -4162,12 +4162,15 @@ impl ChatViewPanel {
         if open.as_deref() != Some(&format!("sendgroup::{list_name}")) {
             return;
         }
-        let Some((initial, _)) = current_campaign(list_name) else {
+        let Some((initial, follow)) = current_campaign(list_name) else {
             return;
         };
         let inner_c = self.inner.clone();
         let inner_f = self.inner.clone();
+        let inner_g = self.inner.clone();
+        let inner_g2 = self.inner.clone();
         let group = list_name.to_string();
+        let group_g = group.clone();
         let group_c = group.clone();
         crate::ui::campaign::show_status_dialog(
             self.inner.root.upcast_ref(),
@@ -4291,6 +4294,46 @@ impl ChatViewPanel {
             },
             move |no_reply| {
                 Self::compose_send_group(&inner_f, &group, no_reply, "", "follow_up");
+            },
+            move |pending| {
+                // The latest follow-up, same wordings, to the next batch of
+                // non-repliers it has not reached.
+                let Some(f) = follow.clone() else {
+                    return;
+                };
+                let cfg = load_list_config(&group_g);
+                let limit = cfg.batch_limit as usize;
+                let batch: Vec<String> = if limit > 0 {
+                    pending.into_iter().take(limit).collect()
+                } else {
+                    pending
+                };
+                let n = batch.len();
+                let confirm = adw::AlertDialog::new(
+                    Some("Continue the follow-up?"),
+                    Some(&format!(
+                        "Sends your last follow-up, with the same wordings, to the next {n} \
+                         people who have not replied and have not had it yet."
+                    )),
+                );
+                confirm.add_response("cancel", "Cancel");
+                confirm.add_response("send", &format!("Send to {n}"));
+                confirm.set_response_appearance("send", adw::ResponseAppearance::Suggested);
+                confirm.set_close_response("cancel");
+                let inner_g = inner_g.clone();
+                let group_g = group_g.clone();
+                confirm.connect_response(None, move |_, resp| {
+                    if resp != "send" {
+                        return;
+                    }
+                    inner_g.bridge.send_command(WaCommand::MultiSend {
+                        chat_ids: batch.clone(),
+                        text: f.text.clone(),
+                        delay_secs: load_list_config(&group_g).delay,
+                        variants: f.variants.clone(),
+                    });
+                });
+                confirm.present(Some(&inner_g2.root));
             },
         );
     }
