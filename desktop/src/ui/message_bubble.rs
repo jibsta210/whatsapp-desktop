@@ -2693,9 +2693,19 @@ fn build_link_preview_card(
         });
         std::thread::spawn(move || {
             use std::io::Read;
-            if let Ok(resp) = ureq::get(&url_c).call() {
+            // A sender's own preview image is stored locally; ours is a URL.
+            if !url_c.starts_with("http") {
+                if let Ok(bytes) = std::fs::read(&url_c) {
+                    let _ = tx_img.send_blocking(bytes);
+                }
+            } else if let Ok(resp) = ureq::get(&url_c).call() {
                 let mut bytes = Vec::new();
-                if resp.into_reader().read_to_end(&mut bytes).is_ok() {
+                if resp
+                    .into_reader()
+                    .take(8_000_000)
+                    .read_to_end(&mut bytes)
+                    .is_ok()
+                {
                     let _ = tx_img.send_blocking(bytes);
                 }
             }

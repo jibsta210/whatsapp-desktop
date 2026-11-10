@@ -3910,7 +3910,7 @@ async fn handle_wa_event(
 
                     // Senders often omit preview metadata, leaving a bare link.
                     // Fetch it ourselves, off the message path so nothing blocks.
-                    if m.link_url.is_none()
+                    if m.link_thumbnail_path.is_none()
                         && let Some(url) = m.text.as_deref().and_then(first_http_url)
                     {
                         spawn_link_preview_fetch(
@@ -10774,7 +10774,12 @@ fn map_history_message(h: &wa::HistorySyncMsg, chat_id: &str) -> Option<Incoming
         link_title,
         link_description,
         link_url,
-        link_thumbnail_path: None,
+        link_thumbnail_path: web_msg
+            .message
+            .as_ref()
+            .and_then(|m| m.get_base_message().extended_text_message.as_deref())
+            .and_then(|e| e.jpeg_thumbnail.as_deref())
+            .and_then(|b| save_link_thumbnail(web_msg.key.id.as_deref().unwrap_or_default(), b)),
         receipt_status: if from_me {
             ReceiptStatus::Sent
         } else {
@@ -11011,10 +11016,17 @@ fn map_message(msg: wa::Message, info: MessageInfo) -> Option<IncomingMessage> {
         media_caption,
         contact_name: None,
         contact_vcard: None,
-        link_title: None,
-        link_description: None,
-        link_url: None,
-        link_thumbnail_path: None,
+        // The sender's own preview. These were extracted above and then
+        // dropped here, so a link shared from a phone arrived with no title,
+        // description or image at all.
+        link_thumbnail_path: base
+            .extended_text_message
+            .as_deref()
+            .and_then(|e| e.jpeg_thumbnail.as_deref())
+            .and_then(|b| save_link_thumbnail(&info.id, b)),
+        link_title,
+        link_description,
+        link_url,
         receipt_status: if info.source.is_from_me {
             ReceiptStatus::Sent
         } else {
@@ -11270,21 +11282,12 @@ pub fn fetch_link_preview_blocking(u: String) -> (Option<String>, Option<String>
                 .read_to_end(&mut bytes)
                 .ok();
             let body = String::from_utf8_lossy(&bytes);
-            let extract = |tag: &str| -> Option<String> {
-                // Search for property="og:X" content="..." in any order
-                if let Some(pos) = body.find(tag) {
-                    let region = &body[pos.saturating_sub(100)..body.len().min(pos + 300)];
-                    if let Some(c) = region.find("content=\"") {
-                        let start = c + 9;
-                        if let Some(end) = region[start..].find('"') {
-                            let val = &region[start..start + end];
-                            if !val.is_empty() {
-                                return Some(val.to_string());
-                            }
-                        }
-                    }
-                }
-                None
+            let metas = parse_meta_tags(&body);
+            let extract = |key: &str| -> Option<String> {
+                metas
+                    .iter()
+                    .find(|(k, v)| k.eq_ignore_ascii_case(key) && !v.is_empty())
+                    .map(|(_, v)| v.clone())
             };
             let title = extract("og:title").or_else(|| {
                 body.split("<title>")
@@ -11293,8 +11296,12 @@ pub fn fetch_link_preview_blocking(u: String) -> (Option<String>, Option<String>
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
             });
-            let desc = extract("og:description");
-            let thumb = extract("og:image");
+            let desc = extract("og:description")
+                .or_else(|| extract("twitter:description"))
+                .or_else(|| extract("description"));
+            let thumb = extract("og:image")
+                .or_else(|| extract("og:image:url"))
+                .or_else(|| extract("twitter:image"));
             log::info!("OG scrape: title={title:?}");
             (title, desc, thumb)
         }
@@ -11302,6 +11309,115 @@ pub fn fetch_link_preview_blocking(u: String) -> (Option<String>, Option<String>
             log::warn!("OG fetch failed: {e}");
             (None, None, None)
         }
+    }
+}
+
+/// Every `<meta>` tag as (property-or-name, content), each read from within its
+/// own tag. The scraper used to take the first `content="` found up to 100
+/// bytes *before* the key, which is usually the previous tag's — an event page
+/// previewed as "website" (its og:type) — and sliced the page at fixed byte
+/// offsets, which panics when an offset lands inside a multi-byte character.
+fn parse_meta_tags(html: &str) -> Vec<(String, String)> {
+    fn attr(tag: &str, name: &str) -> Option<String> {
+        let lower = tag.to_ascii_lowercase();
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(name) {
+            let at = from + rel;
+            from = at + name.len();
+            // Whole attribute name only: "content" must not match "data-content".
+            let before_ok = at == 0
+                || !lower.as_bytes()[at - 1].is_ascii_alphanumeric()
+                    && lower.as_bytes()[at - 1] != b'-';
+            let rest = tag[at + name.len()..].trim_start();
+            let Some(rest) = rest.strip_prefix('=') else {
+                continue;
+            };
+            if !before_ok {
+                continue;
+            }
+            let rest = rest.trim_start();
+            let (quote, body) = match rest.chars().next() {
+                Some(q @ ('"' | '\'')) => (q, &rest[1..]),
+                _ => {
+                    return rest
+                        .split(|c: char| c.is_whitespace() || c == '>')
+                        .next()
+                        .map(str::to_string);
+                }
+            };
+            return body.find(quote).map(|end| html_unescape(&body[..end]));
+        }
+        None
+    }
+    let mut out = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(rel) = lower[from..].find("<meta") {
+        let start = from + rel;
+        let Some(len) = html[start..].find('>') else {
+            break;
+        };
+        let tag = &html[start..start + len];
+        from = start + len;
+        let key = attr(tag, "property").or_else(|| attr(tag, "name"));
+        if let (Some(k), Some(v)) = (key, attr(tag, "content")) {
+            out.push((k, v.trim().to_string()));
+        }
+    }
+    out
+}
+
+fn html_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&apos;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+}
+
+/// Store a link preview's inline JPEG next to other media and return its path.
+fn save_link_thumbnail(msg_id: &str, bytes: &[u8]) -> Option<String> {
+    if bytes.len() < 100 {
+        return None;
+    }
+    let safe: String = msg_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let path = format!("wa_media/linkthumb_{safe}.jpg");
+    if !std::path::Path::new(&path).exists() {
+        let _ = std::fs::create_dir_all("wa_media");
+        std::fs::write(&path, bytes).ok()?;
+    }
+    Some(path)
+}
+
+#[cfg(test)]
+mod meta_tag_tests {
+    use super::parse_meta_tags;
+
+    #[test]
+    fn each_value_comes_from_its_own_tag() {
+        let html = r#"<meta property="og:type" content="website" />
+<meta property="og:site_name" content="Example Co" />
+<meta property="og:title" content="Spring Open House – Preview" />
+<meta property="og:description" content="Sat · 1:00 p.m. — Unit 1/C" />
+<meta content="https://example.test/img.png" property="og:image">"#;
+        let m = parse_meta_tags(html);
+        let get = |k: &str| m.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("og:title"), Some("Spring Open House – Preview"));
+        assert_eq!(get("og:description"), Some("Sat · 1:00 p.m. — Unit 1/C"));
+        assert_eq!(get("og:image"), Some("https://example.test/img.png"));
+    }
+
+    #[test]
+    fn multibyte_text_does_not_panic_and_entities_decode() {
+        let html = "<p>房师—’</p><meta name='description' content='A &amp; B &quot;q&quot;'>";
+        let m = parse_meta_tags(html);
+        assert_eq!(m[0].1, r#"A & B "q""#);
     }
 }
 
