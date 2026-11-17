@@ -9281,10 +9281,21 @@ async fn handle_command(
                     conversation: Some(text.clone()),
                     ..Default::default()
                 };
-                match client.send_message(jid, msg).await {
+                match client.send_message(jid.clone(), msg).await {
                     Ok(real_id) => {
                         let real_id = real_id.message_id;
                         sent += 1;
+                        // Sending from the phone leaves the chat read there;
+                        // sending from here did not, so every chat a list
+                        // touched showed as unread on the phone until opened.
+                        // Mark it read on all devices, as opening it would.
+                        if let Err(e) = client
+                            .chat_actions()
+                            .mark_chat_as_read(&jid, true, None)
+                            .await
+                        {
+                            log::warn!("MultiSend: mark {cid} read on other devices failed: {e:#}");
+                        }
                         log::info!("MultiSend to {cid} OK → {real_id}");
                         // Emit self-message event so it appears in the target chat locally
                         let now_ts = std::time::SystemTime::now()
