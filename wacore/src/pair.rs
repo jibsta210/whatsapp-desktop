@@ -18,7 +18,6 @@ use waproto::whatsapp::AdvEncryptionType;
 const ADV_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 0];
 const ADV_PREFIX_DEVICE_SIGNATURE_GENERATE: &[u8] = &[6, 1];
 const ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE: &[u8] = &[6, 5];
-const ADV_HOSTED_PREFIX_DEVICE_SIGNATURE_VERIFICATION: &[u8] = &[6, 6];
 
 // Aliases for HMAC-SHA256
 type HmacSha256 = Hmac<Sha256>;
@@ -185,17 +184,25 @@ impl PairUtils {
         let account_sig_bytes = signed_identity.account_signature();
         let inner_details_bytes = signed_identity.details().to_vec();
 
-        let account_sig_prefix = if is_hosted_account {
-            ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE
+        // Hosted-ness of the *signature* comes from the inner identity's
+        // device_type, not the HMAC container's account_type (whatsmeow
+        // handlePair, Baileys configureSuccessfulPairing). Using the container
+        // flag broke pairing with a phone build that sets them differently:
+        // "signature-mismatch" on every scan after a WhatsApp update.
+        let inner_hosted = wa::AdvDeviceIdentity::decode(&*inner_details_bytes)
+            .map(|d| d.device_type == Some(AdvEncryptionType::Hosted as i32))
+            .unwrap_or(false);
+        let (preferred, other) = if inner_hosted {
+            (
+                ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE,
+                ADV_PREFIX_ACCOUNT_SIGNATURE,
+            )
         } else {
-            ADV_PREFIX_ACCOUNT_SIGNATURE
+            (
+                ADV_PREFIX_ACCOUNT_SIGNATURE,
+                ADV_HOSTED_PREFIX_ACCOUNT_SIGNATURE,
+            )
         };
-
-        let msg_to_verify = Self::concat_bytes(&[
-            account_sig_prefix,
-            &inner_details_bytes,
-            device_state.identity_key.public_key.public_key_bytes(),
-        ]);
 
         let account_public_key = PublicKey::from_djb_public_key_bytes(account_sig_key_bytes)
             .map_err(|e| PairCryptoError {
@@ -204,20 +211,30 @@ impl PairUtils {
                 source: e.into(),
             })?;
 
-        if !account_public_key.verify_signature(&msg_to_verify, account_sig_bytes) {
+        // Either prefix is a valid signature by the account key over our
+        // identity key, so accepting the other one costs no security; it only
+        // stops a flag disagreement from blocking the link.
+        let verifies = |prefix: &[u8]| {
+            let msg = Self::concat_bytes(&[
+                prefix,
+                &inner_details_bytes,
+                device_state.identity_key.public_key.public_key_bytes(),
+            ]);
+            account_public_key.verify_signature(&msg, account_sig_bytes)
+        };
+        if !verifies(preferred) && !verifies(other) {
             return Err(PairCryptoError {
                 code: 401,
                 text: "signature-mismatch",
-                source: anyhow::anyhow!("libsignal signature verification failed"),
+                source: anyhow::anyhow!(
+                    "libsignal signature verification failed (container hosted={is_hosted_account}, inner hosted={inner_hosted})"
+                ),
             });
         }
 
-        // 3. Generate our device signature
-        let device_sig_prefix = if is_hosted_account {
-            ADV_HOSTED_PREFIX_DEVICE_SIGNATURE_VERIFICATION
-        } else {
-            ADV_PREFIX_DEVICE_SIGNATURE_GENERATE
-        };
+        // 3. Generate our device signature. Always the {6,1} prefix: neither
+        // reference implementation uses a hosted variant here.
+        let device_sig_prefix = ADV_PREFIX_DEVICE_SIGNATURE_GENERATE;
 
         let msg_to_sign = Self::concat_bytes(&[
             device_sig_prefix,
