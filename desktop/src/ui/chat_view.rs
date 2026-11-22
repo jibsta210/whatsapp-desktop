@@ -5017,15 +5017,47 @@ impl ChatViewPanel {
         // above can't match the still-pending optimistic bubble — it rendered twice.
         // Adopt the pending bubble by identical text instead of appending.
         if msg.is_from_me && msg.id.starts_with("gm:") && msg.text.is_some() {
+            // Compared with whitespace collapsed: the relay can hand back a
+            // long or multi-line SMS with its line breaks or trailing spaces
+            // changed, and an exact comparison then missed it — the same
+            // message showed twice.
+            let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+            let echoed = norm(msg.text.as_deref().unwrap_or_default());
             let pending = {
                 let bubbles = inner.bubbles.borrow();
-                bubbles
+                let found = bubbles
                     .iter()
                     .find(|(key, bubble)| {
                         (key.starts_with("tmp-") || key.starts_with("gm:tmp_"))
-                            && bubble.live_text().as_deref() == msg.text.as_deref()
+                            && bubble.live_text().as_deref().map(norm).as_deref()
+                                == Some(echoed.as_str())
                     })
-                    .map(|(key, _)| key.clone())
+                    .map(|(key, _)| key.clone());
+                if found.is_none() {
+                    let waiting: Vec<_> = bubbles
+                        .iter()
+                        .filter(|(k, _)| k.starts_with("tmp-") || k.starts_with("gm:tmp_"))
+                        .map(|(k, b)| {
+                            format!(
+                                "{k}={:?}",
+                                b.live_text()
+                                    .unwrap_or_default()
+                                    .chars()
+                                    .take(40)
+                                    .collect::<String>()
+                            )
+                        })
+                        .collect();
+                    if !waiting.is_empty() {
+                        log::info!(
+                            "SMS echo {} {:?} matched no pending bubble; pending: {}",
+                            msg.id,
+                            echoed.chars().take(40).collect::<String>(),
+                            waiting.join(", ")
+                        );
+                    }
+                }
+                found
             };
             if let Some(pending_key) = pending {
                 let mut bubbles = inner.bubbles.borrow_mut();
