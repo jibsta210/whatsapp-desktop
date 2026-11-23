@@ -652,6 +652,12 @@ pub fn mark_healthy() {
 pub fn restart_to_apply() -> anyhow::Result<()> {
     let data_dir = std::env::current_dir()?;
     anyhow::ensure!(data_dir.join(PENDING_FILE).exists(), "no update is ready");
+    relaunch(&[])
+}
+
+/// Exit and start again a second later, outside this process. `extra_env`
+/// is passed to the new process as KEY=VALUE.
+pub fn relaunch(extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
     let unit = format!("whatsapp-update-relaunch-{}", std::process::id());
     let mut command = std::process::Command::new("systemd-run");
@@ -664,6 +670,9 @@ pub fn restart_to_apply() -> anyhow::Result<()> {
     ]);
     if std::env::var("GMESSAGES_ENABLE").as_deref() == Ok("1") {
         command.arg("GMESSAGES_ENABLE=1");
+    }
+    for (k, v) in extra_env {
+        command.arg(format!("{k}={v}"));
     }
     let status = command.arg(exe).status()?;
     anyhow::ensure!(status.success(), "failed to schedule application restart");

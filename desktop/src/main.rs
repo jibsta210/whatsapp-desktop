@@ -185,6 +185,7 @@ fn main() {
         }
     }
     env_logger::init();
+    install_gl_loss_recovery();
     log::info!(
         "whatsapp-desktop launched; logging to {} (prev run at {})",
         log_path.display(),
@@ -221,4 +222,47 @@ fn main() {
 
     let app = WhatsAppApp::new();
     app.run();
+}
+
+/// When the GPU drops the GL context (driver reset, suspend/resume), GTK
+/// cannot draw again: every frame fails with "gdk_gl_context_make_current()
+/// failed" and the window freezes until the app is restarted. Restart it
+/// ourselves — at most once per ten minutes, so a GPU that stays broken does
+/// not turn into a restart loop.
+fn install_gl_loss_recovery() {
+    const GUARD: &str = "WA_GL_RELAUNCH_AT";
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    let recently_relaunched = std::env::var(GUARD)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|at| now().saturating_sub(at) < 600);
+    let fired = std::sync::atomic::AtomicBool::new(false);
+    gtk4::glib::log_set_handler(
+        Some("Gdk"),
+        gtk4::glib::LogLevels::LEVEL_WARNING | gtk4::glib::LogLevels::LEVEL_CRITICAL,
+        false,
+        false,
+        move |domain, level, message| {
+            // Handling a domain silences GLib's own printing of it.
+            eprintln!("({}) {:?}: {message}", domain.unwrap_or("Gdk"), level);
+            if !message.contains("gdk_gl_context_make_current() failed")
+                || recently_relaunched
+                || fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return;
+            }
+            log::error!("GL context lost — the window can no longer draw; restarting the app");
+            let at = now().to_string();
+            gtk4::glib::idle_add_once(move || {
+                if let Err(e) = crate::updater::relaunch(&[(GUARD, at.as_str())]) {
+                    log::error!("could not restart after GL loss: {e:#}");
+                }
+            });
+        },
+    );
 }
