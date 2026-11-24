@@ -2314,82 +2314,100 @@ fn format_whatsapp_markup(text: &str) -> String {
 
 /// Apply WhatsApp inline formatting for a single delimiter character.
 /// Converts e.g., `*text*` → `<b>text</b>`.
+///
+/// Like WhatsApp, a delimiter only formats when a valid closer follows on the
+/// same line; a lone `~` (as in "~$20K") must stay literal text.
 fn apply_inline_format(text: &str, delim: char, tag: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut inside = false;
-    let mut last_was_open = false;
     let chars: Vec<char> = text.chars().collect();
+    let mut result = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
-        // Skip over already-emitted `<a ...>...</a>` link spans verbatim. Without
-        // this, a delimiter opened earlier in the message whose matching char
-        // appears inside the href/link text would inject a close tag inside the
-        // <a> attribute, producing invalid Pango markup that blanks the bubble.
+        // Copy link spans verbatim: a delimiter inside an href would corrupt
+        // the Pango markup and blank the bubble.
         if chars[i] == '<' && chars[i + 1..].starts_with(&['a', ' ']) {
-            // Find the end of the closing </a>
-            let close: Vec<char> = "</a>".chars().collect();
-            let mut j = i;
-            let mut end = None;
-            while j + close.len() <= chars.len() {
-                if chars[j..j + close.len()] == close[..] {
-                    end = Some(j + close.len());
-                    break;
-                }
-                j += 1;
-            }
-            if let Some(e) = end {
-                for &c in &chars[i..e] {
-                    result.push(c);
-                }
-                i = e;
-                last_was_open = false;
-                continue;
-            }
+            let end = find_seq(&chars, i, "</a>").map(|e| e + 4).unwrap_or(chars.len());
+            result.extend(&chars[i..end]);
+            i = end;
+            continue;
         }
-        if chars[i] == delim {
-            // Don't match inside URLs or Pango tags
-            if inside {
-                // Close tag — only if we opened one and there's content
-                result.push_str(&format!("</{tag}>"));
-                inside = false;
-                last_was_open = false;
-            } else {
-                // Open tag — only at word boundary (start of string, after space/newline)
-                let prev = if i > 0 { chars[i - 1] } else { ' ' };
-                if prev == ' ' || prev == '\n' || i == 0 {
-                    result.push_str(&format!("<{tag}>"));
-                    inside = true;
-                    last_was_open = true;
-                } else {
-                    result.push(delim);
-                }
-            }
-        } else {
-            if chars[i] == '\n' && inside {
-                // Newline breaks formatting — close unclosed tag
-                result.push_str(&format!("</{tag}>"));
-                inside = false;
-            }
-            if last_was_open && chars[i] == ' ' {
-                // Space immediately after delimiter — not formatting, revert
-                result.push_str(&format!("</{tag}>"));
-                result.push(delim);
-                result.push(' ');
-                inside = false;
-                last_was_open = false;
-                i += 1;
-                continue;
-            }
-            last_was_open = false;
-            result.push(chars[i]);
+        if chars[i] == delim
+            && (i == 0 || !chars[i - 1].is_alphanumeric())
+            && let Some(close) = find_closer(&chars, i, delim)
+        {
+            result.push_str(&format!("<{tag}>"));
+            result.extend(&chars[i + 1..close]);
+            result.push_str(&format!("</{tag}>"));
+            i = close + 1;
+            continue;
         }
+        result.push(chars[i]);
         i += 1;
     }
-    // Close any unclosed tag (malformed formatting)
-    if inside {
-        result.push_str(&format!("</{tag}>"));
-    }
     result
+}
+
+fn find_seq(chars: &[char], from: usize, seq: &str) -> Option<usize> {
+    let seq: Vec<char> = seq.chars().collect();
+    (from..=chars.len().saturating_sub(seq.len())).find(|&j| chars[j..j + seq.len()] == seq[..])
+}
+
+/// WhatsApp's rules: content starts and ends with non-whitespace, the closer
+/// isn't glued to a following word, and formatting never spans lines or links.
+fn find_closer(chars: &[char], open: usize, delim: char) -> Option<usize> {
+    let first = *chars.get(open + 1)?;
+    if first.is_whitespace() || first == delim {
+        return None;
+    }
+    let mut j = open + 2;
+    while j < chars.len() {
+        let c = chars[j];
+        if c == '\n' || (c == '<' && chars[j + 1..].starts_with(&['a', ' '])) {
+            return None;
+        }
+        if c == delim
+            && !chars[j - 1].is_whitespace()
+            && chars.get(j + 1).is_none_or(|n| !n.is_alphanumeric())
+        {
+            return Some(j);
+        }
+        j += 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod inline_format_tests {
+    use super::apply_inline_format;
+
+    #[test]
+    fn lone_tildes_used_as_approx_stay_literal() {
+        let t = "offer up ~$20K to make it work, about ~6%.";
+        assert_eq!(apply_inline_format(t, '~', "s"), t);
+    }
+
+    #[test]
+    fn unclosed_delimiter_stays_literal() {
+        let t = "may offer ~$20K for the deal...";
+        assert_eq!(apply_inline_format(t, '~', "s"), t);
+    }
+
+    #[test]
+    fn valid_pairs_still_format() {
+        assert_eq!(apply_inline_format("a ~gone~ b", '~', "s"), "a <s>gone</s> b");
+        assert_eq!(apply_inline_format("*hi there*!", '*', "b"), "<b>hi there</b>!");
+    }
+
+    #[test]
+    fn formatting_does_not_span_lines() {
+        let t = "~one\ntwo~";
+        assert_eq!(apply_inline_format(t, '~', "s"), t);
+    }
+
+    #[test]
+    fn snake_case_is_not_italic() {
+        let t = "file_name_here";
+        assert_eq!(apply_inline_format(t, '_', "i"), t);
+    }
 }
 
 fn open_video_window(path: &str) {
