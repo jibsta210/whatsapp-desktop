@@ -661,6 +661,8 @@ pub enum WaCommand {
         /// Reworded versions of `text`. When non-empty, recipient i gets
         /// `variants[i % len]` so no two consecutive sends are identical.
         variants: Vec<String>,
+        /// Photo, video or file sent with each message; the text becomes its caption.
+        media_path: Option<String>,
     },
     /// Where a send-list campaign stands for each recipient, worked out from
     /// the chats themselves: who got it, who replied, who got the follow-up.

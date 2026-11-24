@@ -90,8 +90,8 @@ pub fn generate_variations(text: &str, n: usize) -> Result<Vec<String>, String> 
 }
 
 /// Compose a campaign message with optional AI variants, then hand
-/// `(text, variants)` to `on_send`. `variants` is empty when the user chose to
-/// send the text as is; otherwise it includes the original.
+/// `(text, variants, attachment)` to `on_send`. `variants` is empty when the
+/// user chose to send the text as is; otherwise it includes the original.
 pub fn show_compose_dialog(
     parent: &gtk4::Widget,
     title: &str,
@@ -99,7 +99,7 @@ pub fn show_compose_dialog(
     recipients: usize,
     reword_default: bool,
     variation_count: usize,
-    on_send: impl Fn(String, Vec<String>) + 'static,
+    on_send: impl Fn(String, Vec<String>, Option<String>) + 'static,
 ) {
     let dialog = adw::Dialog::new();
     dialog.set_title(title);
@@ -124,6 +124,82 @@ pub fn show_compose_dialog(
     text_frame.set_child(Some(&text_view));
     text_view.set_size_request(-1, 100);
     body.append(&text_frame);
+
+    // One photo, video or file, sent to everyone with the text as its caption.
+    let attachment: Rc<std::cell::RefCell<Option<String>>> = Rc::default();
+    let attach_row = Box::new(Orientation::Horizontal, 8);
+    let attach_btn = Button::new();
+    let attach_content = adw::ButtonContent::new();
+    attach_content.set_icon_name("mail-attachment-symbolic");
+    attach_content.set_label("Attach photo or file");
+    attach_btn.set_child(Some(&attach_content));
+    let thumb = gtk4::Picture::new();
+    thumb.set_size_request(48, 48);
+    thumb.set_content_fit(gtk4::ContentFit::Cover);
+    thumb.set_visible(false);
+    let attach_label = Label::new(None);
+    attach_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    attach_label.set_hexpand(true);
+    attach_label.set_halign(Align::Start);
+    let remove_btn = Button::from_icon_name("edit-delete-symbolic");
+    remove_btn.add_css_class("flat");
+    remove_btn.set_tooltip_text(Some("Remove attachment"));
+    remove_btn.set_visible(false);
+    attach_row.append(&attach_btn);
+    attach_row.append(&thumb);
+    attach_row.append(&attach_label);
+    attach_row.append(&remove_btn);
+    body.append(&attach_row);
+    let show_attachment: Rc<dyn Fn(Option<String>)> = {
+        let (attachment, thumb, attach_label, remove_btn) = (
+            attachment.clone(),
+            thumb.clone(),
+            attach_label.clone(),
+            remove_btn.clone(),
+        );
+        Rc::new(move |path: Option<String>| {
+            let is_image = path.as_deref().is_some_and(|p| {
+                let l = p.to_lowercase();
+                [".jpg", ".jpeg", ".png", ".webp", ".gif"]
+                    .iter()
+                    .any(|e| l.ends_with(e))
+            });
+            thumb.set_filename(path.as_deref().filter(|_| is_image));
+            thumb.set_visible(is_image);
+            attach_label.set_text(
+                path.as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_name())
+                    .and_then(|f| f.to_str())
+                    .unwrap_or(""),
+            );
+            remove_btn.set_visible(path.is_some());
+            *attachment.borrow_mut() = path;
+        })
+    };
+    {
+        let show = show_attachment.clone();
+        remove_btn.connect_clicked(move |_| show(None));
+    }
+    {
+        let show = show_attachment.clone();
+        let dialog_w = dialog.downgrade();
+        attach_btn.connect_clicked(move |_| {
+            let chooser = gtk4::FileDialog::new();
+            chooser.set_title("Attach to every message");
+            let show = show.clone();
+            let parent = dialog_w
+                .upgrade()
+                .and_then(|d| d.root())
+                .and_then(|r| r.downcast::<gtk4::Window>().ok());
+            chooser.open(parent.as_ref(), gtk4::gio::Cancellable::NONE, move |res| {
+                if let Ok(file) = res
+                    && let Some(p) = file.path()
+                {
+                    show(Some(p.to_string_lossy().into_owned()));
+                }
+            });
+        });
+    }
 
     let reword = CheckButton::with_label("Reword it for each person with AI (lowers spam risk)");
     reword.set_active(reword_default);
@@ -226,8 +302,18 @@ pub fn show_compose_dialog(
                             tv.set_top_margin(6);
                             tv.set_bottom_margin(6);
                             tv.buffer().set_text(t);
+                            // A wrapped TextView reports its height only after
+                            // a layout pass, so inside the list it was sized to
+                            // a sliver. A per-box scroller with a floor always
+                            // shows several lines and scrolls the rest.
+                            let sw = ScrolledWindow::new();
+                            sw.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+                            sw.set_min_content_height(130);
+                            sw.set_max_content_height(260);
+                            sw.set_propagate_natural_height(true);
+                            sw.set_child(Some(&tv));
                             let f = gtk4::Frame::new(None);
-                            f.set_child(Some(&tv));
+                            f.set_child(Some(&sw));
                             variants_box.append(&f);
                             v.push(tv);
                         }
@@ -249,7 +335,8 @@ pub fn show_compose_dialog(
         let dialog_c = dialog.clone();
         send_btn.connect_clicked(move |_| {
             let text = buffer_text(&text_view);
-            if text.trim().is_empty() {
+            let media = attachment.borrow().clone();
+            if text.trim().is_empty() && media.is_none() {
                 return;
             }
             let variants: Vec<String> = if reword.is_active() {
@@ -263,7 +350,7 @@ pub fn show_compose_dialog(
                 Vec::new()
             };
             dialog_c.close();
-            on_send(text, variants);
+            on_send(text, variants, media);
         });
     }
 

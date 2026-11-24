@@ -2879,6 +2879,7 @@ pub fn show_multi_send_window(
             text,
             delay_secs: DEFAULT_SEND_DELAY,
             variants: Vec::new(),
+            media_path: None,
         });
         if let Some(window) = window_weak.upgrade() {
             window.close();

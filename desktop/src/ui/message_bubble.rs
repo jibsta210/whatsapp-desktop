@@ -2325,7 +2325,9 @@ fn apply_inline_format(text: &str, delim: char, tag: &str) -> String {
         // Copy link spans verbatim: a delimiter inside an href would corrupt
         // the Pango markup and blank the bubble.
         if chars[i] == '<' && chars[i + 1..].starts_with(&['a', ' ']) {
-            let end = find_seq(&chars, i, "</a>").map(|e| e + 4).unwrap_or(chars.len());
+            let end = find_seq(&chars, i, "</a>")
+                .map(|e| e + 4)
+                .unwrap_or(chars.len());
             result.extend(&chars[i..end]);
             i = end;
             continue;
@@ -2393,8 +2395,14 @@ mod inline_format_tests {
 
     #[test]
     fn valid_pairs_still_format() {
-        assert_eq!(apply_inline_format("a ~gone~ b", '~', "s"), "a <s>gone</s> b");
-        assert_eq!(apply_inline_format("*hi there*!", '*', "b"), "<b>hi there</b>!");
+        assert_eq!(
+            apply_inline_format("a ~gone~ b", '~', "s"),
+            "a <s>gone</s> b"
+        );
+        assert_eq!(
+            apply_inline_format("*hi there*!", '*', "b"),
+            "<b>hi there</b>!"
+        );
     }
 
     #[test]

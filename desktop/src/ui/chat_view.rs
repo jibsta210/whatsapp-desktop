@@ -3994,13 +3994,14 @@ impl ChatViewPanel {
             n,
             cfg.ai_variations,
             cfg.variation_count as usize,
-            move |text, variants| {
-                save_send_group_entry(&group, &text, kind, variants.clone());
+            move |text, variants, media| {
+                save_send_group_entry(&group, &text, kind, variants.clone(), media.clone());
                 inner_c.bridge.send_command(WaCommand::MultiSend {
                     chat_ids: chat_ids.clone(),
                     text,
                     delay_secs: load_list_config(&group).delay,
                     variants,
+                    media_path: media,
                 });
             },
         );
@@ -4198,7 +4199,7 @@ impl ChatViewPanel {
                         batch.len(),
                         true,
                         cfg.variation_count as usize,
-                        move |text, variants| {
+                        move |text, variants, media| {
                             // Recorded on the original entry so Progress still
                             // counts these people as sent.
                             add_wordings_to_entry(&group_cc, ts, &text, &variants);
@@ -4207,6 +4208,7 @@ impl ChatViewPanel {
                                 text,
                                 delay_secs: load_list_config(&group_cc).delay,
                                 variants,
+                                media_path: media,
                             });
                         },
                     );
@@ -4288,6 +4290,7 @@ impl ChatViewPanel {
                         text: initial.text.clone(),
                         delay_secs: (lo, hi),
                         variants: initial.variants.clone(),
+                        media_path: initial.media_path.clone(),
                     });
                 });
                 confirm.present(Some(&root));
@@ -4331,6 +4334,7 @@ impl ChatViewPanel {
                         text: f.text.clone(),
                         delay_secs: load_list_config(&group_g).delay,
                         variants: f.variants.clone(),
+                        media_path: f.media_path.clone(),
                     });
                 });
                 confirm.present(Some(&inner_g2.root));
@@ -8401,6 +8405,9 @@ struct SendGroupHistoryEntry {
     /// text went out unchanged.
     #[serde(default)]
     variants: Vec<String>,
+    /// Attachment sent with it, so Continue sends the same one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    media_path: Option<String>,
 }
 
 fn load_send_group_entries(group_name: &str) -> Vec<SendGroupHistoryEntry> {
@@ -8557,7 +8564,13 @@ fn add_wordings_to_entry(group_name: &str, ts: i64, text: &str, variants: &[Stri
     }
 }
 
-fn save_send_group_entry(group_name: &str, text: &str, kind: &str, variants: Vec<String>) {
+fn save_send_group_entry(
+    group_name: &str,
+    text: &str,
+    kind: &str,
+    variants: Vec<String>,
+    media_path: Option<String>,
+) {
     let path = send_group_history_path(group_name);
     let mut entries: Vec<SendGroupHistoryEntry> = std::fs::read_to_string(&path)
         .ok()
@@ -8571,6 +8584,7 @@ fn save_send_group_entry(group_name: &str, text: &str, kind: &str, variants: Vec
             .as_secs() as i64,
         kind: kind.to_string(),
         variants,
+        media_path,
     });
     if let Ok(data) = serde_json::to_string_pretty(&entries) {
         let _ = std::fs::write(path, data);

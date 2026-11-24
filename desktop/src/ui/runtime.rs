@@ -1136,6 +1136,102 @@ fn migrate_json_to_bincode() {
 /// `14155551234@s.whatsapp.net` → `+14155551234`
 /// `12345.6789@lid` → `+12345` (LID — not a real phone, but better than raw JID)
 /// Groups and anything else → returned as-is.
+#[derive(Clone, Copy, PartialEq)]
+enum OutgoingKind {
+    Image,
+    Video,
+    Document,
+}
+
+fn outgoing_kind(path: &str) -> (OutgoingKind, String) {
+    let lower = path.to_lowercase();
+    if [".jpg", ".jpeg", ".png", ".webp", ".gif"]
+        .iter()
+        .any(|e| lower.ends_with(e))
+    {
+        (OutgoingKind::Image, "image/jpeg".into())
+    } else if [".mp4", ".mov", ".avi"].iter().any(|e| lower.ends_with(e)) {
+        (OutgoingKind::Video, "video/mp4".into())
+    } else {
+        // application/octet-stream made receivers save every file as .bin.
+        (OutgoingKind::Document, mime_from_extension(&lower))
+    }
+}
+
+fn outgoing_media_message(
+    kind: OutgoingKind,
+    up: &whatsapp_rust::upload::UploadResponse,
+    mime: &str,
+    filename: &str,
+    caption: Option<String>,
+) -> wa::Message {
+    let mimetype = Some(mime.to_string());
+    let url = Some(up.url.clone());
+    let direct_path = Some(up.direct_path.clone());
+    let media_key = Some(up.media_key.to_vec());
+    let file_enc_sha256 = Some(up.file_enc_sha256.to_vec());
+    let file_sha256 = Some(up.file_sha256.to_vec());
+    let file_length = Some(up.file_length);
+    match kind {
+        OutgoingKind::Image => wa::Message {
+            image_message: Some(Box::new(wa::message::ImageMessage {
+                mimetype,
+                caption,
+                url,
+                direct_path,
+                media_key,
+                file_enc_sha256,
+                file_sha256,
+                file_length,
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+        OutgoingKind::Video => wa::Message {
+            video_message: Some(Box::new(wa::message::VideoMessage {
+                mimetype,
+                caption,
+                url,
+                direct_path,
+                media_key,
+                file_enc_sha256,
+                file_sha256,
+                file_length,
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+        OutgoingKind::Document => wa::Message {
+            document_message: Some(Box::new(wa::message::DocumentMessage {
+                mimetype,
+                caption,
+                url,
+                direct_path,
+                media_key,
+                file_enc_sha256,
+                file_sha256,
+                file_length,
+                file_name: Some(filename.to_string()),
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+    }
+}
+
+/// Read a file off the async runtime; big files on a small worker stack overflowed.
+async fn read_file_off_runtime(path: &str) -> std::io::Result<Vec<u8>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let p = path.to_string();
+    std::thread::Builder::new()
+        .name("file-read".into())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(move || {
+            let _ = tx.send(std::fs::read(p));
+        })?;
+    rx.await.map_err(std::io::Error::other)?
+}
+
 /// Map a file extension to a proper MIME type. Used when sending
 /// documents — WhatsApp receivers store files with `application/octet-stream`
 /// as `.bin`, losing the original extension. Returning the correct MIME
@@ -1516,7 +1612,12 @@ async fn campaign_status(
         let outgoing_match = |set: &std::collections::HashSet<String>, from: i64| {
             msgs.iter()
                 .filter(|m| m.is_from_me && secs(m.timestamp) >= from - SLACK)
-                .filter(|m| m.text.as_deref().is_some_and(|t| set.contains(&norm(t))))
+                .filter(|m| {
+                    m.text
+                        .as_deref()
+                        .or(m.media_caption.as_deref())
+                        .is_some_and(|t| set.contains(&norm(t)))
+                })
                 .map(|m| secs(m.timestamp))
                 .min()
         };
@@ -9198,6 +9299,7 @@ async fn handle_command(
             text,
             delay_secs,
             variants,
+            media_path,
         } => {
             // Lists built from a group's members carry LIDs. Send to the phone
             // JID where one is known so the message lands in the existing chat
@@ -9236,6 +9338,52 @@ async fn handle_command(
             let min_delay = delay_secs.0.max(1);
             let max_delay = delay_secs.1.max(min_delay);
             let total = chat_ids.len() as u32;
+            // Upload once; every recipient's message points at the same blob,
+            // as forwarding does.
+            let media = match media_path.as_deref() {
+                None => None,
+                Some(path) => {
+                    let (kind, mime) = outgoing_kind(path);
+                    let filename = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .unwrap_or("file")
+                        .to_string();
+                    let uploaded = match read_file_off_runtime(path).await {
+                        Ok(data) if data.len() > 64 * 1024 * 1024 => {
+                            Err("the attachment is over 64 MB".to_string())
+                        }
+                        Ok(data) => {
+                            let upload_type = match kind {
+                                OutgoingKind::Image => wacore::download::MediaType::Image,
+                                OutgoingKind::Video => wacore::download::MediaType::Video,
+                                OutgoingKind::Document => wacore::download::MediaType::Document,
+                            };
+                            client
+                                .upload(data, upload_type, Default::default())
+                                .await
+                                .map_err(|e| format!("upload failed: {e}"))
+                        }
+                        Err(e) => Err(format!("could not read the attachment: {e}")),
+                    };
+                    match uploaded {
+                        Ok(up) => Some((kind, mime, filename, up, persist_outgoing_media(path))),
+                        Err(e) => {
+                            log::warn!("MultiSend: {e}");
+                            let _ = tx
+                                .send(WaEvent::ErrorToast(format!("Nothing sent — {e}")))
+                                .await;
+                            let _ = tx
+                                .send(WaEvent::MultiSendComplete {
+                                    sent: 0,
+                                    failed: total,
+                                })
+                                .await;
+                            return Ok(());
+                        }
+                    }
+                }
+            };
             let mut sent = 0u32;
             let mut failed = 0u32;
             for (i, cid) in chat_ids.iter().enumerate() {
@@ -9277,9 +9425,15 @@ async fn handle_command(
                 } else {
                     variants[i % variants.len()].clone()
                 };
-                let msg = wa::Message {
-                    conversation: Some(text.clone()),
-                    ..Default::default()
+                let caption = Some(text.clone()).filter(|t| !t.trim().is_empty());
+                let msg = match &media {
+                    Some((kind, mime, filename, up, _)) => {
+                        outgoing_media_message(*kind, up, mime, filename, caption.clone())
+                    }
+                    None => wa::Message {
+                        conversation: Some(text.clone()),
+                        ..Default::default()
+                    },
                 };
                 match client.send_message(jid.clone(), msg).await {
                     Ok(real_id) => {
@@ -9302,12 +9456,23 @@ async fn handle_command(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs() as i64;
-                        let self_msg = IncomingMessage::outgoing(
+                        let mut self_msg = IncomingMessage::outgoing(
                             real_id.to_string(),
                             cid.clone(),
                             Some(text.clone()),
                             now_ts,
                         );
+                        if let Some((kind, _, filename, _, local)) = &media {
+                            self_msg.text = None;
+                            self_msg.media_caption = caption.clone();
+                            self_msg.media_type = Some(match kind {
+                                OutgoingKind::Image => crate::bridge::MediaType::Image,
+                                OutgoingKind::Video => crate::bridge::MediaType::Video,
+                                OutgoingKind::Document => crate::bridge::MediaType::Document,
+                            });
+                            self_msg.media_local_path = Some(local.clone());
+                            self_msg.media_filename = Some(filename.clone());
+                        }
                         // Route through the choke point so each target row's
                         // preview/timestamp updates and emits ChatRowChanged —
                         // the bare history push left broadcast rows frozen once
