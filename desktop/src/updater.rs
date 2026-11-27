@@ -655,7 +655,7 @@ pub fn restart_to_apply() -> anyhow::Result<()> {
     relaunch(&[])
 }
 
-/// Exit and start again a second later, outside this process. `extra_env`
+/// Exit and start again two seconds later, outside this process. `extra_env`
 /// is passed to the new process as KEY=VALUE.
 pub fn relaunch(extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
@@ -665,7 +665,7 @@ pub fn relaunch(extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
         "--user",
         "--collect",
         &format!("--unit={unit}"),
-        "--on-active=1s",
+        "--on-active=2s",
         "/usr/bin/env",
     ]);
     if std::env::var("GMESSAGES_ENABLE").as_deref() == Ok("1") {
@@ -676,7 +676,11 @@ pub fn relaunch(extra_env: &[(&str, &str)]) -> anyhow::Result<()> {
     }
     let status = command.arg(exe).status()?;
     anyhow::ensure!(status.success(), "failed to schedule application restart");
-    std::process::exit(0);
+    log::logger().flush();
+    // _exit, not exit: exit's C destructors tear down GTK/Mesa under a
+    // running main thread and segfaulted, and the core dump kept the old
+    // instance holding the app's D-Bus name so the new one failed to start.
+    unsafe { libc::_exit(0) }
 }
 
 #[cfg(test)]

@@ -237,10 +237,9 @@ fn install_gl_loss_recovery() {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     };
-    let recently_relaunched = std::env::var(GUARD)
+    let last_relaunch = std::env::var(GUARD)
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .is_some_and(|at| now().saturating_sub(at) < 600);
+        .and_then(|v| v.parse::<u64>().ok());
     let fired = std::sync::atomic::AtomicBool::new(false);
     // GTK 4 logs through the structured writer, which log_set_handler never
     // sees — so the first version of this recovery never fired.
@@ -253,7 +252,8 @@ fn install_gl_loss_recovery() {
         if lost && !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
             // A second loss within minutes means the driver keeps dropping GL;
             // come back on the software renderer rather than freeze again.
-            let software = recently_relaunched;
+            // Judged at loss time: a restart hours ago is not a repeat.
+            let software = last_relaunch.is_some_and(|at| now().saturating_sub(at) < 600);
             log::error!(
                 "GL context lost — the window can no longer draw; restarting{}",
                 if software {
