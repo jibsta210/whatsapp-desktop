@@ -242,27 +242,42 @@ fn install_gl_loss_recovery() {
         .and_then(|v| v.parse::<u64>().ok())
         .is_some_and(|at| now().saturating_sub(at) < 600);
     let fired = std::sync::atomic::AtomicBool::new(false);
-    gtk4::glib::log_set_handler(
-        Some("Gdk"),
-        gtk4::glib::LogLevels::LEVEL_WARNING | gtk4::glib::LogLevels::LEVEL_CRITICAL,
-        false,
-        false,
-        move |domain, level, message| {
-            // Handling a domain silences GLib's own printing of it.
-            eprintln!("({}) {:?}: {message}", domain.unwrap_or("Gdk"), level);
-            if !message.contains("gdk_gl_context_make_current() failed")
-                || recently_relaunched
-                || fired.swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
-                return;
-            }
-            log::error!("GL context lost — the window can no longer draw; restarting the app");
+    // GTK 4 logs through the structured writer, which log_set_handler never
+    // sees — so the first version of this recovery never fired.
+    gtk4::glib::log_set_writer_func(move |level, fields| {
+        let lost = fields.iter().any(|f| {
+            f.key() == "MESSAGE"
+                && f.value_str()
+                    .is_some_and(|m| m.contains("gdk_gl_context_make_current() failed"))
+        });
+        if lost && !fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // A second loss within minutes means the driver keeps dropping GL;
+            // come back on the software renderer rather than freeze again.
+            let software = recently_relaunched;
+            log::error!(
+                "GL context lost — the window can no longer draw; restarting{}",
+                if software {
+                    " on the software renderer"
+                } else {
+                    ""
+                }
+            );
             let at = now().to_string();
-            gtk4::glib::idle_add_once(move || {
-                if let Err(e) = crate::updater::relaunch(&[(GUARD, at.as_str())]) {
+            // Off the GLib callback: relaunch exits the process.
+            std::thread::spawn(move || {
+                let mut env = vec![(GUARD, at.as_str())];
+                if software {
+                    env.push(("GSK_RENDERER", "cairo"));
+                }
+                if let Err(e) = crate::updater::relaunch(&env) {
                     log::error!("could not restart after GL loss: {e:#}");
                 }
             });
-        },
-    );
+        }
+        gtk4::glib::log_writer_default(level, fields)
+    });
+    // Lets the recovery be exercised without a real GPU fault.
+    if std::env::var_os("WA_SIMULATE_GL_LOSS").is_some() {
+        gtk4::glib::g_warning!("Gdk", "gdk_gl_context_make_current() failed");
+    }
 }
